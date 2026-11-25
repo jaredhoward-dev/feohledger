@@ -90,6 +90,10 @@ export const messages = {
 	'shell.legalAccept.continue': 'Accepter et continuer',
 	'shell.legalAccept.continuing': 'Enregistrement…',
 	'shell.legalAccept.failed': 'Votre acceptation n\'a pas été enregistrée. Réessayez.',
+	'shell.privacyAck.heading': 'Confirmez avoir lu notre politique de confidentialité',
+	'shell.privacyAck.body': 'Avant de continuer, lisez la politique de confidentialité en vigueur, qui explique comment la plateforme traite les informations que vous saisissez ici. Sinon, déconnectez-vous.',
+	'shell.privacyAck.continue': 'Confirmer et continuer',
+	'shell.privacyAck.failed': 'Votre confirmation n\'a pas été enregistrée. Réessayez.',
 
 	// Common buttons / states
 	'common.save': 'Enregistrer',

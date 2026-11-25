@@ -93,6 +93,10 @@ export const messages = {
 	'shell.legalAccept.continue': '同意して続行',
 	'shell.legalAccept.continuing': '保存しています…',
 	'shell.legalAccept.failed': '同意を保存できませんでした。もう一度お試しください。',
+	'shell.privacyAck.heading': 'プライバシーポリシーの確認',
+	'shell.privacyAck.body': '続行する前に、最新のプライバシーポリシーをお読みください。ここで入力する情報をプラットフォームがどのように取り扱うかを説明しています。確認しない場合はログアウトしてください。',
+	'shell.privacyAck.continue': '確認して続行',
+	'shell.privacyAck.failed': '確認を保存できませんでした。もう一度お試しください。',
 
 	// Common buttons / states
 	'common.save': '保存',

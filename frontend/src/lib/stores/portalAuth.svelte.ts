@@ -1,4 +1,5 @@
 import { portalApi, setPortalToken, clearPortalToken, hasPortalToken } from '#lib/portalApi.ts';
+import { ACKNOWLEDGED_PORTAL_VERSIONS } from '#lib/legal/acceptance.ts';
 
 interface PortalUser {
 	id: string;
@@ -9,6 +10,11 @@ interface PortalUser {
 	vendor_id: string;
 	vendor_name: string;
 	vendor_status: string;
+	// True while the supplier has not acknowledged the Privacy Policy version in
+	// force: the portal layout draws its blocking step in place of the shell
+	// until `acknowledgeLegal()` clears it (`docs/decisions.md` §500). Optional:
+	// an older response omits it, which reads as nothing to acknowledge.
+	legal_acceptance_required?: boolean;
 }
 
 interface PortalTokenResponse {
@@ -91,6 +97,17 @@ function createPortalAuth() {
 		}
 	}
 
+	// The portal re-prompt's submit: posts the Privacy Policy version this build
+	// carries and takes the profile the endpoint answers with, so the flag
+	// clears (and the shell renders) without a second `/me`. A refusal — the
+	// coded 422 for a stale build, a 429 — is thrown for the step to state.
+	async function acknowledgeLegal(): Promise<void> {
+		user = await portalApi.post<PortalUser>(
+			'/api/portal/auth/legal-acknowledgement',
+			ACKNOWLEDGED_PORTAL_VERSIONS
+		);
+	}
+
 	async function changePassword(current_password: string, new_password: string) {
 		user = await portalApi.post<PortalUser>('/api/portal/auth/change-password', {
 			current_password,
@@ -137,6 +154,7 @@ function createPortalAuth() {
 		logout,
 		fetchUser,
 		changePassword,
+		acknowledgeLegal,
 		startMfaEnrollment,
 		verifyMfaEnrollment,
 		disableMfa,
