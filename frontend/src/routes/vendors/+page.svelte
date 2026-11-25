@@ -387,11 +387,21 @@
 			const data = await api.get<{ items: Vendor[]; total: number }>(
 				`/api/vendors?${params}`
 			);
-			// Superseded by a newer fetch, or by a local edit. A whole-list read
-			// is also stale once a row decision has patched the list since it
-			// was issued; an append is not (see `refreshVendorRow`).
+			// Superseded by a newer fetch, or by a local edit.
 			if (!fetchSequence.canCommit(token)) return;
-			if (!opts.append && patchEpoch !== patchesAtStart) return;
+			// A whole-list read issued before a row decision patched the list
+			// carries a pre-decision snapshot of that row, so it cannot land
+			// as is. It is still the ONLY read for the current filter / search
+			// / sort, though: dropping it left the previous filter's rows,
+			// total and page under the new filter's chips and URL. Ask again —
+			// the new read is issued after the patch, so it carries the
+			// decision, and it takes over the sequence (this call's `finally`
+			// then leaves `loading` to it). An append is not stale this way
+			// (see `refreshVendorRow`).
+			if (!opts.append && patchEpoch !== patchesAtStart) {
+				void fetchVendors({ nextPage: opts.nextPage });
+				return;
+			}
 			vendors = opts.append ? appendUnique(vendors, data.items) : data.items;
 			// A whole-list read carries every row's verdict afresh.
 			if (!opts.append && rowRefreshFailed.size) rowRefreshFailed = new Set();
@@ -626,8 +636,9 @@
 	// - a whole-list read issued after the re-read (a filter change) answers
 	//   for that row itself, so the re-read stands down (`listEpoch`);
 	// - a whole-list read issued before the decision carries a pre-decision
-	//   snapshot, so it stands down instead (`patchEpoch`, checked in
-	//   `fetchVendors`). An append needs no guard: `appendUnique` keeps the
+	//   snapshot, so it is re-issued instead of landing (`patchEpoch`,
+	//   checked in `fetchVendors`) — not dropped, since it may be the only
+	//   read for a filter chosen while the decision was in flight. An append needs no guard: `appendUnique` keeps the
 	//   row already on screen, so the patched row's fresh data survives a
 	//   page that lands after it.
 	const rowSequences = new Map<string, ReturnType<typeof createRequestSequencer>>();
@@ -656,7 +667,8 @@
 		const id = updated.id;
 		// Until the server's answer lands the row shows its new status with
 		// its actions withheld (fail closed). Bumping `patchEpoch` first stops
-		// a whole-list read already in flight putting the old status back.
+		// a whole-list read already in flight putting the old status back: it
+		// is re-issued rather than landed (see `fetchVendors`).
 		patchEpoch += 1;
 		vendors = vendors.map((v) =>
 			v.id === id ? { ...v, status: updated.status, status_actions: undefined } : v
