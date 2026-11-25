@@ -373,7 +373,13 @@
 	{#if error}
 		<LoadError message={error} onretry={load} testId="partner-error" />
 	{:else}
-		<div class="partner-table">
+		<!-- `wide` (the 1000px floor below) only while rows are on the way or
+		     present: the settled empty row is a sentence — for a workspace that
+		     is not a partner, the page's whole explanation — and a sentence
+		     centred in a 1000px table runs off a phone screen (WCAG 1.4.10;
+		     tests-e2e/a11y/reflow.spec.ts). Loading keeps the floor so the
+		     header does not move when rows land. -->
+		<div class="partner-table" class:wide={loading || children.length > 0}>
 		<DataTable
 			columns={COLUMNS}
 			fixed
@@ -638,17 +644,20 @@
 	   ARMED label, fr "Confirmer le détachement" (≈214px as drawn), so arming
 	   Detach does not overprint the cell — the unarmed es "Desvincular" needs
 	   only ≈126px. Tenant and Brand name share the rest, and the `min-width`
-	   keeps them readable (past it the table scrolls inside its region).
+	   keeps them readable (past it the table scrolls inside its region) —
+	   applied under `.wide` only, with the column widths (a fixed table is
+	   at least as wide as its columns), so the settled empty row's sentence
+	   reflows to the viewport instead.
 	   DataTable renders these `<th>` from `columns`, so the selectors go
 	   through `:global` under this page-owned wrapper (the /gl-accounts
 	   pattern). */
 	.partner-table {
 		min-width: 0;
 	}
-	.partner-table :global(table) { min-width: 1000px; }
-	.partner-table :global(th.col-slug) { width: 200px; }
-	.partner-table :global(th.col-plan) { width: 110px; }
-	.partner-table :global(th.actions-col) { width: 280px; }
+	.partner-table.wide :global(table) { min-width: 1000px; }
+	.partner-table.wide :global(th.col-slug) { width: 200px; }
+	.partner-table.wide :global(th.col-plan) { width: 110px; }
+	.partner-table.wide :global(th.actions-col) { width: 280px; }
 
 	.mono {
 		font-family: ui-monospace, SFMono-Regular, Menlo, monospace;

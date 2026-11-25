@@ -305,3 +305,54 @@ test.describe("reflow at 320px — /organization's panels (WCAG 1.4.10)", () => 
 		});
 	}
 });
+
+/**
+ * /admin/partner for a workspace that is not a partner. Its whole explanation
+ * is the children table's empty row (decisions §501), and the route sweep above
+ * cannot see whether that sentence fits: the table scrolls inside its own
+ * region, so the DOCUMENT never overflows even while the sentence sits centred
+ * in a 1000px-wide table, mostly off a 320px screen. The table's width floor
+ * applies only while rows are loading or present
+ * (`src/routes/admin/partner/+page.svelte`, `.partner-table.wide`), so the
+ * settled empty row — as wide as the table it spans — must lie inside the
+ * viewport. The overview is answered here so the state does not depend
+ * on whether the worker tenant happens to administer a child.
+ */
+test.describe('reflow at 320px — /admin/partner when the workspace is not a partner', () => {
+	test('the not-a-partner sentence fits the screen', async ({ page }) => {
+		await page.route(
+			(url) => url.pathname === '/api/partner',
+			(route) =>
+				route.request().method() === 'GET'
+					? route.fulfill({
+							json: {
+								organization_id: '00000000-0000-4000-8000-000000000440',
+								name: 'Reflow Fixture Workspace',
+								is_partner: false,
+								children: []
+							}
+						})
+					: route.fallback()
+		);
+		await page.setViewportSize({ width: 320, height: 720 });
+		await page.goto('/admin/partner');
+
+		await expect(page.locator('aside.sidebar').first()).toBeVisible();
+		await expect(page).not.toHaveURL(/\/login/);
+		const empty = page.locator('.partner-table').getByTestId('table-empty');
+		await expect(empty).toContainText('partner');
+
+		const box = await empty.boundingBox();
+		expect(box, 'the empty row is not laid out').not.toBeNull();
+		expect(box!.x).toBeGreaterThanOrEqual(0);
+		expect(
+			box!.x + box!.width,
+			'the not-a-partner sentence runs off a 320px screen'
+		).toBeLessThanOrEqual(320);
+
+		const overflow = await page.evaluate(
+			() => document.documentElement.scrollWidth - document.documentElement.clientWidth
+		);
+		expect(overflow, 'horizontal page overflow on /admin/partner at 320px').toBeLessThanOrEqual(1);
+	});
+});
