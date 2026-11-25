@@ -25,10 +25,12 @@ from app.models.gl_account import GLAccount
 from app.models.invoice import Invoice, InvoiceStatus
 from app.models.organization import Organization
 from app.models.payment import Payment, PaymentRun
+from app.models.virtual_card import VirtualCard
 from app.models.workflow import AuditLog, WorkflowDefinition, WorkflowInstance
 from app.services import erp_payment_writeback
 from app.services.erp_adapters.base import ErpPostResult, erp_refusal
 from app.services.payment_erp_sync import _sync_payments
+from app.services.payment_settlement_record import CARD_SETTLED_STATUS
 
 COMPANY = "9130"
 REALM = f"quickbooks_online:{COMPANY}"
@@ -173,9 +175,27 @@ async def test_a_card_payment_uses_the_card_account(realdb):
     # Uncharged, the card leg has moved nothing: no write-back (decisions §537).
     await _sync(realdb, run_id, adapter)
     adapter.post_payment.assert_not_awaited()
-    # The card webhook writes the charge onto the leg; the next pass writes back.
+    # The charge settles and the card webhook writes it onto the leg (only a
+    # settled charge counts, decisions §543); the next pass writes back.
     async with realdb.sessionmaker("a")() as s:
         payment = await s.get(Payment, pay_id)
+        invoice = await s.get(Invoice, payment.invoice_id)
+        s.add(
+            VirtualCard(
+                invoice_id=invoice.id,
+                payment_id=pay_id,
+                organization_id=realdb.info("a").org_id,
+                entity_id=invoice.entity_id,
+                correlation_id=payment.correlation_id,
+                card_provider="mock",
+                provider_card_id=f"card-{uuid.uuid4().hex[:10]}",
+                last_four="9999",
+                amount_limit=payment.amount,
+                amount_charged=Decimal("100.00"),
+                currency="USD",
+                status=CARD_SETTLED_STATUS,
+            )
+        )
         payment.settled_amount = Decimal("100.00")
         payment.settled_currency = "USD"
         await s.commit()
