@@ -1,6 +1,7 @@
 import { api, ApiError, setToken, clearToken, hasToken } from '#lib/api.ts';
 import { sessionRejection } from '#lib/api/sessionRejection.ts';
 import { rememberNextForSso } from '#lib/utils/postLoginRedirect.ts';
+import { ACCEPTED_LEGAL_VERSIONS } from '#lib/legal/acceptance.ts';
 import { performAuthentication, performRegistration } from '#lib/webauthn.ts';
 
 export interface Passkey {
@@ -80,6 +81,12 @@ interface User {
 	// setting reads to show an upgrade prompt instead of a control the server
 	// would refuse with a 402. Advisory — the server enforces every gate.
 	entitlements?: string[];
+	// The account has not accepted the Terms of Service / Privacy Policy
+	// versions in force (`docs/decisions.md` §495). The root layout draws
+	// `layout/LegalAcceptStep` in the app shell's place while it is true, and
+	// `acceptLegal()` clears it (§497). Optional: an older response omits it,
+	// which reads as nothing to accept.
+	legal_acceptance_required?: boolean;
 }
 
 interface TokenResponse {
@@ -303,6 +310,22 @@ function createAuthStore() {
 		}
 	}
 
+	/**
+	 * Accept the Terms / Privacy versions this build carries
+	 * (`POST /api/auth/legal-acceptance`) and take the account it answers with,
+	 * so `legal_acceptance_required` clears without a second `/me`. Throws the
+	 * `ApiError` for the caller to state: a 422 `legal_acceptance_required`
+	 * (the versions in force changed since this bundle loaded) or a 429.
+	 */
+	async function acceptLegal(): Promise<void> {
+		const me = await api.post<User>('/api/auth/legal-acceptance', ACCEPTED_LEGAL_VERSIONS);
+		// A `/me` still in flight was sent before the acceptance; its answer
+		// must not land after this one and put the step back.
+		latestLoad++;
+		user = me;
+		userStatus = 'ready';
+	}
+
 	async function logout() {
 		try {
 			await api.post('/api/auth/logout', {});
@@ -368,6 +391,7 @@ function createAuthStore() {
 		revokeOtherSessions,
 		logout,
 		fetchUser,
+		acceptLegal,
 		hasRole,
 		hasAnyRole,
 		can,

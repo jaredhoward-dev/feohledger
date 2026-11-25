@@ -152,13 +152,15 @@ set_password_email_failed` and no account is created; with no tenant base URL to
 point a link at, the invite is a `503 set_password_link_unavailable` before
 anything is created (`backend/app/api/set_password_links.py`).
 
-**Who is not yet asked to accept the Terms.** Only signup and a set-password
-link require acceptance today. Users who existed before it, SSO / SCIM-provisioned
-users (they never redeem a set-password link), users after a version bump,
-mobile and API callers are reported by `GET /api/auth/me`
-(`legal_acceptance_required`) but neither prompted nor blocked: the in-app
-accept screen and the server-side gate are not built (`docs/authentication.md`
-§ Terms and Privacy acceptance, `docs/followups.md`).
+**Existing users are asked on the web; mobile and API callers are not yet.**
+Signup and a set-password link take acceptance as part of the form. Everyone
+else — users who existed before §495, SSO / SCIM-provisioned users (they never
+redeem a set-password link), users after a version bump — is reported by
+`GET /api/auth/me` (`legal_acceptance_required`) and, on signing in to the web
+app, meets a blocking accept step before any page (decisions §497). Mobile
+users and API callers are not yet prompted, and no server-side gate refuses an
+unaccepted user, so the flag is enforced only by the web screen
+(`docs/authentication.md` § Terms and Privacy acceptance, `docs/followups.md`).
 
 ### An address can belong to only one workspace
 

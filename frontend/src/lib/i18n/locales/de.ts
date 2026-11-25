@@ -84,6 +84,11 @@ export const messages = {
 	'shell.accountLoad.errorHeading': 'Ihr Konto konnte nicht geladen werden',
 	'shell.accountLoad.errorBody':
 		'Der Server hat nicht geantwortet. Prüfen Sie Ihre Verbindung und versuchen Sie es erneut, oder melden Sie sich ab und wieder an.',
+	'shell.legalAccept.heading': 'Nutzungsbedingungen prüfen und akzeptieren',
+	'shell.legalAccept.body': 'Bevor Sie fortfahren, lesen und akzeptieren Sie bitte die aktuellen Nutzungsbedingungen und die Datenschutzerklärung. Wenn Sie nicht zustimmen, melden Sie sich ab.',
+	'shell.legalAccept.continue': 'Akzeptieren und fortfahren',
+	'shell.legalAccept.continuing': 'Wird gespeichert…',
+	'shell.legalAccept.failed': 'Ihre Zustimmung wurde nicht gespeichert. Versuchen Sie es erneut.',
 
 	// Common buttons / states
 	'common.save': 'Speichern',

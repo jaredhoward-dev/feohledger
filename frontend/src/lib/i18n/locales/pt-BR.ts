@@ -86,6 +86,11 @@ export const messages = {
 	'shell.accountLoad.errorHeading': 'Não foi possível carregar sua conta',
 	'shell.accountLoad.errorBody':
 		'O servidor não respondeu. Verifique sua conexão e tente novamente, ou saia e entre de novo.',
+	'shell.legalAccept.heading': 'Revise e aceite nossos termos',
+	'shell.legalAccept.body': 'Antes de continuar, leia e aceite os termos de serviço e a política de privacidade vigentes. Se não concordar, saia.',
+	'shell.legalAccept.continue': 'Aceitar e continuar',
+	'shell.legalAccept.continuing': 'Salvando…',
+	'shell.legalAccept.failed': 'Sua aceitação não foi salva. Tente novamente.',
 
 	// Common buttons / states
 	'common.save': 'Salvar',

@@ -95,6 +95,11 @@ export const en = {
 	'shell.accountLoad.errorHeading': 'We couldn\'t load your account',
 	'shell.accountLoad.errorBody':
 		'The server didn\'t answer. Check your connection and try again, or log out and sign in again.',
+	'shell.legalAccept.heading': 'Review and accept our terms',
+	'shell.legalAccept.body': 'Before you continue, read and accept the current Terms of Service and Privacy Policy. If you don\'t agree, log out.',
+	'shell.legalAccept.continue': 'Accept and continue',
+	'shell.legalAccept.continuing': 'Saving…',
+	'shell.legalAccept.failed': 'Your acceptance wasn\'t saved. Try again.',
 
 	// Common buttons / states (reused across surfaces)
 	'common.save': 'Save',

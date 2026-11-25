@@ -25402,6 +25402,50 @@ value is easier in the vendor ERP-links table. *Backfilling from audit rows*:
 they are history, not a complete record of every link.
 
 
+## 497. The web re-prompt is a full-page step in the shell's place, not a modal (round 38)
+
+**Context.** §495 added `legal_acceptance_required` on `/me` and
+`POST /api/auth/legal-acceptance`, but nothing in the web app read the flag, so
+existing, SSO / SCIM and post-bump users were never asked.
+
+**Decision.** While the flag is true, the root layout draws
+`layout/LegalAcceptStep` **instead of** the app shell, in the branch beside
+`layout/AccountLoadState`: the shared `auth/LegalAcceptCheckbox`, *Accept and
+continue* and *Log out* (the only other way on). `auth.acceptLegal()` posts the
+versions the bundle carries and takes the account the endpoint returns, so the
+flag clears without a second `/me` and the shell renders.
+
+- *Full page over a modal.* A modal over the shell would mount the page behind
+  it, which fires its reads (and, once the server gate of §495 exists, a
+  wall of refusals) before the user has accepted; it would also need its own
+  "cannot be dismissed" exceptions to `ui/Modal`'s Escape and backdrop
+  handling. In the shell's place nothing behind it mounts, and the URL is left
+  untouched, so "continue to where the user was going" needs no `?next=`: the
+  page at that address renders the moment the flag clears. It is the same
+  shape as the account-load panel, so the layout has one pattern for "signed
+  in, but not into the app yet".
+- *No route.* `/change-password` is a route because the forced change predates
+  the layout branch and owns a form other paths link to; the accept step has
+  no address of its own to bookmark or link, and a route would need the
+  redirect-and-return dance `tenantHostRoute` does for the password change.
+- *Order.* The forced password change comes first (its route renders
+  standalone); the step follows on the next app page.
+- *Side effects wait.* The branding load and the notification poll start only
+  once the flag is clear, like the forced change, so no app call runs behind
+  the step.
+- *Seeds.* `scripts/seed.py` records the versions in force for every account it
+  creates, source `seed` (no person ticked anything for a fixture, so the row
+  does not borrow a control's name); the e2e helper that creates accounts
+  mid-run does the same unless a spec opts out. This is not the backfill §495
+  refuses: those are fixture accounts in seeded orgs, not real users.
+
+**Rejected.** *A dismissible banner*: not an accept control and records
+nothing until clicked, the browsewrap §495 rejected. *Checking the flag in
+`tenantHostRoute` and redirecting to `/accept-terms`*: a second navigation to
+race the auth wall, and a route a signed-out visitor could land on.
+**Still open:** mobile, the supplier portal and the server-side gate
+(`docs/followups.md`).
+
 ## 498. The Flutter app asks for Terms / Privacy acceptance, with versions generated from the backend (round 38)
 
 **Problem.** §495 added `legal_acceptance_required` on `/me` and `POST

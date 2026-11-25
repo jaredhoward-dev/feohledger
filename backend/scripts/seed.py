@@ -93,6 +93,7 @@ from app.services.control_plane_bootstrap import (
     create_control_tables as bootstrap_control_tables,
 )
 from app.services.erp_link_realm import UNNAMED_REALM
+from app.services.legal_acceptance import CURRENT_LEGAL_VERSIONS, record_acceptances
 from app.services.tenant_provisioning import CONTROL_TABLES
 from app.utils.dates import utc_today
 from app.utils.passwords import pwd_context
@@ -352,6 +353,42 @@ async def ensure_seed_plan_entitled(
     return True
 
 
+#: ``legal_acceptances.source`` for the rows below. Not one of the service's
+#: ``SOURCE_*`` controls on purpose: no person ticked a box for a fixture
+#: account, and the row should say so rather than borrow a control's name.
+SEED_LEGAL_SOURCE = "seed"
+
+
+async def ensure_seeded_users_accepted_legal(
+    session: AsyncSession, organization_ids: list[uuid.UUID]
+) -> None:
+    """Record acceptance of the Terms / Privacy versions in force for every
+    user of the seeded orgs, so the web app's blocking re-prompt
+    (``legal_acceptance_required`` on ``/me``, decisions §495, §497) does not
+    stand between the demo logins / every e2e spec and the app.
+
+    Through ``legal_acceptance.record_acceptances``, the one writer, so a
+    re-run is a no-op (``ON CONFLICT DO NOTHING``) and a version bump is
+    picked up by re-running the seed. Runs on the already-seeded path too,
+    the same backfill shape as :func:`ensure_demo_billing_baseline`. Only
+    fixture accounts in seeded orgs: this is not the backfill §495 refuses
+    for real users. Caller commits.
+    """
+    rows = (
+        await session.execute(
+            select(User.id, User.organization_id).where(User.organization_id.in_(organization_ids))
+        )
+    ).all()
+    for user_id, org_id in rows:
+        await record_acceptances(
+            session,
+            user_id=user_id,
+            organization_id=org_id,
+            versions=CURRENT_LEGAL_VERSIONS,
+            source=SEED_LEGAL_SOURCE,
+        )
+
+
 async def ensure_demo_billing_baseline(session: AsyncSession) -> None:
     """Bind the two demo tenants to their seeded plans (:data:`ACME_PLAN_CODE`
     / :data:`TECHFLOW_PLAN_CODE`) and repair an already-seeded control plane.
@@ -387,8 +424,12 @@ async def seed_control_plane():
             # its own `continue`). Without this, a demo tenant stuck on a plan
             # that grants no `public_api` could never be repaired by re-running
             # the seed.
-            print("  Control plane already seeded — refreshing billing baseline only.")
+            print(
+                "  Control plane already seeded — refreshing billing baseline "
+                "and legal acceptances only."
+            )
             await ensure_demo_billing_baseline(session)
+            await ensure_seeded_users_accepted_legal(session, [ACME_ORG_ID, TECH_ORG_ID])
             await session.commit()
             return
 
@@ -540,6 +581,7 @@ async def seed_control_plane():
         # FROM. Which plan each demo tenant lands on, and why they differ, is
         # documented on ACME_PLAN_CODE / TECHFLOW_PLAN_CODE above.
         await ensure_demo_billing_baseline(session)
+        await ensure_seeded_users_accepted_legal(session, [ACME_ORG_ID, TECH_ORG_ID])
 
         await session.commit()
         print(
@@ -1977,6 +2019,11 @@ async def seed_e2e_control_plane(roles: dict[str, "Role"]) -> list[tuple[str, uu
             await ensure_seed_plan_entitled(
                 session, organization_id=e2e_org_id, plan_code=E2E_PLAN_CODE
             )
+        # Every worker user, including those of a tenant seeded before this
+        # existed (the `continue` above): the step would block every spec.
+        await ensure_seeded_users_accepted_legal(
+            session, [e2e_org_id for _db, e2e_org_id, _label in created]
+        )
 
         await session.commit()
 

@@ -88,6 +88,11 @@ export const messages = {
 	'shell.accountLoad.errorHeading': 'アカウントを読み込めませんでした',
 	'shell.accountLoad.errorBody':
 		'サーバーから応答がありません。接続を確認して再試行するか、ログアウトしてからもう一度サインインしてください。',
+	'shell.legalAccept.heading': '利用規約の確認と同意',
+	'shell.legalAccept.body': '続行する前に、最新の利用規約とプライバシーポリシーをお読みのうえ同意してください。同意しない場合はログアウトしてください。',
+	'shell.legalAccept.continue': '同意して続行',
+	'shell.legalAccept.continuing': '保存しています…',
+	'shell.legalAccept.failed': '同意を保存できませんでした。もう一度お試しください。',
 
 	// Common buttons / states
 	'common.save': '保存',
