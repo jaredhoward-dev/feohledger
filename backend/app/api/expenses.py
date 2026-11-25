@@ -978,6 +978,7 @@ async def export_expenses(
     date_to: date | None = Query(None),
     report_id: uuid.UUID | None = Query(None),
     search: str | None = Query(None),
+    attachable: bool = Query(False),
     entity_id: uuid.UUID | None = Depends(get_entity_id),
 ):
     """Stream the filtered expense register as ``text/csv``.
@@ -994,7 +995,9 @@ async def export_expenses(
     FastAPI drops an undeclared query param silently, so a CSV taken mid-search
     covered the whole status-filtered set with nothing to say it had. The
     export-only filters (`category`, the date range) stay here: they are not on
-    the list surface, and the CSV is the place a period is sliced."""
+    the list surface, and the CSV is the place a period is sliced.
+    `attachable=true` narrows by the list's own `_attachable_by`, so an export
+    of the caller's attachable lines covers that set and no wider."""
     from app.services.report_export import EXPORTERS
 
     base = _expense_list_filters(
@@ -1015,6 +1018,8 @@ async def export_expenses(
         base = base.where(Expense.expense_date >= date_from)
     if date_to:
         base = base.where(Expense.expense_date <= date_to)
+    if attachable:
+        base = _attachable_by(base, user.id)
     base = base.order_by(Expense.expense_date.desc())
 
     rows = (await db.execute(base)).all()
