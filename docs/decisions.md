@@ -28710,3 +28710,92 @@ blind.
 **Tests.** `backend/tests/test_erp_dispatch_check.py::test_a_netsuite_bill_is_read_with_its_stored_credentials`
 fails without the fix (the `NetSuiteConfigError` → `erp_bill_unverified` hold)
 and passes with it.
+
+## 553. The workspace lookup spends an address's budget only after a solved captcha, and requires one on every deployment; a deployed API must decide `FEOH_TRUSTED_PROXY_CIDRS` (§518 / §525 follow-up, round 47)
+
+Both are operator decisions, taken for round 47.
+
+**1. Workspace lookup order (`POST /api/workspace-lookup`, §518).** The route
+checked the per-address budget before the captcha, so anyone, from rotating
+IPs and without ever solving a captcha, could spend a stranger's three hourly
+lookups and lock them out of the flow. The order is now: per-IP budget (cheap,
+refuses a flood from one source before any outbound hCaptcha call), the shape
+check, the captcha, then the per-address budget. Only a solved captcha spends
+an address's budget. Nothing else changes: every well-formed address that gets
+that far gets the same 200, and the lookup, the send and the audit row still
+run on the detached task after the response. A 429 on the address budget comes
+after the captcha for a known and an unknown address alike, so it is no oracle.
+A solved token spent on that 429 is gone, as any answered request spends it;
+the form resets the widget on every answer.
+
+**2. The captcha is required on every deployment.** `_require_captcha_in_deployed_envs`
+demanded the hCaptcha secret and site key only while `FEOH_SIGNUP_ENABLED` was
+on. But the lookup is deliberately not behind that switch (§518: closing signup
+does not stop users forgetting their workspace), so an invite-only deployment,
+which is what production runs, served a public, email-sending endpoint with no
+captcha. The pair is now required whenever `FEOH_ENVIRONMENT` is deployed,
+signup open or closed; `deploy/decrypt-env.sh` requires both unconditionally
+and `deploy/smoke.sh` expects `public-config` to serve a site key either way.
+Local dev and CI (not deployed) keep running both flows with no captcha.
+
+*Rejected: a `FEOH_WORKSPACE_LOOKUP_ENABLED` switch* gating both the route and
+the requirement. `/find-workspace` is the apex's only sign-in entry (the
+landing page's "Sign in" links go there), so turning it off is not a real
+option for a deployment, and a switch would add a 404 path, a public-config
+field and a frontend branch to buy an operator out of holding a free hCaptcha
+key. "Required when deployed" is the simplest rule that is true. The frontend
+needed no change: `/find-workspace` already reads the site key from
+`public-config` whatever the signup switch says.
+
+**3. `FEOH_TRUSTED_PROXY_CIDRS` must be decided on a deployment.** Empty means
+"trust no `X-Forwarded-For`". Behind a proxy that collapses every caller into
+the proxy's address, so every per-IP limit (login, signup, the workspace
+lookup, §525's ERP-webhook unseal budget) becomes one global bucket that one
+caller can exhaust for everyone. A deployed environment now refuses to boot
+with it empty (`_require_trusted_proxy_decision_in_deployed_envs`). An API
+reached directly, with no proxy, sets the explicit opt-out `none`: trust no
+forwarded header and key on the socket peer (`services/rate_limit.TRUSTED_PROXY_NONE`).
+Empty is never read as `none`. Every environment also refuses a malformed
+value at boot (`_validate_trusted_proxy_cidrs`): an entry that is not a CIDR
+or address, `none` mixed with CIDRs, or a value with no entry at all (`,`).
+The resolver used to skip a bad entry silently, which left a deployment
+trusting less than its operator believed, the same global-bucket failure.
+
+Deploy paths:
+
+- **Single-VM compose** (`deploy/compose.prod.yml`): already
+  `${FEOH_TRUSTED_PROXY_CIDRS:-172.28.0.0/16}`, the pinned network Caddy is on,
+  and compose's `:-` fills an empty sops value too, so the guard never sees
+  empty there. `test_config_boot_guards.py` pins that the default matches the
+  pinned subnet and passes the validator. `prod.sops.yaml.example` documents
+  the override and why `none` is wrong for that stack.
+- **ECS** (`aws-deploy.yml`): the task definition is re-registered from the
+  live one, so its environment is not in this repo. `docs/production-deployment.md`
+  now lists `FEOH_TRUSTED_PROXY_CIDRS` (the VPC CIDR, `infra` `var.vpc_cidr`)
+  as required. An ECS task without it will refuse to start: an operator step.
+- **Day-one rehearsal** (`scripts/day-one/stack.sh`, `pnpm day-one:up`, CI's
+  `day-one-e2e`): the browser reaches the API directly, so `none`; and
+  hCaptcha's published test pair (not secrets) for the now-unconditional
+  captcha requirement. The journey never submits a captcha.
+  `test_the_day_one_rehearsal_env_passes_every_deployed_boot_guard` builds
+  `Settings` from that heredoc.
+- **The e2e and backend CI jobs** run with `FEOH_ENVIRONMENT` unset
+  (development), so neither guard applies.
+
+**Operator step.** Production runs signup closed with no hCaptcha keys. Before
+the next deploy, add `FEOH_HCAPTCHA_SECRET` and `FEOH_HCAPTCHA_SITEKEY` to the
+VM's sops file (`deploy/prod.sops.yaml.example` § Self-service signup +
+hCaptcha); `decrypt-env.sh` refuses the deploy until they are there, before
+anything on the VM changes.
+
+**Tests.** `tests/test_workspace_lookup.py`: a failed captcha spends no
+per-address budget (fails on the old order), and the per-IP budget refuses
+before any captcha verification. `tests/test_config_boot_guards.py`: deployed
+and missing either captcha key refuses, signup open or closed; local needs
+neither; deployed and empty or blank proxy setting refuses; `none` in any case
+and CIDR lists are accepted; malformed values are refused in every
+environment; the compose default. `tests/test_rate_limit_security.py`: with
+`none`, a forged `X-Forwarded-For` is ignored from every peer and buckets are
+per socket peer. `tests/test_deploy_decrypt_env.py`, `tests/test_deploy_smoke.py`
+and `tests/test_signup.py` updated from "closed signup waives the captcha" to
+the new rule.

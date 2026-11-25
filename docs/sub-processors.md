@@ -73,10 +73,11 @@ engaged before anyone configures anything:**
    loud `provider_error` is the lesser harm. The consequence for this register
    is unambiguous: **Anthropic is a default sub-processor on any deployed
    instance**, and the whole invoice document goes to it.
-3. **hCaptcha** — bot protection on the public signup form (§ 21). Mandatory:
+3. **hCaptcha** — bot protection on the public signup form and the public
+   workspace lookup (§ 21). Mandatory:
    `config.py::_require_captcha_in_deployed_envs` **refuses to boot** a deployed
-   environment with `FEOH_HCAPTCHA_SECRET` unset, rather than failing the captcha
-   open on a public, tenant-creating endpoint.
+   environment with `FEOH_HCAPTCHA_SECRET` unset, signup open or closed
+   (decisions §553), rather than failing the captcha open on a public endpoint.
 
 For everything else a provider becomes an **active sub-processor** only when an
 operator (or an individual tenant, via `Organization.settings`) explicitly
@@ -504,12 +505,12 @@ application.
 
 | Processor | Service | Data categories | Processing location | Active when configured | DPA / sub-processing status |
 |-----------|---------|-----------------|---------------------|------------------------|------------------------------|
-| **hCaptcha (Intuition Machines, Inc.)** | Bot protection on `POST /api/signup`; server-side token verification against `hcaptcha.com/siteverify` | The **requester's IP address** (`remoteip`), the challenge token, and whatever browser signals hCaptcha's own in-page script collects. No invoice, vendor, payment or tax data | US | **Deployed — always** | DPA — to be confirmed |
+| **hCaptcha (Intuition Machines, Inc.)** | Bot protection on `POST /api/signup` and `POST /api/workspace-lookup`; server-side token verification against `hcaptcha.com/siteverify` | The **requester's IP address** (`remoteip`), the challenge token, and whatever browser signals hCaptcha's own in-page script collects. No invoice, vendor, payment or tax data | US | **Deployed — always** | DPA — to be confirmed |
 
 > **Mandatory, not optional.** `config.py::_require_captcha_in_deployed_envs`
-> raises at boot if `FEOH_HCAPTCHA_SECRET` is unset in a deployed environment, so
-> the service refuses to start rather than fail the captcha open on a public,
-> tenant-creating endpoint. With the secret empty (local dev only)
+> raises at boot if `FEOH_HCAPTCHA_SECRET` is unset in a deployed environment,
+> signup open or closed (decisions §553), so the service refuses to start rather
+> than fail the captcha open on a public endpoint. With the secret empty (local dev only)
 > `verify_captcha` is a no-op that logs a WARNING and contacts nobody — which is
 > why this is "Deployed — always" rather than "Configured only".
 

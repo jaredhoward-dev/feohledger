@@ -258,7 +258,7 @@ jobs:
         # The same script deploy.sh ends with on the VM (#575), here through
         # public DNS: the apex, api/health, a tenant host's TLS, and
         # /api/public-config agreeing with SIGNUP_ENABLED (plus a captcha site
-        # key whenever signup is on). Repository variables, none secret; an
+        # key, signup open or not: the workspace lookup needs one, §553). Repository variables, none secret; an
         # unset one fails the step rather than skipping its check.
         env:
           APP_URL: ${{ vars.APP_URL }}

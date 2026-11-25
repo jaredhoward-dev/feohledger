@@ -175,50 +175,20 @@ def test_refuses_a_missing_required_var(deploy: Deploy, missing: str, shape: str
     assert missing in result.stderr
 
 
-@pytest.mark.parametrize("spelling", ["false", "False", "0", "no", "off", "f", "n"])
-def test_a_closed_signup_needs_no_captcha_keys(deploy: Deploy, spelling: str) -> None:
-    """The app demands the hCaptcha secret and site key only while self-service
-    signup is on (config.py `_require_captcha_in_deployed_envs`). The script
-    mirrors that, for every spelling pydantic reads as false, so an invite-only
-    deploy is not refused here for keys the app itself would boot without."""
-    dotenv = _dotenv(
-        {
-            "FEOH_HCAPTCHA_SECRET": None,
-            "FEOH_HCAPTCHA_SITEKEY": None,
-            "FEOH_SIGNUP_ENABLED": spelling,
-        }
-    )
-    result = deploy.run(dotenv)
-    assert result.returncode == 0, result.stderr
-    assert deploy.env.read_text() == dotenv
-
-
 @pytest.mark.parametrize("key", ["FEOH_HCAPTCHA_SECRET", "FEOH_HCAPTCHA_SITEKEY"])
-@pytest.mark.parametrize("signup", [None, "true", "1", "falsey"])
-def test_an_open_signup_still_needs_both_captcha_keys(
+@pytest.mark.parametrize("signup", [None, "true", "false", "0", "off"])
+def test_both_captcha_keys_are_required_signup_open_or_closed(
     deploy: Deploy, signup: str | None, key: str
 ) -> None:
-    """Unset, true, or anything pydantic would not read as false keeps signup on,
-    and with it the captcha requirement — never loosened by a near-miss spelling.
-    The site key counts as much as the secret: without it /signup renders no
-    widget and every signup fails the captcha (#575)."""
+    """The app demands the hCaptcha secret and site key on every deployment
+    (config.py `_require_captcha_in_deployed_envs`, docs/decisions.md §553):
+    `/api/workspace-lookup` is public and served whether signup is open or not,
+    so closing signup no longer waives them. The site key counts as much as the
+    secret: without it no widget renders and every request fails (#575)."""
     deploy.env.write_text(PREVIOUS_ENV)
     result = deploy.run(_dotenv({key: None, "FEOH_SIGNUP_ENABLED": signup}))
     _assert_refused_and_kept(deploy, result)
     assert key in result.stderr
-
-
-def test_the_last_signup_line_wins_as_for_compose(deploy: Deploy) -> None:
-    """Compose and the app read the LAST FEOH_SIGNUP_ENABLED line; an earlier
-    `false` must not waive the captcha keys for a signup the app serves."""
-    deploy.env.write_text(PREVIOUS_ENV)
-    dotenv = (
-        _dotenv({"FEOH_HCAPTCHA_SITEKEY": None})
-        + "FEOH_SIGNUP_ENABLED=false\nFEOH_SIGNUP_ENABLED=true\n"
-    )
-    result = deploy.run(dotenv)
-    _assert_refused_and_kept(deploy, result)
-    assert "FEOH_HCAPTCHA_SITEKEY" in result.stderr
 
 
 @pytest.mark.parametrize("provider", ["console", "Console", "CONSOLE "])

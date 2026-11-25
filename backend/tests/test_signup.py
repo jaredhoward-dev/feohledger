@@ -421,6 +421,7 @@ def test_config_requires_captcha_in_deployed_env():
             hcaptcha_sitekey="site-key",
             secret_key=strong_key,
             subprocessor_notices_enabled=True,
+            trusted_proxy_cidrs="172.28.0.0/16",
         ).is_deployed
         is True
     )
@@ -1484,38 +1485,29 @@ def test_signup_is_open_by_default():
     assert Settings.model_fields["signup_enabled"].default is True
 
 
-def test_a_deployed_env_with_signup_closed_needs_no_captcha_secret():
-    """The captcha boot check protects a public, tenant-creating endpoint; with
-    signup closed there is none, so it must not make an operator hold a
-    credential for a feature they turned off. While signup is open it still
-    refuses to boot, exactly as before."""
+def test_a_deployed_env_with_signup_closed_still_needs_the_captcha_secret():
+    """Closing signup used to waive the captcha boot check. It no longer does
+    (decisions §553): `/api/workspace-lookup` is public and served whether
+    signup is open or not (§518), so an invite-only deployment with no secret
+    would run the lookup with no captcha. Both shapes refuse to boot."""
     import pytest
     from pydantic import ValidationError
 
     from app.config import Settings
 
     strong_key = "x" * 32
-    closed = Settings(
-        environment="production",
-        email_provider="ses",
-        credential_kms_key_id="alias/test-app",
-        hcaptcha_secret="",
-        secret_key=strong_key,
-        signup_enabled=False,
-        subprocessor_notices_enabled=True,
-    )
-    assert closed.is_deployed is True
-    assert closed.signup_enabled is False
-
-    with pytest.raises(ValidationError, match="FEOH_SIGNUP_ENABLED"):
-        Settings(
-            environment="production",
-            email_provider="ses",
-            credential_kms_key_id="alias/test-app",
-            hcaptcha_secret="",
-            secret_key=strong_key,
-            signup_enabled=True,
-        )
+    for signup_enabled in (False, True):
+        with pytest.raises(ValidationError, match="FEOH_HCAPTCHA_SECRET"):
+            Settings(
+                environment="production",
+                email_provider="ses",
+                credential_kms_key_id="alias/test-app",
+                hcaptcha_secret="",
+                secret_key=strong_key,
+                signup_enabled=signup_enabled,
+                subprocessor_notices_enabled=True,
+                trusted_proxy_cidrs="none",
+            )
 
 
 # ---------------------------------------------------------------------------

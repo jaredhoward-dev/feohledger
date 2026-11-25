@@ -403,3 +403,48 @@ def test_auth_audit_ip_goes_through_the_shared_resolver(_trust_alb_proxy):
     # Untrusted direct caller: the spoofable header must stay ignored.
     untrusted = auth._client_ip(_fake_request(ip="203.0.113.1", forwarded="198.51.100.10"))
     assert untrusted == "203.0.113.1"
+
+
+# ---------------------------------------------------------------------------
+# The explicit "no proxy" opt-out (decisions §553)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("value", ["none", "NONE", " None "])
+def test_resolve_client_ip_with_the_no_proxy_opt_out_keys_on_the_socket_peer(monkeypatch, value):
+    """`FEOH_TRUSTED_PROXY_CIDRS=none` is a deployment clients reach directly:
+    no peer is a proxy, so a forged X-Forwarded-For is ignored from anyone —
+    including a peer that would match a private range."""
+    from app.config import settings
+    from app.services.rate_limit import resolve_client_ip
+
+    monkeypatch.setattr(settings, "trusted_proxy_cidrs", value)
+    for peer in ("203.0.113.1", "10.0.0.5", "172.28.0.2"):
+        assert resolve_client_ip(_fake_request(ip=peer, forwarded="198.51.100.10")) == peer
+
+
+@pytest.mark.asyncio
+async def test_rate_limit_with_the_no_proxy_opt_out_buckets_per_peer(fake_redis, monkeypatch):
+    """Direct-to-internet: two clients are two buckets, and a rotating forged
+    X-Forwarded-For does not open a fresh one."""
+    from app.config import settings
+    from app.services.rate_limit import RateLimitExceeded, check_rate_limit
+
+    monkeypatch.setattr(settings, "trusted_proxy_cidrs", "none")
+    for n in range(3):
+        await check_rate_limit(
+            "auth_login",
+            _fake_request(ip="203.0.113.1", forwarded=f"198.51.100.{n}"),
+            limit=3,
+            window_seconds=3600,
+        )
+    with pytest.raises(RateLimitExceeded):
+        await check_rate_limit(
+            "auth_login",
+            _fake_request(ip="203.0.113.1", forwarded="198.51.100.99"),
+            limit=3,
+            window_seconds=3600,
+        )
+    await check_rate_limit(
+        "auth_login", _fake_request(ip="203.0.113.2"), limit=3, window_seconds=3600
+    )

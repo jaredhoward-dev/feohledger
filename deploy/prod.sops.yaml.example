@@ -117,8 +117,12 @@ FEOH_WEBAUTHN_RP_ID: "feohledger.com"
 FEOH_WEBAUTHN_ORIGINS: "https://feohledger.com,https://*.feohledger.com"
 # FEOH_TRUSTED_PROXY_CIDRS defaults in compose.prod.yml to the pinned compose
 # subnet (172.28.0.0/16) so rate limits + audit rows see the real client
-# through Caddy. Only set here to override (e.g. an external LB in front).
-# FEOH_TRUSTED_PROXY_CIDRS: ""
+# through Caddy. Only set here to override (e.g. an external LB in front: list
+# its network too). A deployed API refuses to boot with it empty (§553); an
+# empty value here still gets compose's default. "none" means clients reach
+# the API with no proxy in front — never true on this stack, where Caddy is
+# the only ingress.
+# FEOH_TRUSTED_PROXY_CIDRS: "172.28.0.0/16"
 # The region THIS stack runs in, compared against each tenant's residency pin
 # and reported as the advisory `alignment` block on /api/organization/data-
 # residency. Nothing routes or blocks on it (decisions.md §34), but leaving it
@@ -157,19 +161,22 @@ FEOH_APPROVAL_SIGNING_KEY: ""
 
 # ── Self-service signup + hCaptcha ──
 # FEOH_SIGNUP_ENABLED is the switch. "false" closes signup: every /api/signup/*
-# route answers 404, /signup says signup is closed, and neither hCaptcha key is
-# needed — the right setting for a pilot whose tenants come from add-tenant.sh.
-# Delete the line (or set "true") to open public signup; then BOTH hCaptcha
-# keys are REQUIRED — FEOH_ENVIRONMENT=production refuses to boot without
-# either (config.py _require_captcha_in_deployed_envs), and decrypt-env.sh
-# refuses before it gets that far. The secret verifies each signup; the site
-# key is what /api/public-config hands the browser so the widget renders, and
-# without it every signup fails the captcha. The post-deploy smoke check
-# (deploy/smoke.sh) confirms public-config reports this switch and the key.
-# docs/self-service-signup.md § Turning signup off.
+# route answers 404 and /signup says signup is closed — the right setting for a
+# pilot whose tenants come from add-tenant.sh. Delete the line (or set "true")
+# to open public signup. docs/self-service-signup.md § Turning signup off.
 FEOH_SIGNUP_ENABLED: "false"
-# FEOH_HCAPTCHA_SECRET: ""
-# FEOH_HCAPTCHA_SITEKEY: ""
+# BOTH hCaptcha keys are REQUIRED on every deployment, signup open or closed
+# (docs/decisions.md §553): the public "email me my workspace address" form on
+# /find-workspace (POST /api/workspace-lookup) is served either way and
+# verifies the captcha. FEOH_ENVIRONMENT=production refuses to boot without
+# either (config.py _require_captcha_in_deployed_envs), and decrypt-env.sh
+# refuses before it gets that far. The secret verifies each request; the site
+# key is what /api/public-config hands the browser so the widget renders, and
+# without it every lookup (and signup) fails the captcha. The post-deploy smoke
+# check (deploy/smoke.sh) confirms public-config serves the key. Both from the
+# same hCaptcha account, the site key listing the apex host.
+FEOH_HCAPTCHA_SECRET: ""
+FEOH_HCAPTCHA_SITEKEY: ""
 
 # ── Platform billing (our own billing of each tenant) ──
 # The AI-read overage backstop: reports any overage unit the post-read leg
