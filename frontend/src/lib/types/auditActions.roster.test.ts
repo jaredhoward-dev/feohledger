@@ -4,7 +4,10 @@ import type { MessageKey } from '#lib/i18n/messages.ts';
 
 // The real store imports `$app/env`. Every lookup below passes its own `has`
 // (English from every catalogue), so the runtime's default is never consulted.
-vi.mock('#lib/i18n/store.svelte.ts', () => ({ hasMessage: () => false }));
+vi.mock('#lib/i18n/store.svelte.ts', () => ({
+	hasMessage: () => false,
+	ensureSlices: () => Promise.resolve()
+}));
 
 const { DYNAMIC_ACTION_TEMPLATES, auditActionKey, auditActionLabel } = await import('./auditActions');
 const { INVOICE_TIMELINE_LABEL_KEYS, invoiceTimelineActionLabel } = await import('./invoiceTimelineActions');

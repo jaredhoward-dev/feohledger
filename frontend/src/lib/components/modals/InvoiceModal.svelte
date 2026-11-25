@@ -27,8 +27,11 @@
 	import Money from '#lib/components/ui/Money.svelte';
 	import Badge from '#lib/components/ui/Badge.svelte';
 	import type { BadgeTone } from '#lib/components/ui/badgeTone.ts';
-	import { ensureSlices, m } from '#lib/i18n/store.svelte.ts';
-	import { invoiceTimelineActionLabel } from '#lib/types/invoiceTimelineActions.ts';
+	import { m } from '#lib/i18n/store.svelte.ts';
+	import {
+		invoiceTimelineActionLabel,
+		loadLabelledTimeline,
+	} from '#lib/types/invoiceTimelineActions.ts';
 	import LoadingState from '#lib/components/ui/LoadingState.svelte';
 	import { erpRefusalText } from '#lib/api/erpRefusals.ts';
 	import { invoiceWarningText, poMatchIssueText } from '#lib/api/invoiceWarnings.ts';
@@ -170,9 +173,10 @@
 	// Timeline labels: invoice-voice overrides, then the /audit console's
 	// catalogue, which covers every token the backend writes
 	// (`types/invoiceTimelineActions.ts`, decisions §522). That catalogue is
-	// a lazy slice the modal loads itself, since it opens on several routes;
-	// a row rendered before it lands shows its token, then relabels.
-	void ensureSlices('audit');
+	// a lazy slice the modal loads itself, since it opens on several routes.
+	// `loadAuditLog` hands the rows over only once that slice has landed too
+	// (`loadLabelledTimeline`), so no row is drawn with its raw token first
+	// (decisions §529).
 	function actionLabel(action: string): string {
 		return invoiceTimelineActionLabel(action, m);
 	}
@@ -1745,7 +1749,7 @@
 	async function loadAuditLog() {
 		auditLoading = true;
 		try {
-			auditLog = await getInvoiceAuditLog(invoice.id);
+			auditLog = await loadLabelledTimeline(() => getInvoiceAuditLog(invoice.id));
 		} catch {
 			// non-critical
 		} finally {
@@ -2646,7 +2650,7 @@
 				{/if}
 
 				{#if auditLog.length > 0}
-					<div class="activity-section">
+					<div class="activity-section" data-ready={auditLoading ? 'false' : 'true'}>
 						<div class="activity-title">{m('invoices.modal.activity.title')}</div>
 						<div class="activity-list">
 							{#each auditLog as entry}

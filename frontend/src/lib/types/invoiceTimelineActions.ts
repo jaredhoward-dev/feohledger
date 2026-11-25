@@ -10,11 +10,14 @@
 // (`auditActions.roster.test.ts`) holds complete against the backend source.
 // The modal loads that catalogue slice itself (`ensureSlices('audit')`).
 //
+// The rows are only handed to the view once that slice has landed too
+// (`loadLabelledTimeline`), so they render labelled the first time (§529).
+//
 // Before decisions §522 the modal's map was the only source, so a token it
 // lacked (`invoice.erp_failed`, `invoice.erp_retried`, …) rendered raw.
 
 import type { MessageKey } from '#lib/i18n/messages.ts';
-import { hasMessage } from '#lib/i18n/store.svelte.ts';
+import { ensureSlices, hasMessage } from '#lib/i18n/store.svelte.ts';
 import { auditActionLabel } from './auditActions';
 
 type Translate = (key: MessageKey, params?: Record<string, string | number>) => string;
@@ -67,4 +70,19 @@ export function invoiceTimelineActionLabel(
 	return Object.hasOwn(INVOICE_TIMELINE_LABEL_KEYS, action)
 		? t(INVOICE_TIMELINE_LABEL_KEYS[action])
 		: auditActionLabel(action, t, has);
+}
+
+/**
+ * Fetch the timeline rows and resolve only once the `audit` label slice has
+ * landed as well, so a row is never drawn with its raw token and relabelled a
+ * moment later (decisions §529). `ensureSlices` never rejects (a slice that
+ * cannot load falls back to English, or to nothing, and settles), so this
+ * rejects exactly when `fetchRows` does.
+ */
+export async function loadLabelledTimeline<T>(
+	fetchRows: () => Promise<T>,
+	loadLabels: () => Promise<void> = () => ensureSlices('audit')
+): Promise<T> {
+	const [rows] = await Promise.all([fetchRows(), loadLabels()]);
+	return rows;
 }
