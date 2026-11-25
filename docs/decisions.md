@@ -30803,3 +30803,70 @@ voided or deleted credit of ours is still `bill_payment_voided` and dropped.
 - `test_qbo_status_sync_adapter.py`: a bill read 503, a network error and a
   token refresh failure before the create are `not_posted`; a recorded credit
   not ours is held on post and refused on void.
+
+## 583. A void reverses only a discount credit it has an entry for; a QuickBooks token failure on the create is not posted; the stall flag is per payment and reason; the booked id is compared before it is cleared; a dropped reservation is retried only by hand (§582 final review, round 49)
+
+A last review of §582 found four gaps and one wrong statement.
+
+**1. Every void ran the credit lookup, opted in or not.** `void_written_payment`
+called `find_discount_credit` for every QuickBooks or Xero payment void with no
+known credit id. Xero's lookup is the `CreditNoteNumber==` filter §577 lists as
+unconfirmed, so if real Xero rejects it, every void fails before `void_payment`,
+for orgs that never booked a credit. Since §581 each credit we create is
+preceded by a committed reservation, so a credit of ours always has an entry in
+`erp_discount_credits_pending`, `erp_discount_credit_voids_pending` or
+`erp_discount_credits_booked`. Now the reversal runs only when one of those maps
+names the payment; otherwise the void goes straight to `void_payment`. A
+reservation with no id yet is an entry, so it still gets the lookup.
+
+**2. A QuickBooks token failure on the create read as "may stand".** §582 set
+`not_posted` from whether the create had been sent. `ErpTokenRefreshError` or
+`ErpNotConnectedError` from the create's `_request` is raised either before any
+request goes out or after QuickBooks answered 401 and the refresh failed.
+Either way QuickBooks never took the create. Both are now `not_posted`
+regardless of `sent`. None can be raised after the credit exists:
+`_apply_discount_credit` catches its own.
+
+**3. The stall flag deduped by kind per invoice.** `open_erp_reconciliation_exception`
+skips a report while a live row of the same kind is on the invoice. A live
+`unidentified` flag therefore hid a later `discount_credit_not_ours` carrying
+the credit's id, and one payment's flag hid another payment's on the same
+invoice. It now takes `dedupe_on`, more `erp_report` keys a live row must also
+match, and the stall flag passes `("payment_id", "reason")`.
+- **Why separate rows, not updating the live one:** each is a fact a person
+  resolves on its own. Rewriting a live row's report would overwrite the first
+  payment's marker or the unidentified record's context, and one resolution
+  would close both. There are three reasons and few payments per invoice, so
+  the count stays bounded. A repeat of the same payment and reason is still
+  deduped.
+
+**4. The void cleared the booked map unconditionally.** The void's final clear
+dropped `erp_discount_credits_booked[<payment>]` whatever it held by then. Now,
+as with the other two maps, a booked id written while the void called the ERP
+(it differs from the one read before the call) leaves the whole void pending,
+and the entry is cleared only when it equals the `credit_id` the void reversed.
+- **Why "unchanged since read" gates the clear, not "equals the reversed id":**
+  the void prefers a pending map's id over the booked one. If both were ever
+  present with different ids, gating on equality would never clear the payment
+  and would loop every pass. Gating on change catches the race. The equality
+  check still keeps any id the void did not reverse.
+
+**5. Correction to §582 #3.** §582 said a dropped reservation is "retried" by a
+later write-back or sweep. The sweep (`resume_pending_credits`) walks only
+existing records, so nothing retries a dropped one automatically. The only
+retry is a manual write-back re-run (`POST /api/payments/runs/{id}/sync-erp`)
+while the invoice is `paid`. Until then the `payment_writeback_balance_open`
+flag carries the reason as `discount_credit_failure`.
+`backend/docs/erp-integration.md` is corrected to match.
+
+**Tests.** Each fails on the code before this entry.
+- `test_erp_payment_writeback.py`:
+  - a void with no credit entry never calls `find_discount_credit`, and voids
+    even when the lookup would raise;
+  - a reservation with no id still gets the lookup (a guard that the gate is
+    not too broad; it passes before and after);
+  - a booked id changed during the void's call is kept and the void stays
+    pending;
+  - the stall flag is one per payment and reason.
+- `test_qbo_status_sync_adapter.py`: a refresh failure or a lost connection on
+  the create call (after a 401) is `not_posted`.
