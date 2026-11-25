@@ -2750,6 +2750,31 @@ async def test_status_states_whether_a_payment_check_would_run_now(realdb, monke
 
 
 @pytest.mark.plan("scale")
+async def test_status_states_the_payment_check_verdict_without_an_oauth_connection(
+    realdb, monkeypatch
+):
+    """A stored-credential ERP has no OAuth block, and its verdict is still
+    stated (decisions §549), so the settings page draws "check payments now"
+    for an opted-in NetSuite tenant exactly when the POST would run a pass."""
+    monkeypatch.setattr(settings, "erp_status_sync_enabled", True)
+    await _set_settings(realdb, {"erp": _netsuite_config("on")})
+    body = await _status_body(realdb)
+    assert body["connected"] is False and body["provider"] is None
+    assert body["status_sync_available"] is True and body["status_sync_refusal"] is None
+
+    await _set_settings(realdb, {"erp": _netsuite_config("off")})
+    body = await _status_body(realdb)
+    assert body["status_sync_available"] is False
+    assert body["status_sync_refusal"] == "status_sync_unsupported"
+
+    monkeypatch.setattr(settings, "erp_status_sync_enabled", False)
+    await _set_settings(realdb, {"erp": _netsuite_config("on")})
+    body = await _status_body(realdb)
+    assert body["status_sync_available"] is False
+    assert body["status_sync_refusal"] == "status_sync_off"
+
+
+@pytest.mark.plan("scale")
 async def test_status_offers_no_payment_check_when_the_verdict_cannot_be_read(realdb, monkeypatch):
     from app.services import erp_status_sync
     from app.services.credential_crypto import CredentialCryptoError
