@@ -61,6 +61,8 @@
 	import LineTotalCheckPanel from '#lib/components/organization/LineTotalCheckPanel.svelte';
 	import MatchRulesPanel from '#lib/components/organization/MatchRulesPanel.svelte';
 	import AgentAutonomyPanel from '#lib/components/organization/AgentAutonomyPanel.svelte';
+	import CompanyProfilePanel from '#lib/components/organization/CompanyProfilePanel.svelte';
+	import type { CompanyFields } from '#lib/components/organization/panelState.ts';
 	import { withoutOwnedFraudKeys } from '#lib/types/orgControls.ts';
 	import type { StoredErpConfig } from '#lib/types/erpConnection.ts';
 	import {
@@ -141,13 +143,17 @@
 	// fallback branch read "Loading…" forever after a failed load (#635).
 	let orgLoadFailed = $state(false);
 	// Editable fields
-	let name = $state('');
-	let address = $state('');
-	let phone = $state('');
-	let website = $state('');
-	let taxId = $state('');
-	let vatNumber = $state('');
-	let companiesHouseNumber = $state('');
+	// Each panel's fields are one object, owned here and bound into the panel
+	// component, so an unsaved edit survives a panel switch (`panelState.ts`).
+	let company = $state<CompanyFields>({
+		name: '',
+		address: '',
+		phone: '',
+		website: '',
+		taxId: '',
+		vatNumber: '',
+		companiesHouseNumber: ''
+	});
 	let currency = $state('USD');
 	// The stored default is the user's choice, never re-seeded; marking it
 	// touched once loaded also shows a malformed stored code as an error.
@@ -597,13 +603,15 @@
 		try {
 			const data = await api.get<OrgResponse>('/api/organization');
 			org = data;
-			name = data.name;
-			address = data.settings.company.address;
-			phone = data.settings.company.phone;
-			website = data.settings.company.website;
-			taxId = data.settings.company.tax_id;
-			vatNumber = data.settings.company.vat_registration_number ?? '';
-			companiesHouseNumber = data.settings.company.companies_house_number ?? '';
+			company = {
+				name: data.name,
+				address: data.settings.company.address,
+				phone: data.settings.company.phone,
+				website: data.settings.company.website,
+				taxId: data.settings.company.tax_id,
+				vatNumber: data.settings.company.vat_registration_number ?? '',
+				companiesHouseNumber: data.settings.company.companies_house_number ?? ''
+			};
 			currency = data.settings.invoice_defaults.currency;
 			currencyTouched = true;
 			paymentTerms = data.settings.invoice_defaults.payment_terms;
@@ -879,7 +887,7 @@
 	 *  it toasts once, when both have settled. */
 	async function patchOrg(partial: Record<string, unknown>) {
 		const data = await api.patch<OrgResponse>('/api/organization', {
-			...(partial.company ? { name: name.trim() } : {}),
+			...(partial.company ? { name: company.name.trim() } : {}),
 			settings: partial,
 		});
 		org = data;
@@ -895,10 +903,12 @@
 		try {
 			await patchSettings(m('org.section.companySaved'), {
 				company: {
-					address, phone, website,
-					tax_id: taxId,
-					vat_registration_number: vatNumber,
-					companies_house_number: companiesHouseNumber,
+					address: company.address,
+					phone: company.phone,
+					website: company.website,
+					tax_id: company.taxId,
+					vat_registration_number: company.vatNumber,
+					companies_house_number: company.companiesHouseNumber,
 					logo_url: org?.settings.company.logo_url ?? '',
 				},
 			});
@@ -2014,44 +2024,7 @@
 				{/if}
 
 				{#if section === 'company'}
-					<section class="card" id="org-company">
-						<h2>{m('org.section.company')}</h2>
-						<div class="form-grid">
-							<label>
-								<span>{m('org.company.name')}</span>
-								<input type="text" bind:value={name} />
-							</label>
-							<label>
-								<span>{m('org.company.taxId')}</span>
-								<input type="text" bind:value={taxId} placeholder={m('org.company.taxIdPlaceholder')} />
-							</label>
-							<label>
-								<span>{m('org.company.vatNumber')}</span>
-								<input type="text" bind:value={vatNumber} />
-							</label>
-							<label>
-								<span>{m('org.company.companiesHouseNumber')}</span>
-								<input type="text" bind:value={companiesHouseNumber} />
-							</label>
-							<label class="full-width">
-								<span>{m('org.company.address')}</span>
-								<textarea bind:value={address} rows="2" placeholder={m('org.company.addressPlaceholder')}></textarea>
-							</label>
-							<label>
-								<span>{m('org.company.phone')}</span>
-								<input type="tel" bind:value={phone} />
-							</label>
-							<label>
-								<span>{m('org.company.website')}</span>
-								<input type="url" bind:value={website} placeholder={'https://'} />
-							</label>
-						</div>
-						<div class="section-footer">
-							<button class="btn-save-section" disabled={savingProfile} onclick={saveProfile}>
-								{savingProfile ? m('org.common.saving') : m('org.company.save')}
-							</button>
-						</div>
-					</section>
+					<CompanyProfilePanel bind:fields={company} saving={savingProfile} onsave={saveProfile} />
 				{/if}
 
 				{#if section === 'defaults'}
