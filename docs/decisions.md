@@ -28044,3 +28044,103 @@ the cursor is read by the next tick (and, as the control, not with no overlap);
 the second listing asks from `through − 10 min`.
 `tests/test_sweep_health.py`: every sweep's enabled flag, parametrized over the
 registry, is what its health snapshot reads.
+
+## 544. A card whose authorization is reversed or expires returns to unspent; a decline or a post-settlement reversal does not (§543 follow-up, round 46)
+
+**Problem.** §543 made only a settled charge count on a run's card leg, so a
+lapsed authorization never needed an undo on the payment. But the card webhook
+still ignored reversal / expiry / decline events, so the `VirtualCard` kept the
+`charged` status and authorized `amount_charged` after the hold lapsed. A
+payment void (`card_already_charged`, `not_closed_final`) and a re-run reusing
+the card (`card_settlement_block`) both refuse a spent card, so the card could
+never be closed or reused, though no money had moved. Two latent gaps sat
+beside it: Lithic's real event, `card_transaction.updated`, names no outcome
+(its body's `status` does) and contains "transaction", so `_classify_card_event`
+read every Lithic update, the authorization included, as a settlement; and
+Lithic's transaction `token` (our fallback dedupe key) is the same on every
+update, so a reversal would have been deduped as a replay of its authorization.
+
+**Decision.**
+
+* *Reversal and expiry release the hold.* `_classify_card_lapse` names the
+  lapse. On a `charged` card the webhook sets `active`
+  (`CARD_LAPSED_STATUS`), clears `amount_charged`, `charged_at` and
+  `merchant_name`, and writes `card.authorization_lapsed` (`from`, `to`,
+  `lapse`, `released_amount` as a string Decimal). Same path as the other
+  card events: HMAC verified against the owning tenant's secret, deduped by
+  event id, silent 204 on every rejection, the card row locked.
+* *Why `active`, not the exact pre-authorization status.* Nothing stores it
+  except the `card.charged` audit row, which may have shipped to SQS in
+  `lambda` audit mode, and no code distinguishes `created` / `sent` / `active`:
+  all three are live and unspent to every reader (the dashboard's active-card
+  queries, `CARD_SPENT_STATUSES`, the void, `card_settlement_block`, vendor
+  revocation). The vendor demonstrably holds the card (they presented it),
+  which is what `active` means. No migration.
+* *A decline never releases a standing hold.* A second attempt at a
+  single-use card is declined while the first hold stands, and we keep no
+  per-authorization id to tie a decline to the hold. Releasing on a decline
+  would let a void cancel the payment while the first hold can still clear,
+  which could pay the invoice twice; keeping the card `charged` only leaves
+  the operator where they were before. Fail-closed: logged, card unchanged.
+* *A partial reversal leaves the card authorized.* A reversal carrying an
+  amount below `amount_charged` (`_is_partial_reversal`) leaves part of the
+  hold. Lithic sets `VOIDED` only when nothing is held, so a Lithic reversal
+  is always whole.
+* *A settled card is never touched.* A reversal or expiry on a `completed`
+  card is a refund or chargeback, a different flow: the card, its rebate and
+  the run's recorded figure stand, a warning is logged and a
+  `card.reversal_after_settlement` row records it for a person to act on (a
+  payment void and, if money came back, the refund flow). A *settlement*
+  reversal, refund, return or chargeback is not a lapse at all.
+* *The run's card leg stays `in_flight` throughout,* since the authorization
+  wrote nothing onto it (§543), and nothing re-dispatches a payment sync on a
+  lapse: there is nothing new for it to do.
+* *A clearing after the lapse still settles.* Networks allow a merchant's
+  clearing after the authorization expired (a force post). With the card
+  back at `active`, the settlement branch would have dropped money that moved,
+  so a settlement now completes a `charged` card or an unspent one (`created`
+  / `sent` / `active`, never `cancelled`); `card.settled`'s `from` records
+  which. The one-rebate-per-card index still holds.
+* *Provider mapping* (checked 2026-11-25).
+  Lithic: `card_transaction.updated` read by `status` — `PENDING`,
+  `SETTLED`, `VOIDED` ("no hold and no settled amount"), `EXPIRED`
+  ("Lithic has automatically expired the authorization"), `DECLINED`; any
+  other status is inert, never a settlement
+  (<https://docs.lithic.com/docs/transactions>,
+  <https://docs.lithic.com/docs/types-of-events>). Without an explicit
+  `event_id`, an update is deduped on `token:STATUS`, so each stage applies
+  once and a retry of one is still a replay. Nium: the reversal webhook's
+  `template` is `CARD_TRANSACTION_REVERSAL_WEBHOOK` with `transactionAmount`
+  (<https://docs.nium.com/docs/developers/notifications-and-webhooks/issuing-and-card-events/transaction-reversal>);
+  `template` and `transactionAmount` are now read when `eventType` /
+  `amount` are absent. **Not verified:** a Nium expiry or decline webhook
+  name (Nium documents that it expires unsettled authorizations, but no
+  webhook for it was found), and Lithic's delivery envelope (whether
+  `event_id` or only the `webhook-id` header carries the delivery id). The
+  classifier stays fail-closed: an unrecognised name changes nothing.
+  Mock: `authorization.reversal` / `authorization.expired`.
+* *Locally* (guard rail 7), `pnpm simulate:card -- --tenant acme --card <id>
+  --reverse` (or `--expire`) sends the authorization and then its lapse
+  through the real signed webhook; not combinable with `--settle`.
+
+**Why not store the pre-authorization status or the authorization id.** A
+column for either needs a tenant migration for a distinction nothing reads
+(the status) or for a per-provider id we do not yet parse reliably (the
+authorization). Tying declines and partial reversals to their authorization
+is the change that would need it; until then the fail-closed reading above
+holds.
+
+**Guard.** New `tests/test_card_authorization_lapse.py` (real signed webhook,
+per provider): reversal and expiry → `active`, no figure, one audit row, leg
+`in_flight`, no dispatch; a decline leaves a `charged` card; a replayed
+reversal is deduped (it does not undo a later authorization); an unsigned one
+changes nothing; a reversal after settlement leaves the card, rebate and leg
+untouched with a `card.reversal_after_settlement` row; a partial reversal
+leaves the card authorized; a clearing after the lapse settles; a re-run's
+`card_settlement_block` refuses the authorized card and accepts the lapsed
+one. `tests/test_card_webhook_classification.py`: the lapse classifier, the
+Lithic status mapping (unknown status inert), the per-stage Lithic dedupe key,
+the partial-reversal rule. `tests/test_payment_void_card_retry.py`: a void
+after a lapsed authorization cancels the card. `tests/test_mock_card_simulator.py`:
+`lapse=` sends the authorization then its lapse; bad / combined options are
+refused; the CLI's `--settle` / `--reverse` / `--expire` are exclusive.
