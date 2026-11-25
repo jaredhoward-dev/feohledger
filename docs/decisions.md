@@ -26293,6 +26293,49 @@ visitor's browser that the Cookie Notice would have to list, and the case it
 would add (a store that reads but refuses every write) is the old Safari
 private-mode quota, which current browsers no longer have.
 
+## 515. A report's lines are picked from the attach gate's own set, and added in bulk from the list (round 42)
+
+**Problem.** On `/expenses` a draft report's attach control was a free-text
+"Expense ID to attach" box. No screen shows an expense's id; a datalist offered
+the loaded page's own loose lines, but only that page, by id. The list had no
+way to put several lines on a report. Building a report from the UI meant
+copying ids out of the API (`docs/known-issues.md`, found 2026-10-06).
+
+**Decision.** Two filters on existing list endpoints, no new route:
+
+- `GET /api/expenses?attachable=true` returns the lines an attach by the
+  caller accepts: on no report, `draft`, and created by the caller or by no
+  recorded creator (`api/expenses._attachable_by`). That is
+  `report_line_creator_refusal`'s rule read from the caller's side (only the
+  owner composes a report, so the owner is the caller). `ui/ExpensePicker`
+  (a `SearchPicker` wrapper, like the vendor and invoice pickers) reads it,
+  server-searched by merchant / description / category.
+- `GET /api/expense-reports?mine=true` narrows to the caller's own reports.
+  With `status=draft` it is the target list for the bulk bar's **Add to
+  report**, and the page keeps only rows whose `actions.compose` is null.
+
+The bulk add is one attach call over the whole selection. The endpoint
+already refuses the whole call on the first line it cannot take, so a partial
+report is never left. The page shows the server's localized refusal and does
+not pre-filter the selection.
+
+**Calls made.** *NULL-creator lines are offered.* The gate accepts them from
+any report owner (decisions §434), so leaving them out would strand pre-0134
+loose lines with no UI path. *Lines on another report are not offered by the
+picker.* Moving a line off a report rewrites that report, and an "attach"
+field should not do that quietly. The bulk action still sends whatever is
+selected, so a line on one of the caller's own unlocked reports moves, as the
+endpoint always allowed. *`draft` only.* Every line off a report is a draft
+(reject hands lines back as draft), so this drops nothing real and keeps a
+stray non-draft row out of a report being built.
+
+**Rejected.** *Filtering the loaded page in the browser*: an attachable line
+past page one was unreachable, which is the defect. *A new
+`/expenses/attachable` route*: the list endpoint already has the entity scope,
+search, sort and paging. *Per-line verdicts on the list for the bulk action*:
+the attach is all-or-nothing, so one server answer for the whole selection
+says more than a per-row tally would.
+
 ## 516. Radio choices in a dialog share one `.radio-card` class, and the stacked-field label rule skips choice labels (round 42)
 
 **Problem.** `app.css`'s `.modal label` makes every label in a dialog a

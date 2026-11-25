@@ -30,7 +30,6 @@
 		RECONCILIATION_STATUSES,
 		reconciliationStatusLabelKey,
 		canAuthorLooseLine,
-		isLineCreator,
 		RECONCILIATION_STATUS_TONES
 	} from '#lib/types/expense.ts';
 	import { expenseStore } from '#lib/stores/expenses.svelte.ts';
@@ -46,6 +45,7 @@
 		createExpenseReport,
 		getExpenseReport,
 		attachExpenses,
+		searchAttachableExpenses,
 		expenseReportSummary,
 		deleteExpense as apiDeleteExpense,
 		listPolicies,
@@ -87,6 +87,9 @@
 	import RefusalNote from '#lib/components/ui/RefusalNote.svelte';
 	import BulkBar from '#lib/components/ui/BulkBar.svelte';
 	import Money from '#lib/components/ui/Money.svelte';
+	import ExpensePicker from '#lib/components/ui/ExpensePicker.svelte';
+	import { composableReports, type ExpensePickerOption } from '#lib/utils/expensePicker.ts';
+	import type { SearchPickerLoad } from '#lib/utils/searchPicker.ts';
 	import { DEFAULT_CURRENCY, formatMoney } from '#lib/utils/money.ts';
 	import { formatCurrencyTotals } from '#lib/utils/currencyGroups.ts';
 	import { formatDate } from '#lib/utils/time.ts';
@@ -520,6 +523,79 @@
 		}
 	}
 
+	// --- Bulk "Add to report" ---
+	// The target is one of the caller's own draft reports: only the owner
+	// composes a report, so `mine=true&status=draft` is the whole set the
+	// attach could accept, and `composableReports` keeps the menu to the
+	// server's `compose` verdict. Read when a selection starts (not on mount:
+	// most visits never select), and again on the next selection, so a report
+	// created or submitted meanwhile is reflected.
+	const BULK_REPORTS_PAGE_SIZE = 100;
+	let bulkReportId = $state('');
+	let bulkReports = $state<ExpenseReport[]>([]);
+	let bulkReportsTotal = $state(0);
+	let bulkReportsState = $state<'idle' | 'loading' | 'ready' | 'failed'>('idle');
+	const bulkReportsSequence = createRequestSequencer();
+
+	async function loadBulkReports() {
+		const token = bulkReportsSequence.start();
+		bulkReportsState = 'loading';
+		try {
+			const res = await listExpenseReports({
+				status: 'draft',
+				mine: true,
+				page_size: BULK_REPORTS_PAGE_SIZE
+			});
+			if (!bulkReportsSequence.canCommit(token)) return;
+			bulkReports = composableReports(res.items);
+			bulkReportsTotal = res.total;
+			if (!bulkReports.some((r) => r.id === bulkReportId)) bulkReportId = '';
+			bulkReportsState = 'ready';
+		} catch {
+			if (bulkReportsSequence.isCurrentRequest(token)) bulkReportsState = 'failed';
+		}
+	}
+
+	$effect(() => {
+		const wanted = tab === 'expenses' && canCreate && selected.size > 0;
+		untrack(() => {
+			if (!wanted) {
+				bulkReportsState = 'idle';
+				bulkReportsSequence.start();
+				return;
+			}
+			if (bulkReportsState === 'idle') void loadBulkReports();
+		});
+	});
+
+	// One attach call over the whole selection: the server checks every line
+	// (its creator, the source report it may sit on, the conversion into the
+	// report's currency) and refuses the whole attach on the first it cannot
+	// take, so a partial report is never left behind. Its refusal is shown as
+	// the server's own localized sentence.
+	async function applyBulkAttach() {
+		if (selected.size === 0 || !bulkReportId) return;
+		bulkBusy = true;
+		try {
+			const report = await attachExpenses(bulkReportId, [...selected], false);
+			toast(
+				m('expenses.bulk.addedToReport', { n: selected.size, report: report.report_number }),
+				'success'
+			);
+			selected = new Set();
+			selectedAllMatching = false;
+			bulkReportId = '';
+			attachSourceVersion += 1;
+			appliedSearch = currentSearchTerm();
+			await expenseStore.fetch(buildParams()); // noqa: raw-fetch-in-component — store method, routes through api client
+			void loadExpenseSummary();
+		} catch (err) {
+			toast(err instanceof Error ? err.message : m('expenses.bulk.addToReportFailed'), 'error');
+		} finally {
+			bulkBusy = false;
+		}
+	}
+
 	// --- Per-row delete ---
 	async function deleteExpense(id: string) {
 		try {
@@ -583,6 +659,15 @@
 	let newReportTitle = $state('');
 	let reportBusy = $state(false);
 	let attachId = $state('');
+	// Bumped by every write that changes which lines are attachable (attach,
+	// detach, bulk Add to report): the picker's source is a NEW function after
+	// it, so the picker drops the options it held and re-reads the set.
+	let attachSourceVersion = $state(0);
+	const attachSource = $derived.by((): SearchPickerLoad<ExpensePickerOption> => {
+		void attachSourceVersion;
+		void activeReport?.id;
+		return (query) => searchAttachableExpenses(query);
+	});
 
 	// One sequencer per sub-list on this page (reports / policies / pre-approvals
 	// / card transactions), never one shared counter: they are four independent
@@ -713,33 +798,20 @@
 		}
 	}
 
-	// The caller's own loaded lines that sit on no report: what the attach
-	// input suggests. Attach goes only onto a report its line's creator owns
-	// (decisions §434, `expense_report_foreign_line`), so a colleague's line is
-	// never offered. Only the loaded page is known here; an ID typed beyond it
-	// is the server's to judge.
-	const attachableExpenses = $derived(
-		activeReport
-			? expenseStore.all.filter(
-					(e) => e.report_id === null && isLineCreator(e, activeReport!.employee_user_id)
-				)
-			: []
-	);
-
+	// What to attach is picked from the server's attachable set
+	// (`GET /api/expenses?attachable=true` — the caller's own loose draft
+	// lines, the attach gate's rule), never typed as an id no screen shows
+	// (decisions §515). Whatever the server still refuses (a currency with no
+	// rate, a report that left draft in another tab) arrives as its own
+	// localized sentence in the toast.
 	async function attachToReport() {
-		if (!activeReport || !attachId.trim()) return;
-		// A line this page has loaded and knows is a colleague's is refused here
-		// with the server's own sentence, not sent to be refused.
-		const known = expenseStore.all.find((e) => e.id === attachId.trim());
-		if (known && !isLineCreator(known, activeReport.employee_user_id)) {
-			toast(m('refusal.expenseReportForeignLine'), 'error');
-			return;
-		}
+		if (!activeReport || !attachId) return;
 		reportBusy = true;
 		try {
-			const updated = await attachExpenses(activeReport.id, [attachId.trim()], false);
+			const updated = await attachExpenses(activeReport.id, [attachId], false);
 			await adoptReport(updated);
 			attachId = '';
+			attachSourceVersion += 1;
 			toast(m('expenses.reports.toast.attached'), 'success');
 			await refreshSummary();
 			await loadReports();
@@ -756,6 +828,7 @@
 		try {
 			const updated = await attachExpenses(activeReport.id, [expenseId], true);
 			await adoptReport(updated);
+			attachSourceVersion += 1;
 			toast(m('expenses.reports.toast.detached'), 'success');
 			await refreshSummary();
 			await loadReports();
@@ -1615,24 +1688,25 @@
 				{/if}
 
 				{#if isAllowed(activeReport.actions?.compose)}
+					<!-- A picker over the caller's own loose draft lines, never a typed
+					     id (decisions §515). Its hint and count line are its own
+					     description; the server's refusal, if any, is the toast. -->
 					<div class="attach-row">
-						<input
-							type="text"
-							placeholder={m('expenses.reports.attachPlaceholder')}
+						<ExpensePicker
 							bind:value={attachId}
-							aria-label={m('expenses.reports.attachAria')}
-							aria-describedby="expense-attach-hint"
-							list="expense-attach-options"
-							data-testid="expense-attach-input"
+							load={attachSource}
+							label={m('expenses.reports.attachLabel')}
+							hint={m('expenses.reports.attachHint')}
+							disabled={reportBusy}
+							testid="expense-attach-picker"
 						/>
-						<datalist id="expense-attach-options">
-							{#each attachableExpenses as e (e.id)}
-								<option value={e.id}>{e.merchant ?? e.id} · {formatMoney(e.amount, { currency: e.currency })}</option>
-							{/each}
-						</datalist>
-						<button class="btn-secondary" disabled={reportBusy || !attachId.trim()} onclick={attachToReport}>{m('expenses.reports.attach')}</button>
+						<button
+							class="btn-secondary"
+							disabled={reportBusy || !attachId}
+							onclick={attachToReport}
+							data-testid="expense-attach-submit"
+						>{m('expenses.reports.attach')}</button>
 					</div>
-					<p class="attach-hint" id="expense-attach-hint">{m('expenses.reports.attachHint')}</p>
 				{/if}
 
 				<DataTable
@@ -2014,6 +2088,44 @@
 			<button type="button" class="btn-primary" disabled={bulkBusy} onclick={applyBulkGl}>
 				{bulkBusy ? m('expenses.bulk.applying') : m('expenses.bulk.glCode', { n: selected.size })}
 			</button>
+			{#if canCreate}
+				<!-- Add the selection to one of the caller's own draft reports
+				     (decisions §515). The menu is the server's `compose` set; an
+				     empty or unreachable set says so rather than showing nothing. -->
+				<span class="bulk-report-group" data-testid="expense-bulk-add-to-report">
+					{#if bulkReportsState === 'failed'}
+						<span class="bulk-all-matching-note">{m('expenses.bulk.reportsLoadFailed')}</span>
+						<button type="button" class="btn-secondary" onclick={() => loadBulkReports()}>{m('common.retry')}</button>
+					{:else if bulkReportsState === 'ready' && bulkReports.length === 0}
+						<span class="bulk-all-matching-note">{m('expenses.bulk.noDraftReports')}</span>
+					{:else}
+						<select
+							class="bulk-gl-select"
+							bind:value={bulkReportId}
+							aria-label={m('expenses.bulk.reportAria')}
+							disabled={bulkBusy || bulkReportsState !== 'ready'}
+							data-testid="expense-bulk-report-select"
+						>
+							<option value="">{bulkReportsState === 'loading' ? m('common.loading') : m('expenses.bulk.chooseReport')}</option>
+							{#each bulkReports as r (r.id)}
+								<option value={r.id}>{r.title ? `${r.report_number} — ${r.title}` : r.report_number}</option>
+							{/each}
+						</select>
+						{#if bulkReportsTotal > bulkReports.length && bulkReportsState === 'ready'}
+							<span class="bulk-all-matching-note">{m('expenses.bulk.reportsPartial', { shown: formatCount(bulkReports.length), total: formatCount(bulkReportsTotal) })}</span>
+						{/if}
+						<button
+							type="button"
+							class="btn-secondary"
+							disabled={bulkBusy || !bulkReportId}
+							onclick={applyBulkAttach}
+							data-testid="expense-bulk-add-submit"
+						>
+							{m('expenses.bulk.addToReport', { n: selected.size })}
+						</button>
+					{/if}
+				</span>
+			{/if}
 		{/snippet}
 	</BulkBar>
 {/if}
@@ -2198,6 +2310,13 @@
 		font-size: 0.82rem;
 	}
 
+	.bulk-report-group {
+		display: inline-flex;
+		align-items: center;
+		gap: 8px;
+		flex-wrap: wrap;
+	}
+
 	.bulk-all-matching-note {
 		font-size: 0.82rem;
 		color: var(--text-muted);
@@ -2232,13 +2351,18 @@
 		align-items: center;
 		gap: 8px;
 	}
-	.attach-hint {
-		margin: 6px 0 12px;
-		font-size: 0.8rem;
-		color: var(--text-muted);
+	/* The picker carries its own label above and its hint + count line below,
+	   so the button sits under it rather than centred beside three lines. */
+	.attach-row {
+		display: flex;
+		flex-direction: column;
+		align-items: stretch;
+		gap: 8px;
+		max-width: 32rem;
 	}
-
-	.attach-row,
+	.attach-row > button {
+		align-self: flex-start;
+	}
 	.reject-row {
 		display: flex;
 		gap: 8px;
@@ -2248,7 +2372,6 @@
 	/* Text-entry recipe. No checkbox sits under this selector today, but it
 	   outranks the global control base in `app.css`, so the carve-out keeps a
 	   later one from losing its tick (`background:` resets the drawn mark). */
-	.attach-row input:not([type='checkbox']):not([type='radio']),
 	.reject-row input:not([type='checkbox']):not([type='radio']) {
 		padding: 7px 9px;
 		border-radius: 5px;

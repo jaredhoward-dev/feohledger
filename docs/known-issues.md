@@ -5,16 +5,15 @@ names the root cause, the evidence, blast radius, and a recommended fix
 approach — this is a staging area for real problems, not a place to let them
 go stale. See root `CLAUDE.md` guard rail 6 (no dangling deferred findings).
 
-**Six entries are open**:
-the expense-report Attach dead end found while
-writing the help centre, the `all`-mode approval-chain segregation deadlock,
+**Five entries are open**: the `all`-mode approval-chain segregation deadlock,
 an out-of-office delegation that cannot stand in on an `all`-mode level (found
 2026-11-24),
 the legal-contents smooth-scroll race and the e2e cleanup race directly below,
 and the `payments/` local-e2e flake near the bottom. The run builder reading
 a missing invoice currency as USD, found 2026-10-21, was fixed on 2026-11-18
 (decisions §457) but left open here until 2026-11-25; it sits struck in place.
-The `/complete` amount
+The expense-report Attach dead end, found writing the help centre, was struck
+on 2026-11-25 (§515). The `/complete` amount
 floor approving an invoice whose PO was never matched, found and struck on
 2026-11-15, sits struck above the run-builder entry. Merge.dev's vendor listing
 calling an endpoint Merge does not publish, found and struck on 2026-10-26, sits
@@ -39,7 +38,7 @@ this note has now warned about twice. Two defects were **fixed on 2026-09-17**:
 the `/organization` 320px reflow defect (issue #432), along with six more routes
 that failed the same criterion and had no entry at all because nothing measured
 them; and the local-e2e `alembic` drift, which now has a pre-run guard that
-refuses to start against a stale database. Twenty-five of the thirty-one `##`
+refuses to start against a stale database. Twenty-six of the thirty-one `##`
 entries are now `~~struck-through~~` resolved stubs. (This line said "the other
 fifteen" while the file held fifteen struck in total, the two above included,
 later "seventeen of the twenty-four" while nineteen were struck, and then
@@ -485,7 +484,19 @@ against their REST counterparts in the same change. Trigger: next change to the
 assistant, or before the assistant is enabled for a production tenant, whichever
 is first.
 
-## An expense report's Attach asks for an expense ID the UI never shows
+## ~~An expense report's Attach asks for an expense ID the UI never shows~~ — FIXED 2026-11-25
+
+**Resolution (round 42, `docs/decisions.md` §515).** Done as recommended. The
+report's attach control is `ui/ExpensePicker`, a `SearchPicker` over
+`GET /api/expenses?attachable=true` (the caller's own loose draft lines plus
+unrecorded ones, the attach gate's rule), and the expenses list's bulk bar has
+**Add to report** over the caller's own draft reports
+(`GET /api/expense-reports?mine=true&status=draft`). The "submit expenses" help
+guide describes both. One correction to the diagnosis below: by the time it
+was fixed the text box had gained a datalist suggesting the loaded page's own
+loose lines, still by id and only for the loaded page, so the dead end stood.
+The original diagnosis stands below.
+
 
 **Root cause.** On `/expenses`, a draft report's attach control is a text box
 labelled "Expense ID to attach". No surface in the web app displays an

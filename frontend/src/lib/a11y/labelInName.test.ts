@@ -22,7 +22,6 @@ import { loadAllMessages } from '#lib/i18n/allMessages.ts';
  *  Aria key names a different control than the one showing `<key>`. */
 const NOT_A_PAIR: Record<string, string> = {
 	'expenses.reports.rejectAria': 'labels the rejection-reason textarea, not the Reject button',
-	'expenses.reports.attachAria': 'labels the expense-id input, not the Attach button',
 	'invoices.modal.review.rejectAria': 'labels the rejection-reason textarea, not the Reject button',
 	'scheduledReports.modal.createAria': 'names the create dialog, not the Create button',
 	'workflows.mgmt.ver.fromAria': 'labels the "from version" select beside a "From" caption',
