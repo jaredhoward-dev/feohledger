@@ -566,7 +566,9 @@ Decisions §295; the phase-by-phase account is
   land on `payment.erp_post_failed` plus an `erp_reconciliation` exception.
   `currency_mismatch` also covers a bill or a payment that states no currency
   (QuickBooks states every bill's, the home one included): fail closed, never
-  posted as a bare number. A payment void voids the BillPayment too.
+  posted as a bare number. A payment void voids the BillPayment too. An
+  early-payment discount is booked only by the org's opt-in (§ Early-payment
+  discount booked as a vendor credit, below).
 - **Checked again at dispatch.** A bill paid in QuickBooks reaches us within
   seconds by webhook, or by the next sweep — too late for a run already
   executing. So every payment re-reads its bill from QuickBooks immediately
@@ -580,6 +582,54 @@ Decisions §295; the phase-by-phase account is
   keeps its signing secrets only in the sealed store, and an adapter without
   them held every payment `erp_bill_unverified`. Credentials that cannot be
   opened hold the item the same way.
+
+### Early-payment discount booked as a vendor credit (opt-in, decisions §575)
+
+Neither ERP's payment carries a discount, so by default the bill stays open
+there by the discount and `payment_writeback_balance_open` asks a person to book
+it. An org can instead turn on `settings.erp.book_discount_as_credit: "on"`
+(QuickBooks Online and Xero; off when absent) and pick
+`settings.erp.discount_credit_account`, a GL code of ours from the synced chart,
+required while on (`PATCH /api/organization` answers 422 otherwise;
+`catalog.discount_credit_refusal`). Then, right after a successful payment
+write-back whose `Payment.discount_amount` is positive, the adapter books that
+discount (`post_discount_credit`, `DiscountCreditPayload`):
+
+| | QuickBooks Online | Xero |
+|---|---|---|
+| Credit | `POST vendorcredit` — `VendorRef` (the bill's), one `AccountBasedExpenseLineDetail` line to the discount account, `CurrencyRef` (the bill's), `PrivateNote: "FeohLedger discount <payment id>"` | `PUT CreditNotes` — `Type: ACCPAYCREDIT`, `Status: AUTHORISED`, the bill's `Contact` and `CurrencyCode`, `LineAmountTypes: NoTax`, one line to the discount `AccountID`, `CreditNoteNumber: "FeohLedger discount <payment id>"` (`Reference` is ACCRECCREDIT-only) |
+| Applied | `POST billpayment`, `TotalAmt: 0`, one line linking the `Bill` and one the `VendorCredit`, same marker, from the payment's own pay-from account | `PUT CreditNotes/{id}/Allocations` — `{Amount, Invoice: {InvoiceID}, Date}` |
+| Idempotent | the bill's BillPayments searched for the marker first; each create carries its own `requestid` (`<payment id>:vc` / `:vca`), so a credit created but not applied is replayed and applied once | credit notes looked up by number first (one found unallocated is allocated, never re-created); `Idempotency-Key` `<payment id>:cn` / `:cna`; one of ours voided or deleted in Xero is refused `bill_payment_voided` (`params.document = discount_credit`) |
+| Void | `POST billpayment?operation=delete`, then `POST vendorcredit?operation=delete` (only while it carries our marker) | `DELETE CreditNotes/{id}/Allocations/{allocation}` for each, then `POST CreditNotes/{id}` `{Status: VOIDED}` |
+
+Refused before any write, on the existing codes: no discount (or, for
+QuickBooks, pay-from) account linked under the current realm →
+`payment_account_not_mapped` with `params.account`; bill gone →
+`bill_not_in_erp`; the bill's currency missing or not the invoice's →
+`currency_mismatch`; more than the bill still has open after our payment →
+`payment_exceeds_balance` with `params.document = discount_credit`. The amount
+is the exact `Decimal` (`dumps_exact_json`). Success writes
+`payment.erp_discount_credit_posted` and the flag is judged on the balance the
+credit left (zero: no flag). A refusal or failure writes
+`payment.erp_discount_credit_failed` (coded) and the balance-open flag is
+opened exactly as without the opt-in, with `erp_report.discount_credit_failure`
+naming the code. A payment void reverses our credit FIRST
+(`void_discount_credit`, whatever the opt-in says now, since it may have been
+booked while on; `payment.erp_discount_credit_reversed`); if that fails the
+payment void is not attempted, `payment.erp_void_failed` carries
+`document: discount_credit`, and the pending marker makes the sweep retry from
+the credit. QuickBooks' `bill_report` counts our discount application as ours
+(`_discount_marker`), so a bill closed by our payment plus our credit is
+`paid_only_by_us`; Xero's existing rule (a credit no larger than the discount
+our own payment took, beside our write-back) already reads it as ours.
+
+Shapes were taken from the providers' API references on 2026-11-25
+(<https://developer.intuit.com/app/developer/qbo/docs/api/accounting/all-entities/vendorcredit>,
+<https://developer.intuit.com/app/developer/qbo/docs/api/accounting/all-entities/billpayment>,
+<https://developer.xero.com/documentation/api/accounting/creditnotes>) and are
+exercised against `tools/fake-erp` and the adapter doubles only, not yet a real
+company; a read-back that is not what we wrote fails closed
+(`vendor_credit_unconfirmed` / `credit_note_unconfirmed`).
 
 ### Xero status sync-back and payment write-back
 
@@ -684,7 +734,8 @@ differs:
   supplier is posted and the bill stays open by the discount; the write-back's
   `erp_payment_writeback_balance_open` flag (with the discount taken in
   `erp_report.discount_amount`) tells the bookkeeper to record it there, and
-  no credit note is created on their behalf (§295's answer, kept). The credit
+  no credit note is created on their behalf unless the org opts in (§ Early-
+  payment discount booked as a vendor credit, below; decisions §575). The credit
   they then record is not "paid twice" only when our write-back is on the bill
   (`ErpBillReport.our_payment_applied`), nobody else's payment is, and what
   came off beyond our write-back (`reduced_outside_amount`) is no more than the

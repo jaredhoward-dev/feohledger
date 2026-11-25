@@ -84,6 +84,7 @@ from app.services.erp_adapters.base import (
     PAYMENTS_SCOPE_MISSING,
     SYNC_LISTING_MAX_ROWS,
     VENDOR_NOT_LINKED,
+    DiscountCreditPayload,
     ErpBillReport,
     ErpBillState,
     ErpInvoiceStatus,
@@ -1266,6 +1267,252 @@ class XeroAdapter(OAuthErpAdapter):
         except httpx.HTTPError:
             return ErpPostResult(success=False, message=f"{PROVIDER} void failed: network_error")
 
+    # -- early-payment discount as a credit note (decisions §575) -----------
+    #
+    # Shapes, from Xero's Accounting API reference (read 2026-11-25),
+    # https://developer.xero.com/documentation/api/accounting/creditnotes :
+    # * PUT CreditNotes {"CreditNotes": [{Type "ACCPAYCREDIT", Contact
+    #   {ContactID}, Date, Status "AUTHORISED", LineAmountTypes "NoTax",
+    #   CurrencyCode, CreditNoteNumber, LineItems [{Description, Quantity,
+    #   UnitAmount, AccountID}]}]}. ``Reference`` is ACCRECCREDIT-only, and an
+    #   ACCPAYCREDIT's ``CreditNoteNumber`` need not be unique, so our marker
+    #   rides the number.
+    # * PUT CreditNotes/{CreditNoteID}/Allocations {"Allocations": [{Amount,
+    #   Invoice {InvoiceID}, Date}]} — allocate to a bill.
+    # * DELETE CreditNotes/{CreditNoteID}/Allocations/{AllocationID}, then
+    #   POST CreditNotes/{CreditNoteID} {Status "VOIDED"}: Xero voids only a
+    #   credit note with no allocation left.
+    # A read-back that is not one credit note with our number fails closed.
+
+    supports_discount_credit = True
+
+    async def _our_credit_notes(self, client, headers, payment_id: str) -> list[dict]:
+        """Every credit note carrying our marker for ``payment_id``, read whole
+        (allocations included), voided and deleted ones too."""
+        resp = await _status_get(
+            client,
+            f"{_api_base()}/CreditNotes",
+            params={"where": f'CreditNoteNumber=="{_discount_reference(payment_id)}"'},
+            headers=headers,
+        )
+        if resp.status_code != 200:
+            raise XeroRequestError(resp.status_code)
+        out = []
+        for row in _json(resp).get("CreditNotes") or []:
+            if not isinstance(row, dict) or _discount_marker(row) != str(payment_id).lower():
+                continue
+            out.append(await self._read_credit_note(client, headers, str(row.get("CreditNoteID"))))
+        return out
+
+    async def _read_credit_note(self, client, headers, credit_id: str) -> dict:
+        resp = await _status_get(client, f"{_api_base()}/CreditNotes/{credit_id}", headers=headers)
+        if resp.status_code != 200:
+            raise XeroRequestError(resp.status_code)
+        rows = _json(resp).get("CreditNotes") or []
+        if not rows or not isinstance(rows[0], dict) or not rows[0].get("CreditNoteID"):
+            raise XeroRequestError(resp.status_code)
+        return rows[0]
+
+    async def post_discount_credit(self, payload: DiscountCreditPayload) -> ErpPostResult:
+        """Book the discount as an ACCPAYCREDIT credit note to the org's
+        discount account and allocate it to the bill.
+
+        Idempotent on ``payload.payment_id``: our credit note is looked up by
+        its number (``"FeohLedger discount <id>"``) first; one found live but
+        not yet allocated to this bill (a crash between the two writes) is
+        allocated, never created again; each write carries its own
+        ``Idempotency-Key``. A credit note of ours someone voided or deleted in
+        Xero is refused (``bill_payment_voided``, ``params.document``).
+        Refused before any write: no discount account mapped, a bill gone,
+        another currency or none stated, more than the bill still has due.
+        """
+        if not payload.bill_id:
+            return erp_preflight_refusal(PROVIDER, BILL_NOT_IN_ERP)
+        if not payload.discount_account_erp_id:
+            refused = erp_preflight_refusal(PROVIDER, PAYMENT_ACCOUNT_NOT_MAPPED)
+            refused.refusal_params = {"account": "discount"}
+            return refused
+        try:
+            headers = await self._headers()
+            async with self.oauth_client(timeout=30) as client:
+                bill = await self._read_bill(client, headers, payload.bill_id)
+                if str(bill.get("Status") or "").upper() in _GONE_STATUSES:
+                    return _nothing_posted(erp_refusal(PROVIDER, BILL_NOT_IN_ERP))
+                ours = await self._our_credit_notes(client, headers, payload.payment_id)
+                live = [c for c in ours if str(c.get("Status") or "").upper() not in _GONE_STATUSES]
+                if not live and ours:
+                    refused = erp_refusal(PROVIDER, BILL_PAYMENT_VOIDED)
+                    refused.refusal_params = {"document": "discount_credit"}
+                    return refused
+                bill_currency = iso_currency_or_none(bill.get("CurrencyCode"))
+                if bill_currency is None or bill_currency != iso_currency_or_none(payload.currency):
+                    return _nothing_posted(erp_refusal(PROVIDER, CURRENCY_MISMATCH))
+                credit = live[0] if live else None
+                if credit is not None and _allocated_to(credit, payload.bill_id) > 0:
+                    return ErpPostResult(
+                        success=True,
+                        erp_document_id=str(credit.get("CreditNoteID")),
+                        message="Discount credit already in Xero (found by number)",
+                        bill_balance_after=_decimal(bill.get("AmountDue")),
+                    )
+                if (
+                    credit is not None
+                    and iso_currency_or_none(credit.get("CurrencyCode")) != bill_currency
+                ):
+                    return erp_refusal(PROVIDER, CURRENCY_MISMATCH)
+                due = _decimal(bill.get("AmountDue"))
+                if due is None or payload.amount <= 0 or payload.amount > due:
+                    refused = _nothing_posted(erp_refusal(PROVIDER, PAYMENT_EXCEEDS_BALANCE))
+                    refused.refusal_params = {"document": "discount_credit"}
+                    return refused
+                if credit is None:
+                    contact_id = (bill.get("Contact") or {}).get("ContactID")
+                    body = {
+                        "CreditNotes": [
+                            {
+                                "Type": "ACCPAYCREDIT",
+                                "Contact": {"ContactID": str(contact_id)},
+                                "Date": payload.credit_on.isoformat(),
+                                "Status": "AUTHORISED",
+                                "LineAmountTypes": "NoTax",
+                                "CurrencyCode": bill_currency,
+                                "CreditNoteNumber": _discount_reference(payload.payment_id),
+                                "LineItems": [
+                                    {
+                                        "Description": "Early-payment discount",
+                                        "Quantity": Decimal("1"),
+                                        "UnitAmount": payload.amount,
+                                        "AccountID": str(payload.discount_account_erp_id),
+                                    }
+                                ],
+                            }
+                        ]
+                    }
+                    resp = await client.put(
+                        f"{_api_base()}/CreditNotes",
+                        content=dumps_exact_json(body),
+                        headers={
+                            **headers,
+                            "Content-Type": "application/json",
+                            "Idempotency-Key": _credit_key(payload.payment_id, "cn"),
+                        },
+                    )
+                    if resp.status_code not in (200, 201):
+                        refused = _failure(resp)
+                        refused.not_posted = not erp_status_retryable(resp.status_code)
+                        return refused
+                    rows = _json(resp).get("CreditNotes") or [{}]
+                    created_id = rows[0].get("CreditNoteID") if isinstance(rows[0], dict) else None
+                    if not created_id:
+                        return ErpPostResult(
+                            success=False,
+                            message=f"{PROVIDER} post failed: credit_note_unconfirmed",
+                        )
+                    credit = await self._read_credit_note(client, headers, str(created_id))
+                    if _discount_marker(credit) != str(payload.payment_id).lower():
+                        return ErpPostResult(
+                            success=False,
+                            message=f"{PROVIDER} post failed: credit_note_unconfirmed",
+                        )
+                credit_id = str(credit.get("CreditNoteID"))
+                allocation = {
+                    "Allocations": [
+                        {
+                            "Amount": payload.amount,
+                            "Invoice": {"InvoiceID": str(payload.bill_id)},
+                            "Date": payload.credit_on.isoformat(),
+                        }
+                    ]
+                }
+                resp = await client.put(
+                    f"{_api_base()}/CreditNotes/{credit_id}/Allocations",
+                    content=dumps_exact_json(allocation),
+                    headers={
+                        **headers,
+                        "Content-Type": "application/json",
+                        "Idempotency-Key": _credit_key(payload.payment_id, "cna"),
+                    },
+                )
+                if resp.status_code not in (200, 201):
+                    # The credit note stands unallocated; a retry finds it by
+                    # its number and allocates it.
+                    refused = _failure(resp)
+                    refused.erp_document_id = credit_id
+                    return refused
+                after = await self._read_bill(client, headers, payload.bill_id)
+            return ErpPostResult(
+                success=True,
+                erp_document_id=credit_id,
+                message="Discount booked as a credit note in Xero",
+                bill_balance_after=_decimal(after.get("AmountDue")),
+            )
+        except erp_oauth.ErpTokenRefreshError as exc:
+            return ErpPostResult(success=False, message=str(exc))
+        except erp_oauth.ErpNotConnectedError:
+            return erp_refusal(PROVIDER, NOT_CONNECTED)
+        except XeroRequestError as exc:
+            return erp_http_failure(PROVIDER, exc.status_code)
+        except httpx.HTTPError:
+            return ErpPostResult(success=False, message=f"{PROVIDER} post failed: network_error")
+
+    async def void_discount_credit(self, payload: DiscountCreditPayload) -> ErpPostResult:
+        """Remove our credit note's allocations, then void it. Found by its
+        number, as :meth:`post_discount_credit` finds it; none live is a
+        success with nothing to do, so a retry never voids twice."""
+        try:
+            headers = await self._headers()
+            async with self.oauth_client(timeout=30) as client:
+                live = [
+                    c
+                    for c in await self._our_credit_notes(client, headers, payload.payment_id)
+                    if str(c.get("Status") or "").upper() not in _GONE_STATUSES
+                ]
+                if not live:
+                    return ErpPostResult(success=True, message="No discount credit of ours")
+                credit_id = str(live[0].get("CreditNoteID"))
+                for allocation in live[0].get("Allocations") or []:
+                    allocation_id = (
+                        allocation.get("AllocationID") if isinstance(allocation, dict) else None
+                    )
+                    if not allocation_id:
+                        # Cannot be removed without its id; Xero would refuse
+                        # the void, so say so rather than try.
+                        return ErpPostResult(
+                            success=False,
+                            erp_document_id=credit_id,
+                            message=f"{PROVIDER} void failed: allocation_unidentified",
+                        )
+                    resp = await client.delete(
+                        f"{_api_base()}/CreditNotes/{credit_id}/Allocations/{allocation_id}",
+                        headers=headers,
+                    )
+                    if resp.status_code not in (200, 204):
+                        refused = _failure(resp)
+                        refused.erp_document_id = credit_id
+                        return refused
+                resp = await client.post(
+                    f"{_api_base()}/CreditNotes/{credit_id}",
+                    content=dumps_exact_json(
+                        {"CreditNotes": [{"CreditNoteID": credit_id, "Status": "VOIDED"}]}
+                    ),
+                    headers={**headers, "Content-Type": "application/json"},
+                )
+            if resp.status_code not in (200, 201):
+                refused = _failure(resp)
+                refused.erp_document_id = credit_id
+                return refused
+            return ErpPostResult(
+                success=True, erp_document_id=credit_id, message="Discount credit voided in Xero"
+            )
+        except erp_oauth.ErpTokenRefreshError as exc:
+            return ErpPostResult(success=False, message=str(exc))
+        except erp_oauth.ErpNotConnectedError:
+            return erp_refusal(PROVIDER, NOT_CONNECTED)
+        except XeroRequestError as exc:
+            return erp_http_failure(PROVIDER, exc.status_code)
+        except httpx.HTTPError:
+            return ErpPostResult(success=False, message=f"{PROVIDER} void failed: network_error")
+
     # -- reads -------------------------------------------------------------
 
     async def test_connection(self) -> bool:
@@ -1548,6 +1795,34 @@ def _payment_marker(record: dict) -> str | None:
     """Our payment id, when this Xero payment is one ``post_payment`` wrote."""
     match = _PAYMENT_MARKER.search(str(record.get("Reference") or ""))
     return match.group(1).lower() if match else None
+
+
+#: Our early-payment discount credit note's number (decisions §575).
+_DISCOUNT_MARKER = re.compile(r"FeohLedger discount ([0-9a-fA-F-]{36})(?:\s|$)")
+
+
+def _discount_reference(payment_id: str) -> str:
+    return f"FeohLedger discount {payment_id}"
+
+
+def _discount_marker(record: dict) -> str | None:
+    match = _DISCOUNT_MARKER.search(str(record.get("CreditNoteNumber") or ""))
+    return match.group(1).lower() if match else None
+
+
+def _credit_key(payment_id: str, step: str) -> str:
+    return f"{payment_id}:{step}"[:IDEMPOTENCY_KEY_MAX]
+
+
+def _allocated_to(credit: dict, bill_id: str) -> Decimal:
+    """What this credit note's allocations applied to ``bill_id``."""
+    total = Decimal(0)
+    for allocation in credit.get("Allocations") or []:
+        if not isinstance(allocation, dict):
+            continue
+        if str((allocation.get("Invoice") or {}).get("InvoiceID") or "") == str(bill_id):
+            total += _decimal(allocation.get("Amount")) or Decimal(0)
+    return total
 
 
 def _payment_deleted(record: dict) -> bool:

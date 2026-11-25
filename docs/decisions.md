@@ -30133,3 +30133,86 @@ its precedence, a `failed` transmission allowing the recall, delete-the-mirror
 then recall succeeding, and verdict / door parity over all of them; web
 `codedRefusals.test.ts`; mobile `coded_refusal_messages_test.dart`; e2e
 `recall-approval.spec.ts` (PEPPOL-sent invoice).
+
+## 575. An early-payment discount is booked in the ERP as a vendor credit, by the org's opt-in (follow-up of §295 / §386, round 49)
+
+**The gap.** The payment write-back posts exactly what reached the supplier, and
+neither QuickBooks' BillPayment nor Xero's Payment carries a discount, so a bill
+paid with a discount taken here stayed open in the ERP by the discount and
+`erp_payment_writeback_balance_open` asked a bookkeeper to book it (§295's
+conservative answer, kept by §386). `docs/followups.md` held the durable fix
+pending a product call on whose books carry the discount account; the operator
+delegated it.
+
+**Decision.** An **opt-in per org, off by default**:
+`settings.erp.book_discount_as_credit: "on"` plus
+`settings.erp.discount_credit_account`, a GL code of ours picked from the synced
+chart in the ERP form (`picker: "gl_account"` on the catalogue field), required
+while on (422 on `PATCH /api/organization`,
+`catalog.discount_credit_refusal`). The org names the account, so nothing is
+booked to a guessed one; with it off, nothing changes. When on, after the
+payment write-back succeeds and `Payment.discount_amount > 0`, the adapter
+books the discount as a credit applied to the bill
+(`ErpAdapter.post_discount_credit`, `DiscountCreditPayload`): a QuickBooks
+`VendorCredit` applied by a $0 BillPayment linking the Bill and the
+VendorCredit, or a Xero ACCPAYCREDIT credit note allocated to the bill.
+
+- **Idempotent on the payment id**, like the payment: the credit's marker
+  (`"FeohLedger discount <payment id>"`, QuickBooks `PrivateNote`, Xero
+  `CreditNoteNumber`, since `Reference` is ACCRECCREDIT-only) is looked up
+  before any write, and each create carries its own request key
+  (`<id>:vc`/`:vca`, `<id>:cn`/`:cna`), so a credit created but never applied
+  is replayed or found and applied once, never created twice. A credit of ours
+  someone voided in Xero is refused `bill_payment_voided` rather than booked
+  over their decision.
+- **Exact and capped.** `Decimal` end to end (`dumps_exact_json`); never more
+  than what the bill still has open after our payment (refused
+  `payment_exceeds_balance`, `params.document = discount_credit`), and never in
+  another currency or with none stated (`currency_mismatch`, fail closed).
+- **No new refusal codes.** The existing registered codes carry the meaning
+  with a `params` qualifier (`account: discount`, `document:
+  discount_credit`), so every locale and the mobile catalogue already state
+  them. Rejected: new codes, which would need web + mobile catalogue entries in
+  every locale for what is the same refusal on a second document.
+- **A failure keeps today's behaviour.** A refused or failed credit is audited
+  coded (`payment.erp_discount_credit_failed`) and the balance-open flag opens
+  as it would without the opt-in, now naming
+  `erp_report.discount_credit_failure`, so a person books it. It never undoes
+  the payment write-back, which already stands.
+- **A void reverses the credit first**, whatever the opt-in says now (it may
+  have been booked while on): QuickBooks deletes our application then our
+  VendorCredit (only while it carries our marker); Xero deletes our
+  allocations then voids the credit note (Xero refuses to void an allocated
+  one). If the reversal fails, the payment void is not attempted and the
+  pending marker makes the sweep retry from the credit. Rejected: voiding the
+  payment first — a retry would then audit the payment's void as
+  "not needed" while the credit still stood.
+- **Inbound reads it as ours.** QuickBooks' `bill_report` counts a BillPayment
+  carrying the discount marker toward what we applied, so our payment plus our
+  credit is `paid_only_by_us`, and its $0 total is never taken for a voided
+  write-back (the marker differs from the payment's). Xero needs no change:
+  §386's rule already accepts a credit no larger than the discount our own
+  payment took, beside our write-back.
+
+**Unverified.** The request and response shapes follow the providers' API
+references read on 2026-11-25 (Intuit VendorCredit and BillPayment entity
+pages; Xero Accounting API CreditNotes, including Allocations and deleting an
+allocation) and are exercised against the adapter doubles and `tools/fake-erp`
+only. Points to confirm against a real company: QuickBooks accepting a $0
+BillPayment of a Bill line plus a VendorCredit line through the API, Xero
+accepting `AccountID` on a credit-note line and a `where` on
+`CreditNoteNumber`, and Xero's allocation-delete route. A read-back that is not
+what we wrote fails closed (`*_unconfirmed`). A QuickBooks VendorCredit whose
+delete fails after its application was deleted can no longer be found through
+the bill; that failure names the credit (`erp_document_id`) on the flag.
+
+**Tests.** `tests/test_qbo_status_sync_adapter.py` and
+`tests/test_xero_status_sync_adapter.py` (booked and applied, idempotent
+replay, created-but-unapplied retried once, void reverses once, currency /
+balance / account refused before any write, our credit read as ours);
+`tests/test_erp_payment_writeback.py` (opt-in books with the resolved accounts
+and leaves no flag, off changes nothing, a refused credit keeps the flag with
+its code, an unlinked account reaches the adapter as unmapped, a void reverses
+the credit before the payment and stops when it cannot, the setting's
+validation); `frontend/src/lib/types/erpConnection.test.ts` (the picker's
+options).

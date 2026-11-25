@@ -36,6 +36,8 @@
 	import { replaceState } from '$app/navigation';
 	import { page } from '$app/state';
 	import { api, ApiError } from '#lib/api.ts';
+	import { listGlAccounts } from '#lib/api/glAccounts.ts';
+	import type { GlAccount } from '#lib/types/glAccount.ts';
 	import { CREDENTIAL_BLOCK_UNOPENABLE } from '#lib/api/codedRefusals.ts';
 	import CredentialResetPrompt from '#lib/components/organization/CredentialResetPrompt.svelte';
 	import { getProviderCredentials, updateProviderCredentials } from '#lib/api/providerCredentials.ts';
@@ -80,6 +82,7 @@
 		oauthScopeGapKeys,
 		optionLabelKey,
 		pickRefusalKey,
+		glChartOptions,
 		platformConnectUrl,
 		readOAuthReturn,
 		secretIsSaved,
@@ -176,6 +179,10 @@
 	 *  and says nothing. */
 	let pickExplicit = false;
 	let statusEl = $state<HTMLParagraphElement | null>(null);
+	/** The synced chart, for a `picker: 'gl_account'` field (the discount
+	 *  credit's account, decisions §575). Read once, when such a field shows. */
+	let glChart = $state<GlAccount[] | null>(null);
+	let glChartRequested = false;
 
 	const groups = $derived(catalog ? groupProviders(catalog.providers) : []);
 	const provider = $derived<ErpProvider | null>(
@@ -192,6 +199,13 @@
 				)
 			: []
 	);
+	$effect(() => {
+		if (glChartRequested || !mainFields.some((f) => f.picker === 'gl_account')) return;
+		glChartRequested = true;
+		listGlAccounts({ active_only: true })
+			.then((rows) => (glChart = rows))
+			.catch(() => (glChart = []));
+	});
 	const byoFields = $derived(
 		provider && isOAuth ? provider.fields.filter((f) => BYO_APP_FIELDS.includes(f.name)) : []
 	);
@@ -733,7 +747,24 @@
 		{:else}
 			<label>
 				<span>{fieldLabel(f)}</span>
-				{#if f.options}
+				{#if f.picker === 'gl_account'}
+					{@const chart = glChartOptions(glChart, values[f.name])}
+					<select
+						id={inputId}
+						bind:value={values[f.name]}
+						name={f.name}
+						required={isRequired(f)}
+						aria-invalid={invalid.includes(f.name) ? 'true' : undefined}
+						aria-describedby={helpId}
+						onchange={() => clearInvalid(f.name)}
+						data-testid="erp-picker-{f.name}"
+					>
+						<option value="">{m('org.erp.pickAccount')}</option>
+						{#each chart as account (account.code)}
+							<option value={account.code}>{account.label}</option>
+						{/each}
+					</select>
+				{:else if f.options}
 					<select id={inputId} bind:value={values[f.name]} name={f.name} aria-describedby={helpId}>
 						{#each f.options as option (option)}
 							<option value={option}>{optionLabel(option)}</option>

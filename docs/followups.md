@@ -849,18 +849,6 @@ lands. Pure doc drift was corrected in the same PR. The two diagnosed defects
       non-clerk preparer role, add a non-sensitive permission tier the
       role-grant guards exempt, and move entry onto it. **Trigger:** the first
       customer asking for a custom preparer role.
-- [ ] **(c) An early-payment discount taken here is never booked in the ERP.**
-      The write-back posts the exact amount that reached the supplier
-      (QuickBooks and Xero; §295, §386), and neither ERP's payment carries a
-      discount, so the bill stays open there by the discount and the
-      `erp_payment_writeback_balance_open` flag (with `discount_amount` in its
-      `erp_report`) asks the bookkeeper to record it. **Durable fix:** an
-      opt-in per-org setting that books the discount as a vendor credit
-      (QuickBooks `VendorCredit`, a Xero ACCPAY credit note) applied to the
-      bill on write-back, idempotent on the payment id like the payment.
-      Needs a product call on whose books carry the discount account.
-      **Trigger:** the first customer who takes early-payment discounts with
-      status sync on.
 ### Surfaced by the no-rail pilot (2026-10-06, issue #517, decisions §251)
 
 

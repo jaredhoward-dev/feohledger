@@ -622,6 +622,33 @@ class PaymentPayload:
 
 
 @dataclass
+class DiscountCreditPayload:
+    """An early-payment discount taken in FeohLedger, booked in the ERP as a
+    vendor credit applied to the bill (decisions §575): QuickBooks
+    ``VendorCredit`` + a $0 BillPayment applying it, Xero an ``ACCPAYCREDIT``
+    credit note allocated to the bill. Opt-in per org
+    (``settings.erp.book_discount_as_credit``)."""
+
+    #: Our ``Payment.id`` — the idempotency key, carried in the credit's marker
+    #: (``"FeohLedger discount <id>"``) and its create's request key.
+    payment_id: str
+    bill_id: str
+    #: The discount taken (``Payment.discount_amount``), exact.
+    amount: Decimal
+    #: The bill's currency as FeohLedger knows it; the ERP's must match.
+    currency: str
+    credit_on: date
+    #: The ERP id of the account the discount is booked to
+    #: (``settings.erp.discount_credit_account``, our GL code, resolved under
+    #: the current realm). None = not mapped or not linked: refused.
+    discount_account_erp_id: str | None = None
+    #: QuickBooks applies the credit through a $0 BillPayment, which still
+    #: names a pay-from account: the payment's own (``PaymentPayload``).
+    pay_from_account_erp_id: str | None = None
+    card: bool = False
+
+
+@dataclass
 class PoLinePayload:
     description: str | None = None
     quantity: Decimal | None = None
@@ -1145,6 +1172,21 @@ class ErpAdapter:
         """Reverse what :meth:`post_payment` wrote for ``payload.payment_id``.
         Success when nothing of ours is left on the bill. Default: refused."""
         return self._no_status_sync()
+
+    #: Can book an early-payment discount as a vendor credit applied to the
+    #: bill on write-back (decisions §575). Off for every adapter but the two
+    #: that implement it; the org's opt-in is read by the write-back.
+    supports_discount_credit: bool = False
+
+    async def post_discount_credit(self, payload: DiscountCreditPayload) -> ErpPostResult:
+        """Book ``payload.amount`` as a vendor credit applied to the bill,
+        idempotently on ``payload.payment_id``. Default: refused."""
+        return self._no_status_sync()
+
+    async def void_discount_credit(self, payload: DiscountCreditPayload) -> ErpPostResult:
+        """Reverse the credit :meth:`post_discount_credit` booked. Success when
+        nothing of ours is there. Default: nothing was ever booked."""
+        return ErpPostResult(success=True, message="No discount credit to reverse")
 
     async def bill_report(self, bill_id: str) -> ErpBillReport:
         """Where ``bill_id`` stands now. ``deleted`` only on the ERP's positive

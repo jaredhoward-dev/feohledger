@@ -43,6 +43,8 @@ NOT_REFUSALS = {
     "STATUS_SYNC_ON",
     "BILL_VOID_ANY",  # an adapter's bill-void scope (decisions §542)
     "BILL_VOID_DRAFT_ONLY",
+    "DISCOUNT_CREDIT_FIELD",  # the discount-credit opt-in's settings keys (decisions §575)
+    "DISCOUNT_ACCOUNT_FIELD",
 }
 
 _CONSTANT = re.compile(r'^([A-Z][A-Z0-9_]*) = "([a-z][a-z0-9_]*)"$', re.MULTILINE)

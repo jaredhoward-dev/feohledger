@@ -447,6 +447,9 @@ async def update_organization(
                 if isinstance(erp_before, dict) and erp_catalog.OAUTH_KEY in erp_before:
                     kept[erp_catalog.OAUTH_KEY] = erp_before[erp_catalog.OAUTH_KEY]
                 body.settings["erp"] = kept or None
+            discount_refusal = erp_catalog.discount_credit_refusal(body.settings.get("erp"))
+            if discount_refusal:
+                raise HTTPException(status_code=422, detail=discount_refusal)
             await ensure_live_erp_entitled(db, org.id, body.settings.get("erp"))
             # Same connection: only a switched-off sign-in method's secrets go.
             secret_drops["erp"] = (

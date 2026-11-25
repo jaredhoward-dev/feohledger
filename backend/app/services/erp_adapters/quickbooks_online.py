@@ -82,6 +82,7 @@ from app.services.erp_adapters.base import (
     PAYMENT_ACCOUNT_NOT_MAPPED,
     PAYMENT_EXCEEDS_BALANCE,
     VENDOR_NOT_LINKED,
+    DiscountCreditPayload,
     ErpBillReport,
     ErpBillState,
     ErpInvoiceStatus,
@@ -977,12 +978,19 @@ class QuickBooksOnlineAdapter(OAuthErpAdapter):
             state = ErpBillState.open
         payments = [p for p in await self._bill_payments(bill) if not _is_voided_payment(p)]
         ours = [p for p in payments if _payment_marker(p) is not None and not _ours_voided(p)]
-        external = [p for p in payments if _payment_marker(p) is None]
+        # Our early-payment discount booked as a vendor credit (§575) is ours
+        # too: it counts toward what we applied, never as an outside reduction.
+        our_credits = [p for p in payments if _discount_marker(p) is not None]
+        external = [
+            p for p in payments if _payment_marker(p) is None and _discount_marker(p) is None
+        ]
         # Judged by the BALANCE, not by who made a payment: anything that took
         # the bill down beyond what our own write-backs applied to it — a
         # person's payment, a vendor credit applied in a $0 BillPayment, a
         # journal entry — was done outside FeohLedger.
-        ours_applied = sum((_applied_to(p, str(bill.get("Id"))) for p in ours), Decimal(0))
+        ours_applied = sum(
+            (_applied_to(p, str(bill.get("Id"))) for p in [*ours, *our_credits]), Decimal(0)
+        )
         reduced_outside = (
             balance is not None and total is not None and (total - balance) > ours_applied
         )
@@ -1241,6 +1249,224 @@ class QuickBooksOnlineAdapter(OAuthErpAdapter):
         except httpx.HTTPError:
             return ErpPostResult(success=False, message=f"{PROVIDER} void failed: network_error")
 
+    # -- early-payment discount as a vendor credit (decisions §575) ---------
+    #
+    # Shapes, from Intuit's API reference (read 2026-11-25):
+    # * VendorCredit — https://developer.intuit.com/app/developer/qbo/docs/api/
+    #   accounting/all-entities/vendorcredit : VendorRef, Line[] of
+    #   AccountBasedExpenseLineDetail{AccountRef}, Amount, DetailType,
+    #   TxnDate, PrivateNote, CurrencyRef; delete = POST
+    #   vendorcredit?operation=delete {Id, SyncToken}.
+    # * BillPayment — https://developer.intuit.com/app/developer/qbo/docs/api/
+    #   accounting/all-entities/billpayment : a credit is applied to a bill by
+    #   a BillPayment whose Line[] links the Bill and the VendorCredit
+    #   (LinkedTxn TxnType "VendorCredit"), TotalAmt 0; delete = POST
+    #   billpayment?operation=delete {Id, SyncToken}.
+    # What the code reads back is checked, and anything else fails closed: a
+    # created record with no Id is "unconfirmed", never "booked".
+
+    supports_discount_credit = True
+
+    async def _our_discount_credit(self, bill: dict, payment_id: str) -> dict | None:
+        """The $0 BillPayment applying OUR credit for ``payment_id`` to the bill."""
+        for record in await self._bill_payments(bill):
+            if _discount_marker(record) == str(payment_id).lower():
+                return record
+        return None
+
+    async def post_discount_credit(self, payload: DiscountCreditPayload) -> ErpPostResult:
+        """Book the discount as a ``VendorCredit`` to the org's discount account
+        and apply it to the bill with a $0 BillPayment, both marked
+        ``"FeohLedger discount <payment id>"``.
+
+        Idempotent on ``payload.payment_id`` in §295's two layers: the bill's
+        BillPayments are searched for our credit's marker first, and each
+        create carries its own ``requestid`` (the payment id with ``:vc`` /
+        ``:vca``), so a retry after the credit was created but not applied gets
+        Intuit's replay of the same credit and applies it once. Refused before
+        any write: no discount or pay-from account mapped
+        (``payment_account_not_mapped``, ``params.account``), a bill gone
+        (``bill_not_in_erp``), another currency or none stated
+        (``currency_mismatch``), or more than the bill still has open
+        (``payment_exceeds_balance``, ``params.document = discount_credit``).
+        """
+        if not payload.bill_id:
+            return _nothing_posted(erp_refusal(PROVIDER, BILL_NOT_IN_ERP))
+        for account, erp_id in (
+            ("discount", payload.discount_account_erp_id),
+            ("pay_from", payload.pay_from_account_erp_id),
+        ):
+            if not erp_id:
+                refused = _nothing_posted(erp_refusal(PROVIDER, PAYMENT_ACCOUNT_NOT_MAPPED))
+                refused.refusal_params = {"account": account}
+                return refused
+        try:
+            bill = await self._live_bill(payload.bill_id)
+            if bill is None:
+                return _nothing_posted(erp_refusal(PROVIDER, BILL_NOT_IN_ERP))
+            existing = await self._our_discount_credit(bill, payload.payment_id)
+            if existing is not None:
+                return ErpPostResult(
+                    success=True,
+                    erp_document_id=_credit_id(existing),
+                    message="Discount credit already in QuickBooks Online (found by PrivateNote)",
+                    bill_balance_after=_dec(bill.get("Balance")),
+                )
+            bill_currency = iso_currency_or_none((bill.get("CurrencyRef") or {}).get("value"))
+            if bill_currency is None or bill_currency != iso_currency_or_none(payload.currency):
+                return _nothing_posted(erp_refusal(PROVIDER, CURRENCY_MISMATCH))
+            balance = _dec(bill.get("Balance"))
+            if balance is None or payload.amount <= 0 or payload.amount > balance:
+                refused = _nothing_posted(erp_refusal(PROVIDER, PAYMENT_EXCEEDS_BALANCE))
+                refused.refusal_params = {"document": "discount_credit"}
+                return refused
+            vendor = {"value": str((bill.get("VendorRef") or {}).get("value"))}
+            note = _discount_note(payload.payment_id)
+            credit_body = {
+                "VendorRef": vendor,
+                "TxnDate": payload.credit_on.isoformat(),
+                "PrivateNote": note,
+                "CurrencyRef": {"value": bill_currency},
+                "Line": [
+                    {
+                        "Amount": payload.amount,
+                        "DetailType": "AccountBasedExpenseLineDetail",
+                        "Description": "Early-payment discount",
+                        "AccountBasedExpenseLineDetail": {
+                            "AccountRef": {"value": str(payload.discount_account_erp_id)}
+                        },
+                    }
+                ],
+            }
+            resp = await self._request(
+                "POST",
+                "vendorcredit",
+                params={"requestid": _credit_request_id(payload.payment_id, "vc")},
+                body=credit_body,
+            )
+            if resp.status_code != 200:
+                refused = self._payment_refusal(resp)
+                refused.not_posted = not erp_status_retryable(resp.status_code)
+                return refused
+            credit = _json(resp).get("VendorCredit") or {}
+            credit_id = credit.get("Id") if isinstance(credit, dict) else None
+            if credit_id is None:
+                return ErpPostResult(
+                    success=False, message=f"{PROVIDER} post failed: vendor_credit_unconfirmed"
+                )
+            account = {"value": str(payload.pay_from_account_erp_id)}
+            apply_body: dict[str, Any] = {
+                "VendorRef": vendor,
+                "TotalAmt": Decimal("0"),
+                "TxnDate": payload.credit_on.isoformat(),
+                "PrivateNote": note,
+                "CurrencyRef": {"value": bill_currency},
+                "Line": [
+                    {
+                        "Amount": payload.amount,
+                        "LinkedTxn": [{"TxnId": str(bill.get("Id")), "TxnType": "Bill"}],
+                    },
+                    {
+                        "Amount": payload.amount,
+                        "LinkedTxn": [{"TxnId": str(credit_id), "TxnType": "VendorCredit"}],
+                    },
+                ],
+            }
+            if payload.card:
+                apply_body["PayType"] = "CreditCard"
+                apply_body["CreditCardPayment"] = {"CCAccountRef": account}
+            else:
+                apply_body["PayType"] = "Check"
+                apply_body["CheckPayment"] = {"BankAccountRef": account}
+            resp = await self._request(
+                "POST",
+                "billpayment",
+                params={"requestid": _credit_request_id(payload.payment_id, "vca")},
+                body=apply_body,
+            )
+            if resp.status_code != 200:
+                # The credit stands unapplied; a retry replays its create
+                # (same requestid) and applies it.
+                return self._payment_refusal(resp)
+            applied = _json(resp).get("BillPayment") or {}
+            if not isinstance(applied, dict) or applied.get("Id") is None:
+                return ErpPostResult(
+                    success=False, message=f"{PROVIDER} post failed: vendor_credit_unconfirmed"
+                )
+            after = await self._live_bill(str(bill.get("Id")))
+            return ErpPostResult(
+                success=True,
+                erp_document_id=str(credit_id),
+                message="Discount booked as a vendor credit in QuickBooks Online",
+                bill_balance_after=_dec(after.get("Balance")) if after else None,
+            )
+        except erp_oauth.ErpTokenRefreshError as exc:
+            return ErpPostResult(success=False, message=str(exc))
+        except erp_oauth.ErpNotConnectedError:
+            return erp_refusal(PROVIDER, NOT_CONNECTED)
+        except QboRequestError as exc:
+            return erp_http_failure(PROVIDER, exc.status_code)
+        except httpx.HTTPError:
+            return ErpPostResult(success=False, message=f"{PROVIDER} post failed: network_error")
+
+    async def void_discount_credit(self, payload: DiscountCreditPayload) -> ErpPostResult:
+        """Delete our credit's applying BillPayment, then the VendorCredit it
+        applied. Found through the bill by our marker, so nothing booked (or a
+        bill already gone) is a success with nothing to do, and a retry never
+        deletes twice. The credit is deleted only while it still carries our
+        marker. If its delete fails after the application's, the failure names
+        the credit (``erp_document_id``) for the person the flag goes to: with
+        the application gone, the bill no longer leads to it."""
+        try:
+            bill = await self._live_bill(payload.bill_id) if payload.bill_id else None
+            if bill is None:
+                return ErpPostResult(success=True, message="No bill in QuickBooks Online")
+            record = await self._our_discount_credit(bill, payload.payment_id)
+            if record is None:
+                return ErpPostResult(success=True, message="No discount credit of ours")
+            credit_id = _credit_id(record)
+            resp = await self._request(
+                "POST",
+                "billpayment",
+                params={"operation": "delete"},
+                body={"Id": str(record.get("Id")), "SyncToken": str(record.get("SyncToken", "0"))},
+            )
+            if resp.status_code != 200:
+                return self._payment_refusal(resp)
+            if credit_id:
+                got = await self._request("GET", f"vendorcredit/{credit_id}", timeout=15)
+                if got.status_code == 200:
+                    credit = _json(got).get("VendorCredit") or {}
+                    if _discount_marker(credit) == str(payload.payment_id).lower():
+                        resp = await self._request(
+                            "POST",
+                            "vendorcredit",
+                            params={"operation": "delete"},
+                            body={
+                                "Id": str(credit_id),
+                                "SyncToken": str(credit.get("SyncToken", "0")),
+                            },
+                        )
+                        if resp.status_code != 200:
+                            refused = self._payment_refusal(resp)
+                            refused.erp_document_id = credit_id
+                            return refused
+                elif not _object_not_found(got):
+                    raise QboRequestError(got.status_code)
+            return ErpPostResult(
+                success=True,
+                erp_document_id=credit_id,
+                message="Discount credit deleted in QuickBooks Online",
+            )
+        except erp_oauth.ErpTokenRefreshError as exc:
+            return ErpPostResult(success=False, message=str(exc))
+        except erp_oauth.ErpNotConnectedError:
+            return erp_refusal(PROVIDER, NOT_CONNECTED)
+        except QboRequestError as exc:
+            return erp_http_failure(PROVIDER, exc.status_code)
+        except httpx.HTTPError:
+            return ErpPostResult(success=False, message=f"{PROVIDER} void failed: network_error")
+
     # -- reads -------------------------------------------------------------
 
     async def test_connection(self) -> bool:
@@ -1352,6 +1578,36 @@ _PAYMENT_MARKER = re.compile(r"FeohLedger payment ([0-9a-fA-F-]{36})(?:\s|$)")
 
 def _payment_note(payment_id: str) -> str:
     return f"FeohLedger payment {payment_id}"
+
+
+#: The marker on the VendorCredit and the $0 BillPayment that book an
+#: early-payment discount of ours (decisions §575). Not matched by
+#: ``_PAYMENT_MARKER``: our cash write-back never has a zero total, the credit's
+#: application always does.
+_DISCOUNT_MARKER = re.compile(r"FeohLedger discount ([0-9a-fA-F-]{36})(?:\s|$)")
+
+
+def _discount_note(payment_id: str) -> str:
+    return f"FeohLedger discount {payment_id}"
+
+
+def _discount_marker(record: dict) -> str | None:
+    match = _DISCOUNT_MARKER.search(str(record.get("PrivateNote") or ""))
+    return match.group(1).lower() if match else None
+
+
+def _credit_request_id(payment_id: str, step: str) -> str:
+    return f"{payment_id}:{step}"[:REQUEST_ID_MAX]
+
+
+def _credit_id(record: dict) -> str | None:
+    """The VendorCredit our $0 BillPayment applies."""
+    for line in record.get("Line") or []:
+        if isinstance(line, dict):
+            ids = _linked_ids(line, "VendorCredit")
+            if ids:
+                return ids[0]
+    return None
 
 
 def _bill_correlation(bill: dict) -> str | None:
