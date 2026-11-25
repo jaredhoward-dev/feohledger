@@ -342,6 +342,31 @@
 	// sequencer for the same reason — see `fetchCounts`.
 	const countsSequence = createRequestSequencer();
 
+	// The list's active search / status / sort, as query params — shared by the
+	// page read and the one-row re-read after a Verify / Reject, so both ask
+	// the server about the same filtered set.
+	function listFilterParams(): URLSearchParams {
+		const params = new URLSearchParams();
+		// `untrack`: this is also called (via fetchVendors) from the
+		// statusFilter `$effect` above. A plain read of `search` here would make
+		// THAT effect depend on `search` too (Svelte tracks reads transitively
+		// through called functions), so every keystroke would re-fire it — an
+		// immediate, un-debounced fetch racing the dedicated debounce timer.
+		// `untrack` still reads the current value (the request still carries the
+		// live search term); it just stops that read from registering as a
+		// dependency of whichever effect calls this.
+		const currentSearch = untrack(() => search);
+		if (currentSearch.trim()) params.set('search', currentSearch.trim());
+		if (statusFilter !== 'all') params.set('status', statusFilter);
+		// Same `untrack` reasoning as `search` above, for the sort state.
+		const currentSort = untrack(() => sortField);
+		if (currentSort) {
+			params.set('sort', currentSort);
+			params.set('order', untrack(() => sortOrder));
+		}
+		return params;
+	}
+
 	async function fetchVendors(opts: { append?: boolean; nextPage?: number } = {}) {
 		const token = fetchSequence.start();
 		if (!opts.append) {
@@ -350,29 +375,9 @@
 		}
 		try {
 			const nextPage = opts.nextPage ?? 1;
-			const params = new URLSearchParams({
-				page: String(nextPage),
-				page_size: String(PAGE_SIZE)
-			});
-			// `untrack`: this function is also called from the statusFilter
-			// `$effect` above. A plain read of `search` here would make THAT
-			// effect depend on `search` too (Svelte tracks reads transitively
-			// through called functions), so every keystroke would re-fire it —
-			// an immediate, un-debounced fetch racing the dedicated debounce
-			// timer. `untrack` still reads the current value (the request still
-			// carries the live search term); it just stops that read from
-			// registering as a dependency of whichever effect calls this.
-			const currentSearch = untrack(() => search);
-			if (currentSearch.trim()) params.set('search', currentSearch.trim());
-			if (statusFilter !== 'all') params.set('status', statusFilter);
-			// Same `untrack` reasoning as `search` above: this function is also
-			// called from the status/search effects, and a plain read here would
-			// make THOSE effects depend on the sort state too.
-			const currentSort = untrack(() => sortField);
-			if (currentSort) {
-				params.set('sort', currentSort);
-				params.set('order', untrack(() => sortOrder));
-			}
+			const params = listFilterParams();
+			params.set('page', String(nextPage));
+			params.set('page_size', String(PAGE_SIZE));
 			const data = await api.get<{ items: Vendor[]; total: number }>(
 				`/api/vendors?${params}`
 			);
@@ -593,10 +598,58 @@
 		}
 	}
 
+	// After a single-row Verify / Reject, re-read THAT row rather than page 1,
+	// so a reviewer working down pages added by Load more keeps them (decisions
+	// §506). `GET /api/vendors?id=` answers under the page's own filters: one
+	// row in the list shape, carrying the server's fresh `status_actions`
+	// verdict, or an empty page when the row has left the filter (it is then
+	// dropped and the "N matching" total falls by one). Nothing here decides
+	// which actions a status allows or which statuses a filter matches.
+	async function refreshVendorRow(updated: Vendor) {
+		const id = updated.id;
+		// Until the server's answer lands the row shows its new status with
+		// its actions withheld (fail closed) — the verdict it carried was for
+		// the old status. Retiring pre-edit reads first stops one of them
+		// putting the old status back.
+		fetchSequence.supersedeInFlight();
+		vendors = vendors.map((v) =>
+			v.id === id ? { ...v, status: updated.status, status_actions: undefined } : v
+		);
+		const token = fetchSequence.start();
+		try {
+			const params = listFilterParams();
+			params.set('id', id);
+			params.set('page_size', '1');
+			const data = await api.get<{ items: Vendor[]; total: number }>(`/api/vendors?${params}`);
+			// A newer list read (a filter change) answers for itself.
+			if (!fetchSequence.canCommit(token)) return;
+			const [row] = data.items;
+			if (row) {
+				vendors = vendors.map((v) => (v.id === id ? row : v));
+			} else if (vendors.some((v) => v.id === id)) {
+				vendors = vendors.filter((v) => v.id !== id);
+				total = Math.max(0, total - 1);
+				if (selected.has(id)) {
+					const next = new Set(selected);
+					next.delete(id);
+					selected = next;
+				}
+			}
+		} catch {
+			// The decision itself landed (its toast says so); the row keeps its
+			// new status with no actions until the next list read.
+		} finally {
+			if (fetchSequence.isCurrentRequest(token)) loaded = true;
+		}
+		// The chip tallies are whole-set server counts; re-ask rather than
+		// shifting them by hand.
+		fetchCounts();
+	}
+
 	async function verifyVendor(id: string) {
 		try {
-			await api.post(`/api/vendors/${id}/verify`, {});
-			await fetchVendors();
+			const verified = await api.post<Vendor>(`/api/vendors/${id}/verify`, {});
+			await refreshVendorRow(verified);
 			toast(m('vendors.toast.verified'), 'success');
 		} catch (err) {
 			toast(errorMessage(err, m('vendors.toast.verifyFailed')), 'error');
@@ -617,7 +670,7 @@
 	async function rejectVendor(id: string) {
 		try {
 			const rejected = await rejectVendorRequest(id);
-			await fetchVendors();
+			await refreshVendorRow(rejected);
 			toast(m('vendors.toast.rejected'), 'success');
 			toastCardRevocations([rejected.card_revocation]);
 		} catch (err) {

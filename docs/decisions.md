@@ -25798,3 +25798,38 @@ payment ids passed into the adapter, a cross-layer change for one adapter.
 *Turning `supports_status_sync` on with the write-back refused*: the push would
 land payable, and FeohLedger's own payment would never reach the ERP, so the
 bill would stay open there and be paid again.
+
+## 506. A row Verify / Reject on /vendors re-reads that one row through the list endpoint, not page 1 (round 40)
+
+**Context.** `verifyVendor` and `rejectVendor` refetched with `fetchVendors()`,
+which reloads page 1 only, so a reviewer working down pages added by Load more
+was thrown back to the first 20 rows after every decision. Patching the row
+from the `/verify` / `/reject` response was not enough: those return a plain
+`VendorResponse`, without the list row's `status_actions` verdict or its
+`invoice_count`, and they say nothing about whether the row still matches the
+reviewer's search and status filter.
+
+**Decision.** `GET /api/vendors` takes `?id=<uuid>`, which narrows the same
+filtered, entity-scoped query to one row. After a decision the page marks the
+row with its new status and no actions (fail closed while it asks), then
+re-reads it with its own search / status / sort plus `id`: one item is the
+row in the exact list shape, verdict included, and is patched in place; an
+empty page means it has left the filter, so it is dropped, removed from the
+selection, and the "N matching" total falls by one. The chip tallies are
+re-read from `GET /api/vendors/counts`, never shifted by hand. The re-read
+runs on the list's request sequencer, so a filter change issued meanwhile
+answers for itself.
+
+Why the list endpoint and not a richer `/verify` response (the other option
+the followup named): membership in the active filter is a server question
+(search spans name, code and email; status filters are comma lists; entity
+scope applies), and answering it in the client would restate those rules.
+One read through the list's own filter builder gives the row shape, the
+verdict and the membership answer from the code that already produces them.
+`?id=` stays out of `_vendor_list_filters`, since `/ids` and `/counts`
+describe the whole set.
+
+Accepted: under a `status` sort a re-read row keeps its place until the next
+full read, and a Load more already in flight when the decision lands is
+retired (the reviewer clicks it again), the same trade `applyVendorUpdate`
+already makes for a pre-edit read.
