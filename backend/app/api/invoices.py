@@ -112,6 +112,11 @@ from app.services.audit_access import build_field_diff
 from app.services.audit_dispatch import dispatch_audit
 from app.services.csv_import import MAX_CSV_IMPORT_SIZE, import_invoices_csv
 from app.services.erp_export_gate import live_claims
+from app.services.erp_payment_writeback import (
+    PENDING_CREDITS_KEY,
+    PENDING_VOID_CREDITS_KEY,
+    PENDING_VOIDS_KEY,
+)
 from app.services.gl_chart import refuse_gl_codes_outside_chart
 from app.services.gl_recode import RecodeFilter, bulk_recode_gl
 from app.services.invoice_warnings import reconcile_line_totals, refresh_warnings
@@ -2500,6 +2505,72 @@ def _delete_claim_refusal(claim: str) -> dict:
     return coded_refusal(INVOICE_DELETE_CLAIMED, _DELETE_CLAIM_MESSAGES[claim], claim=claim)
 
 
+#: A voided payment returns the invoice to `approved`, so it is deletable, while
+#: the ERP side of the void (or of a discount credit) may still be unfinished:
+#: `WorkflowInstance.state_data` holds the payment ids the status-sync sweep has
+#: yet to reverse or apply (`erp_payment_writeback`'s three pending maps). The
+#: cascade deletes that instance, and the BillPayment / VendorCredit would stand
+#: in the ERP with nothing left to finish or report them (decisions §580).
+INVOICE_DELETE_ERP_REVERSAL_PENDING = "invoice_delete_erp_reversal_pending"
+_DELETE_ERP_REVERSAL_MESSAGE = (
+    "A payment on this invoice is still being reversed in the ERP, or its discount "
+    "credit is still being booked there. Wait for the ERP sync to finish it, or resolve "
+    "the ERP exception on this invoice, before deleting the invoice."
+)
+_ERP_PENDING_KEYS = (PENDING_VOIDS_KEY, PENDING_VOID_CREDITS_KEY, PENDING_CREDITS_KEY)
+
+#: Any outbound PEPPOL transmission not `failed` (`sending` counts: its outcome
+#: is unknown) is the local record of an e-invoice the receiver may hold. A
+#: transmitted e-invoice is corrected by a credit note, not erased — the rule
+#: §573 applies to the recall (decisions §580).
+INVOICE_DELETE_PEPPOL_TRANSMITTED = "invoice_delete_peppol_transmitted"
+_DELETE_PEPPOL_MESSAGE = (
+    "This invoice has been sent over PEPPOL, and the receiver may hold it. Issue a "
+    "credit note to cancel it; the invoice and its transmission record can't be deleted."
+)
+
+
+async def _delete_refusals(db: AsyncSession, invoice_ids) -> dict[uuid.UUID, dict]:
+    """The coded refusal, per invoice id, of everything that stops a hard delete
+    beyond the status check: a live claim (§577), an unfinished ERP reversal and
+    a PEPPOL transmission (§580), named in that order — a claim is cleared
+    first, and a transmission is never cleared."""
+    ids = list(invoice_ids)
+    if not ids:
+        return {}
+    refusals: dict[uuid.UUID, dict] = {}
+    for inv_id, claim in (await live_claims(db, ids)).items():
+        refusals[inv_id] = _delete_claim_refusal(claim)
+    states = (
+        await db.execute(
+            select(WorkflowInstance.invoice_id, WorkflowInstance.state_data).where(
+                WorkflowInstance.invoice_id.in_(ids)
+            )
+        )
+    ).all()
+    for inv_id, state in states:
+        if inv_id not in refusals and any((state or {}).get(k) for k in _ERP_PENDING_KEYS):
+            refusals[inv_id] = coded_refusal(
+                INVOICE_DELETE_ERP_REVERSAL_PENDING, _DELETE_ERP_REVERSAL_MESSAGE
+            )
+    transmitted = (
+        await db.execute(
+            select(PeppolTransmission.invoice_id)
+            .where(
+                PeppolTransmission.invoice_id.in_(ids),
+                PeppolTransmission.direction == "outbound",
+                PeppolTransmission.status != "failed",
+            )
+            .distinct()
+        )
+    ).scalars()
+    for inv_id in transmitted:
+        refusals.setdefault(
+            inv_id, coded_refusal(INVOICE_DELETE_PEPPOL_TRANSMITTED, _DELETE_PEPPOL_MESSAGE)
+        )
+    return refusals
+
+
 @router.delete("/{invoice_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_invoice(
     invoice_id: uuid.UUID,
@@ -2515,9 +2586,9 @@ async def delete_invoice(
     invoice = await get_invoice_for_update(db, invoice_id)
     if invoice.status in IMMUTABLE_STATUSES:
         raise HTTPException(status_code=409, detail="Cannot delete invoice in this status")
-    claim = (await live_claims(db, [invoice.id])).get(invoice.id)
-    if claim is not None:
-        raise HTTPException(status_code=409, detail=_delete_claim_refusal(claim))
+    refusal = (await _delete_refusals(db, [invoice.id])).get(invoice.id)
+    if refusal is not None:
+        raise HTTPException(status_code=409, detail=refusal)
     # Audit BEFORE the cascade: afterwards there is no row left to describe.
     # `_delete_invoice_cascade` deliberately does not touch `audit_log`, so this
     # row (and the invoice's whole prior trail) survives the delete — which is
@@ -2726,9 +2797,11 @@ async def bulk_delete(
     # reported as skipped rather than silently dropped from the count.
     found = {inv.id for inv in invoices}
     skipped: list[str] = [str(i) for i in ids if i not in found]
-    claimed = await live_claims(db, found)
+    # A live claim, an unfinished ERP reversal or a PEPPOL transmission skips
+    # the row, as the single delete refuses it (decisions §577, §580).
+    refused = await _delete_refusals(db, found)
     for inv in invoices:
-        if inv.status in IMMUTABLE_STATUSES or inv.id in claimed:
+        if inv.status in IMMUTABLE_STATUSES or inv.id in refused:
             skipped.append(str(inv.id))
         else:
             await _audit_invoice_deleted(db, inv, actor_id=user.id, bulk=True)

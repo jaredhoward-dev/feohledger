@@ -59,6 +59,8 @@ export const enRefusal = {
 	'refusal.cardBlocksRecall': "A virtual card has been issued to pay this invoice. Cancel the card before recalling the approval.",
 	'refusal.paymentBlocksDelete': "FeohLedger is already paying this invoice: it has a live payment. Cancel its payment run or void the payment before deleting the invoice.",
 	'refusal.cardBlocksDelete': "A virtual card has been issued to pay this invoice. Cancel the card before deleting the invoice.",
+	'refusal.erpReversalBlocksDelete': "A payment on this invoice is still being reversed in the ERP, or its discount credit is still being booked there. Wait for the ERP sync to finish it, or resolve the ERP exception on this invoice, before deleting the invoice.",
+	'refusal.peppolBlocksDelete': "This invoice has been sent over PEPPOL, and the receiver may hold it. Issue a credit note to cancel it; the invoice and its transmission record can't be deleted.",
 	'refusal.paymentRunSegregation': "Segregation of duties: the user who created this payment run cannot also approve or execute it. A different user must.",
 	'refusal.paymentRunAwaitingCfo': "This run exceeds the organization's CFO-approval threshold and is awaiting sign-off from a user with the CFO role.",
 	'refusal.paymentCfoRequired': "This payment is above your organization's CFO sign-off threshold. Book it through a payment run for CFO approval, or ask a CFO to create it.",

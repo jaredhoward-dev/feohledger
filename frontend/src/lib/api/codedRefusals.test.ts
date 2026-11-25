@@ -908,6 +908,25 @@ describe('deleting an invoice a rail holds (decisions §577)', () => {
 	});
 });
 
+describe('deleting an invoice with an unfinished ERP reversal or a PEPPOL transmission (decisions §580)', () => {
+	const locales = { en, de, fr, es, 'pt-BR': ptBR, ja } as const;
+
+	it('states both refusals in all six locales', () => {
+		for (const [loc, catalogue] of Object.entries(locales)) {
+			const t = translator(catalogue as typeof en, loc);
+			const cat = catalogue as Record<string, string>;
+			expect(cat['refusal.erpReversalBlocksDelete']).toBeTruthy();
+			expect(cat['refusal.peppolBlocksDelete']).toBeTruthy();
+			expect(codedRefusalText('invoice_delete_erp_reversal_pending', {}, t)).toBe(
+				cat['refusal.erpReversalBlocksDelete']
+			);
+			expect(codedRefusalText('invoice_delete_peppol_transmitted', {}, t)).toBe(
+				cat['refusal.peppolBlocksDelete']
+			);
+		}
+	});
+});
+
 describe('Partner Admin and the link code (decisions §574)', () => {
 	const locales = { en, de, fr, es, 'pt-BR': ptBR, ja } as const;
 
@@ -1729,8 +1748,9 @@ describe('the invoice bulk-status endpoint’s own skips (`api/invoices.bulk_sta
 		const codes = [...source.matchAll(/^INVOICE_[A-Z_]+ = "(invoice_[a-z_]+)"/gm)].map(
 			(x) => x[1]
 		);
-		// Five bulk-status skips, plus the delete door's claim (decisions §577).
-		expect(codes).toHaveLength(6);
+		// Five bulk-status skips, plus the delete door's claim (decisions §577)
+		// and its ERP-reversal and PEPPOL refusals (§580).
+		expect(codes).toHaveLength(8);
 		for (const code of codes) {
 			expect(CODED_REFUSAL_CODES, `no sentence for "${code}"`).toContain(code);
 		}

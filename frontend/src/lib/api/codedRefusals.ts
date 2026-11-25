@@ -464,6 +464,10 @@ const BUILDERS: Record<string, Builder> = {
 		if (claim === 'virtual_card') return t('refusal.cardBlocksDelete');
 		return null;
 	},
+	// `DELETE /api/invoices/{id}` — the ERP side of a void or a discount credit is
+	// unfinished, or the invoice went out over PEPPOL (decisions §580).
+	invoice_delete_erp_reversal_pending: fixed('refusal.erpReversalBlocksDelete'),
+	invoice_delete_peppol_transmitted: fixed('refusal.peppolBlocksDelete'),
 	// The state machine's own 409s (`services/workflow_engine.py`), reached
 	// through every door that transitions an invoice and through a
 	// `POST /bulk/status` row's skip. `params.status` / `params.target` are
