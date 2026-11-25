@@ -1638,6 +1638,8 @@ export const messages = {
 	'contracts.empty': 'Aucun contrat ne correspond à vos filtres.',
 	'contracts.empty.errored': 'Impossible de charger les contrats. Réessayez.',
 	'contracts.notFound': 'Contrat introuvable',
+	'contracts.deepLink.loadFailed': 'Impossible de charger le contrat lié. Réessayez.',
+	'contracts.selectRowAria': 'Sélectionner le contrat {number}',
 	'contracts.row.open': 'Ouvrir le contrat {number}',
 	'contracts.overSpendLimit': 'Limite de dépenses dépassée',
 	'contracts.loadMore': 'Charger plus ({shown} sur {total})',

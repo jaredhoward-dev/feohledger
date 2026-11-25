@@ -1779,6 +1779,8 @@ export const en = {
 	'contracts.empty': 'No contracts match your filters.',
 	'contracts.empty.errored': 'Could not load contracts. Try again.',
 	'contracts.notFound': 'Contract not found',
+	'contracts.deepLink.loadFailed': 'Couldn’t load the linked contract. Try again.',
+	'contracts.selectRowAria': 'Select contract {number}',
 	'contracts.row.open': 'Open contract {number}',
 	'contracts.overSpendLimit': 'Over spend limit',
 	'contracts.loadMore': 'Load more ({shown} of {total})',

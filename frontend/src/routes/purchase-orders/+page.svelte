@@ -25,6 +25,8 @@
 	import { poStatusLabel, poStatusTone } from '#lib/types/purchaseOrder.ts';
 	import { createRequestSequencer } from '#lib/utils/requestSequence.ts';
 	import { untrack } from 'svelte';
+	import { page as pageState } from '$app/state';
+	import { replaceState } from '$app/navigation';
 
 	const COLUMNS = $derived([
 		{ label: m('purchaseOrders.col.poNumber'), class: 'col-number' },
@@ -103,8 +105,17 @@
 	// on a re-load, the previous filter's rows standing as this one's answer.
 	// A failed load-more keeps the rows already shown and only toasts.
 	let errored = $state(false);
-	let search = $state('');
-	let statusFilter = $state<'all' | 'open' | 'unissued' | 'closed' | 'cancelled'>('all');
+	// URL-backed: `?search=`, `?status=` and the open PO's `?id=` are read on
+	// load and written back by `syncUrl()`, so a reload, a copied link or a
+	// return to the page lands on the same filtered list and the same PO (they
+	// lived in component state only, and every reload reset the view).
+	type StatusFilter = 'all' | 'open' | 'unissued' | 'closed' | 'cancelled';
+	const STATUS_FILTERS: readonly StatusFilter[] = ['all', 'open', 'unissued', 'closed', 'cancelled'];
+	function statusFromUrl(raw: string | null): StatusFilter {
+		return STATUS_FILTERS.includes(raw as StatusFilter) ? (raw as StatusFilter) : 'all';
+	}
+	let search = $state(pageState.url.searchParams.get('search') ?? '');
+	let statusFilter = $state<StatusFilter>(statusFromUrl(pageState.url.searchParams.get('status')));
 	// The badge text is the shared PO status label (`poStatusLabel`), not the
 	// raw column value — `open` is a database token, "Open" is what a clerk
 	// reads, and `partially_received` / `received` / `voided` read as words
@@ -117,15 +128,46 @@
 
 	let syncing = $state(false);
 
-	let detailId = $state<string | null>(null);
+	let detailId = $state<string | null>(pageState.url.searchParams.get('id'));
 	let detail = $state<PODetail | null>(null);
 	let detailLoading = $state(false);
 
 	let searchTimer: ReturnType<typeof setTimeout> | null = null;
 
+	// The route's ONLY `replaceState` caller. It builds the query from
+	// component state and reads `page.url` for the pathname alone: SvelteKit's
+	// shallow `replaceState` never updates `page.url`, so rebuilding from it
+	// would resurrect a closed PO's `?id=` (the /invoices single-writer shape).
+	// Every read is untracked — this is a writer called from effects.
+	function syncUrl() {
+		untrack(() => {
+			const params = new URLSearchParams();
+			if (detailId) params.set('id', detailId);
+			const q = search.trim();
+			if (q) params.set('search', q);
+			if (statusFilter !== 'all') params.set('status', statusFilter);
+			const qs = params.toString();
+			replaceState(`${pageState.url.pathname}${qs ? `?${qs}` : ''}`, {});
+		});
+	}
+
 	$effect(() => {
-		void loadPos();
-		void fetchCounts();
+		// Mount load carries the filters the URL arrived with.
+		untrack(() => {
+			void loadPos({ search, status: statusFilter });
+			void fetchCounts({ search });
+		});
+	});
+
+	// A REAL navigation to `/purchase-orders?id=…` while the page is already
+	// mounted (a link elsewhere in the shell) opens that PO. `page.url` only
+	// changes on real navigation, so this never fights `syncUrl()`.
+	let lastUrlId: string | null = pageState.url.searchParams.get('id');
+	$effect(() => {
+		const id = pageState.url.searchParams.get('id');
+		if (id === lastUrlId) return;
+		lastUrlId = id;
+		untrack(() => (detailId = id));
 	});
 
 	// A status chip is a discrete action, so it fetches immediately — it used
@@ -145,6 +187,7 @@
 			statusEffectRan = true;
 			return;
 		}
+		syncUrl();
 		void loadPos({ search: untrack(() => search), status: s });
 	});
 
@@ -157,6 +200,7 @@
 		}
 		if (searchTimer) clearTimeout(searchTimer);
 		searchTimer = setTimeout(() => {
+			syncUrl();
 			void loadPos({ search: q, status: untrack(() => statusFilter) });
 			// The tallies are search-scoped too — a chip count that ignored the
 			// active search would contradict the list under it.
@@ -169,12 +213,20 @@
 		};
 	});
 
+	let detailEffectRan = false;
 	$effect(() => {
-		if (!detailId) {
+		const id = detailId;
+		// Opening and closing the detail both land in the URL: closing (the
+		// ×, Escape, or a failed load) drops `?id=` so a reload does not
+		// re-open a PO the user already dismissed. Skipped on the mount run,
+		// where the URL already says what the state does.
+		if (detailEffectRan) syncUrl();
+		detailEffectRan = true;
+		if (!id) {
 			detail = null;
 			return;
 		}
-		void loadDetail(detailId);
+		void loadDetail(id);
 	});
 
 	// Sequences every `loadPos` call (mount, chip, debounced search, load-more —
