@@ -1854,9 +1854,13 @@ the number:
 - **`blackbaud_fe_nxt`** links by the GL API's `account_id`, stored
   `id:<account_id>` for the same reason Intacct's carries `key:` (decisions
   §494). AP distributions take only `account_number`, so the push resolves
-  each `id:` link to the account's **current** number from one walk of
-  `GET /generalledger/v1/accounts` per push (stopping at the page holding the
-  last id it needs; never a read per line), and refuses `account_inactive`
+  each `id:` link to the account's **current** number once per push (never a
+  read per line): one `GET /generalledger/v1/accounts/{account_id}` per
+  distinct id when the bill links at most 5 (`CHART_RESOLVE_PER_ID_MAX`; a 404
+  is an id gone from the chart), otherwise one walk of
+  `GET /generalledger/v1/accounts` (stopping at the page holding the last id
+  it needs). The push's call reserve is the path's own cost: the id count, or
+  the walk's page cap. It refuses `account_inactive`
   (`params.accounts` = our GL codes) before the create when a linked id is no
   longer in the chart or is closed to data entry. A link still holding a
   number posts by that number, with no chart read, until the next chart sync
@@ -3371,7 +3375,7 @@ so every tenant on the platform key draws on one bucket — see *Call budget* be
 
 | Operation | Call |
 |---|---|
-| `post_invoice` | pre-flight refusals → `GET /accountspayable/v1/invoices?search_text=<number>&limit=500` (narrowed by `from_date`/`to_date` only when that page is full) → `GET /generalledger/v1/fiscalyears` (cached 15 min per environment) → `GET /generalledger/v1/accounts`, 100 a page, only when a distribution is `id:`-linked and only until every linked id is found (§494) → `POST /accountspayable/v1/invoices/process` (on a 400, `GET /vendors/{id}`) → `GET …/backgroundProcess/{id}/status` (≤ 5 reads, backing off 1, 2, 4, 8 s) → `…/result` |
+| `post_invoice` | pre-flight refusals → `GET /accountspayable/v1/invoices?search_text=<number>&limit=500` (narrowed by `from_date`/`to_date` only when that page is full) → `GET /generalledger/v1/fiscalyears` (cached 15 min per environment) → only when a distribution is `id:`-linked (§494): `GET /generalledger/v1/accounts/{account_id}` once per distinct id when there are ≤ 5, else `GET /generalledger/v1/accounts`, 100 a page, until every linked id is found → `POST /accountspayable/v1/invoices/process` (on a 400, `GET /vendors/{id}`) → `GET …/backgroundProcess/{id}/status` (≤ 5 reads, backing off 1, 2, 4, 8 s) → `…/result` |
 | `get_invoice_status` | `GET /accountspayable/v1/invoices/{id}`: `Pending` draft, `Approved` open (a zero balance stays open until FE NXT says `Paid`, decisions §303), `PartiallyPaid`, `Paid`, `Deleted` cancelled |
 | `void_invoice` | not automated (`False`): the AP API has no invoice delete, and cancelling a posted payable is an adjustment in an open period |
 | `list_vendors` / `list_pos` | `GET /accountspayable/v1/vendors` / `/purchaseorders`, 100 a page; vendors up to `SYNC_LISTING_MAX_ROWS` (else `ErpListingIncomplete`), with `vendor_status` `Inactive` **and `OnHold`** emitted `active=False`; POs read whole the same way (`list_pos_report`; a failed page, a transport error or more than `SYNC_LISTING_MAX_ROWS` raises `ErpListingIncomplete`, never an empty or partial list), linked to their vendor by `vendor_id` (`PoPayload.vendor_erp_id`); template POs dropped; a `DeletedOrder` comes through `cancelled` when it carries a total (so a row synced earlier stops counting as an open commitment) and is dropped, never marked, when it does not; any other PO with no usable `order_total` skipped and named in `skipped` as `unpriceable` (§323); PO `currency` stays NULL |
