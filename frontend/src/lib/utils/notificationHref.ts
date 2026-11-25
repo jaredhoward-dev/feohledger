@@ -34,6 +34,9 @@ export const NOTIFICATION_ROUTES: Record<string, Resolver> = {
 	// ai_invoice_usage — the plan's AI allowance / spending cap, shown on the
 	// billing page's usage meters.
 	billing: () => '/billing',
+	// erp_bill_flagged — a duplicate / fraud flag on an invoice already in the
+	// ERP; `/exceptions?id=` opens the flag, which offers the ERP void (§539).
+	exception: withId('/exceptions'),
 	// erp_connection_expiring / erp_call_quota — both about the org's ERP
 	// connection, which lives in the ERP section of the settings screen. Any
 	// other event filed under this generic type has no known home yet.

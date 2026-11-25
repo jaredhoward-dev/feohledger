@@ -25,7 +25,8 @@ export type NotificationEventType =
 	| 'cash_shortfall_projected'
 	| 'ai_invoice_usage'
 	| 'erp_connection_expiring'
-	| 'erp_call_quota';
+	| 'erp_call_quota'
+	| 'erp_bill_flagged';
 
 export interface Notification {
 	id: string;
@@ -100,7 +101,8 @@ export const EVENT_LABEL_KEYS: Record<NotificationEventType, MessageKey> = {
 	cash_shortfall_projected: 'profile.notifications.event.cashShortfallProjected',
 	ai_invoice_usage: 'profile.notifications.event.aiInvoiceUsage',
 	erp_connection_expiring: 'profile.notifications.event.erpConnectionExpiring',
-	erp_call_quota: 'profile.notifications.event.erpCallQuota'
+	erp_call_quota: 'profile.notifications.event.erpCallQuota',
+	erp_bill_flagged: 'profile.notifications.event.erpBillFlagged'
 };
 
 /**
@@ -119,5 +121,6 @@ export const EVENT_ORDER: NotificationEventType[] = [
 	'cash_shortfall_projected',
 	'ai_invoice_usage',
 	'erp_connection_expiring',
-	'erp_call_quota'
+	'erp_call_quota',
+	'erp_bill_flagged'
 ];
