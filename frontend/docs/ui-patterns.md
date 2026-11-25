@@ -496,6 +496,16 @@ affordance on each resolves the whole filtered set via that resource's
 `GET .../ids` sibling endpoint (`getVendorIds`/`getContractIds`/`getExpenseIds`)
 rather than only the currently-loaded page.
 
+**"Select all N matching" counts only the rows the action can select.** N is
+the size of the set `GET .../ids` will return, never a `total` that includes
+rows whose checkbox is disabled: `/invoices` subtracts the system-managed
+statuses (`selectableMatchingTotal`), `/exceptions` counts open + escalated
+under All, the payments queue uses the server's `selectable_total`. When the
+tallies behind N are missing or describe another filter (a failed counts
+read), fall back or withhold the button rather than offer the old N. Offer it
+only when N exceeds what is already selected, and format N with
+`formatCount`.
+
 ### Pagination + Load more
 
 Default page size is **20** across all list endpoints. Backend
