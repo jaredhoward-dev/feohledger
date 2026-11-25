@@ -342,7 +342,7 @@ included, is a `422` coded `legal_acceptance_required`.
 Each recorded acceptance writes `auth.legal.accepted` to the tenant's auth
 trail (`{versions, source, ip}`).
 
-**The re-prompt: the web app, the mobile app and the supplier portal ask; there is no server-side gate.**
+**The re-prompt: the web app, the mobile app and the supplier portal ask, and the server refuses everything else until they do.**
 `GET /api/auth/me` returns `legal_acceptance_required` (the user has not
 accepted the versions in force) and `POST /api/auth/legal-acceptance` records
 it (source `reprompt`; 10/min per account; audited only on a first
@@ -360,12 +360,25 @@ own route. So on the web every signed-in employee is asked: existing users,
 SSO / SCIM users, anyone after a version bump, a forgot-password reset of a
 password account.
 
-Still **not gated**: the flag is advisory server-side. No gate refuses an
-unaccepted user, so an API caller is never asked, and neither is a user who
-opens neither the web nor the mobile app. Supplier-portal users are asked for
-the Privacy Policy at set-password and after sign-in (below, decisions §500).
-The server-side gate is the one piece left (the re-prompt entry in
-`docs/followups.md`).
+**The server-side gate** (decisions §505). While the flag is true,
+`api/deps.get_current_user` answers every employee request with a **403 coded
+`legal_acceptance_required`**, except the routes the accept step needs
+(`LEGAL_GATE_EXEMPT_ROUTES`, which depend on `get_authenticated_user`
+directly): `GET /api/auth/me`, `POST /api/auth/legal-acceptance` and `POST
+/api/auth/change-password` (the forced change comes first). Logout never
+resolves a user, so it always works; login, MFA, set-password and the SSO /
+SAML callbacks issue tokens and are not gated, so an SSO user signs in and
+then meets the step. The current-acceptance count rides on the resolver's own
+user query, so the gate adds no round trip. The portal twin is
+`get_current_vendor_user` (403 `privacy_acknowledgement_required`; exempt:
+portal `/me`, `/legal-acknowledgement`, `/change-password`). Out of scope:
+`/api/v1` API keys (no person behind a key), SCIM, inbound webhooks and public
+pages. Not yet covered: the Slack / Teams approval buttons and the emailed
+approve link, which act on a single-use action token rather than a JWT
+(`docs/followups.md`). **Existing users with nothing on record are blocked
+until they accept on the web or mobile, and a mobile build older than a
+version bump can only sign out — ship a bump with, or after, an app release
+carrying the new versions.**
 
 **The mobile app asks** (decisions §498). When `/me` says
 `legal_acceptance_required` (after sign-in, on session restore, or on app
@@ -454,7 +467,7 @@ changed:
 
 ### Protected routes
 
-All endpoints except the explicit allowlist (login flow, OIDC handshake, signup, webhooks, SCIM, health) require a valid Bearer token AND the right role. Authentication and role checks are enforced via FastAPI dependencies in `app/api/deps.py` (`get_current_user`, `require_roles`). See **Role-based access control** below for the full permission matrix.
+All endpoints except the explicit allowlist (login flow, OIDC handshake, signup, webhooks, SCIM, health) require a valid Bearer token AND the right role, and an employee who owes a Terms / Privacy acceptance is refused everywhere but the accept step's routes (above, decisions §505). Authentication and role checks are enforced via FastAPI dependencies in `app/api/deps.py` (`get_current_user`, `require_roles`). See **Role-based access control** below for the full permission matrix.
 
 ## Token Revocation (Blocklist)
 

@@ -25798,3 +25798,60 @@ payment ids passed into the adapter, a cross-layer change for one adapter.
 *Turning `supports_status_sync` on with the write-back refused*: the push would
 land payable, and FeohLedger's own payment would never reach the ERP, so the
 bill would stay open there and be paid again.
+
+## 505. The server refuses an employee or supplier who owes a Terms / Privacy acceptance (round 40)
+
+**Problem.** §495–§500 record acceptance and draw an accept step on the web,
+mobile and the supplier portal, but `legal_acceptance_required` was advisory:
+an API caller with an employee or portal JWT, or anyone who never opened a
+client, was never asked, and nothing refused them.
+
+**Decision.**
+
+- **One chokepoint per population.** `api/deps.get_current_user` (every
+  employee route, directly or through `require_roles` / `require_permission`)
+  now depends on `get_authenticated_user`, the old resolver, and answers a
+  user who has not accepted every version in `CURRENT_LEGAL_VERSIONS` with a
+  **403 coded `legal_acceptance_required`** — the code the accept endpoint's
+  422 already uses, so every client's answer is its accept step.
+  `api/portal_deps.get_current_vendor_user` does the same over
+  `get_authenticated_vendor_user`, with the portal's code
+  `privacy_acknowledgement_required` (§499).
+- **No extra round trip for employees.** The count of current acceptances is
+  folded into the resolver's own user query (`User.legal_current_acceptances`,
+  a `query_expression` loaded by `with_expression`); a user loaded any other
+  way falls back to `missing_documents`. The portal gate is one indexed read
+  of the tenant `vendor_user_legal_acceptances`.
+- **Exempt: the minimum the accept steps need**, listed in
+  `LEGAL_GATE_EXEMPT_ROUTES` / `PORTAL_LEGAL_GATE_EXEMPT_ROUTES` and pinned
+  against the app's routes by `tests/test_legal_acceptance_gate.py`:
+  `GET /me` (the flag), the accept / acknowledge endpoint, and
+  `change-password` (the forced change comes before the step, §497, §500).
+  Logout reads the token itself and never resolves a user. Login, MFA,
+  set-password and the SSO / SAML callbacks issue tokens rather than take
+  one, so an SSO user signs in normally and then meets the step like anyone
+  with an employee JWT. Branding and i18n need nothing: the web step loads no
+  branding until the flag clears (§497) and catalogues ship in the bundle;
+  `/api/public-config` and `/portal/branding` are public.
+- **Out of scope, by construction:** the `/api/v1` developer API
+  (`X-API-Key`; a key is not a person and has no one to accept — the key's
+  creator met the gate in the app that minted it), SCIM's bearer token, the
+  inbound webhooks (signed machine callers), and the public pages. None of
+  them reaches either resolver; the test pins that no API-key route does.
+  **Not covered, and tracked in `docs/followups.md`:** the Slack / Teams
+  approval buttons and the emailed approve link act for a person on a
+  single-use action token, not a JWT, so they do not reach the gate either.
+- **Consequences.** Every existing user with no acceptance on record is
+  refused everywhere but the step until they accept on the web or mobile.
+  A mobile build older than a version bump can then only sign out (its Accept
+  is refused, §498), so a bump must ship with, or after, an app release
+  carrying the new versions. Tests: the pytest harness records acceptance for
+  every user it inserts (`conftest._test_users_accept_the_legal_versions`,
+  the seed's shape), and a test of the unaccepted path opts out with
+  `@pytest.mark.legal_unaccepted`.
+
+**Rejected.** *A path allowlist checked inside one resolver*: needs the
+request in a function tests call directly, and hides the exemption from the
+dependency graph the RBAC sweep reads. *A per-router check*: the next router
+forgets it. *Gating `/api/v1`*: there is no person behind a key to accept, and
+refusing a key would break integrations for a step nobody can take.
