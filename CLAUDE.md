@@ -502,6 +502,15 @@ below or in `## Project invariants` — this is the index.)
    session and subagent: a bare `pytest`, an unscoped `playwright test` and
    `pnpm test` / `test:backend` / `test:frontend` / `test:e2e` are refused; prefix
    `FEOH_FULL_SUITE=1` for the no-bounded-caller-set case.
+   **The drift guards need no database: run them even when Postgres is down.**
+   `tests/test_rbac.py`, `test_sod_endpoint_wiring.py`,
+   `test_settings_writers_lock_the_org_row.py`, `test_whole_set_kpi_rollups.py`
+   and `test_legal_acceptance_gate.py` walk the route table or the source and
+   finish in seconds. A change that adds or re-gates a route, writes
+   `Organization.settings`, adds a permission check or a `/counts` endpoint
+   runs them before committing. Round lanes skipped them as "needs Postgres"
+   and they failed in CI three times in one PR (#768), each round trip about
+   an hour.
 
 ## Git workflow
 
