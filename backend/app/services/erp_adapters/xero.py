@@ -1330,9 +1330,13 @@ class XeroAdapter(OAuthErpAdapter):
         not yet allocated to this bill (a crash between the two writes) is
         allocated, never created again; each write carries its own
         ``Idempotency-Key``. A credit note of ours someone voided or deleted in
-        Xero is refused (``bill_payment_voided``, ``params.document``).
+        Xero is refused (``bill_payment_voided``, ``params.document``); a
+        recorded id that reads back without our number fails
+        (``discount_credit_not_ours``) with the id, so the record is held.
         Refused before any write: no discount account mapped, a bill gone,
         another currency or none stated, more than the bill still has due.
+        Any failure before the create request goes out is ``not_posted``
+        (decisions §582).
         """
         if not payload.bill_id:
             return erp_preflight_refusal(PROVIDER, BILL_NOT_IN_ERP)
@@ -1340,6 +1344,19 @@ class XeroAdapter(OAuthErpAdapter):
             refused = erp_preflight_refusal(PROVIDER, PAYMENT_ACCOUNT_NOT_MAPPED)
             refused.refusal_params = {"account": "discount"}
             return refused
+        # What a failure below may leave in Xero (decisions §582): until the
+        # create goes out, nothing (``not_posted``, so the write-back drops its
+        # reservation and a later pass retries); once a note of ours is known
+        # (found live, or answered to our create), its id rides every failure.
+        sent = False
+        known_id: str | None = None
+
+        def failed(result: ErpPostResult) -> ErpPostResult:
+            if known_id and not result.erp_document_id:
+                result.erp_document_id = known_id
+            result.not_posted = not sent and known_id is None
+            return result
+
         try:
             headers = await self._headers()
             async with self.oauth_client(timeout=30) as client:
@@ -1352,13 +1369,17 @@ class XeroAdapter(OAuthErpAdapter):
                     # number again and create on a miss. Not ours, voided or
                     # deleted is refused below as someone's decision.
                     known = await self._read_credit_note(client, headers, str(payload.credit_id))
-                    mine = _discount_marker(known) == str(payload.payment_id).lower()
-                    ours = [known] if mine else []
-                    if not ours:
-                        refused = erp_refusal(PROVIDER, BILL_PAYMENT_VOIDED)
-                        refused.refusal_params = {"document": "discount_credit"}
-                        refused.erp_document_id = str(payload.credit_id)
-                        return refused
+                    if _discount_marker(known) != str(payload.payment_id).lower():
+                        # Recorded as ours, read without our number: Xero may
+                        # have kept its own on our create (§581's residual).
+                        # Held for a person, never dropped as someone's void
+                        # nor booked over (decisions §582).
+                        return ErpPostResult(
+                            success=False,
+                            erp_document_id=str(payload.credit_id),
+                            message=f"{PROVIDER} post failed: discount_credit_not_ours",
+                        )
+                    ours = [known]
                 else:
                     ours = await self._our_credit_notes(client, headers, payload.payment_id)
                 live = [c for c in ours if str(c.get("Status") or "").upper() not in _GONE_STATUSES]
@@ -1371,6 +1392,8 @@ class XeroAdapter(OAuthErpAdapter):
                 if bill_currency is None or bill_currency != iso_currency_or_none(payload.currency):
                     return _nothing_posted(erp_refusal(PROVIDER, CURRENCY_MISMATCH))
                 credit = live[0] if live else None
+                if credit is not None:
+                    known_id = str(credit.get("CreditNoteID"))
                 if credit is not None and _allocated_to(credit, payload.bill_id) > 0:
                     return ErpPostResult(
                         success=True,
@@ -1411,6 +1434,7 @@ class XeroAdapter(OAuthErpAdapter):
                             }
                         ]
                     }
+                    sent = True
                     resp = await client.put(
                         f"{_api_base()}/CreditNotes",
                         content=dumps_exact_json(body),
@@ -1431,6 +1455,9 @@ class XeroAdapter(OAuthErpAdapter):
                             success=False,
                             message=f"{PROVIDER} post failed: credit_note_unconfirmed",
                         )
+                    # Xero answered OUR create with this id: from here every
+                    # failure carries it (decisions §582).
+                    known_id = str(created_id)
                     credit = await self._read_credit_note(client, headers, str(created_id))
                     if _discount_marker(credit) != str(payload.payment_id).lower():
                         # Xero answered OUR create with this id: it is ours
@@ -1474,13 +1501,15 @@ class XeroAdapter(OAuthErpAdapter):
                 bill_balance_after=_decimal(after.get("AmountDue")),
             )
         except erp_oauth.ErpTokenRefreshError as exc:
-            return ErpPostResult(success=False, message=str(exc))
+            return failed(ErpPostResult(success=False, message=str(exc)))
         except erp_oauth.ErpNotConnectedError:
-            return erp_refusal(PROVIDER, NOT_CONNECTED)
+            return failed(erp_refusal(PROVIDER, NOT_CONNECTED))
         except XeroRequestError as exc:
-            return erp_http_failure(PROVIDER, exc.status_code)
+            return failed(erp_http_failure(PROVIDER, exc.status_code))
         except httpx.HTTPError:
-            return ErpPostResult(success=False, message=f"{PROVIDER} post failed: network_error")
+            return failed(
+                ErpPostResult(success=False, message=f"{PROVIDER} post failed: network_error")
+            )
 
     async def find_discount_credit(self, payload: DiscountCreditPayload) -> str | None:
         """Our live credit note for the payment, found by its number."""

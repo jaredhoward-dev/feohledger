@@ -1306,6 +1306,16 @@ class QuickBooksOnlineAdapter(OAuthErpAdapter):
                 refused = _nothing_posted(erp_refusal(PROVIDER, PAYMENT_ACCOUNT_NOT_MAPPED))
                 refused.refusal_params = {"account": account}
                 return refused
+        # Until the VendorCredit create goes out nothing of this attempt is in
+        # QuickBooks: a failure before it (a 5xx or network error reading the
+        # bill, a token refresh) is ``not_posted``, so the write-back drops
+        # its reservation and a later pass retries (decisions §582).
+        sent = False
+
+        def failed(result: ErpPostResult) -> ErpPostResult:
+            result.not_posted = not sent
+            return result
+
         try:
             bill = await self._live_bill(payload.bill_id)
             if bill is None:
@@ -1332,14 +1342,22 @@ class QuickBooksOnlineAdapter(OAuthErpAdapter):
                 # An earlier attempt created our credit and its application
                 # failed (decisions §577): apply THAT one, read by id, rather
                 # than lean on ``requestid`` replaying its create.
-                known = await self._our_vendor_credit(payload.credit_id, payload.payment_id)
+                known = await self._read_vendor_credit(str(payload.credit_id))
                 if known is None:
-                    # Deleted, or no longer ours, in QuickBooks: someone
-                    # decided about it there; never book over that.
+                    # Deleted in QuickBooks: someone decided about it there;
+                    # never book over that.
                     refused = erp_refusal(PROVIDER, BILL_PAYMENT_VOIDED)
                     refused.refusal_params = {"document": "discount_credit"}
                     refused.erp_document_id = payload.credit_id
                     return refused
+                if _discount_marker(known) != str(payload.payment_id).lower():
+                    # Recorded as ours, read without our marker: held for a
+                    # person, never dropped nor booked over (decisions §582).
+                    return ErpPostResult(
+                        success=False,
+                        erp_document_id=str(payload.credit_id),
+                        message=f"{PROVIDER} post failed: discount_credit_not_ours",
+                    )
                 return await self._apply_discount_credit(
                     payload, bill, vendor, note, bill_currency, str(payload.credit_id)
                 )
@@ -1359,6 +1377,7 @@ class QuickBooksOnlineAdapter(OAuthErpAdapter):
                     }
                 ],
             }
+            sent = True
             resp = await self._request(
                 "POST",
                 "vendorcredit",
@@ -1379,24 +1398,27 @@ class QuickBooksOnlineAdapter(OAuthErpAdapter):
                 payload, bill, vendor, note, bill_currency, str(credit_id)
             )
         except erp_oauth.ErpTokenRefreshError as exc:
-            return ErpPostResult(success=False, message=str(exc))
+            return failed(ErpPostResult(success=False, message=str(exc)))
         except erp_oauth.ErpNotConnectedError:
-            return erp_refusal(PROVIDER, NOT_CONNECTED)
+            return failed(erp_refusal(PROVIDER, NOT_CONNECTED))
         except QboRequestError as exc:
-            return erp_http_failure(PROVIDER, exc.status_code)
+            return failed(erp_http_failure(PROVIDER, exc.status_code))
         except httpx.HTTPError:
-            return ErpPostResult(success=False, message=f"{PROVIDER} post failed: network_error")
+            return failed(
+                ErpPostResult(success=False, message=f"{PROVIDER} post failed: network_error")
+            )
 
-    async def _our_vendor_credit(self, credit_id: str, payment_id: str) -> dict | None:
-        """Our VendorCredit ``credit_id`` while it still carries our marker for
-        ``payment_id``; None when QuickBooks says it is gone or it is not ours.
-        Raises on any other answer."""
+    async def _read_vendor_credit(self, credit_id: str) -> dict | None:
+        """The VendorCredit ``credit_id`` as QuickBooks holds it, or None when
+        QuickBooks says it is gone (404 / object-not-found). Whether it is
+        ours is the caller's check: "gone" and "not ours" are different
+        answers (decisions §582). Raises on any other answer."""
         got = await self._request("GET", f"vendorcredit/{credit_id}", timeout=15)
         if got.status_code == 200:
-            credit = _json(got).get("VendorCredit") or {}
-            if isinstance(credit, dict) and _discount_marker(credit) == str(payment_id).lower():
+            credit = _json(got).get("VendorCredit")
+            if isinstance(credit, dict) and credit.get("Id") is not None:
                 return credit
-            return None
+            raise QboRequestError(got.status_code)
         if _object_not_found(got):
             return None
         raise QboRequestError(got.status_code)
@@ -1479,8 +1501,10 @@ class QuickBooksOnlineAdapter(OAuthErpAdapter):
         applied. Found through the bill by our marker, so nothing booked (or a
         bill already gone) is a success with nothing to do, and a retry never
         deletes twice. The credit is deleted only while it still carries our
-        marker. If its delete fails after the application's, the failure names
-        the credit (``erp_document_id``) for the person the flag goes to: with
+        marker; a recorded one that does not is refused
+        (``discount_credit_not_ours``), never reported done (decisions §582).
+        If its delete fails after the application's, the failure names the
+        credit (``erp_document_id``) for the person the flag goes to: with
         the application gone, the bill no longer leads to it."""
         try:
             bill = await self._live_bill(payload.bill_id) if payload.bill_id else None
@@ -1509,7 +1533,19 @@ class QuickBooksOnlineAdapter(OAuthErpAdapter):
                 if not credit_id:
                     return ErpPostResult(success=True, message="No discount credit of ours")
             if credit_id:
-                credit = await self._our_vendor_credit(str(credit_id), payload.payment_id)
+                credit = await self._read_vendor_credit(str(credit_id))
+                if (
+                    credit is not None
+                    and _discount_marker(credit) != str(payload.payment_id).lower()
+                ):
+                    # A recorded credit that is not ours is refused, never
+                    # reported done: only QuickBooks saying it is gone is
+                    # (decisions §582, as Xero's void, §581).
+                    return ErpPostResult(
+                        success=False,
+                        erp_document_id=str(credit_id),
+                        message=f"{PROVIDER} void failed: discount_credit_not_ours",
+                    )
                 if credit is not None:
                     resp = await self._request(
                         "POST",

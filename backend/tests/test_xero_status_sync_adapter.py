@@ -1139,3 +1139,90 @@ def test_the_discount_credit_refuses_before_writing(xero, credit, code):
     result = asyncio.run(_adapter().post_discount_credit(_credit(**credit)))
     assert not result.success and result.refusal_code == code and result.not_posted
     assert not xero.sent("PUT", "/CreditNotes")
+
+
+# ---------------------------------------------------------------------------
+# decisions §582: what a failure says it left in Xero
+
+
+def _raise_on(xero, method: str, path_end: str, exc: Exception) -> None:
+    real = xero.handle
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        if request.method == method and request.url.path.endswith(path_end):
+            xero.requests.append(request)
+            raise exc
+        return real(request)
+
+    xero.handle = handle
+
+
+def test_a_bill_read_failure_before_the_create_is_not_posted(xero):
+    """Nothing was sent: the write-back drops its reservation and retries,
+    rather than keep a ``credit_id: null`` record that stalls (§582)."""
+    _discounted_bill(xero)
+    xero.answers[("GET", "Invoices")] = httpx.Response(503)
+    result = asyncio.run(_adapter().post_discount_credit(_credit()))
+    assert not result.success and result.not_posted
+    assert not xero.sent("PUT", "/CreditNotes")
+
+
+def test_a_token_refresh_failure_before_the_create_is_not_posted(xero):
+    from app.services import erp_oauth
+
+    _discounted_bill(xero)
+    with patch.object(
+        XeroAdapter,
+        "access_token",
+        AsyncMock(side_effect=erp_oauth.ErpTokenRefreshError("xero", "unreachable")),
+    ):
+        result = asyncio.run(_adapter().post_discount_credit(_credit()))
+    assert not result.success and result.not_posted
+    assert not xero.sent("PUT", "/CreditNotes")
+
+
+def test_a_lost_create_answer_is_not_not_posted(xero):
+    _discounted_bill(xero)
+    _raise_on(xero, "PUT", "/CreditNotes", httpx.ReadTimeout("lost"))
+    result = asyncio.run(_adapter().post_discount_credit(_credit()))
+    assert not result.success and not result.not_posted
+
+
+def test_a_created_note_keeps_its_id_when_its_read_back_fails(xero):
+    """Before §582 the 503 on the read-back lost the id Xero had just
+    answered our create with: the record kept ``credit_id: null``."""
+    _discounted_bill(xero)
+
+    async def unreadable(self, client, headers, credit_id):
+        raise XeroRequestError(503)
+
+    with patch.object(XeroAdapter, "_read_credit_note", unreadable):
+        result = asyncio.run(_adapter().post_discount_credit(_credit()))
+    [created] = xero.credit_notes
+    assert not result.success and not result.not_posted
+    assert result.erp_document_id == created
+
+
+def test_a_created_note_keeps_its_id_when_its_allocation_is_lost(xero):
+    _discounted_bill(xero)
+    _raise_on(xero, "PUT", "/Allocations", httpx.ConnectError("down"))
+    result = asyncio.run(_adapter().post_discount_credit(_credit()))
+    [created] = xero.credit_notes
+    assert not result.success and not result.not_posted
+    assert result.erp_document_id == created
+
+
+def test_a_recorded_note_without_our_number_is_held_not_dropped_on_post(xero):
+    """§581's residual: a note Xero renumbered was refused as
+    ``bill_payment_voided`` and its record dropped silently. Now it fails
+    with its id, so the record is held and flagged (§582)."""
+    _discounted_bill(xero)
+    xero.fail_allocation = True
+    failed = asyncio.run(_adapter().post_discount_credit(_credit()))
+    xero.fail_allocation = False
+    xero.credit_notes[failed.erp_document_id]["CreditNoteNumber"] = "CN-0042"
+    result = asyncio.run(_adapter().post_discount_credit(_credit(credit_id=failed.erp_document_id)))
+    assert not result.success and result.refusal_code != BILL_PAYMENT_VOIDED
+    assert "discount_credit_not_ours" in result.message and not result.not_posted
+    assert result.erp_document_id == failed.erp_document_id
+    assert len(xero.sent("PUT", "/CreditNotes")) == 1
