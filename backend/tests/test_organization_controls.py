@@ -11,11 +11,16 @@ Covers:
   * Audit first: a row that cannot be written is a 503 with nothing saved.
   * The generic `PATCH /api/organization` carries both keys across a block
     replacement and refuses a different value (`guard_owned_keys`).
+  * Turning the line-total check off stops new findings only: an open
+    `line_total_mismatch` stays open and keeps blocking the payment run.
 
 `Organization.settings` is reset by the `realdb` harness before every test.
 """
 
 from __future__ import annotations
+
+import uuid
+from decimal import Decimal
 
 import pytest
 from fastapi import HTTPException
@@ -23,8 +28,13 @@ from sqlalchemy import select
 from sqlalchemy.orm.attributes import flag_modified
 
 from app.api.organization_controls import guard_owned_keys, line_total_check_enabled
+from app.models.entity import Entity
+from app.models.exception import Exception as APException
+from app.models.invoice import Invoice, InvoiceLineItem, InvoiceStatus
 from app.models.organization import Organization
 from app.models.workflow import AuditLog
+from app.services.invoice_warnings import refresh_warnings
+from app.services.payment_runs import blocked_invoice_ids
 
 LINE_TOTAL = "/api/organization/line-total-check"
 AUTONOMY = "/api/organization/exception-agents/autonomy"
@@ -363,3 +373,60 @@ async def test_put_false_over_a_stored_zero_normalises_it_with_an_audit_row(real
         "new": False,
         "stored": 0,
     }
+
+
+@pytest.mark.asyncio
+async def test_turning_the_check_off_leaves_open_findings_blocking(realdb):
+    """Off stops NEW findings only. An open `line_total_mismatch` is a
+    person's to clear: the next refresh drops the warning from the invoice but
+    leaves the exception open, and the payment-run gate still refuses."""
+    info = realdb.info("a")
+    mk = realdb.sessionmaker("a")
+    async with mk() as s:
+        entity_id = (await s.execute(select(Entity.id).where(Entity.is_default))).scalar_one()
+        inv = Invoice(
+            invoice_number=f"LTC-{uuid.uuid4().hex[:8]}",
+            vendor_name="Acme",
+            amount=Decimal("1037.00"),
+            currency="USD",
+            status=InvoiceStatus.ready_for_review,
+            organization_id=info.org_id,
+            entity_id=entity_id,
+        )
+        s.add(inv)
+        await s.flush()
+        for n, total in enumerate(["500.00", "400.00"], start=1):
+            s.add(
+                InvoiceLineItem(
+                    invoice_id=inv.id, line_number=n, description=f"Line {n}", total=Decimal(total)
+                )
+            )
+        await s.flush()
+        await refresh_warnings(s, inv, org_settings=await _settings(realdb))
+        await s.commit()
+        assert "line_total_mismatch" in [w.get("code") for w in inv.warnings or []]
+        assert await blocked_invoice_ids(s, [inv.id]) == {inv.id}
+
+    async with realdb.client(key="a", role="admin") as c:
+        resp = await c.put(LINE_TOTAL, json={"enabled": False})
+        assert resp.status_code == 200, resp.text
+
+    async with mk() as s:
+        inv = await s.get(Invoice, inv.id)
+        await refresh_warnings(s, inv, org_settings=await _settings(realdb))
+        await s.commit()
+        assert "line_total_mismatch" not in [w.get("code") for w in inv.warnings or []]
+        statuses = (
+            (
+                await s.execute(
+                    select(APException.status).where(
+                        APException.invoice_id == inv.id,
+                        APException.exception_type == "line_total_mismatch",
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert [str(st) for st in statuses] == ["open"]
+        assert await blocked_invoice_ids(s, [inv.id]) == {inv.id}
