@@ -899,10 +899,8 @@
 	 * How many rows "Select all N matching" would select: the open + escalated
 	 * rows within the current filters, which is what `GET /api/exceptions/ids`
 	 * resolves (`selectAllMatching` sends `status=open,escalated` under All).
-	 * Under the All chip that is NOT `total`: `total` counts the resolved and
-	 * dismissed rows too, so the button promised "Select all 45" and then
-	 * selected 15, and offered itself even when every selectable row was
-	 * already selected. The status tallies honour every filter but status, so
+	 * Under the All chip that is NOT `total`, which counts resolved and
+	 * dismissed rows too. The status tallies honour every filter but status, so
 	 * open + escalated is that set's size; null while it is unknown.
 	 */
 	let selectableMatchingCount = $derived(

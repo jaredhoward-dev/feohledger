@@ -155,11 +155,8 @@
 	// the URL. It is the route's ONLY `replaceState` caller and builds the
 	// query from component state, reading `page.url` for the pathname alone:
 	// SvelteKit's shallow `replaceState` never updates `page.url`, so a writer
-	// that rebuilt from it worked off the URL of the last REAL navigation. On
-	// a deep-linked arrival that put the closed contract's `?id=` back on
-	// every later filter change (a reload re-opened it) and made closing the
-	// modal revert the filters to the ones the link carried (the /invoices
-	// and /recurring single-writer shape).
+	// that rebuilt from it would write back a closed contract's `?id=` (the
+	// /invoices and /recurring single-writer shape).
 	//
 	// EVERY read in here is untracked, because syncUrl() is a WRITER called
 	// from the filter `$effect`s below — not a source of dependencies:
@@ -304,9 +301,7 @@
 		// A "select all N matching" set was resolved against the OLD term, so
 		// it no longer describes anything on screen; drop out of matching mode
 		// now (before the debounced fetch lands) so the prune effect narrows
-		// `selected` to what the new search shows. Left set, a bulk Terminate
-		// went to every contract the previous filter matched (/invoices does
-		// the same).
+		// `selected` to what the new search shows (/invoices does the same).
 		selectedAllMatching = false;
 		clearTimeout(searchTimer);
 		searchTimer = setTimeout(() => {

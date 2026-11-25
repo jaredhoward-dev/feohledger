@@ -233,10 +233,7 @@
 	// Each bulk action shows on the gate its own endpoint uses, not one gate
 	// for the bar. `/bulk/status` is `require_permission(vendor.manage)`,
 	// `/bulk/screen` `require_roles(admin, ap_manager)` and `/bulk/export`
-	// `require_roles(admin, ap_manager, cfo)`. Gating the whole bar on
-	// vendor.manage hid Export from the CFO the export endpoint admits (who
-	// still got row checkboxes that did nothing), and offered Screen to a
-	// custom vendor.manage role it 403s.
+	// `require_roles(admin, ap_manager, cfo)`.
 	const canBulkScreen = $derived(auth.isManager);
 	const canBulkExport = $derived(auth.isManager || auth.isCfo);
 	const canBulk = $derived(canManageVendors || canBulkScreen || canBulkExport);
@@ -498,10 +495,8 @@
 
 	// "All N matching" names the set a search + status filter matched, and
 	// the prune effect above stands aside for it (most of those ids are off
-	// the loaded page). So once the filter moves, nothing else retires it: the
-	// bar kept counting the old set, and a bulk Reject stopped payments for
-	// vendors the table was no longer showing. The selection ends with the
-	// filter it was made under.
+	// the loaded page), so nothing else retires it: the selection ends with
+	// the filter it was made under.
 	const filterKey = $derived(`${statusFilter}\u0000${search.trim()}`);
 	let matchingKey = '';
 	$effect(() => {

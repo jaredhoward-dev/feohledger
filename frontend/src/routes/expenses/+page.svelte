@@ -123,8 +123,7 @@
 	type Tab = 'expenses' | 'reports' | 'policies' | 'preapprovals' | 'cards';
 	const TABS: readonly Tab[] = ['expenses', 'reports', 'policies', 'preapprovals', 'cards'];
 	// A `?tab=` this page has no panel for (a typo, a stale bookmark) opens the
-	// default tab. It used to be cast straight to `Tab`, so the page rendered a
-	// tablist with nothing selected over an empty panel, and no control said why.
+	// default tab rather than a tablist with nothing selected.
 	function parseTab(raw: string | null): Tab {
 		return TABS.includes(raw as Tab) ? (raw as Tab) : 'expenses';
 	}
@@ -855,8 +854,7 @@
 		return list.map((v) => policyViolationText(v, m)).join('; ');
 	}
 
-	// …and so does `?tab=policies` for a reader without the Policies tab: its
-	// panel used to render under a tablist that did not offer it.
+	// …and so does `?tab=policies` for a reader without the Policies tab.
 	$effect(() => {
 		if (tab === 'policies' && !canManagePolicies) untrack(() => switchTab('expenses'));
 	});
@@ -880,9 +878,8 @@
 		return p.threshold_currency ?? orgCurrency.currency;
 	}
 
-	// Paged like the reports list. This tab and pre-approvals used to read only
-	// the first page the server sent (20 rows) with no footer, so a 21st policy
-	// existed, still applied to every submit, and could not be found here.
+	// Paged like the reports list: the server pages policies too, and every
+	// policy applies to every submit, so each must be reachable here.
 	const POLICIES_PAGE_SIZE = 50;
 	let policies = $state<ExpensePolicy[]>([]);
 	let policiesLoading = $state(false);
@@ -1130,10 +1127,9 @@
 	let matchTxn = $state<CorporateCardTransaction | null>(null);
 	let matchSuggestions = $state<CardMatchSuggestion[]>([]);
 	let matchLoading = $state(false);
-	// A failed suggestions read is stated in the dialog with a Retry. It used to
-	// toast and then fall through to the empty branch, so the dialog said "No
-	// candidate expenses … Try Create expense instead" about a list it never got
-	// — steering the user to mint a second expense for a charge that had one.
+	// A failed suggestions read is stated in the dialog with a Retry, never as
+	// "No candidate expenses … Try Create expense instead": that would steer
+	// the user to mint a second expense for a charge that may have one.
 	let matchErrored = $state(false);
 	const matchSequence = createRequestSequencer();
 

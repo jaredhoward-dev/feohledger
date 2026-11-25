@@ -57,11 +57,9 @@
 	let loading = $state(true);
 	let loadingMore = $state(false);
 	// The decision log's OWN fetch state, apart from the mount-wide `loading`
-	// (which also covers the KPI stats). An action chip re-reads the log alone,
-	// and before these the table had no in-flight state for it, and a failed
-	// read left the previous chip's rows under the newly pressed chip (or, on
-	// mount, "No agent decisions yet" — an all-clear nobody had checked), with
-	// a toast as the only sign and no way to retry.
+	// (which also covers the KPI stats): an action chip re-reads the log alone,
+	// and a failed read must not show "No agent decisions yet" or the previous
+	// chip's rows.
 	let decisionsLoading = $state(true);
 	let decisionsErrored = $state(false);
 	let actionFilter = $state<string | null>(null);

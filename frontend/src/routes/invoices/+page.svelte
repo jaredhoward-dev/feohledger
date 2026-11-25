@@ -562,9 +562,7 @@
 	/**
 	 * Open an invoice from its row, and record it as `?id=` through the single
 	 * writer — the same param a deep link arrives on — so a reload, a copied
-	 * address or a new tab opens the invoice the user was looking at. A row
-	 * open used to leave the URL as it was, so a reload dropped the modal and
-	 * there was no address to share for it.
+	 * address or a new tab opens the invoice the user was looking at.
 	 *
 	 * Only `deepLinkId` is set, never `deepLinkLoaded`: `replaceState` does not
 	 * move `page.url`, so the deep-link effect does not run for this write, and
@@ -689,9 +687,8 @@
 
 	// The Change Status popover is a keyboard surface too: opening it moves
 	// focus to its picker (it renders above the bar, away from the trigger),
-	// and Escape closes it and hands focus back to the trigger. Before, it
-	// opened with focus left on the trigger and only an outside click closed
-	// it — a keyboard user had no way to dismiss it (WCAG 2.1.1, 2.4.3).
+	// and Escape closes it and hands focus back to the trigger (WCAG 2.1.1,
+	// 2.4.3).
 	$effect(() => {
 		if (showBulkStatusSelect && bulkStatusSelect) bulkStatusSelect.focus();
 	});
@@ -737,11 +734,9 @@
 	);
 
 	// What "Select all N matching" would select: the filtered set minus its
-	// system-managed rows, which `GET /api/invoices/ids` excludes. The list's
-	// `total` counts those too, so offering it named a figure the action then
-	// fell short of, and with every row already loaded it still offered the
-	// button whenever one of them was system-managed — a click that selected
-	// nothing new. Falls back to `total` only while the tallies are missing.
+	// system-managed rows, which `GET /api/invoices/ids` excludes (the list's
+	// `total` counts them). Offered only past the loaded page. Falls back to
+	// `total` only while the tallies are missing.
 	let matchingSelectableTotal = $derived(
 		selectableMatchingTotal(invoiceStore.statusCounts, activeStatuses) ?? invoiceStore.total
 	);
