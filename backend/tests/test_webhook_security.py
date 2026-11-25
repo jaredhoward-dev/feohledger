@@ -247,6 +247,9 @@ def _fake_tenant_session_factory(card):
     # and blow up `async with db.begin_nested():` — the rebate savepoint the
     # settled-event path opens for the one-rebate-per-card backstop.
     db.begin_nested = MagicMock()
+    # No other row exists: `db.get` (the settlement's invoice read, §554) finds
+    # nothing, as a lookup of an unknown id does.
+    db.get = AsyncMock(return_value=None)
     factory = MagicMock()
     factory.return_value.__aenter__ = AsyncMock(return_value=db)
     factory.return_value.__aexit__ = AsyncMock(return_value=False)
@@ -290,6 +293,9 @@ def _card_row(provider_card_id: str):
         # settlement reads it to write the charge onto a run's card leg
         # (decisions §543). None: a `/cards/generate` card, no run payment.
         payment_id=None,
+        # `VirtualCard.invoice_id` is non-nullable; a settlement reads the
+        # invoice to judge an overcharge (decisions §554).
+        invoice_id=uuid.uuid4(),
     )
 
 

@@ -402,3 +402,65 @@ async def record_card_spend(db: AsyncSession, card) -> Payment | None:
     payment.settled_currency = card.currency
     payment.settled_amount_unstorable = unstorable
     return payment
+
+
+#: `Exception.erp_report["kind"]` of the flag a card charged past what it pays
+#: opens (decisions §554); deduped by kind like every reconciliation flag (§535).
+CARD_OVER_SETTLED_KIND = "card_over_settled"
+
+
+async def flag_card_over_settlement(db: AsyncSession, card, payment: Payment | None) -> bool:
+    """Open a payment-blocking reconciliation flag when a settled card's total
+    cleared figure exceeds what it pays; return whether one was opened.
+
+    Decisions §554. A card can clear more than once (an incremental capture, a
+    tip, a force post past the limit), and over-settlement is ``covered`` by
+    design (``settlement_coverage``), so without this nothing would tell a
+    person the vendor took more than AP authorized. The target is the run
+    payment's amount when a payment owns the card, else the invoice's. The
+    verdict is ``verify_settlement``'s, with its tolerance and currency rule:
+    a card in another currency than the invoice is not judged here (the
+    settlement verdict for a cross-currency leg is the rail's, not the card's).
+    The finding is the catalogue's ``settlement_amount_over``; the exception is
+    deduped by kind (``card_over_settled``), so each further clearing past the
+    figure does not pile up rows. Does not commit.
+    """
+    from app.services.erp_status_sync import (
+        PAYMENT_RECONCILIATION_EXCEPTION_TYPE,
+        open_erp_reconciliation_exception,
+    )
+    from app.services.payment_settlement import OUTCOME_AMOUNT_MISMATCH
+
+    if card.amount_charged is None or card.status != CARD_SETTLED_STATUS:
+        return False
+    invoice = await db.get(Invoice, card.invoice_id)
+    if invoice is None:
+        return False
+    target = payment.amount if payment is not None else invoice.amount
+    verification = verify_settlement(
+        reported_amount=card.amount_charged,
+        reported_currency=card.currency,
+        target_amount=target,
+        target_currency=invoice.currency,
+        source_amount=payment.source_amount if payment is not None else None,
+        source_currency=payment.source_currency if payment is not None else None,
+    )
+    if verification.outcome != OUTCOME_AMOUNT_MISMATCH or not (
+        verification.variance is not None and verification.variance > 0
+    ):
+        return False
+    logger.warning("Card settled past the amount it pays; flagged for reconciliation")
+    return await open_erp_reconciliation_exception(
+        db,
+        invoice,
+        org_id=card.organization_id,
+        finding=discrepancy_finding(verification),
+        exception_type=PAYMENT_RECONCILIATION_EXCEPTION_TYPE,
+        erp_report={
+            "kind": CARD_OVER_SETTLED_KIND,
+            "virtual_card_id": str(card.id),
+            "settled_amount": str(card.amount_charged),
+            "authorized_amount": str(verification.authorized_amount),
+            "currency": card.currency,
+        },
+    )

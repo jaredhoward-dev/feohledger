@@ -54,6 +54,8 @@ export const enAudit = {
 	'audit.action.card.cancel_failed': "Card cancellation failed",
 	'audit.action.card.cancelled': "Card cancelled",
 	'audit.action.card.charged': "Card charged",
+	'audit.action.card.clearing_added': "Further card clearing recorded",
+	'audit.action.card.clearing_refused': "Further card clearing refused",
 	'audit.action.card.authorization_lapsed': "Card authorization lapsed",
 	'audit.action.card.reversal_after_settlement': "Reversal on a settled card",
 	'audit.action.card.settled_after_cancel': "Card charged after cancellation",

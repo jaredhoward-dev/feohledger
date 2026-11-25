@@ -40,11 +40,22 @@ pytestmark = pytest.mark.asyncio
 TENANT = "a"
 
 
-def _body(provider: str, token: str, outcome: str, *, amount=None) -> bytes:
+def _body(
+    provider: str,
+    token: str,
+    outcome: str,
+    *,
+    amount=None,
+    txn=None,
+    events=None,
+) -> bytes:
     """A provider's delivery for ``outcome`` (authorization / settlement /
     reversal / expiry / decline), in that provider's own shape. Lithic and Nium
     carry the delivery id in a header (`_post`'s ``event_id``), the mock in the
-    body (decisions §555). Nium has no authorization-expiry template."""
+    body (decisions §555). Nium has no authorization-expiry template. ``txn`` is
+    the provider's transaction id (default ``txn_<token>``, one transaction per
+    card); ``events`` is Lithic's ordered `events` list."""
+    txn = txn or f"txn_{token}"
     if provider == "lithic":
         # `card_transaction.updated` carries the transaction; its `status`
         # names the outcome (https://docs.lithic.com/docs/transactions).
@@ -57,13 +68,15 @@ def _body(provider: str, token: str, outcome: str, *, amount=None) -> bytes:
         }[outcome]
         payload = {
             "event_type": "card_transaction.updated",
-            "token": f"txn_{token}",
+            "token": txn,
             "card_token": token,
             "status": status,
             "merchant": {"descriptor": "Acme Fuel"},
         }
         if amount is not None:
             payload["amount"] = int(Decimal(amount) * 100)  # minor units
+        if events is not None:
+            payload["events"] = events
     elif provider == "nium":
         template = {
             "authorization": "CARD_POS_APPROVED_WEBHOOK",
@@ -74,6 +87,7 @@ def _body(provider: str, token: str, outcome: str, *, amount=None) -> bytes:
         payload = {
             "template": template,
             "cardHashId": token,
+            "authCode": txn,
             "merchantName": "Acme Fuel",
         }
         if amount is not None:
@@ -97,6 +111,7 @@ def _body(provider: str, token: str, outcome: str, *, amount=None) -> bytes:
             "card_token": token,
             "type": event_type,
             "event_id": str(uuid.uuid4()),
+            "transaction_id": txn,
             "merchant": {"descriptor": "Acme Fuel"},
         }
         if amount is not None:
@@ -492,3 +507,157 @@ async def test_a_signed_lithic_event_that_is_no_card_stage_changes_nothing(reald
     assert payment.settled_amount is None and state == "in_flight"
     for action in ("card.charged", "card.settled", "card.authorization_lapsed"):
         assert await _audits(realdb, card_id, action) == []
+
+
+# --- A lapse delivered before its authorization (decisions §554) ----------
+
+
+@pytest.mark.parametrize(
+    ("provider", "lapse"),
+    [
+        ("lithic", "reversal"),
+        ("lithic", "expiry"),
+        ("nium", "reversal"),
+        # Nium documents no authorization-expiry template (decisions §555).
+        ("mock", "reversal"),
+        ("mock", "expiry"),
+    ],
+)
+async def test_a_lapse_before_its_authorization_is_applied_when_it_arrives(realdb, provider, lapse):
+    """Out of order: the reversal / expiry first (nothing to release, nothing
+    changes), then its authorization. The authorization is applied as already
+    lapsed — the card stays unspent with no figure — and the one
+    `card.authorization_lapsed` row says `out_of_order: true`. The provider did
+    authorize, so `first_authorized_at` is stamped and a re-run refuses the
+    single-use card (§549); a void still reads it unspent."""
+    from app.services.card_issuance import CARD_SPENT_STATUSES, card_settlement_block
+
+    card_id, pay_id, token = await _leg_with_card(realdb, provider)
+    with patch(
+        "app.services.payment_erp_sync.dispatch_payment_sync", new=AsyncMock()
+    ) as dispatched:
+        assert await _post(realdb, provider, _body(provider, token, lapse)) == 204
+        early = await _card(realdb, card_id)
+        assert early.status == "active" and early.first_authorized_at is None
+        assert await _audits(realdb, card_id, "card.authorization_lapsed") == []
+        assert (
+            await _post(realdb, provider, _body(provider, token, "authorization", amount="100.00"))
+            == 204
+        )
+    dispatched.assert_not_awaited()
+
+    card = await _card(realdb, card_id)
+    assert card.status == "active" and card.status not in CARD_SPENT_STATUSES
+    assert card.amount_charged is None and card.charged_at is None
+    assert card.first_authorized_at is not None
+    assert card_settlement_block(card, Decimal("100.00")) == "card_authorized_before"
+    payment, state = await _leg(realdb, pay_id)
+    assert payment.settled_amount is None and state == "in_flight"
+    assert await _audits(realdb, card_id, "card.charged") == []
+    (row,) = await _audits(realdb, card_id, "card.authorization_lapsed")
+    assert row.details["out_of_order"] is True
+    assert row.details["from"] == "active" and row.details["to"] == "active"
+    assert row.details["lapse"] == lapse
+    assert row.details["released_amount"] == "100.00"  # string Decimal
+    assert token not in json.dumps(row.details)
+
+
+async def test_a_lapse_with_no_authorization_never_marks_the_card_used(realdb):
+    """A lapse alone is not an authorization: the card is not stamped as
+    used, so a re-run may still converge onto it."""
+    from app.services.card_issuance import card_settlement_block
+
+    card_id, _pay_id, token = await _leg_with_card(realdb, "lithic")
+    assert await _post(realdb, "lithic", _body("lithic", token, "expiry")) == 204
+    card = await _card(realdb, card_id)
+    assert card.status == "active" and card.first_authorized_at is None
+    assert card_settlement_block(card, Decimal("100.00")) is None
+
+
+async def test_an_early_lapse_of_another_transaction_does_not_lapse_this_one(realdb):
+    """The memory is per provider transaction: a reversal of transaction A
+    leaves the authorization of transaction B standing."""
+    card_id, _pay_id, token = await _leg_with_card(realdb, "nium")
+    with patch("app.services.payment_erp_sync.dispatch_payment_sync", new=AsyncMock()):
+        assert await _post(realdb, "nium", _body("nium", token, "reversal", txn="A1")) == 204
+        assert (
+            await _post(
+                realdb,
+                "nium",
+                _body("nium", token, "authorization", amount="100.00", txn="B2"),
+            )
+            == 204
+        )
+    card = await _card(realdb, card_id)
+    assert card.status == "charged" and card.amount_charged == Decimal("100.00")
+    assert await _audits(realdb, card_id, "card.authorization_lapsed") == []
+
+
+async def test_an_early_partial_reversal_leaves_the_late_authorization_standing(realdb):
+    """A reversal naming less than the authorization leaves part of the hold,
+    in order (§544) and out of order alike: the card is charged."""
+    card_id, _pay_id, token = await _leg_with_card(realdb, "nium")
+    with patch("app.services.payment_erp_sync.dispatch_payment_sync", new=AsyncMock()):
+        assert await _post(realdb, "nium", _body("nium", token, "reversal", amount="30.00")) == 204
+        assert (
+            await _post(realdb, "nium", _body("nium", token, "authorization", amount="100.00"))
+            == 204
+        )
+    card = await _card(realdb, card_id)
+    assert card.status == "charged" and card.amount_charged == Decimal("100.00")
+    assert await _audits(realdb, card_id, "card.authorization_lapsed") == []
+
+
+async def test_a_replayed_early_lapse_is_remembered_once(realdb):
+    """The lapse row is unique per transaction: a second delivery of it (a new
+    delivery id, so past the Redis dedupe) adds nothing, and the late
+    authorization is lapsed once."""
+    from app.models.virtual_card import CardTransactionEvent
+
+    card_id, _pay_id, token = await _leg_with_card(realdb, "mock")
+    with patch("app.services.payment_erp_sync.dispatch_payment_sync", new=AsyncMock()):
+        assert await _post(realdb, "mock", _body("mock", token, "reversal")) == 204
+        assert await _post(realdb, "mock", _body("mock", token, "reversal")) == 204
+        assert (
+            await _post(realdb, "mock", _body("mock", token, "authorization", amount="100.00"))
+            == 204
+        )
+    async with realdb.sessionmaker(TENANT)() as s:
+        rows = (
+            (
+                await s.execute(
+                    select(CardTransactionEvent).where(
+                        CardTransactionEvent.virtual_card_id == card_id
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+    assert [(r.kind, r.lapse) for r in rows] == [("lapse_applied", "reversal")]
+    assert len(await _audits(realdb, card_id, "card.authorization_lapsed")) == 1
+
+
+async def test_an_applied_early_lapse_is_used_up(realdb):
+    """A remembered lapse lapses ONE authorization. A later authorization that
+    carries the same id (a Nium auth code is not unique per transaction) is a
+    live hold and charges the card."""
+    card_id, _pay_id, token = await _leg_with_card(realdb, "nium")
+    with patch("app.services.payment_erp_sync.dispatch_payment_sync", new=AsyncMock()):
+        assert await _post(realdb, "nium", _body("nium", token, "reversal", txn="114723")) == 204
+        assert (
+            await _post(
+                realdb, "nium", _body("nium", token, "authorization", amount="100.00", txn="114723")
+            )
+            == 204
+        )
+        assert (await _card(realdb, card_id)).status == "active"
+        assert (
+            await _post(
+                realdb, "nium", _body("nium", token, "authorization", amount="90.00", txn="114723")
+            )
+            == 204
+        )
+    card = await _card(realdb, card_id)
+    assert card.status == "charged" and card.amount_charged == Decimal("90.00")
+    assert len(await _audits(realdb, card_id, "card.authorization_lapsed")) == 1

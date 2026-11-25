@@ -28800,60 +28800,130 @@ per socket peer. `tests/test_deploy_decrypt_env.py`, `tests/test_deploy_smoke.py
 and `tests/test_signup.py` updated from "closed signup waives the captcha" to
 the new rule.
 
-## 556. The bill a failed push left in the ERP is named by the adapter's own read-only lookup and voided through the flag void's flow; keeping it is the retry (§286 / §539 / §545 follow-up, round 47)
+## 554. A lapse that arrives before its authorization is applied when the authorization lands; a further clearing on a settled card is added once, flagged when it overcharges, refused when it lowers (§544 / §549 follow-up, round 47)
 
-**Context.** A push that timed out or got a 5xx may have created the bill in the
-ERP. The retry gate's refusal says `possibly_posted: true` (§286), but nothing
-found or voided that bill, and the flag void (§539) needs a document id the
-invoice does not have.
+**Problem 1 — out-of-order lapse.** The card webhook applied a reversal or
+expiry only to a `charged` card (§544). Delivered before its authorization, the
+lapse was inert on an `active` card, and the late authorization then left the
+card `charged` with its hold already released: a void was refused as
+`card_already_charged` and the invoice was stuck until reconciled by hand
+(fail-closed, but stuck).
+
+**Problem 2 — clearings after settlement.** The settlement branch completed a
+card once. A transaction can clear more than once — Lithic: "Once a transaction
+has been partially cleared, there can be any permutation of Clearing, Return,
+Authorization Reversal, and Authorization Expiry messages on this same
+transaction", e.g. "$8 is cleared, $1 is reversed, and another $1 is cleared"
+(<https://docs.lithic.com/docs/transaction-flow>, checked 2026-11-25) — and a
+further clearing on a `completed` card matched no branch, so spend after the
+first settlement was never written onto the card or the run's payment.
 
 **Decision.**
 
-- **Name it with the push's own match.** `ErpAdapter.find_posted_bill(payload)`
-  is the pre-create idempotency lookup offered on its own, read-only, returning
-  a PII-free `FoundBill` (id, number, total, currency, status) or None, and
-  raising when it cannot finish (never "not posted"). `supports_bill_lookup`
-  on the class says which adapters offer it: the mock and QuickBooks Online
-  today. The others' lookups are entangled with `post_invoice`'s client and
-  header state; each is wired as its own change, and until then the action is
-  refused `erp_lookup_unsupported`. `GET /api/invoices/{id}/erp-orphan-bill`
-  runs it with no lock held, on a `failed` invoice that names no bill and is
-  `possibly_posted` (else `erp_lookup_not_failed`), and audits the lookup.
-- **One void flow, generalised at its entry.** `begin_orphan_void` /
-  `finish_orphan_void` are the flag void's steps 1 and 3 for an invoice with no
-  flag; step 2 is the same `call_erp` (positive status read, §542; whole-step
-  bound, §550) with one addition for an orphan: the lookup is run again and the
-  bill is voided only if it still names the id the person confirmed
-  (`erp_void_not_found`). The client's id alone never chooses what is voided.
-  Same marker (`invoices.erp_void_pending`), same staleness takeover, same
-  orphan record when the void cannot be recorded (on the invoice's trail, since
-  there may be no flag). Gated on `payment.void`, reason required.
-- **The invoice stays `failed`.** No transition: `failed` is not payable, and
-  nothing about the approval changed. The void is recorded under
-  `state_data["erp_orphan_bills_voided"]`, separate from the flag void's
-  `erp_bill_voided`, so neither replay can answer for the other. The
-  possibly-posted record is left as it is: voiding one bill does not prove
-  there is no other, so a later retry still runs its own lookup first.
-- **The retry door waits for a live void.** `start_erp_send` refuses
-  `erp_void_in_progress` while the marker is live, under the invoice lock:
-  otherwise a retry's lookup would find, and record as this invoice's, the
-  bill being voided.
-- **No adoption door.** There is no `failed → sent_to_erp` edge and none is
-  added: `retry-erp` already adopts the found bill (the push's lookup returns
-  it as success, `posted_total` checked). With a duplicate / fraud flag open
-  the retry is refused, which is correct: adopting a flagged bill would record
-  it as payable.
+* *Memory, durable.* A new tenant table `card_transaction_events` (migration
+  0148: tenant fan-out, idempotent, no backfill, `ON DELETE CASCADE` from
+  `virtual_cards`; model `CardTransactionEvent`; writer
+  `services/card_transaction_memory.py`), unique per card on
+  `(kind, event_key)`, written with `ON CONFLICT DO NOTHING` under the card row
+  lock. Not an existing field: `first_authorized_at` / `charged_at` are per
+  card, not per transaction, and the audit rows ship to SQS in `lambda` mode.
+  Not a column on `virtual_cards`: a card may see more than one transaction
+  (a declined retry, a multi-use provider) and more than one clearing.
+* *Transaction id* (`_card_transaction_id`): Lithic's transaction `token`
+  (the same on every update of it); Nium's `rhaTransactionId` ("unique
+  transaction ID" for Delegated Model clients), else `authCode` ("authorization
+  code of the transaction" — short and issuer-assigned, not unique, hence only
+  the fallback)
+  (<https://docs.nium.com/docs/developers/notifications-and-webhooks/issuing-and-card-events/transaction-reversal>,
+  checked 2026-11-25); the mock's `transaction_id`.
+* *An early lapse* (reversal / expiry on `created` / `sent` / `active`) is
+  remembered under that id; the card is unchanged and no audit row is written
+  yet. *The authorization of the same transaction* is then applied as lapsed:
+  the card stays (or returns to) `active` with no figure, the run leg stays
+  `in_flight`, nothing is re-dispatched, and one `card.authorization_lapsed` row
+  carries `out_of_order: true`. The lapse row is then used up (kind
+  `lapse_applied`, `consume_lapse`), so it never lapses a later authorization
+  that happens to carry the same id — a false match would leave a live hold on
+  a card every reader treats as unspent, which a void could close and another
+  rail pay, the unsafe direction. **`first_authorized_at` is stamped**, because
+  the provider did authorize: a Lithic `SINGLE_USE` card closes "upon first
+  successful authorization" whatever happens to the hold, which is what §549's
+  `card_authorized_before` refusal exists for. A lapse never followed by an
+  authorization stamps nothing (no authorization happened). A remembered
+  partial reversal (Nium / mock figure below the authorization's) leaves the
+  authorization standing, as in order (§544). A decline is not remembered.
+* *Each clearing is recorded* under its own identity (`_clearing_key`): the
+  newest Lithic financial event's `token` (`CLEARING` / `RETURN` /
+  `RETURN_REVERSAL` in `events`), else the transaction token plus its cumulative
+  figure (a different total is a different clearing); the delivery id for Nium
+  and the mock. The first settlement records its clearing too, so its replay on
+  the now-`completed` card is a no-op even past the Redis dedupe.
+* *A further clearing on a `completed` card* (`_record_further_clearing`):
+  Lithic reports the transaction's cumulative settled figure (`settled_amount`,
+  else the deprecated `amount`, which is the settled figure "once the
+  transaction has settled" but may still read the authorization on a partly
+  cleared one; both settlement branches read the former), so it adds
+  `reported − amount_charged`; the mock reports each clearing's own
+  figure. An increase is added to `amount_charged` (exact Decimal),
+  `record_card_spend` writes the total onto the run payment's `settled_amount`,
+  a still-`pending` rebate is re-based on the total at its own rate (a
+  confirmed / paid rebate is the processor's statement and stands), a
+  `card.clearing_added` row is written, and the payment sync is re-dispatched
+  once after the commit.
+* *Overcharge.* After any settlement (first or further),
+  `payment_settlement_record.flag_card_over_settlement` judges the card total
+  against the run payment's amount (else the invoice's) with
+  `verify_settlement`; over tolerance opens one payment-blocking
+  `payment_reconciliation` exception with the catalogue's
+  `settlement_amount_over` finding, deduped by `erp_report.kind`
+  `card_over_settled` (§535). The figure is still recorded — the money moved —
+  and over-settlement reads `covered` by design, so the flag is what tells a
+  person. Reusing the existing finding needed no new locale strings. While the
+  flag is open a further clearing neither opens another nor rewrites its
+  figure; the newest total is on the card, the payment and the
+  `card.clearing_added` rows. The payment's `settled_amount` changes with no
+  audit row of its own; `card.clearing_added` is that record.
+* *A decrease is refused.* A further clearing that does not raise the total (a
+  Lithic `RETURN` lowering the cumulative figure, a negative mock clearing) is a
+  refund, a different flow, as a reversal after settlement is (§544): the card,
+  payment and rebate stand and `card.clearing_refused` (`not_an_increase`)
+  records it. Applying it would lower `settled_amount` and could turn a `paid`
+  invoice's leg `short` behind the payment sync's back.
+* *Nium is not applied.* Its documented card webhooks describe one
+  `CARD_SETTLEMENT_DEBIT_WEBHOOK` per authorization and no incremental capture;
+  with no clearing id of its own, a second one cannot be told from a
+  redelivery under a new `webhookId`, and adding it would double-count. A
+  further Nium settlement writes `card.clearing_refused`
+  (`provider_single_settlement`) and changes nothing.
 
-**UI.** A shared `ErpOrphanBill` panel (find, found / none / refused / error,
-void behind a confirm with a reason) on a failed invoice in the invoice modal
-for holders of `payment.void`, and in a flag's dialog when the flag's own void
-is refused `erp_void_no_bill`.
+**No event-map change.** No new stage was needed: a further clearing is a
+`settlement` stage on a `completed` card.
 
-**Tests.** `backend/tests/test_erp_orphan_bill.py` (lookup found / none /
-unsupported / failed, RBAC, audit, the shared void with replay, a bill the
-lookup no longer names, a paid orphan, the retry door, the mock and QuickBooks
-lookups); `frontend/src/lib/api/erpOrphanBill.test.ts`;
-`frontend/tests-e2e/exceptions/void-erp-orphan-bill.spec.ts`.
+**Not verified.** That Lithic sends a `card_transaction.updated` per clearing
+(the docs say a webhook is sent "at each step in the transaction lifecycle"),
+and that its delivery carries an `event_id`: without one, `_lithic_event_id`
+keys an update on `token:STATUS`, so a second `SETTLED` delivery is deduped as
+a replay in Redis before this branch runs. That key is the provider-contract
+lane's this round; once the delivery id is read, this branch applies the
+clearing with no further change. Also unverified: that Nium's reversal repeats
+its authorization's `authCode`.
+
+**Guard.** `tests/test_card_authorization_lapse.py`: per provider, a reversal /
+expiry before its authorization leaves the card `active`, unstamped and
+unaudited, and the late authorization is lapsed (`out_of_order: true`,
+`first_authorized_at` set, `card_authorized_before`, leg `in_flight`, no
+dispatch); a lapse alone stamps nothing; another transaction's lapse does not
+lapse this one; an early partial reversal leaves the authorization charged; a
+repeated early lapse is one row; an applied lapse is used up (a later
+authorization with the same Nium auth code charges the card). `tests/test_card_money_path_regression.py`: a
+Lithic incremental capture adds the difference to the card and the run payment
+(rebate re-based, one `card.clearing_added`, two dispatches, its redelivery a
+no-op); a Lithic clearing with no `events` keyed by its total; clearings past
+the payment amount open one `card_over_settled` flag; a decrease and a further
+Nium settlement are refused with `card.clearing_refused`; a partly cleared
+Lithic transaction is read by `settled_amount`.
+`tests/test_migration_0148_card_transaction_events.py`: create, unique key,
+cascade, idempotent, reversible, control plane untouched.
 
 ## 555. Each card provider's webhook is verified the way that provider authenticates it, deduped on its own delivery id, and read only by documented names (§544 / §549 follow-up, round 47)
 
@@ -28952,3 +29022,58 @@ each documented name and the dropped ones. The contract table
 (`test_webhook_contract.py`) now drives the card row through Lithic, including
 a correctly signed stale delivery. The e2e specs sign the real way
 (`frontend/tests-e2e/fixtures/cardWebhook.ts`).
+
+## 556. The bill a failed push left in the ERP is named by the adapter's own read-only lookup and voided through the flag void's flow; keeping it is the retry (§286 / §539 / §545 follow-up, round 47)
+
+**Context.** A push that timed out or got a 5xx may have created the bill in the
+ERP. The retry gate's refusal says `possibly_posted: true` (§286), but nothing
+found or voided that bill, and the flag void (§539) needs a document id the
+invoice does not have.
+
+**Decision.**
+
+- **Name it with the push's own match.** `ErpAdapter.find_posted_bill(payload)`
+  is the pre-create idempotency lookup offered on its own, read-only, returning
+  a PII-free `FoundBill` (id, number, total, currency, status) or None, and
+  raising when it cannot finish (never "not posted"). `supports_bill_lookup`
+  on the class says which adapters offer it: the mock and QuickBooks Online
+  today. The others' lookups are entangled with `post_invoice`'s client and
+  header state; each is wired as its own change, and until then the action is
+  refused `erp_lookup_unsupported`. `GET /api/invoices/{id}/erp-orphan-bill`
+  runs it with no lock held, on a `failed` invoice that names no bill and is
+  `possibly_posted` (else `erp_lookup_not_failed`), and audits the lookup.
+- **One void flow, generalised at its entry.** `begin_orphan_void` /
+  `finish_orphan_void` are the flag void's steps 1 and 3 for an invoice with no
+  flag; step 2 is the same `call_erp` (positive status read, §542; whole-step
+  bound, §550) with one addition for an orphan: the lookup is run again and the
+  bill is voided only if it still names the id the person confirmed
+  (`erp_void_not_found`). The client's id alone never chooses what is voided.
+  Same marker (`invoices.erp_void_pending`), same staleness takeover, same
+  orphan record when the void cannot be recorded (on the invoice's trail, since
+  there may be no flag). Gated on `payment.void`, reason required.
+- **The invoice stays `failed`.** No transition: `failed` is not payable, and
+  nothing about the approval changed. The void is recorded under
+  `state_data["erp_orphan_bills_voided"]`, separate from the flag void's
+  `erp_bill_voided`, so neither replay can answer for the other. The
+  possibly-posted record is left as it is: voiding one bill does not prove
+  there is no other, so a later retry still runs its own lookup first.
+- **The retry door waits for a live void.** `start_erp_send` refuses
+  `erp_void_in_progress` while the marker is live, under the invoice lock:
+  otherwise a retry's lookup would find, and record as this invoice's, the
+  bill being voided.
+- **No adoption door.** There is no `failed → sent_to_erp` edge and none is
+  added: `retry-erp` already adopts the found bill (the push's lookup returns
+  it as success, `posted_total` checked). With a duplicate / fraud flag open
+  the retry is refused, which is correct: adopting a flagged bill would record
+  it as payable.
+
+**UI.** A shared `ErpOrphanBill` panel (find, found / none / refused / error,
+void behind a confirm with a reason) on a failed invoice in the invoice modal
+for holders of `payment.void`, and in a flag's dialog when the flag's own void
+is refused `erp_void_no_bill`.
+
+**Tests.** `backend/tests/test_erp_orphan_bill.py` (lookup found / none /
+unsupported / failed, RBAC, audit, the shared void with replay, a bill the
+lookup no longer names, a paid orphan, the retry door, the mock and QuickBooks
+lookups); `frontend/src/lib/api/erpOrphanBill.test.ts`;
+`frontend/tests-e2e/exceptions/void-erp-orphan-bill.spec.ts`.
