@@ -2516,8 +2516,7 @@ export const en = {
 	'expenses.preapprovals.col.remaining': 'Remaining',
 	'expenses.preapprovals.drawn': 'Drawn {amount}',
 	'expenses.preapprovals.exhausted': 'Used up',
-	'expenses.preapprovalDraw.badge': 'Pre-approved',
-	'expenses.preapprovalDraw.title': 'Draws {amount} from an approved pre-approval',
+	'expenses.preapprovalDraw.badge': 'Pre-approved · {amount}',
 
 	// Pre-approval request status labels (#lib/types/expense.ts)
 	'expenses.preapprovals.status.pending': 'Pending',
