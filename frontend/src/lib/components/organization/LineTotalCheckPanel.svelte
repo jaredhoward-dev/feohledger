@@ -10,7 +10,7 @@
 	 *
 	 * Admin-only end to end: `readOnly` renders the notice and makes no read.
 	 */
-	import LoadError from '#lib/components/ui/LoadError.svelte';
+	import OrgSettingPanel from '#lib/components/organization/OrgSettingPanel.svelte';
 	import { toast } from '#lib/components/ui/Toast.svelte';
 	import { getLineTotalCheck, saveLineTotalCheck } from '#lib/api/orgControls.ts';
 	import { m } from '#lib/i18n/store.svelte.ts';
@@ -72,69 +72,44 @@
 	}
 </script>
 
-<section class="card" aria-labelledby="{uid}-title" data-testid="line-total-panel">
-	<h2 id="{uid}-title">{m('org.section.lineTotal')}</h2>
-	<p class="card-hint">{m('org.lineTotal.intro')}</p>
-
-	{#if readOnly}
-		<p class="card-hint" data-testid="line-total-admin-only">
-			{m('org.readOnly.sectionAdminOnly')}
-		</p>
-	{:else if loading || (stored === null && !loadFailed)}
-		<p class="card-hint" role="status">{m('org.loading')}</p>
-	{:else if loadFailed}
-		<LoadError message={m('org.lineTotal.loadFailed')} onretry={load} testId="line-total-load-error" />
-	{:else}
-		<label class="switch-row">
-			<input
-				type="checkbox"
-				bind:checked={enabled}
-				disabled={saving}
-				aria-describedby="{uid}-effect"
-				data-testid="line-total-toggle"
-			/>
-			<span>{m('org.lineTotal.toggle')}</span>
-		</label>
-		<p id="{uid}-effect" class="field-hint">{m('org.lineTotal.effect')}</p>
-		{#if !enabled}
-			<p class="off-warning" data-testid="line-total-off-warning">{m('org.lineTotal.offWarning')}</p>
-		{/if}
-		<div class="section-footer">
-			<button
-				type="button"
-				class="btn-save-section"
-				disabled={saving || !dirty}
-				onclick={save}
-				data-testid="line-total-save"
-			>
-				{saving ? m('org.common.saving') : m('org.lineTotal.save')}
-			</button>
-		</div>
+<OrgSettingPanel
+	title={m('org.section.lineTotal')}
+	intro={m('org.lineTotal.intro')}
+	testId="line-total"
+	{readOnly}
+	loading={loading || (stored === null && !loadFailed)}
+	{loadFailed}
+	loadFailedMessage={m('org.lineTotal.loadFailed')}
+	onretry={load}
+>
+	<label class="switch-row">
+		<input
+			type="checkbox"
+			bind:checked={enabled}
+			disabled={saving}
+			aria-describedby="{uid}-effect"
+			data-testid="line-total-toggle"
+		/>
+		<span>{m('org.lineTotal.toggle')}</span>
+	</label>
+	<p id="{uid}-effect" class="field-hint">{m('org.lineTotal.effect')}</p>
+	{#if !enabled}
+		<p class="off-warning" data-testid="line-total-off-warning">{m('org.lineTotal.offWarning')}</p>
 	{/if}
-</section>
+	{#snippet footer()}
+		<button
+			type="button"
+			class="btn-primary"
+			disabled={saving || !dirty}
+			onclick={save}
+			data-testid="line-total-save"
+		>
+			{saving ? m('org.common.saving') : m('org.lineTotal.save')}
+		</button>
+	{/snippet}
+</OrgSettingPanel>
 
 <style>
-	/* The panel frame the sibling organization panels use
-	   (`CloseWorkspacePanel.svelte`). */
-	.card {
-		background: var(--surface);
-		border: 1px solid var(--border);
-		border-radius: 8px;
-		padding: 20px 24px;
-	}
-
-	.card h2 {
-		font-size: 1rem;
-		font-weight: 600;
-		margin: 0 0 4px;
-	}
-
-	.card-hint {
-		font-size: 0.82rem;
-		color: var(--text-muted);
-		margin: 0 0 14px;
-	}
-
 	.switch-row {
 		display: flex;
 		align-items: center;
@@ -167,34 +142,5 @@
 		font-size: 0.82rem;
 		background: var(--warning-tint);
 		color: var(--warning-on-tint);
-	}
-
-	.section-footer {
-		display: flex;
-		flex-wrap: wrap;
-		gap: 12px;
-		margin-top: 16px;
-	}
-
-	.btn-save-section {
-		padding: 8px 18px;
-		border-radius: 6px;
-		border: none;
-		background: var(--accent-strong);
-		color: #fff;
-		font-size: 0.85rem;
-		font-weight: 500;
-		cursor: pointer;
-		font-family: inherit;
-		white-space: nowrap;
-	}
-
-	.btn-save-section:hover:not(:disabled) {
-		opacity: 0.85;
-	}
-
-	.btn-save-section:disabled {
-		opacity: 0.5;
-		cursor: not-allowed;
 	}
 </style>
