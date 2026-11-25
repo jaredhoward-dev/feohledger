@@ -824,6 +824,9 @@ export const en = {
 	'invoices.empty.fresh': 'No invoices yet. Upload one, create one manually, or import a CSV to load your open AP.',
 	'invoices.row.delete': 'Delete',
 	'invoices.row.confirm': 'Confirm',
+	'invoices.row.selectAria': 'Select invoice {number}',
+	'invoices.row.selectDraftAria': 'Select draft invoice',
+	'invoices.row.editDraftAria': 'Edit draft invoice',
 	'invoices.loadMore': 'Load more ({shown} of {total})',
 	'invoices.showingAll': '{total, plural, one {Showing all # invoice} other {Showing all # invoices}}',
 

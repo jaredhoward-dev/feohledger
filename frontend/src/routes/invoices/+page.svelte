@@ -1062,7 +1062,7 @@
 					aria-pressed={activeStatuses.includes(s)}
 					onclick={() => toggleStatus(s)}
 				>
-					{m(INVOICE_STATUS_LABEL_KEYS[s])} <span class="count">{statusCount(s)}</span>
+					{m(INVOICE_STATUS_LABEL_KEYS[s])} <span class="count">{formatCount(statusCount(s))}</span>
 				</button>
 			{/each}
 			<HelpTip term="workflow" />
@@ -1218,14 +1218,14 @@
 						if (isRowOpenClick(e)) editing = invoice;
 					}}
 				>
-					<td class="checkbox-col" title={SYSTEM_MANAGED_STATUSES.has(invoice.status) ? m('invoices.systemManagedTitle', { status: m(INVOICE_STATUS_LABEL_KEYS[invoice.status]) }) : ''}><input type="checkbox" aria-label={`Select invoice ${invoice.invoice_number}`} checked={selected.has(invoice.id)} disabled={SYSTEM_MANAGED_STATUSES.has(invoice.status)} onchange={() => toggleSelect(invoice.id)} /></td>
+					<td class="checkbox-col" title={SYSTEM_MANAGED_STATUSES.has(invoice.status) ? m('invoices.systemManagedTitle', { status: m(INVOICE_STATUS_LABEL_KEYS[invoice.status]) }) : ''}><input type="checkbox" aria-label={invoice.invoice_number ? m('invoices.row.selectAria', { number: invoice.invoice_number }) : m('invoices.row.selectDraftAria')} checked={selected.has(invoice.id)} disabled={SYSTEM_MANAGED_STATUSES.has(invoice.status)} onchange={() => toggleSelect(invoice.id)} /></td>
 					<td class="mono" title={invoice.invoice_number || undefined}>
 						<!-- Flex, so a long number gives way and its warning icon keeps
 						     its place (#575): `RowLink` ellipsizes, the icon never shrinks. -->
 						<span class="num-cell">
 						<RowLink
 							onclick={() => (editing = invoice)}
-							ariaLabel={`Edit invoice ${invoice.invoice_number || 'draft'}`}
+							ariaLabel={invoice.invoice_number ? m('invoices.modal.dialogLabel', { number: invoice.invoice_number }) : m('invoices.row.editDraftAria')}
 						>
 							{invoice.invoice_number || '—'}
 						</RowLink>

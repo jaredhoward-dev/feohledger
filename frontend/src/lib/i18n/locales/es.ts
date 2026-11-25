@@ -745,6 +745,9 @@ export const messages = {
 	'invoices.empty.fresh': 'Aún no hay facturas. Suba una, cree una manualmente o importe un CSV para cargar sus cuentas por pagar abiertas.',
 	'invoices.row.delete': 'Eliminar',
 	'invoices.row.confirm': 'Confirmar',
+	'invoices.row.selectAria': 'Seleccionar factura {number}',
+	'invoices.row.selectDraftAria': 'Seleccionar borrador de factura',
+	'invoices.row.editDraftAria': 'Editar borrador de factura',
 	'invoices.loadMore': 'Cargar más ({shown} de {total})',
 	'invoices.showingAll': '{total, plural, one {Mostrando # factura} other {Mostrando todas las # facturas}}',
 

@@ -743,6 +743,9 @@ export const messages = {
 	'invoices.empty.fresh': 'Noch keine Rechnungen. Laden Sie eine hoch, erstellen Sie eine manuell oder importieren Sie eine CSV, um Ihre offenen Verbindlichkeiten zu laden.',
 	'invoices.row.delete': 'Löschen',
 	'invoices.row.confirm': 'Bestätigen',
+	'invoices.row.selectAria': 'Rechnung {number} auswählen',
+	'invoices.row.selectDraftAria': 'Rechnungsentwurf auswählen',
+	'invoices.row.editDraftAria': 'Rechnungsentwurf bearbeiten',
 	'invoices.loadMore': 'Mehr laden ({shown} von {total})',
 	'invoices.showingAll': '{total, plural, one {Alle # Rechnung werden angezeigt} other {Alle # Rechnungen werden angezeigt}}',
 
