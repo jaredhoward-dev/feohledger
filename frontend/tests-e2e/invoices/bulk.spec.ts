@@ -80,6 +80,30 @@ test.describe('/invoices bulk bar (acme admin)', () => {
 		const optionCount = await dropdown.locator('option').count();
 		expect(optionCount).toBeGreaterThan(0);
 	});
+
+	test('Change Status popover takes focus and closes on Escape, back to its trigger', async ({
+		page
+	}) => {
+		await page
+			.locator('table tbody tr td.checkbox-col input[type="checkbox"]:not([disabled])')
+			.first()
+			.check();
+		const trigger = page.getByRole('button', { name: 'Change Status' });
+		await expect(trigger).toHaveAttribute('aria-expanded', 'false');
+		await trigger.click();
+
+		// Opening moves focus into the popover, onto its picker.
+		const select = page.locator('.bulk-status-dropdown select');
+		await expect(select).toBeFocused();
+		await expect(trigger).toHaveAttribute('aria-expanded', 'true');
+
+		// Escape dismisses it — before, only an outside click did — and focus
+		// returns to the trigger rather than dropping to the page.
+		await page.keyboard.press('Escape');
+		await expect(page.locator('.bulk-status-dropdown')).toHaveCount(0);
+		await expect(trigger).toBeFocused();
+		await expect(trigger).toHaveAttribute('aria-expanded', 'false');
+	});
 });
 
 /**

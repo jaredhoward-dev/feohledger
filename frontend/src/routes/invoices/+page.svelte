@@ -661,6 +661,23 @@
 	let bulkRejectReason = $state('');
 	let bulkNeedsReason = $derived(bulkStatusValue === 'rejected');
 	let showBulkStatusSelect = $state(false);
+	let bulkStatusTrigger = $state<HTMLButtonElement | null>(null);
+	let bulkStatusSelect = $state<HTMLSelectElement | null>(null);
+
+	// The Change Status popover is a keyboard surface too: opening it moves
+	// focus to its picker (it renders above the bar, away from the trigger),
+	// and Escape closes it and hands focus back to the trigger. Before, it
+	// opened with focus left on the trigger and only an outside click closed
+	// it — a keyboard user had no way to dismiss it (WCAG 2.1.1, 2.4.3).
+	$effect(() => {
+		if (showBulkStatusSelect && bulkStatusSelect) bulkStatusSelect.focus();
+	});
+	function onBulkStatusKeydown(e: KeyboardEvent) {
+		if (e.key !== 'Escape') return;
+		e.preventDefault();
+		showBulkStatusSelect = false;
+		bulkStatusTrigger?.focus();
+	}
 
 	// True once "Select all N matching" has resolved the WHOLE filtered set
 	// (not just the loaded page) into `selected` — see `selectAllMatching()`
@@ -1104,7 +1121,10 @@
 					<span class="bulk-btn-wrap" title={validBulkTransitions.length === 0 ? m('invoices.bulk.noTransitions') : ''}>
 						<button
 							class="btn-secondary"
+							bind:this={bulkStatusTrigger}
 							disabled={bulkBusy || validBulkTransitions.length === 0}
+							aria-expanded={showBulkStatusSelect && validBulkTransitions.length > 0}
+							aria-controls="invoices-bulk-status-popover"
 							onclick={(e) => { e.stopPropagation(); showBulkStatusSelect = !showBulkStatusSelect; }}
 						>
 							<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/></svg>
@@ -1112,8 +1132,15 @@
 						</button>
 					</span>
 					{#if showBulkStatusSelect && validBulkTransitions.length > 0}
-						<div class="bulk-status-dropdown">
-							<select bind:value={bulkStatusValue} aria-label={m('invoices.bulk.newStatusAria')}>
+						<!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
+						<div
+							class="bulk-status-dropdown"
+							id="invoices-bulk-status-popover"
+							role="group"
+							aria-label={m('invoices.bulk.changeStatus')}
+							onkeydown={onBulkStatusKeydown}
+						>
+							<select bind:this={bulkStatusSelect} bind:value={bulkStatusValue} aria-label={m('invoices.bulk.newStatusAria')}>
 								{#each validBulkTransitions as s}
 									<option value={s}>{m(INVOICE_STATUS_LABEL_KEYS[s])}</option>
 								{/each}
