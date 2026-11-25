@@ -415,8 +415,9 @@ forgery, so the ERP never redelivers it. The `erp-status-poll` sweep
 default) is the backstop. For every tenant whose adapter is not Merge.dev and
 has no status sync of its own (QuickBooks Online and Xero have theirs, next two
 sections), it calls
-`get_invoice_status(erp_document_id)` for invoices at `sent_to_erp`,
-`posted_in_erp` or `payment_scheduled`, least recently polled first and at most
+`get_invoice_status(erp_document_id)` for invoices at `approved`,
+`sent_to_erp`, `posted_in_erp` or `payment_scheduled` that carry an ERP
+document id, least recently polled first and at most
 `FEOH_ERP_STATUS_POLL_SWEEP_BATCH_SIZE` per tenant a tick. A bill is asked
 about only under the connection that issued it, by the webhook's own
 by-document rule — one function, `erp_link_realm.bill_realm_clause`, called by
@@ -425,6 +426,12 @@ pre-realm (NULL) push counts only while `legacy_links_trusted` holds, and a
 connection that names no company (`mock`, an OAuth ERP with no consent) polls
 nothing, as the webhook matches nothing for it. The push must also have been
 confirmed after the ERP went live (§428) when that moment is known.
+`approved` is polled because a payment void returns an invoice there with its
+bill and realm intact (§535): a dropped ERP `paid` must still be read, or the
+next run pays the bill again. Its `paid` goes through
+`record_erp_reported_payment` and every double-pay refusal (a live card, a run
+holding it: a blocking `paid_not_recorded` row); `open` has no edge from
+`approved`, and `cancelled` opens the "voided after posting" review row.
 
 - **One transition.** What it reads is applied through
   `services/erp_status_report.apply_erp_status_report`, the very function the
@@ -437,13 +444,16 @@ confirmed after the ERP went live (§428) when that moment is known.
   `paid` report for a `payment_scheduled` invoice moves it to `paid` only over
   a `completed` payment whose settlement covers it; one that settled short is
   held behind the settled-short `erp_reconciliation` row, as before. With no
-  completed payment — our rail payment still pending or processing, or a live
-  virtual card, which books no `Payment` — the ERP's `paid` cannot be ours
-  (`payment_erp_sync` writes nothing back to these adapters), so someone paid
-  the bill in the ERP while we are paying it too. The invoice is not moved; one
-  payment-blocking `payment_reconciliation` opens (code
-  `exception.erp_paid_while_scheduled`, the QuickBooks sync's own sentence,
-  `erp_report.kind` `paid_while_scheduled`).
+  completed payment — our rail payment still pending or processing, or none
+  on file — moving to `paid` could hide a double payment, so the invoice is
+  not moved; one payment-blocking `payment_reconciliation` opens (code
+  `exception.erp_paid_while_payment_in_flight`, `erp_report.kind`
+  `paid_while_scheduled`). The sentence is not the QuickBooks sync's
+  `erp_paid_while_scheduled` (§535): QuickBooks raises that only when the
+  bill's balance shows a payment from outside us, while this route cannot
+  tell, and the usual cause is a bookkeeper recording our own in-flight
+  payment in the ERP — so it asks a person to confirm which payment the entry
+  is before voiding anything, never to void one.
 - **Settled with no payment (§532).** `settled_no_payment` — nothing owing in
   the ERP and no payment behind it (a credit applied, a write-off) — is never
   a payment (§303), and the invoice is not moved. The sweep opens one
@@ -461,10 +471,12 @@ confirmed after the ERP went live (§428) when that moment is known.
   `partly_paid`, `source: poll`). Both reads first withdraw a payment the ERP
   reported earlier that FeohLedger could not record (§319): neither is a bill
   paid in full.
-- **Deduplicated by kind (§533).** Every row this route and the sweep open goes
-  through `erp_status_sync.open_erp_reconciliation_exception` with
-  `same_kind=True`: it is skipped only while a live row of the same type AND
-  `erp_report.kind` exists. An unrelated live row of the same type (a
+- **Deduplicated by kind (§533, §535).** Every ERP reconciliation row — this
+  route's, the sweep's, and since §535 every other caller's (the QuickBooks and
+  Xero syncs, the payment write-back and its void, the sync-back's failed leg)
+  — goes through `erp_status_sync.open_erp_reconciliation_exception` (or, for
+  the sync-back, `live_erp_report_of_kind`): it is skipped only while a live
+  row of the same type AND `erp_report.kind` exists. There is no per-type mode. An unrelated live row of the same type (a
   settled-short row beside a void, another report's `payment_reconciliation`)
   never swallows it, because each change is reported once — the webhook by
   event id, the sweep by its recorded read — and a swallowed report would be
