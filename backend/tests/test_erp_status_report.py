@@ -414,10 +414,22 @@ async def test_paid_over_an_uncharged_run_card_leg_is_held_and_the_card_left_alo
         assert card.status == card_status
 
 
-@pytest.mark.parametrize("card_status", ["charged", "completed"])
-async def test_paid_over_a_run_card_leg_charged_in_full_moves_to_paid(realdb, card_status):
+async def test_paid_over_a_run_card_leg_only_authorized_is_held(realdb):
+    """Decisions §544: authorized in full (`charged`) is not money moved — the
+    authorization can still be reversed or expire — so an ERP `paid` is held
+    behind the in-flight row, exactly as for an uncharged card."""
     inv_id = await _seed(realdb, InvoiceStatus.payment_scheduled)
-    await _card_leg(realdb, inv_id, card_status=card_status, charged="500.00")
+    await _card_leg(realdb, inv_id, card_status="charged", charged="500.00")
+
+    assert await _apply(realdb, inv_id, "paid") == report.HELD_PAID_WHILE_SCHEDULED
+    assert await _status(realdb, inv_id) == InvoiceStatus.payment_scheduled
+    [exc] = await _exceptions(realdb, inv_id)
+    assert exc.erp_report["kind"] == "paid_while_scheduled"
+
+
+async def test_paid_over_a_run_card_leg_settled_in_full_moves_to_paid(realdb):
+    inv_id = await _seed(realdb, InvoiceStatus.payment_scheduled)
+    await _card_leg(realdb, inv_id, card_status="completed", charged="500.00")
 
     assert await _apply(realdb, inv_id, "paid") == report.TRANSITIONED
     assert await _status(realdb, inv_id) == InvoiceStatus.paid

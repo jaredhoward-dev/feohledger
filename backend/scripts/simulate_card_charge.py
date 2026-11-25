@@ -1,18 +1,21 @@
 """Charge a mock virtual card locally, as its issuer's webhook would.
 
-A payment run's card leg is paid only once its card is charged (decisions
-§537), and the charge comes from the card provider's webhook. On a laptop the
+A payment run's card leg is paid only once its card's charge SETTLES
+(decisions §537, §544), and that comes from the card provider's webhook. On a laptop the
 provider is `mock`, so this sends that webhook instead: signed, through the
 real `/api/cards/webhook/mock` handler, in process (no running backend needed).
-The handler records the charge on the run payment and re-dispatches the
-payment sync, which moves a fully charged invoice to `paid`.
+Without `--settle` only the authorization is sent: the card reads `charged`
+and the run's leg stays in flight (an authorization is a hold, not money
+moved). With `--settle` the handler records the settled charge on the run
+payment and re-dispatches the payment sync, which moves a fully charged
+invoice to `paid`.
 
     python scripts/simulate_card_charge.py --tenant acme --card <card id or token>
     python scripts/simulate_card_charge.py --tenant acme --card <id> --amount 120.00 --settle
 
 Local only: refused when FEOH_ENVIRONMENT is a deployed one, for a tenant whose
 card provider is not `mock`, and for a card that is not a mock card
-(decisions §541). Root shortcut: `pnpm card:simulate -- --tenant acme --card <id>`.
+(decisions §541). Root shortcut: `pnpm simulate:card -- --tenant acme --card <id>`.
 """
 
 import argparse
@@ -67,7 +70,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--amount", type=_amount, default=None, help="charge in major units (default: the limit)"
     )
-    parser.add_argument("--settle", action="store_true", help="also send the settlement event")
+    parser.add_argument(
+        "--settle",
+        action="store_true",
+        help="also send the settlement event (what takes a card-paid invoice to paid)",
+    )
     return asyncio.run(_run(parser.parse_args(argv)))
 
 

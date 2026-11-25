@@ -327,8 +327,8 @@ scan over `seed.py`'s `cards` blocks).
 
 ### Charging a mock card locally
 
-A run's card leg is paid only once its card is charged (decisions §537), and
-the charge arrives as the issuer's webhook. The mock issuer sends none, so on a
+A run's card leg is paid only once its card's charge settles (decisions §537,
+§544), and the charge arrives as the issuer's webhook. The mock issuer sends none, so on a
 laptop a card-paid invoice would wait at `payment_scheduled` for good. Send the
 charge yourself (decisions §541):
 
@@ -343,9 +343,11 @@ amount in major units as a decimal string (default: the card's limit), signs it
 with the tenant's `webhook_signing_secret` (or, when it set none,
 `mock_adapter.MOCK_WEBHOOK_LOCAL_SECRET`) and POSTs it in process to
 `/api/cards/webhook/mock`. So the real handler verifies the signature, dedupes
-the event id, records the charge through `record_card_spend` and re-dispatches
-the run's payment sync: a full charge reaches `paid`, a short one the
-settled-short hold. No running backend is needed; core services are.
+the event id and, on the settlement, records the charge through
+`record_card_spend` and re-dispatches the run's payment sync: a full charge
+reaches `paid`, a short one the settled-short hold. **Without `--settle` the
+card is only authorized** (`charged`) and the leg stays `in_flight`: an
+authorization is not money moved (§544). No running backend is needed; core services are.
 
 The webhook's `mock` branch exists only while `FEOH_ENVIRONMENT` is not a
 deployed one; deployed, `mock` is an unknown provider (silent 204). The
@@ -1085,14 +1087,16 @@ with no provider, `cards.region`) drops the sealed card secrets, audited
 3. verifies the HMAC (`verify_hmac_sha256`) — missing/forged signature is rejected,
 4. dedupes by `event_id` (`is_event_already_processed`, Redis `SET NX`) so a re-delivery is a no-op,
 5. applies the state change + writes the audit row in a single committed transaction,
-6. on a charge (authorization, then settlement) of a card a run's
-   `virtual_card` payment owns, writes the charged figure onto that payment's
-   `settled_amount` / `settled_currency` in the same transaction and, after the
-   commit, re-dispatches the run's payment sync. The run marks that payment
-   `completed` at mint, but until this charge the coverage check reads the leg
-   as `in_flight`: the invoice stays `payment_scheduled` and an ERP `paid`
+6. on the **settlement** of a card a run's `virtual_card` payment owns, writes
+   the settled figure onto that payment's `settled_amount` /
+   `settled_currency` in the same transaction and, after the commit,
+   re-dispatches the run's payment sync (once per delivery; a replay is
+   deduped at step 4). The authorization writes nothing onto the payment and
+   dispatches nothing: it is a hold the network can still reverse or let
+   expire (decisions §544). The run marks that payment `completed` at mint,
+   but until the settlement the coverage check reads the leg as `in_flight`: the invoice stays `payment_scheduled` and an ERP `paid`
    report is held behind a blocking row rather than closing it while the card
-   is still spendable (decisions §537; `backend/docs/payments.md` § A run's
+   is still spendable (decisions §537, §544; `backend/docs/payments.md` § A run's
    card leg counts what its card was charged).
 
 **Event classification (`_classify_card_event`)** decides whether a callback

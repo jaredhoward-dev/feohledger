@@ -1,7 +1,8 @@
 """Charge a mock virtual card on a laptop: the local equivalent of the issuer.
 
 Since decisions §537 a payment run's card leg counts only what its card was
-charged, and the charge arrives as the provider's webhook. The mock card
+charged — since §544 only a SETTLED charge — and the charge arrives as the
+provider's webhook. The mock card
 adapter has no provider behind it, so without this a card-paid invoice on a
 laptop stayed at ``payment_scheduled`` for good (guard rail 7, decisions §541).
 
@@ -9,13 +10,16 @@ This sends the event a provider would: an authorization (and, with ``settle``,
 its settlement) for one mock card, signed with the tenant's
 ``webhook_signing_secret`` (or, when it set none, the public
 ``MOCK_WEBHOOK_LOCAL_SECRET``), POSTed to ``/api/cards/webhook/mock`` on the
-ASGI app given. So the real handler verifies it, dedupes it, writes the charge
-through ``record_card_spend`` and re-dispatches the run's payment sync, exactly
-as for a Lithic delivery. Nothing here writes a card or a payment itself.
+ASGI app given. So the real handler verifies it, dedupes it and, on the
+settlement, writes the charge through ``record_card_spend`` and re-dispatches
+the run's payment sync, exactly as for a Lithic delivery. The authorization
+alone leaves the run's leg in flight (an authorization is not money moved,
+§544), so ``settle`` is what takes a card-paid invoice to ``paid``. Nothing
+here writes a card or a payment itself.
 
 Refused (``MockCardSimulationRefused``, by code) in a deployed environment, for
 a tenant whose card provider is not ``mock``, and for a card that is not a mock
-card. ``scripts/simulate_card_charge.py`` (``pnpm card:simulate``) is the CLI.
+card. ``scripts/simulate_card_charge.py`` (``pnpm simulate:card``) is the CLI.
 """
 
 from __future__ import annotations

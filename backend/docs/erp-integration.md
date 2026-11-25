@@ -633,7 +633,7 @@ differs:
   by `erp_reference` within the realm the push recorded, exactly one invoice or
   none (the way a deleted QuickBooks bill is matched). A push that recorded no
   realm can therefore never match, so the sweep does not read its bill back
-  either (`ErpAdapter.bills_match_by_reference` → `_bills_we_posted`);
+  either (`ErpAdapter.bills_match_by_reference` → `bills_we_posted`);
   QuickBooks still reads such bills, since its marker can match them.
 - **Paid, part-paid, credited.** `report_from_bill`: `deleted` for `DELETED` /
   `VOIDED`; `paid` for `Status == PAID` with nothing due; `partially_paid` /
@@ -2962,8 +2962,12 @@ write-error guides (read 2026-11-13). Reasoning: `docs/decisions.md` §399.
   the bills Merge changed after the tenant's cursor
   (`Organization.settings.erp_merge_readback`: `through`, the moment the last
   listing started, and `pending`, that listing's bills not yet applied; a first
-  pass looks back `FEOH_MERGE_READBACK_SWEEP_LOOKBACK_HOURS`), keeps the ones an
-  invoice was pushed as (`_bills_we_posted`, the route's own filter), and reads
+  pass looks back `FEOH_MERGE_READBACK_SWEEP_LOOKBACK_HOURS`; later passes ask
+  from `through` less `FEOH_MERGE_READBACK_SWEEP_OVERLAP_MINUTES`, default 10,
+  since `through` is our clock and a bill Merge stamped just before it by skew
+  or its own sync lag would otherwise never be listed; re-reading the overlap
+  is harmless, decisions §544), keeps the ones an
+  invoice was pushed as (`bills_we_posted`, the route's own filter), and reads
   each back and applies it exactly as the route does (`bill_report` →
   `apply_bill_report`, marked `source: reconciliation_sweep`). At most
   `FEOH_MERGE_READBACK_SWEEP_BATCH_SIZE` reads a tick; the rest stays pending.

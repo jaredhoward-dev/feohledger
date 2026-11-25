@@ -283,7 +283,7 @@ __all__ = [
 ]
 
 
-# ── A run's virtual-card leg (decisions §537) ─────────────────────────────
+# ── A run's virtual-card leg (decisions §537, §544) ───────────────────────
 #
 # A run's card leg books a `completed` `Payment` the moment the card is MINTED
 # (`api/payments._execute_single_payment`), but money moves only when the vendor
@@ -292,9 +292,14 @@ __all__ = [
 # failed OPEN, so the payment sync and an ERP `paid` report both closed the
 # invoice while the card was still spendable. These two functions are the whole
 # fix: the card's charge is written onto the payment it pays, and coverage of a
-# card leg asks the card when nothing has been written yet.
+# card leg asks the card. Only a SETTLED charge counts (§544): an authorization
+# can still be reversed or expire, so it leaves the leg in flight.
 
 CARD_LEG_METHOD = "virtual_card"
+#: The card status that means the vendor's charge CLEARED — money moved. The
+#: card webhook sets it on a settlement event; ``charged`` is only the
+#: authorization, a hold that can still be reversed or expire (decisions §544).
+CARD_SETTLED_STATUS = "completed"
 
 
 async def card_leg_card(db: AsyncSession, payment: Payment):
@@ -334,23 +339,29 @@ async def payment_coverage(db: AsyncSession, payment: Payment, invoice_currency:
     report (`erp_status_report`, webhook and poll alike) — so they cannot
     disagree about a card leg.
 
-    A card leg with no figure on the payment reads its card: uncharged (or no
-    card found) is ``in_flight``, since nothing has moved; charged, the card's
-    ``amount_charged`` is the settled figure. A leg the card webhook already
-    stamped (:func:`record_card_spend`) is read off the payment like any rail.
+    A card leg counts only a SETTLED charge (decisions §544). Its card is read
+    every time: not yet settled (``created`` / ``sent`` / ``active``, merely
+    authorized as ``charged``, cancelled, or no card found) is ``in_flight``,
+    whatever the payment carries, because an authorization is a hold the
+    network can still reverse or let expire — no money has moved. Settled
+    (``completed``), the figure the webhook stamped on the payment
+    (:func:`record_card_spend`) is judged like any rail's, falling back to the
+    card's own ``amount_charged`` when nothing was stamped.
     """
-    from app.services.card_issuance import CARD_SPENT_STATUSES
     from app.services.payment_settlement import settlement_coverage
 
     settled = payment.settled_amount
     settled_currency = payment.settled_currency
     unstorable = bool(payment.settled_amount_unstorable)
     awaiting = False
-    if payment.method == CARD_LEG_METHOD and settled is None and not unstorable:
+    if payment.method == CARD_LEG_METHOD:
         card = await card_leg_card(db, payment)
-        if card is None or card.status not in CARD_SPENT_STATUSES:
+        if card is None or card.status != CARD_SETTLED_STATUS:
+            # Not money yet: a figure an earlier build stamped at the
+            # authorization (§537) is not evidence of a settled charge either.
             awaiting = True
-        else:
+            settled, settled_currency, unstorable = None, None, False
+        elif settled is None and not unstorable:
             settled, unstorable = persistable_settled_amount(card.amount_charged)
             settled_currency = card.currency
     return settlement_coverage(
@@ -366,17 +377,22 @@ async def payment_coverage(db: AsyncSession, payment: Payment, invoice_currency:
 
 
 async def record_card_spend(db: AsyncSession, card) -> Payment | None:
-    """Write a card's charge onto the run payment it pays; return that payment.
+    """Write a card's SETTLED charge onto the run payment it pays; return it.
 
-    Called by the card webhook on the authorization and again on settlement
-    (whose figure replaces the authorized one), so ``payments.settled_amount``
-    of a card leg is what the vendor actually took. A short charge then holds
-    the invoice exactly as a short ACH does, and ``/settlement/accept`` and
-    ``/void`` are its exits. Returns ``None`` — nothing written — for a card no
-    run payment owns (``/cards/generate``), a non-card or non-completed payment,
-    or a charge with no amount.
+    Called by the card webhook on settlement only (decisions §544): an
+    authorization is a hold, not money moved — the network can reverse it or
+    let it expire, and a card provider sends those as their own events — so the
+    leg stays ``in_flight`` (:func:`payment_coverage`) until the charge clears.
+    Then ``payments.settled_amount`` is what the vendor actually took: a short
+    charge holds the invoice exactly as a short ACH does, and
+    ``/settlement/accept`` and ``/void`` are its exits.
+
+    Returns ``None`` — nothing written — for a card not yet settled, a card no
+    run payment owns (``/cards/generate``), a non-card or non-completed
+    payment, or a charge with no amount. Idempotent: the same card writes the
+    same figure.
     """
-    if card.payment_id is None or card.amount_charged is None:
+    if card.payment_id is None or card.amount_charged is None or card.status != CARD_SETTLED_STATUS:
         return None
     payment = await db.get(Payment, card.payment_id)
     if payment is None or payment.method != CARD_LEG_METHOD or payment.status != "completed":

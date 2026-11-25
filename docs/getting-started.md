@@ -91,15 +91,17 @@ The seed script creates 2 organizations, 6 users, 4 roles, 10 vendors, and 10 in
 ### Paying by virtual card locally
 
 The demo tenants issue cards through the `mock` provider, which never charges
-them, and a payment run's card leg is paid only once its card is charged. To
+them, and a payment run's card leg is paid only once its card's charge settles. To
 finish one, charge the card the way its issuer would (backend venv active):
 
 ```bash
-pnpm simulate:card -- --tenant acme --card <card id or mock_card_… token>
+pnpm simulate:card -- --tenant acme --card <card id or mock_card_… token> --settle
 ```
 
 The card's `id` is in `GET /api/cards` (or `virtual_cards.id` in the tenant
-database). Add `--settle` for the settlement too, or `--amount 90.00` for a short charge.
+database). `--settle` sends the settlement after the authorization; without it the card
+is only authorized and the invoice stays `payment_scheduled` (an authorization is not money
+moved). Add `--amount 90.00` for a short charge.
 Details: [backend/docs/virtual-cards.md](../backend/docs/virtual-cards.md)
 § Charging a mock card locally.
 

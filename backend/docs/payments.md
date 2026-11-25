@@ -1504,7 +1504,7 @@ verifier's *did the rail report what we authorized?*.
 | `covered` | some authorized leg is satisfied, **or** nothing was ever reported | invoice proceeds to `paid` |
 | `short` | a figure was reported and falls below every currency-compatible leg by more than a cent | invoice held at `payment_scheduled` |
 | `uncertain` | reported in a currency matching no authorized leg, **or** reported a figure the column cannot hold | invoice held at `payment_scheduled` |
-| `in_flight` | a run's `virtual_card` leg whose card has not been charged (no figure on the payment, card not `charged` / `completed`) | nothing moved: the payment sync skips the leg; an ERP `paid` takes the in-flight hold (decisions §537) |
+| `in_flight` | a run's `virtual_card` leg whose card's charge has not settled (card not `completed`: uncharged, only authorized, or missing) | nothing moved: the payment sync skips the leg; an ERP `paid` takes the in-flight hold (decisions §537, §544) |
 
 Over-settlement is `covered`: the vendor is not short, so the payable is
 discharged even though the verifier still raises `amount_mismatch` on the same
@@ -1515,6 +1515,8 @@ as the verifier treats a missing amount as `unverified`.
 
 ##### A run's card leg counts what its card was charged
 
+Only a **settled** charge counts (decisions §544).
+
 The card leg books a `completed` `Payment` when the card is **minted**
 (`_execute_single_payment`), but no money moves until the vendor charges it.
 The NULL fail-open above is for a rail that moved money and reported no
@@ -1522,24 +1524,32 @@ figure; an uncharged card has moved nothing, and reading it as covered let an
 ERP `paid` for a bill settled outside us close the invoice while the card was
 still spendable (decisions §537). So every coverage decision goes through
 `payment_settlement_record.payment_coverage`, which for a `virtual_card`
-payment with no figure reads its card (`card_leg_card`: the card naming the
-payment, else the invoice's unlinked one):
+payment always reads its card (`card_leg_card`: the card naming the payment,
+else the invoice's unlinked one):
 
-- **uncharged, or no card** → `in_flight`. `payment_erp_sync` skips the leg
+- **not settled** (`created` / `sent` / `active`, only authorized `charged`,
+  `cancelled`, or no card) → `in_flight`, whatever figure the payment carries.
+  An authorization is a hold the network can still reverse, let expire or
+  decline at clearing; no money has moved until the charge settles. `payment_erp_sync` skips the leg
   (counted `skipped`, like a `submitted` ACH); `erp_status_report` (generic
   webhook and `erp-status-poll`) opens the in-flight hold — one blocking
   `payment_reconciliation`, `erp_paid_while_payment_in_flight`, no transition.
   The card is left alone: nothing cancels it automatically, because the ERP
   entry may be a bookkeeper recording our own card payment.
-- **charged** → the card's `amount_charged` is the settled figure, so a full
-  charge is `covered` and a short one `short`.
+- **settled** (`completed`) → the figure the webhook stamped on the payment,
+  or the card's `amount_charged` when none was, so a full charge is `covered`
+  and a short one `short`.
 
-The card webhook writes the charge onto the payment too
-(`record_card_spend`, at authorization and again at settlement, the settled
-figure replacing the authorized one), then re-dispatches the payment sync for
-the run, which is what moves the skipped invoice to `paid` — or holds it short,
+The card webhook writes the settled charge onto the payment
+(`record_card_spend`, on the settlement event only; an authorization writes
+nothing and dispatches nothing), then re-dispatches the payment sync for the
+run (`dispatch_payment_sync` only schedules the pass on the running loop, after
+the commit, so no ERP latency reaches the issuer's response), which is what moves the skipped invoice to `paid` — or holds it short,
 with `/settlement/accept` and `/void` as the exits. A card no run payment owns
-(`/cards/generate`) has no payment to write.
+(`/cards/generate`) has no payment to write. A reversed, expired or declined
+authorization needs no undo: it never counted. The card itself stays `charged`
+(the webhook leaves a card untouched on those events), so the leg stays
+`in_flight` until a settlement arrives or a person voids the payment.
 
 ##### A figure the column cannot hold
 

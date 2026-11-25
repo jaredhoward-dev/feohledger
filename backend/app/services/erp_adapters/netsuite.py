@@ -1239,7 +1239,7 @@ class NetSuiteAdapter(ErpAdapter):
         in the account's time zone, which this adapter does not know, so a UTC
         stamp could start the window up to 14 hours late. Reading a few more
         bills costs reads; the sweep only reads back bills an invoice was
-        pushed as (``_bills_we_posted``).
+        pushed as (``bills_we_posted``).
 
         Past :data:`SYNC_LISTING_MAX_ROWS` either read is
         :class:`ErpListingIncomplete` (truncated), and the sweep reads back
