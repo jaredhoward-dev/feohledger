@@ -42,7 +42,10 @@ export function clearSort(current: SortState): SortState {
  * unknown field falls back to the default order; any `order` other than
  * `desc` reads as ascending.
  */
-export function sortFromUrl(params: URLSearchParams, fields: readonly string[]): SortState {
+export function sortFromUrl(
+	params: Pick<URLSearchParams, 'get'>,
+	fields: readonly string[]
+): SortState {
 	const field = params.get('sort');
 	return {
 		field: field && fields.includes(field) ? field : null,
