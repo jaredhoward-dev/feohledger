@@ -1363,5 +1363,8 @@
   "legalAcceptButton": "同意する",
   "legalAcceptSignOut": "サインアウト",
   "legalAcceptTickRequired": "利用規約とプライバシーポリシーに同意するには、チェックボックスをオンにしてください。",
-  "legalAcceptAppOutdated": "このバージョンのアプリは現在有効なものより古い利用規約またはプライバシーポリシーを表示しているため、同意を記録できません。アプリストアからアプリを更新するか、Web アプリで同意してから、もう一度サインインしてください。"
+  "legalAcceptAppOutdated": "このバージョンのアプリは現在有効なものより古い利用規約またはプライバシーポリシーを表示しているため、同意を記録できません。アプリストアからアプリを更新するか、Web アプリで同意してから、もう一度サインインしてください。",
+  "invoiceDetailAssignedElsewhere": "担当者: {name}(承認者としてこのまま処理できます)",
+  "invoiceDetailAssignedElsewhereUnnamed": "別の担当者に割り当て済み(承認者としてこのまま処理できます)",
+  "payQueueRescheduledFrom": "{date} から変更"
 }

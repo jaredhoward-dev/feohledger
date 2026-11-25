@@ -118,6 +118,13 @@ test.describe('invoice modal — review decisions follow the server verdict', ()
 		const approve = modal.getByRole('button', { name: 'Approve', exact: true });
 		await expect(approve).toBeEnabled();
 		await expect(modal.getByRole('button', { name: 'Reject', exact: true })).toBeEnabled();
+		// Both buttons are described by the note, so a screen-reader user hears
+		// whose invoice it is before deciding it.
+		for (const name of ['Approve', 'Reject']) {
+			await expect(modal.getByRole('button', { name, exact: true })).toHaveAccessibleDescription(
+				'Assigned to E2E Colleague — you can still act as an approver.'
+			);
+		}
 
 		const approved = page.waitForResponse(
 			(r) => r.url().endsWith(`/api/invoices/${id}/approve`) && r.request().method() === 'POST'

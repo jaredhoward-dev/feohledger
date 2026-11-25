@@ -5129,6 +5129,20 @@ class AppLocalizationsPt extends AppLocalizations {
   @override
   String get legalAcceptAppOutdated =>
       'Esta versão da app mostra Termos ou uma Política de Privacidade anteriores aos que estão em vigor, por isso não pode registar a sua aceitação. Atualize a app na sua loja de aplicações, ou aceite na aplicação web, e inicie sessão novamente.';
+
+  @override
+  String invoiceDetailAssignedElsewhere(String name) {
+    return 'Atribuída a $name — você ainda pode agir como aprovador.';
+  }
+
+  @override
+  String get invoiceDetailAssignedElsewhereUnnamed =>
+      'Atribuída a um colega — você ainda pode agir como aprovador.';
+
+  @override
+  String payQueueRescheduledFrom(String date) {
+    return 'reprogramada de $date';
+  }
 }
 
 /// The translations for Portuguese, as used in Brazil (`pt_BR`).
@@ -10254,4 +10268,18 @@ class AppLocalizationsPtBr extends AppLocalizationsPt {
   @override
   String get legalAcceptAppOutdated =>
       'Esta versão do app mostra Termos ou uma Política de Privacidade anteriores aos vigentes, por isso não pode registrar sua aceitação. Atualize o app na sua loja de aplicativos, ou aceite no aplicativo web, e entre novamente.';
+
+  @override
+  String invoiceDetailAssignedElsewhere(String name) {
+    return 'Atribuída a $name — você ainda pode agir como aprovador.';
+  }
+
+  @override
+  String get invoiceDetailAssignedElsewhereUnnamed =>
+      'Atribuída a um colega — você ainda pode agir como aprovador.';
+
+  @override
+  String payQueueRescheduledFrom(String date) {
+    return 'reprogramada de $date';
+  }
 }

@@ -1169,5 +1169,8 @@
   "legalAcceptButton": "Akzeptieren",
   "legalAcceptSignOut": "Abmelden",
   "legalAcceptTickRequired": "Setzen Sie das Häkchen, um die Nutzungsbedingungen und die Datenschutzerklärung zu akzeptieren.",
-  "legalAcceptAppOutdated": "Diese App-Version zeigt ältere Nutzungsbedingungen oder eine ältere Datenschutzerklärung als die derzeit geltenden und kann Ihre Zustimmung daher nicht erfassen. Aktualisieren Sie die App über Ihren App Store oder stimmen Sie in der Web-App zu und melden Sie sich dann erneut an."
+  "legalAcceptAppOutdated": "Diese App-Version zeigt ältere Nutzungsbedingungen oder eine ältere Datenschutzerklärung als die derzeit geltenden und kann Ihre Zustimmung daher nicht erfassen. Aktualisieren Sie die App über Ihren App Store oder stimmen Sie in der Web-App zu und melden Sie sich dann erneut an.",
+  "invoiceDetailAssignedElsewhere": "Zugewiesen an {name} – Sie können trotzdem als Genehmiger entscheiden.",
+  "invoiceDetailAssignedElsewhereUnnamed": "Einer Kollegin oder einem Kollegen zugewiesen – Sie können trotzdem als Genehmiger entscheiden.",
+  "payQueueRescheduledFrom": "verschoben vom {date}"
 }

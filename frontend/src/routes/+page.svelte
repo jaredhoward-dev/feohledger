@@ -148,9 +148,8 @@
 		return formatMoney(amount, { currency, whole: true });
 	}
 
-	// Due-date cell: locale-aware short date, no year (the shared helper drives
-	// its locale off the active i18n picker).
-	// The upcoming list's compact date: no year.
+	// The upcoming list's compact date: locale-aware (the shared helper follows
+	// the active i18n picker), no year.
 	const DUE_OPTS: Intl.DateTimeFormatOptions = { month: 'short', day: 'numeric' };
 
 	// Pipeline order
@@ -585,6 +584,7 @@
 										overdue={inv.is_overdue}
 										overdueLabel={m('dashboard.overdue')}
 										opts={DUE_OPTS}
+										align="end"
 									/>
 								</span>
 							</div>
@@ -1174,7 +1174,6 @@
 	.overdue-text {
 		color: var(--danger);
 	}
-
 
 	/* Trend */
 	.trend-chart {

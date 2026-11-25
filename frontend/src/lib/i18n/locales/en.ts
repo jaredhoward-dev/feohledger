@@ -2516,8 +2516,7 @@ export const en = {
 	'expenses.preapprovals.col.remaining': 'Remaining',
 	'expenses.preapprovals.drawn': 'Drawn {amount}',
 	'expenses.preapprovals.exhausted': 'Used up',
-	'expenses.preapprovalDraw.badge': 'Pre-approved',
-	'expenses.preapprovalDraw.title': 'Draws {amount} from an approved pre-approval',
+	'expenses.preapprovalDraw.badge': 'Pre-approved · {amount}',
 
 	// Pre-approval request status labels (#lib/types/expense.ts)
 	'expenses.preapprovals.status.pending': 'Pending',
@@ -5163,6 +5162,7 @@ export const en = {
 	'invoices.modal.review.assignedElsewhereUnnamed': 'Assigned to a colleague — you can still act as an approver.',
 	'invoices.modal.review.assignedHintPost': ' for review.',
 	'invoices.modal.review.assignedHintPre': 'Assigned to ',
+	'invoices.modal.review.checking': 'Checking what you can do here…',
 	'invoices.modal.review.confirmReject': 'Confirm Reject',
 	'invoices.modal.review.reject': 'Reject',
 	'invoices.modal.review.rejectAria': 'Reason for rejection',

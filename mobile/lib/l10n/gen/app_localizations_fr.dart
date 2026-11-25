@@ -5143,4 +5143,18 @@ class AppLocalizationsFr extends AppLocalizations {
   @override
   String get legalAcceptAppOutdated =>
       'Cette version de l’app affiche des Conditions ou une Politique de confidentialité antérieures à celles en vigueur ; elle ne peut donc pas enregistrer votre acceptation. Mettez l’app à jour depuis votre magasin d’applications, ou acceptez dans l’application web, puis reconnectez-vous.';
+
+  @override
+  String invoiceDetailAssignedElsewhere(String name) {
+    return 'Assignée à $name — vous pouvez tout de même agir en tant qu’approbateur.';
+  }
+
+  @override
+  String get invoiceDetailAssignedElsewhereUnnamed =>
+      'Assignée à un collègue — vous pouvez tout de même agir en tant qu’approbateur.';
+
+  @override
+  String payQueueRescheduledFrom(String date) {
+    return 'reportée du $date';
+  }
 }

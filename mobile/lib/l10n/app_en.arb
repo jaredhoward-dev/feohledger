@@ -4593,5 +4593,27 @@
   "legalAcceptAppOutdated": "This version of the app shows older Terms or an older Privacy Policy than the ones now in force, so it cannot record your acceptance. Update the app from your app store, or accept in the web app, then sign in again.",
   "@legalAcceptAppOutdated": {
     "description": "Accept screen: the server refused the versions this build carries (422 legal_acceptance_required), so the app is older than the Terms / Privacy in force."
+  },
+  "invoiceDetailAssignedElsewhere": "Assigned to {name} — you can still act as an approver.",
+  "@invoiceDetailAssignedElsewhere": {
+    "description": "Invoice detail: note above Approve / Reject when the invoice is assigned to a colleague (decisions §564). Assignment is routing, not authority; also read as the buttons' semantics hint.",
+    "placeholders": {
+      "name": {
+        "type": "String"
+      }
+    }
+  },
+  "invoiceDetailAssignedElsewhereUnnamed": "Assigned to a colleague — you can still act as an approver.",
+  "@invoiceDetailAssignedElsewhereUnnamed": {
+    "description": "Invoice detail: the same note when the assignee has no stored name."
+  },
+  "payQueueRescheduledFrom": "rescheduled from {date}",
+  "@payQueueRescheduledFrom": {
+    "description": "Payment queue row: the invoice's own due date when a payment schedule moved it; the row's date is the effective one (decisions §565).",
+    "placeholders": {
+      "date": {
+        "type": "String"
+      }
+    }
   }
 }

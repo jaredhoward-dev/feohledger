@@ -21,7 +21,6 @@
 		EXPENSE_FILTER_STATUSES,
 		EXPENSE_STATUS_LABEL_KEYS,
 		expenseStatusLabelKey,
-		EXPENSE_STATUS_TONES,
 		expenseReportStatusLabelKey,
 		EXPENSE_REPORT_STATUS_TONES,
 		EXPENSE_PREAPPROVAL_STATUSES,
@@ -31,8 +30,7 @@
 		reconciliationStatusLabelKey,
 		canAuthorLooseLine,
 		RECONCILIATION_STATUS_TONES,
-		preapprovalBalance,
-		drawsPreapproval
+		preapprovalBalance
 	} from '#lib/types/expense.ts';
 	import { expenseStore } from '#lib/stores/expenses.svelte.ts';
 	import { auth } from '#lib/stores/auth.svelte.ts';
@@ -91,6 +89,7 @@
 	import LinkedMessage from '#lib/components/ui/LinkedMessage.svelte';
 	import Money from '#lib/components/ui/Money.svelte';
 	import ExpensePicker from '#lib/components/ui/ExpensePicker.svelte';
+	import ExpenseStatusCell from '#lib/components/ui/ExpenseStatusCell.svelte';
 	import { composableReports, splitAttachable, type ExpensePickerOption } from '#lib/utils/expensePicker.ts';
 	import type { SearchPickerLoad } from '#lib/utils/searchPicker.ts';
 	import { DEFAULT_CURRENCY, formatMoney } from '#lib/utils/money.ts';
@@ -959,11 +958,6 @@
 		exportExpensesCsv({ report_id: activeReport.id });
 	}
 
-	// --- Violation badge helpers (shared by expenses + report-detail rows) ---
-	function violationTitle(list: PolicyViolation[]): string {
-		return list.map((v) => policyViolationText(v, m)).join('; ');
-	}
-
 	// …and so does `?tab=policies` for a reader without the Policies tab.
 	$effect(() => {
 		if (tab === 'policies' && !canManagePolicies) untrack(() => switchTab('expenses'));
@@ -1580,25 +1574,7 @@
 						<td class="muted">{glLabel(exp.gl_account_id)}</td>
 						<td class="right mono"><Money amount={exp.amount} currency={exp.currency} /></td>
 						<td>
-							<!-- The 6px that used to be the violation pill's own
-							     `margin-left` lives on this wrapper: `<Badge>` owns colour
-							     and metrics, the caller owns placement. `cursor: help` is
-							     inherited down onto the pill from `.violation-chip`, which
-							     is also the caller's to own — the tooltip is the point of
-							     that chip. -->
-							<span class="status-cell">
-								<Badge tone={EXPENSE_STATUS_TONES[exp.status as ExpenseStatus]} variant={exp.status}>{statusLabel(exp.status)}</Badge>
-								{#if drawsPreapproval(exp)}
-									<span class="violation-chip" data-testid="expense-preapproval-draw">
-										<Badge tone="success" variant="preapproval-draw" title={m('expenses.preapprovalDraw.title', { amount: formatMoney(exp.preapproval_drawn_amount, { currency: exp.currency }) })}>{m('expenses.preapprovalDraw.badge')}</Badge>
-									</span>
-								{/if}
-								{#if exp.policy_violations && exp.policy_violations.length}
-									<span class="violation-chip">
-										<Badge tone="danger" variant="violation" title={violationTitle(exp.policy_violations)}>⚠ {exp.policy_violations.length}</Badge>
-									</span>
-								{/if}
-							</span>
+							<ExpenseStatusCell expense={exp} />
 						</td>
 						<td class="actions">
 							<!-- A colleague's line on no report is theirs to delete
@@ -1780,19 +1756,7 @@
 								<td>{exp.category ?? '—'}</td>
 								<td class="right mono"><Money amount={exp.amount} currency={exp.currency} /></td>
 								<td>
-									<span class="status-cell">
-										<Badge tone={EXPENSE_STATUS_TONES[exp.status as ExpenseStatus]} variant={exp.status}>{statusLabel(exp.status)}</Badge>
-										{#if drawsPreapproval(exp)}
-											<span class="violation-chip" data-testid="expense-preapproval-draw">
-												<Badge tone="success" variant="preapproval-draw" title={m('expenses.preapprovalDraw.title', { amount: formatMoney(exp.preapproval_drawn_amount, { currency: exp.currency }) })}>{m('expenses.preapprovalDraw.badge')}</Badge>
-											</span>
-										{/if}
-										{#if exp.policy_violations && exp.policy_violations.length}
-											<span class="violation-chip">
-												<Badge tone="danger" variant="violation" title={violationTitle(exp.policy_violations)}>⚠ {exp.policy_violations.length}</Badge>
-											</span>
-										{/if}
-									</span>
+									<ExpenseStatusCell expense={exp} />
 								</td>
 								<td class="actions">
 									{#if isAllowed(activeReport?.actions?.compose)}
@@ -2367,25 +2331,6 @@
 	   status two different shades, which is what they were doing (.12 alpha
 	   here, .15 in the modal). What stays here is placement and the tooltip
 	   affordance. */
-
-	/* Status pill + the optional policy-violation pill beside it. The 6px was
-	   the violation pill's own `margin-left`; `flex-wrap` keeps the pair able to
-	   break at a narrow viewport, which two inline runs did for free and a flex
-	   row must be told to do (SC 1.4.10). */
-	.status-cell {
-		display: inline-flex;
-		align-items: center;
-		gap: 6px;
-		flex-wrap: wrap;
-	}
-
-	/* `cursor` is inherited, so the caller can own the affordance without
-	   `Badge` growing a prop for it. The pill's whole job is its `title`
-	   tooltip, which is what the help cursor advertises. */
-	.violation-chip {
-		display: inline-flex;
-		cursor: help;
-	}
 
 	/* A pre-approval's draw-down under its remaining balance (decisions §563):
 	   a second, quieter line in the same cell, so the figure stays the one the

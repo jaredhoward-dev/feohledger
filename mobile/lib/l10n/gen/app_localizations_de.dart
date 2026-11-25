@@ -5136,4 +5136,18 @@ class AppLocalizationsDe extends AppLocalizations {
   @override
   String get legalAcceptAppOutdated =>
       'Diese App-Version zeigt ältere Nutzungsbedingungen oder eine ältere Datenschutzerklärung als die derzeit geltenden und kann Ihre Zustimmung daher nicht erfassen. Aktualisieren Sie die App über Ihren App Store oder stimmen Sie in der Web-App zu und melden Sie sich dann erneut an.';
+
+  @override
+  String invoiceDetailAssignedElsewhere(String name) {
+    return 'Zugewiesen an $name – Sie können trotzdem als Genehmiger entscheiden.';
+  }
+
+  @override
+  String get invoiceDetailAssignedElsewhereUnnamed =>
+      'Einer Kollegin oder einem Kollegen zugewiesen – Sie können trotzdem als Genehmiger entscheiden.';
+
+  @override
+  String payQueueRescheduledFrom(String date) {
+    return 'verschoben vom $date';
+  }
 }

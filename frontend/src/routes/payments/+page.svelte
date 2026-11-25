@@ -2464,9 +2464,6 @@
 						<td>{item.vendor_name}</td>
 						<td class="right mono">{formatCurrency(item.amount, item.currency)}</td>
 						<td class:overdue-text={item.is_overdue}>
-							<!-- The 6px that used to be the pill's own margin lives on this
-							     row: `<Badge>` owns colour and metrics, the caller owns
-							     placement. -->
 							<span class="due-cell">
 								<DueDate
 									due={item.due_date}
@@ -3790,17 +3787,12 @@
 		color: var(--danger);
 	}
 
-	/* Date + its overdue pill. The gap used to be the pill's own
-	   `margin-left`; `<Badge>` owns colour and metrics, the caller owns
-	   placement. */
+	/* The due-date cell's wrapper. Its date, overdue pill and "rescheduled
+	   from" line are `ui/DueDate.svelte`'s, which owns their gap and the
+	   wrap between date and pill (`.due-main { flex-wrap: wrap }`, SC 1.4.10);
+	   this wrapper only keeps the cell an inline-flex box in the row. */
 	.due-cell {
 		display: inline-flex;
-		align-items: center;
-		gap: 6px;
-		/* The date and the pill were separate inline runs before and could
-		   break between them; a flex row must be told to keep doing that or a
-		   narrow viewport gets a horizontal scrollbar (SC 1.4.10). */
-		flex-wrap: wrap;
 	}
 
 	/* --- Status badges --- */

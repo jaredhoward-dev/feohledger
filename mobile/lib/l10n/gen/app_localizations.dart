@@ -7339,6 +7339,24 @@ abstract class AppLocalizations {
   /// In en, this message translates to:
   /// **'This version of the app shows older Terms or an older Privacy Policy than the ones now in force, so it cannot record your acceptance. Update the app from your app store, or accept in the web app, then sign in again.'**
   String get legalAcceptAppOutdated;
+
+  /// Invoice detail: note above Approve / Reject when the invoice is assigned to a colleague (decisions §564). Assignment is routing, not authority; also read as the buttons' semantics hint.
+  ///
+  /// In en, this message translates to:
+  /// **'Assigned to {name} — you can still act as an approver.'**
+  String invoiceDetailAssignedElsewhere(String name);
+
+  /// Invoice detail: the same note when the assignee has no stored name.
+  ///
+  /// In en, this message translates to:
+  /// **'Assigned to a colleague — you can still act as an approver.'**
+  String get invoiceDetailAssignedElsewhereUnnamed;
+
+  /// Payment queue row: the invoice's own due date when a payment schedule moved it; the row's date is the effective one (decisions §565).
+  ///
+  /// In en, this message translates to:
+  /// **'rescheduled from {date}'**
+  String payQueueRescheduledFrom(String date);
 }
 
 class _AppLocalizationsDelegate

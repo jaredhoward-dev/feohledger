@@ -4885,4 +4885,18 @@ class AppLocalizationsJa extends AppLocalizations {
   @override
   String get legalAcceptAppOutdated =>
       'このバージョンのアプリは現在有効なものより古い利用規約またはプライバシーポリシーを表示しているため、同意を記録できません。アプリストアからアプリを更新するか、Web アプリで同意してから、もう一度サインインしてください。';
+
+  @override
+  String invoiceDetailAssignedElsewhere(String name) {
+    return '担当者: $name(承認者としてこのまま処理できます)';
+  }
+
+  @override
+  String get invoiceDetailAssignedElsewhereUnnamed =>
+      '別の担当者に割り当て済み(承認者としてこのまま処理できます)';
+
+  @override
+  String payQueueRescheduledFrom(String date) {
+    return '$date から変更';
+  }
 }

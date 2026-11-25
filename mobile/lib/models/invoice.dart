@@ -331,6 +331,14 @@ class Invoice {
   /// verdict. Read through [ActionVerdict.fromVerdicts], which fails closed.
   final Map<String, dynamic>? reviewActions;
 
+  /// Who the invoice is routed to for review (`InvoiceResponse.assigned_to_id`)
+  /// and their display name (`assigned_to`). Routing only, never authority
+  /// (decisions §564): read through `assignedElsewhere`
+  /// (`utils/review_assignment.dart`) for the note beside Approve / Reject,
+  /// never to decide whether to offer them.
+  final String? assignedToId;
+  final String? assignedTo;
+
   Invoice({
     required this.id,
     this.invoiceNumber,
@@ -354,6 +362,8 @@ class Invoice {
     this.erpDocumentUrl,
     this.financiallyLocked = true,
     this.reviewActions,
+    this.assignedToId,
+    this.assignedTo,
   });
 
   factory Invoice.fromJson(Map<String, dynamic> json) {
@@ -395,6 +405,8 @@ class Invoice {
       reviewActions: json['review_actions'] is Map
           ? Map<String, dynamic>.from(json['review_actions'] as Map)
           : null,
+      assignedToId: json['assigned_to_id'] as String?,
+      assignedTo: json['assigned_to'] as String?,
     );
   }
 
