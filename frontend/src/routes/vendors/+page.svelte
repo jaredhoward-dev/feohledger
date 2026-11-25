@@ -452,12 +452,17 @@
 	// "select all N matching" affordance on /invoices and /expenses.
 	async function selectAllMatching() {
 		selectingAllMatching = true;
+		const key = filterKey;
 		try {
 			const params: { search?: string; status?: string } = {};
 			const currentSearch = search.trim();
 			if (currentSearch) params.search = currentSearch;
 			if (statusFilter !== 'all') params.status = statusFilter;
 			const res: MatchingIdsResponse = await getVendorIds(params);
+			// The filter moved while the ids were resolving: they answer a
+			// question the table is no longer asking.
+			if (key !== filterKey) return;
+			matchingKey = key;
 			selected = new Set(res.ids);
 			selectedAllMatching = true;
 			if (res.truncated) {
@@ -480,6 +485,18 @@
 		selectedAllMatching = false;
 		if (armed?.action === 'bulkReject') armed = null;
 	}
+
+	// "All N matching" names the set a search + status filter matched, and
+	// the prune effect above stands aside for it (most of those ids are off
+	// the loaded page). So once the filter moves, nothing else retires it: the
+	// bar kept counting the old set, and a bulk Reject stopped payments for
+	// vendors the table was no longer showing. The selection ends with the
+	// filter it was made under.
+	const filterKey = $derived(`${statusFilter}\u0000${search.trim()}`);
+	let matchingKey = '';
+	$effect(() => {
+		if (selectedAllMatching && filterKey !== matchingKey) untrack(clearSelection);
+	});
 
 	async function bulkVerify() {
 		bulkBusy = true;
