@@ -1144,14 +1144,16 @@ scope (§260) — do not fold them into any of these.
       timeout or 5xx, `possibly_posted: true`, decisions §286). Finding and
       voiding it from the failed invoice or its flag landed in round 47
       (decisions §556) for the **mock and QuickBooks Online** adapters
-      (`ErpAdapter.find_posted_bill`). **Still open:** every other adapter
+      (`ErpAdapter.find_posted_bill`), and in round 48 for **Xero and
+      NetSuite** (decisions §566). **Still open:** every other adapter
       answers `erp_lookup_unsupported`, because its pre-create lookup lives
-      inside `post_invoice` with client and header state (Xero
-      `_find_existing_bill`, Sage, Sage ZA, Business Central, NetSuite, Sage
-      Intacct, SYSPRO, Blackbaud, Merge.dev). **Durable fix:** lift each
-      adapter's lookup into `find_posted_bill` and set `supports_bill_lookup`.
-      **Trigger:** a bill found in a non-QuickBooks ERP for an invoice we
-      show as failed, or the next change to that adapter's push.
+      inside `post_invoice` with client and header state (Sage, Sage ZA,
+      Business Central, Sage Intacct, SYSPRO, Blackbaud, Merge.dev). Each
+      whose key carries nothing unique to one invoice also sets
+      `bill_lookup_key_shared`. **Durable fix:** lift each adapter's lookup
+      into `find_posted_bill` and set `supports_bill_lookup`. **Trigger:** a
+      bill found in one of those ERPs for an invoice we show as failed, or the
+      next change to that adapter's push.
 
 ### Surfaced by reviewing the QuickBooks live-test fixes (2026-10-19, decisions §284–§287)
 

@@ -2533,10 +2533,32 @@ holder of `payment.void` can name that bill and void it:
 - `GET /api/invoices/{id}/erp-orphan-bill` runs `ErpAdapter.find_posted_bill`,
   the push's own pre-create idempotency match offered on its own and read-only
   (GETs / queries only). Offered by `supports_bill_lookup` on the class: the
-  **mock** (bills it posted this process, by correlation id) and **QuickBooks
-  Online** (`_find_existing`: DocNumber + vendor + our `PrivateNote` marker).
-  Every other adapter answers 409 `erp_lookup_unsupported`; their lookups live
-  inside `post_invoice` with client state and are wired one at a time. Only an
+  **mock** (bills it posted this process, by correlation id), **QuickBooks
+  Online** (`_find_existing`: DocNumber + vendor + our `PrivateNote` marker),
+  **NetSuite** (`GET vendorBill/eid:<correlation id>`, then the currency's ISO
+  code and, for a bill Paid In Full, what was applied to it — the reads
+  `get_invoice_status` makes; not gated on the §541 status-sync opt-in, since
+  it makes no status-sync call) and **Xero** (`_matching_bills`: a live ACCPAY
+  bill on our contact with our invoice number; two on one key, a bill on
+  another contact or at a status the filter did not ask for, raise) (decisions
+  §566). Every other adapter answers 409 `erp_lookup_unsupported`; their
+  lookups live inside `post_invoice` with client state and are wired one at a
+  time.
+- **A key that is not unique to one invoice is checked against the tenant.**
+  The mock, QuickBooks and NetSuite keys carry the invoice's correlation id
+  (`invoices.correlation_id` is unique), so a found bill is this invoice's
+  push or nothing. Xero's carries nothing of ours (an ACCPAY bill has no field
+  for it), so its class sets `bill_lookup_key_shared` and
+  `erp_bill_void.shared_lookup_keys` refuses the lookup — and the orphan void,
+  whose payload is built by the same `lookup_payload` — with 409
+  `erp_lookup_unsupported` while another invoice in the tenant carries the
+  same number (trimmed, case-folded) from the same vendor or any vendor linked
+  to the same ERP contact, at any status. The served verdict
+  (`erp_orphan_lookup_refusal`) reads the same check, so the page never offers
+  a lookup the server refuses. What it cannot rule out is a bill someone keyed
+  by hand in Xero for the same supplier invoice: the push already adopts such a
+  bill at the approved total, and the lookup shows its number, total and status
+  for the person voiding to judge. Only an
   invoice at `failed`, naming no bill, whose state is `possibly_posted` is
   looked up (409 `erp_lookup_not_failed`). A lookup that cannot finish is 502
   `erp_lookup_failed`, never "none". Answers `{found, bill: {erp_document_id,

@@ -29431,3 +29431,82 @@ unaffected card still cancels); `test_card_money_path_regression.py` (the
 return); `test_qbo_status_sync_adapter.py` (a re-sync with a changed amount
 posts no second BillPayment); `test_provider_credentials.py` (the `whsec_`
 refusal and the per-provider acceptance).
+
+## 566. Xero and NetSuite offer the orphan-bill lookup; a lookup key not unique to one invoice is refused while another invoice shares it (§556 follow-up, round 48)
+
+**Context.** §556's lookup (`ErpAdapter.find_posted_bill`) was wired for the
+mock and QuickBooks only; every other ERP answered `erp_lookup_unsupported`.
+The brief's bar: reuse each adapter's own push-idempotency match, read-only,
+and never name another invoice's bill.
+
+**Decision.**
+
+- **NetSuite** offers it: `GET vendorBill/eid:<correlation id>` (the push's
+  `_find_by_external_id`, whose 404 `NONEXISTENT_ID` is the only "none"; any
+  other answer, a 200 naming another externalId or no id, or a config NetSuite
+  cannot take raises). The bill is then described from the record (`id`,
+  `tranId`, `total`), the currency's ISO code (`_currency_code`, SuiteQL) and
+  the status `get_invoice_status` would read (shared as `_status_of`). A
+  currency or applied-payments read that fails leaves the currency None / the
+  status `unknown` on a bill that WAS found — never a miss. The key is the
+  invoice's correlation id (`invoices.correlation_id` is unique) and NetSuite
+  keeps an externalId unique per record type, so a found bill is this
+  invoice's push or nothing. It makes no status-sync call, so it is **not**
+  gated on §541's per-tenant opt-in.
+- **Xero** offers it: the push's `GET Invoices?InvoiceNumbers&ContactIDs&
+  Statuses=DRAFT,SUBMITTED,AUTHORISED,PAID&where=Type=="ACCPAY"`, now
+  `_matching_bills` (the push still takes the first, unchanged). The lookup
+  raises on a non-200, on more than one bill on the key (which is ours is not
+  knowable), and on a bill with no `InvoiceID`, on a contact other than ours,
+  or at a status the filter did not ask for (Xero ignored the filter or the
+  shape is unknown). Voided / deleted bills are filtered out, so they read as
+  none — as they do for the push.
+- **A key that is not unique to one invoice is checked against the tenant.**
+  Xero's key is supplier + supplier invoice number: an ACCPAY bill has no field
+  for our correlation id (`Reference` is ACCREC-only, as the adapter already
+  states). So `XeroAdapter.bill_lookup_key_shared = True`, and
+  `erp_bill_void.shared_lookup_keys` refuses the lookup with 409
+  `erp_lookup_unsupported` while another invoice in the tenant carries the
+  same number (trimmed, case-folded, so wider than Xero's exact match) from
+  the same vendor or any vendor linked to the same ERP contact, at any status.
+  The served verdict (`erp_orphan_lookup_refusal` on `GET /review-actions` and
+  the duplicate / fraud rows) takes it as `key_shared`, so §560's parity holds;
+  `lookup_payload` raises it too, so the orphan void cannot name that bill by
+  a client-supplied id either. The existing code is reused rather than a new
+  one: "can't be searched for this bill from FeohLedger, look for it in the
+  ERP" is exactly the answer, and a new code would need six locales.
+  *Rejected: writing a marker of ours onto Xero bills (e.g. `Url`)* — it
+  changes the push for every tenant, leaves every bill already posted without
+  it, and is not verifiable here against the real API.
+- **Residual, stated rather than hidden.** A bill someone keyed by hand in Xero
+  for the same supplier invoice matches the key. The push already adopts such
+  a bill at the approved total; the lookup shows its number, total and status,
+  and the void needs `payment.void` and a reason.
+- **The contract guard knows capability-gated methods.**
+  `test_adapter_contract_integrity.test_no_undeclared_skeleton_method` had
+  been red since §556: the base `find_posted_bill` raises
+  `NotImplementedError`, so every adapter without a lookup looked like a
+  skeleton. `CAPABILITY_GATED_METHODS` exempts it on an adapter that does not
+  set `supports_bill_lookup` (callers read the flag first); one that sets the
+  flag and cannot return is still flagged.
+
+**Not verified against the real APIs.** The Xero response fields
+`Contact.ContactID` (read back, not only sent) and the NetSuite `tranId` on
+the read record are relied on beyond what the adapters read before; both are
+what the fake ERP returns and what the push sends, but neither was checked
+against a live account or re-read in the provider docs this round (the Xero
+reference page, https://developer.xero.com/documentation/api/accounting/invoices,
+did not render for an automated fetch on 2026-11-25). The live Xero contract
+test (`pnpm test:erp:xero-live`) is the place to pin them.
+
+**Tests.** `test_erp_xero_adapter.py` (found / none / two on one key / every
+unreadable shape raises / an unlinked payload raises before any call; GET
+only, against `tools/fake-erp` in-process), `test_erp_netsuite_adapter.py`
+(found / none / another invoice's bill never named / failure shapes / bad
+config; no write method), `test_erp_orphan_bill.py` (Xero and NetSuite offer
+it, only Xero's key is shared, the served verdict with `key_shared`, the
+shared-key refusal on lookup, verdict and void for the same vendor, the same
+ERP contact and another status, and a lookup that runs when nothing is
+shared), `test_adapter_contract_integrity.py`. The in-process fake loader
+moved to `tests/fake_erp_module.py` so both adapter suites use it; no fake-erp
+route was needed.
