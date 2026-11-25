@@ -32,10 +32,10 @@
 
 	// $derived so the column headers re-render when the locale changes.
 	let COLUMNS = $derived([
-		{ label: m('audit.col.when') },
+		{ label: m('audit.col.when'), class: 'col-when' },
 		{ label: m('audit.col.action') },
-		{ label: m('audit.col.entity') },
-		{ label: m('audit.col.actor') },
+		{ label: m('audit.col.entity'), class: 'col-entity' },
+		{ label: m('audit.col.actor'), class: 'col-actor' },
 		{ label: m('audit.col.changes') }
 	]);
 
@@ -321,11 +321,21 @@
 	{/if}
 
 	<!-- A failed run is not an empty trail: "no entries" under the error would
-	     tell an auditor the period had no activity. -->
+	     tell an auditor the period had no activity. Before the first run the
+	     row says a query has not been run, which is not a claim about the trail.
+
+	     The trail is the result of a run, and the verification panel sits
+	     below it, so the trail's region has a reserved height and scrolls
+	     under a sticky header: a run returning 400 rows used to push the panel
+	     down by all of them as the response landed. -->
+	<div class="audit-trail">
 	<DataTable
+		fixed
+		stickyHeader
 		columns={COLUMNS}
-		isEmpty={ran && !loading && !queryError && entries.length === 0}
-		empty={m('audit.empty')}
+		isEmpty={!ran || (!loading && !queryError && entries.length === 0)}
+		empty={ran ? m('audit.empty') : m('audit.notRun')}
+		ariaLabel={m('audit.title')}
 	>
 		{#snippet body()}
 			{#each entries as entry (entry.id)}
@@ -365,6 +375,7 @@
 			{/each}
 		{/snippet}
 	</DataTable>
+	</div>
 
 	<!--
 		Approval-signature verification — the SOX non-repudiation control test.
@@ -616,6 +627,29 @@
 	.mode-toggle button.active {
 		background: var(--accent-strong);
 		color: #fff;
+	}
+
+	/* The trail is `fixed` (DataTable's `fixed`), so its columns hold from
+	   first paint instead of re-flowing against each run's rows. Widths are
+	   sized to the six locales, measured with the header's own font metrics
+	   (frontend/docs/ui-patterns.md § Data tables): pt-BR "QUANDO" and
+	   "ENTIDADE", de "AKTEUR" — and to the cells, which wrap: a seconds
+	   timestamp, an entity type with its short id, an actor's name. Action
+	   and Changes take the rest; the `min-width` keeps them readable, past
+	   which the table scrolls inside its region. */
+	.audit-trail {
+		min-width: 0;
+	}
+	.audit-trail :global(.grid-container) {
+		height: 28rem;
+		overflow-y: auto;
+	}
+	.audit-trail :global(table) { min-width: 1000px; }
+	.audit-trail :global(th.col-when) { width: 190px; }
+	.audit-trail :global(th.col-entity) { width: 200px; }
+	.audit-trail :global(th.col-actor) { width: 200px; }
+	.audit-trail :global(td) {
+		overflow-wrap: anywhere;
 	}
 
 	.audit-error {

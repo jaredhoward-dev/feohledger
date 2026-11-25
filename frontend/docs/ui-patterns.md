@@ -65,6 +65,13 @@ So:
 - **A chip row whose roster comes from a response holds its place while that
   response is pending** — render it with just its "All" chip until the roster
   lands (`/exceptions`' type row).
+- **A table that grows above another section gets a reserved height.** When
+  a data-sized table is not the last thing on the page, its rows landing push
+  everything below it down. Give its scroll region a fixed `height` (about
+  five rows) with `overflow-y: auto` and DataTable's `stickyHeader`, under a
+  page wrapper: `/admin/webhooks`' subscriptions (above the deliveries) and
+  the `/audit` trail (above signature verification). The last table on a
+  page needs none — nothing below it moves.
 - **Don't put data-sized controls inline beside fixed ones on a wrapping row.**
   `/invoices`' status chips depend on the active workflow and their width on
   the tallies; inline beside the search box the row fitted on one line at
@@ -256,7 +263,8 @@ grid page instead of hand-rolling `<div class="grid-container"><table>`:
   screening queue, bank changes, /requisitions, /intake, /catalogs, /budgets,
   /recurring, /vendor-statements, /positive-pay, /experiments, /workflows,
   the users directory, /admin/entities, /admin/api-keys,
-  /admin/access-review and both /goods-receipts tabs are converted,
+  /admin/access-review, /admin/webhooks (both tables), the /audit trail and
+  both /goods-receipts tabs are converted,
   /admin/entities, /admin/api-keys, /admin/access-review and the
   inspections tab by mounting the table from first paint with DataTable's own loading row rather than swapping a
   separate loading block for it. Size each fixed column to the widest string

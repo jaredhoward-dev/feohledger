@@ -3945,6 +3945,7 @@ export const messages = {
 	'audit.denied': 'No tiene permiso para ver el registro de auditoría. Esta consola está limitada a administradores y directores financieros.',
 	'audit.downloadCsv': 'Descargar CSV',
 	'audit.empty': 'No hay entradas de auditoría para esta consulta.',
+	'audit.notRun': 'Ejecute una consulta para ver el registro de auditoría.',
 	'audit.error.downloadFailed': 'La descarga falló.',
 	'audit.error.enterInvoiceId': 'Introduzca un ID de factura.',
 	'audit.error.queryFailed': 'La consulta falló.',

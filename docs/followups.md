@@ -1343,31 +1343,31 @@ covered the one page or shape it was written for. #646 / §318 closed the
 QuickBooks half with recorded shapes and a live check; these are the
 user-visible halves still open.
 
-- [ ] **(c) The layout-shift budget covers twenty-seven pages.**
+- [ ] **(c) The layout-shift budget covers twenty-nine pages.**
       `tests-e2e/reactivity/layout-stability.spec.ts` is table-driven
       (`LIST_PAGES`, plus `TAB_PAGES` for a second tab's table): the dashboard
-      and twenty-six list pages are opened with every API response delayed,
-      held to a cumulative layout shift under 0.1, and the twenty-three
+      and twenty-eight list pages are opened with every API response delayed,
+      held to a cumulative layout shift under 0.1, and the twenty-five
       `fixed` tables (both /goods-receipts tabs included) also have their
       header columns' x positions checked. Still in `NOT_LIST_PAGES`, each
-      with its reason: /audit (the signature-verification panel sits below the
-      trail and moves down by the rows a run returns), /admin?tab=roles (the
-      system-roles table has no loading row and grows to four rows, pushing
-      the custom-roles section down), /admin/webhooks (the subscriptions
-      table replaces a loading line and pushes the deliveries section down),
-      /admin/partner (the e2e tenant is not a partner, so the children table
-      never renders), /adaptive, plus /discounts (warning banners and the
-      optimizer panel mount above the offers table once the dashboard lands)
-      and /tax (a loading placeholder is replaced by the box-allocation panel
-      and the table). **Durable fix:** the /gl-accounts pattern (`fixed`,
-      locale-sized `<th>` widths under a page wrapper, the table mounted from
-      first paint with DataTable's loading row) is what moved /goods-receipts
-      across; reserve the fixed four system-role rows on Roles; move the stacked section
-      below a growing table (or give the upper table a reserved height) on
-      /audit and /admin/webhooks; a partner fixture tenant for /admin/partner;
-      reserve the late panels' space on /discounts and /tax; then move each
-      into `LIST_PAGES`. **Trigger:** the next polish pass on any of those
-      pages.
+      with its reason: /admin?tab=roles (the system-roles table has no
+      loading row and grows to four rows, pushing the custom-roles section
+      down), /admin/partner (the e2e tenant is not a partner, so the children
+      table never renders), /adaptive, /discounts (warning banners mount
+      above the offers table once the dashboard lands, and the capture-rate
+      card's reason line grows the KPI row) and /tax (a loading placeholder
+      is replaced by the box-allocation panel and the table, and the toolbar's
+      chips mount with the report). **Durable fix:** the /gl-accounts pattern
+      (`fixed`, locale-sized `<th>` widths under a page wrapper, the table
+      mounted from first paint with DataTable's loading row) is what moved
+      /goods-receipts, /audit and /admin/webhooks across (the last two also
+      reserve the upper table's height, scrolling under a sticky header);
+      reserve the fixed four system-role rows on Roles; a partner fixture
+      tenant for /admin/partner; on /tax mount the toolbar and table from
+      first paint and move the box-allocation panel below the table; on
+      /discounts reserve the banners' slot and the KPI cards' reason line;
+      then move each into `LIST_PAGES`. **Trigger:** the next polish pass on
+      any of those pages.
 - [ ] **(c) No scripted "first customer" release rehearsal.** The 2026-10-22
       walkthrough — sign up, connect QuickBooks, sync the chart and vendors,
       enter an invoice, approve it, push it, pay the bill in QuickBooks, watch

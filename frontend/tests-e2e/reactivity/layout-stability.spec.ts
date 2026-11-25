@@ -239,7 +239,9 @@ const LIST_PAGES: ListPage[] = [
 	{ href: '/admin?tab=users', fixedTable: '.users-table table' },
 	{ href: '/admin/entities', fixedTable: '.entities-table table' },
 	{ href: '/admin/api-keys', fixedTable: '.keys-table table' },
-	{ href: '/admin/access-review', fixedTable: '.review-table table' }
+	{ href: '/admin/access-review', fixedTable: '.review-table table' },
+	{ href: '/admin/webhooks', fixedTable: '.subs-table table' },
+	{ href: '/audit', fixedTable: '.audit-trail table' }
 ];
 
 /**
@@ -281,7 +283,9 @@ const LOCALE_SIZED = new Set([
 	'/admin?tab=users',
 	'/admin/entities',
 	'/admin/api-keys',
-	'/admin/access-review'
+	'/admin/access-review',
+	'/admin/webhooks',
+	'/audit'
 ]);
 
 /**
@@ -297,7 +301,12 @@ const LOCALE_SIZED_VIEWS: (ListPage & { fixedTable: string; label: string })[] =
 	{ href: '/payments?tab=history', fixedTable: '.pay-history table', label: '/payments history' },
 	{ href: '/payments?tab=runs', fixedTable: '.pay-runs table', label: '/payments runs' },
 	{ href: '/payments?tab=cards', fixedTable: '.pay-rebates table', label: '/payments rebates' },
-	{ href: '/payments?tab=cards', fixedTable: '.pay-cards table', label: '/payments cards' }
+	{ href: '/payments?tab=cards', fixedTable: '.pay-cards table', label: '/payments cards' },
+	{
+		href: '/admin/webhooks',
+		fixedTable: '.deliveries-table table',
+		label: '/admin/webhooks deliveries'
+	}
 ];
 
 /**
@@ -311,14 +320,12 @@ const OVERFLOW_LOCALES = ['de', 'es', 'fr', 'pt-BR', 'ja'] as const;
 /**
  * Sidebar destinations deliberately outside the budget, each with its reason.
  * "Unmeasured list page" entries are list pages the budget does not cover yet
- * (docs/followups.md § "The layout-shift budget covers twenty-seven pages"): moving
+ * (docs/followups.md § "The layout-shift budget covers twenty-nine pages"): moving
  * one into `LIST_PAGES` is the whole change once its reason is fixed.
  */
 const NOT_LIST_PAGES: Record<string, string> = {
 	'/discounts':
 		'Unmeasured: the warning banners and the optimizer panel above the offers table mount once the dashboard lands — see docs/followups.md',
-	'/audit':
-		'Unmeasured: the trail is a query result, and the signature-verification panel below the table moves down by the height of the rows a run returns — see docs/followups.md',
 	'/adaptive': 'Unmeasured list page — see docs/followups.md',
 	'/tax':
 		'Unmeasured: a loading placeholder stands where the box-allocation panel and the table mount once the report lands — see docs/followups.md',
@@ -326,8 +333,6 @@ const NOT_LIST_PAGES: Record<string, string> = {
 		'Unmeasured: the system-roles table shows no loading row and grows from its empty row to the four system roles, pushing the custom-roles section down — see docs/followups.md',
 	'/admin/partner':
 		'Unmeasured: the e2e tenant is not a partner, so the page settles on its "not a partner" state and the children table never renders — see docs/followups.md',
-	'/admin/webhooks':
-		'Unmeasured: the subscriptions table replaces a loading line and grows by its rows, pushing the deliveries section down — see docs/followups.md',
 	'/assistant': 'A conversation, not a list',
 	'/cfo': 'Charts and KPI cards, not a list',
 	'/cash-flow': 'A planning workspace, not a list',
@@ -671,6 +676,38 @@ const CARD_PER_STATUS = CARD_STATUSES.map((status, i) => ({
 	invoice_number: `INV-LAYOUT-${i}`
 }));
 
+/** /admin/webhooks' widest rows: a paused subscription (es "INACTIVO") whose
+ *  rotation overlap is live, so the secret cell holds its pill (fr "Secret
+ *  précédent jusqu’à …", which wraps in its column), and one delivery per
+ *  status (de "FEHLGESCHLAGEN"), the failed and dead ones carrying the
+ *  Redeliver button. The e2e seed holds no webhook, so both lists are
+ *  answered with these rows. */
+const WEBHOOK_SUBS = [
+	{
+		id: '00000000-0000-4000-8000-000000000361',
+		name: 'Layout Fixture ERP',
+		target_url: 'https://hooks.example.com/layout-fixture/receiver',
+		event_types: ['invoice.approved', 'payment.sent'],
+		secret_prefix: 'whsec_lay',
+		active: false,
+		created_at: '2026-11-01T09:00:00Z',
+		updated_at: '2026-11-01T09:00:00Z',
+		previous_secret_expires_at: '2099-12-31T23:00:00Z'
+	}
+];
+const WEBHOOK_DELIVERIES = ['pending', 'delivered', 'failed', 'dead'].map((status, i) => ({
+	id: `00000000-0000-4000-8000-00000000037${i}`,
+	subscription_id: WEBHOOK_SUBS[0].id,
+	event_id: `00000000-0000-4000-8000-00000000038${i}`,
+	event_type: 'invoice.approved',
+	status,
+	attempt_count: 3,
+	response_code: 500,
+	next_attempt_at: null,
+	last_attempt_at: '2026-11-01T09:00:00Z',
+	created_at: '2026-11-01T09:00:00Z'
+}));
+
 test.describe('fixed list tables fit their longest locale', () => {
 	for (const locale of OVERFLOW_LOCALES) {
 		const tables = [
@@ -716,6 +753,22 @@ test.describe('fixed list tables fit their longest locale', () => {
 								: route.fallback()
 					);
 				}
+				if (href === '/admin/webhooks') {
+					await page.route(
+						(url) => url.pathname === '/api/webhooks',
+						(route) =>
+							route.request().method() === 'GET'
+								? route.fulfill({ json: WEBHOOK_SUBS })
+								: route.fallback()
+					);
+					await page.route(
+						(url) => url.pathname === '/api/webhooks/deliveries',
+						(route) =>
+							route.request().method() === 'GET'
+								? route.fulfill({ json: WEBHOOK_DELIVERIES })
+								: route.fallback()
+					);
+				}
 				const widest = WIDEST_ROW[href];
 				if (widest) await patchFirstRow(page, widest.pathname, widest.patch);
 				await page.addInitScript((lc) => localStorage.setItem('feoh_locale', lc), locale);
@@ -733,6 +786,10 @@ test.describe('fixed list tables fit their longest locale', () => {
 				if (widest) await expect(table.locator(widest.badge).first()).toBeVisible();
 				if (href === '/goods-receipts?tab=inspections') {
 					await expect(table.locator('.badge.partial')).toBeVisible();
+				}
+				if (href === '/admin/webhooks') {
+					await expect(page.getByTestId('overlap-pill')).toBeVisible();
+					await expect(page.locator('.deliveries-table .badge.dead')).toBeVisible();
 				}
 				if (label === '/payments cards') {
 					for (const status of CARD_STATUSES) {

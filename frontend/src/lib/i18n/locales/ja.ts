@@ -3884,6 +3884,7 @@ export const messages = {
 	'audit.denied': '監査証跡を表示する権限がありません。このコンソールは管理者とCFOに限定されています。',
 	'audit.downloadCsv': 'CSVをダウンロード',
 	'audit.empty': 'このクエリに該当する監査エントリはありません。',
+	'audit.notRun': '監査証跡を表示するには、クエリを実行してください。',
 	'audit.error.downloadFailed': 'ダウンロードに失敗しました。',
 	'audit.error.enterInvoiceId': '請求書IDを入力してください。',
 	'audit.error.queryFailed': 'クエリに失敗しました。',
