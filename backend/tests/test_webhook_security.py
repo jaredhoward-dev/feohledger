@@ -280,6 +280,10 @@ def _card_row(provider_card_id: str):
         # the mutation is applied in memory but never committed, so the test
         # sees a "charged" card and no commit.
         currency="USD",
+        # `VirtualCard.payment_id` is a nullable column every real row carries;
+        # settlement reads it to write the charge onto a run's card leg
+        # (decisions §543). None: a `/cards/generate` card, no run payment.
+        payment_id=None,
     )
 
 
