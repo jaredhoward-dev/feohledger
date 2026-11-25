@@ -80,8 +80,8 @@ ACTION_EXCEPTION_ERP_BILL_VOID_ORPHANED = "exception.erp_bill_void_orphaned"
 #: when the invoice is payable here (decisions §550).
 ERP_REPORT_VOID_ORPHANED = "void_orphaned"
 
-#: Bounds, in seconds, on the two ERP calls made while the invoice, its flag and
-#: its workflow instance are row-locked (decisions §542). Each adapter's HTTP
+#: Bounds, in seconds, on each ERP call of step 2 (decisions §542; since §545
+#: no row lock is held across them, and §550 bounds the step as a whole). Each adapter's HTTP
 #: client already times out per request (15–30 s); these bound the whole call,
 #: which may make several requests (a token refresh, a read before a delete). A
 #: read that runs out is ``erp_void_failed`` (nothing was written); a void that
