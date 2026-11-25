@@ -710,6 +710,7 @@ async def bulk_contract_status(
     db: AsyncSession = Depends(get_tenant_db),
     user: User = Depends(require_roles(ROLE_ADMIN, ROLE_AP_MANAGER)),
     org_id: uuid.UUID = Depends(get_org_id),
+    entity_id: uuid.UUID | None = Depends(get_entity_id),
 ):
     """Bulk activate / terminate / cancel over a hand-picked set of
     contracts — the bulk counterpart of the single-row lifecycle endpoints.
@@ -733,6 +734,10 @@ async def bulk_contract_status(
             continue
 
         try:
+            # The single-row endpoints' entity check, per row: a contract
+            # outside the caller's entity selector reads exactly as a missing
+            # one ("Contract not found"), as it does at `POST /{id}/activate`.
+            await ensure_in_entity_scope(db, Contract, cid, entity_id, detail="Contract not found")
             await _transition(body.action, cid, db, user, org_id)
         except HTTPException as exc:
             skipped.append(

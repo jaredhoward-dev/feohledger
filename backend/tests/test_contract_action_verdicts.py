@@ -205,3 +205,31 @@ async def test_bulk_status_skips_with_the_gates_sentence(realdb):
     assert body["skipped"] == [
         {"id": str(contract_id), "reason": "Cannot activate a contract in 'terminated' status"}
     ]
+
+
+@pytest.mark.asyncio
+async def test_bulk_status_skips_a_contract_outside_the_entity_selector(realdb):
+    """`bulk/status` applies the single-row endpoints' entity check per row:
+    a contract in another entity is skipped as "Contract not found" and left
+    unchanged, exactly as `POST /{id}/activate` answers it."""
+    from tests.entity_scope_probe import two_entities
+
+    contract_id = await _contract(realdb, status="draft")  # in the default entity
+    async with realdb.client(key=TENANT, role="admin") as c:
+        _default_id, other_id = await two_entities(c, slug=f"cv-{uuid.uuid4().hex[:8]}")
+        single = await c.post(
+            f"/api/contracts/{contract_id}/activate", headers={"X-Entity-ID": other_id}
+        )
+        resp = await c.post(
+            "/api/contracts/bulk/status",
+            json={"ids": [str(contract_id)], "action": "activate"},
+            headers={"X-Entity-ID": other_id},
+        )
+    assert single.status_code == 404
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {
+        "updated": 0,
+        "skipped": [{"id": str(contract_id), "reason": single.json()["detail"]}],
+    }
+    async with realdb.sessionmaker(TENANT)() as s:
+        assert (await s.get(Contract, contract_id)).status == ContractStatus.draft
