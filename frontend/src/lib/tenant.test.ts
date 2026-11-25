@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
+	apexPageUrl,
 	classifyHost,
 	currentHostname,
 	parsePlatformDomains,
@@ -206,5 +207,24 @@ describe('getTenantStorageKey (via tenantStorageKeyForHost)', () => {
 	it('has no key on the platform apex or with no hostname', () => {
 		expect(tenantStorageKeyForHost('feohledger.com', PROD_DOMAINS)).toBeNull();
 		expect(tenantStorageKeyForHost(null, PROD_DOMAINS)).toBeNull();
+	});
+});
+
+describe('apexPageUrl', () => {
+	it('builds a page on the declared apex', () => {
+		expect(apexPageUrl('https://feohledger.com', '/find-workspace#email')).toBe(
+			'https://feohledger.com/find-workspace#email'
+		);
+		expect(apexPageUrl('http://localhost:7777/', 'find-workspace')).toBe(
+			'http://localhost:7777/find-workspace'
+		);
+	});
+
+	it('declines rather than guessing when no usable site URL is declared', () => {
+		expect(apexPageUrl('', '/find-workspace')).toBeNull();
+		expect(apexPageUrl(undefined, '/find-workspace')).toBeNull();
+		expect(apexPageUrl('feohledger.com', '/find-workspace')).toBeNull();
+		expect(apexPageUrl('javascript:alert(1)', '/x')).toBeNull();
+		expect(apexPageUrl('https://feohledger.com/app', '/x')).toBeNull();
 	});
 });

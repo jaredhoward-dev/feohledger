@@ -3661,6 +3661,7 @@ export const en = {
 	'auth.login.ssoOnly': 'This workspace uses single sign-on.',
 	'auth.login.or': 'or',
 	'auth.login.signInWith': 'Sign in with {provider}',
+	'auth.login.findWorkspace': "Not sure this is your workspace? Email me my workspace address",
 	'auth.login.forgotPassword': 'Forgot password?',
 	'auth.login.signedOutOtherWorkspace': "You were signed out because your session belonged to a different workspace. Sign in here, or on your own workspace's page.",
 	'auth.login.workspaceClosed': "This workspace has been closed and its accounts deleted. Their email addresses can now be used in another workspace.",

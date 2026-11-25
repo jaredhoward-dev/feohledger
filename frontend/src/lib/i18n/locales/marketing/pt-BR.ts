@@ -136,5 +136,16 @@ export const messages = {
 	'marketing.findWorkspace.noWorkspace': 'Novo no {product}? {create}',
 	'marketing.findWorkspace.panelHeading': 'Por que pedimos o endereço',
 	'marketing.findWorkspace.panelBody':
-		'Cada empresa tem seu próprio espaço de trabalho, com login próprio. Nunca procuramos um espaço de trabalho a partir de um e-mail — assim, ninguém consegue usar esta página para descobrir onde alguém trabalha.'
+		"Cada empresa tem seu próprio espaço de trabalho, com login próprio. Esta página nunca mostra a qual espaço de trabalho um e-mail pertence: se você esqueceu o seu, nós o enviamos para esse endereço — assim, ninguém consegue usar esta página para descobrir onde alguém trabalha.",
+	'marketing.findWorkspace.lookup.heading': "Esqueceu o endereço do seu espaço de trabalho?",
+	'marketing.findWorkspace.lookup.intro': "Digite o e-mail com que você entra. Se ele tiver uma conta, enviaremos a ele um link para a página de login do espaço de trabalho.",
+	'marketing.findWorkspace.lookup.label': "E-mail",
+	'marketing.findWorkspace.lookup.submit': "Enviar o endereço do meu espaço de trabalho",
+	'marketing.findWorkspace.lookup.sending': "Enviando…",
+	'marketing.findWorkspace.lookup.invalid': "Digite um e-mail válido.",
+	'marketing.findWorkspace.lookup.failed': "Não conseguimos enviar. Verifique sua conexão e tente novamente.",
+	'marketing.findWorkspace.lookup.sentHeading': "Verifique seu e-mail",
+	'marketing.findWorkspace.lookup.sent': "Se {email} tiver uma conta, enviamos a ele um link para a página de login do espaço de trabalho. Pode levar alguns minutos — verifique também a pasta de spam.",
+	'marketing.findWorkspace.lookup.again': "Usar outro endereço",
+	'marketing.footer.findWorkspace': "Esqueceu seu espaço de trabalho?"
 } satisfies MarketingMessages;

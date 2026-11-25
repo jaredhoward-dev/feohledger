@@ -3419,6 +3419,7 @@ export const messages = {
 	'auth.login.ssoOnly': 'このワークスペースはシングルサインオン（SSO）を使用します。',
 	'auth.login.or': 'または',
 	'auth.login.signInWith': '{provider}でサインイン',
+	'auth.login.findWorkspace': "このワークスペースで合っているか分かりませんか？アドレスをメールで受け取る",
 	'auth.login.forgotPassword': 'パスワードをお忘れですか？',
 	'auth.login.signedOutOtherWorkspace': "セッションが別のワークスペースのものだったため、サインアウトされました。ここで、またはご自身のワークスペースのページでサインインしてください。",
 	'auth.login.workspaceClosed': "このワークスペースは閉鎖され、そのアカウントは削除されました。それらのメールアドレスは別のワークスペースで使用できるようになりました。",

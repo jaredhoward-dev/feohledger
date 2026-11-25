@@ -11,7 +11,7 @@
 	import { emailFromQuery } from '#lib/utils/prefillEmail.ts';
 	import { api, ApiError } from '#lib/api.ts';
 	import { loginNoticeKey, ownWorkspaceSignInUrl } from '#lib/api/sessionRejection.ts';
-	import { getApiBase, getTenantSlug, hasTenantContext } from '#lib/tenant.ts';
+	import { apexPage, getApiBase, getTenantSlug, hasTenantContext } from '#lib/tenant.ts';
 	import { m } from '#lib/i18n/store.svelte.ts';
 	import type { MessageKey } from '#lib/i18n/messages.ts';
 	import { SSO_PROVIDER_LABELS } from '#lib/types/ssoSettings.ts';
@@ -55,6 +55,11 @@
 	// `null` on the platform apex, which has no workspace. Read at init (the
 	// app is static, there is no server render), so it is there on first paint.
 	const workspaceHost = hasTenantContext() ? window.location.host : null;
+
+	// A failed sign-in may be the wrong workspace altogether: the apex's
+	// "email me my workspace address" form (decisions §518). `null` when the
+	// build declares no apex.
+	const lookupUrl = apexPage('/find-workspace#email');
 
 	// The page the user was sent here from (the auth wall, an ended session),
 	// already validated as a same-origin path; `null` means the dashboard.
@@ -211,6 +216,8 @@
 						<a class="own-workspace-link" href={ownWorkspaceUrl}>
 							{m('auth.login.goToOwnWorkspace')}
 						</a>
+					{:else if lookupUrl}
+						<a class="own-workspace-link" href={lookupUrl}>{m('auth.login.findWorkspace')}</a>
 					{/if}
 				</div>
 			{/if}

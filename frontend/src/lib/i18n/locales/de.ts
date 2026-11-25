@@ -3481,6 +3481,7 @@ export const messages = {
 	'auth.login.ssoOnly': 'Dieser Arbeitsbereich verwendet Single Sign-on.',
 	'auth.login.or': 'oder',
 	'auth.login.signInWith': 'Anmelden mit {provider}',
+	'auth.login.findWorkspace': "Nicht sicher, ob das Ihr Arbeitsbereich ist? Adresse per E-Mail anfordern",
 	'auth.login.forgotPassword': 'Passwort vergessen?',
 	'auth.login.signedOutOtherWorkspace': "Sie wurden abgemeldet, weil Ihre Sitzung zu einem anderen Workspace gehörte. Melden Sie sich hier an oder auf der Seite Ihres eigenen Workspace.",
 	'auth.login.workspaceClosed': "Dieser Workspace wurde geschlossen und seine Konten gelöscht. Ihre E-Mail-Adressen können jetzt in einem anderen Workspace verwendet werden.",

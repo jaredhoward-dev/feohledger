@@ -360,6 +360,7 @@
 			</div>
 			<nav class="footer-links" aria-label={m('marketing.footer.label')}>
 				<a href="/find-workspace">{m('marketing.nav.signIn')}</a>
+				<a href="/find-workspace#email">{m('marketing.footer.findWorkspace')}</a>
 				<a href="/signup">{m('marketing.cta.create')}</a>
 				<a href="#features">{m('marketing.nav.features')}</a>
 				<a href="#how">{m('marketing.nav.how')}</a>
