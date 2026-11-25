@@ -80,7 +80,7 @@
 		disabled={submitting}
 	>
 		{#each pending.companies as company, i (company.id)}
-			<label class="option" class:selected={chosen === company.id}>
+			<label class="radio-card">
 				<input
 					id="{uid}-{i}"
 					type="radio"
@@ -144,6 +144,8 @@
 		line-height: 1.5;
 	}
 
+	/* Each company is a shared `.radio-card` (app.css): row layout,
+	   selected ring, focus ring on the card, 24px minimum target. */
 	fieldset {
 		border: none;
 		margin: 0;
@@ -151,27 +153,6 @@
 		display: flex;
 		flex-direction: column;
 		gap: 8px;
-	}
-
-	.option {
-		display: flex;
-		align-items: flex-start;
-		gap: 10px;
-		padding: 10px 12px;
-		border: 1px solid var(--border);
-		border-radius: 6px;
-		cursor: pointer;
-		/* 24px minimum target (WCAG 2.5.8): the whole row is the label. */
-		min-height: 24px;
-	}
-
-	.option.selected {
-		border-color: var(--accent);
-	}
-
-	.option input {
-		margin: 2px 0 0;
-		flex: none;
 	}
 
 	.option-text {
