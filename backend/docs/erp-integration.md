@@ -768,9 +768,23 @@ live-claim refusals and §386's recorded-cash rule apply unchanged.
   left under Merge.dev is not swept). A credentials-based ERP has no
   `settings.erp.oauth` block, so its mark lives in
   `settings.erp_status_sync = {realm, through}` (written under the org row
-  lock, read only while `realm` is the configured account's). The admin's
-  on-request pass (`POST /api/organization/erp/oauth/status-sync`) is still
-  OAuth-only, and NetSuite has no webhook; the sweep is its only channel.
+  lock, read only while `realm` is the configured account's). NetSuite has
+  no webhook, so the sweep and the admin's on-request pass are its channels.
+- **On-request pass (decisions §547).** `POST
+  /api/organization/erp/oauth/status-sync` is not OAuth-only despite its
+  prefix: `status_sync_now_refusal` selects the tenant as the sweep does, by
+  the adapter `resolve_adapter_key` names. An OAuth ERP is still judged by
+  its connection block (`status_sync_unsupported` for a block of an ERP that
+  does not report back, `status_sync_needs_reconnect`); an ERP reached with
+  stored credentials has none, so only `reports_status_back` (NetSuite's
+  opt-in) and the deployment switch decide. Every other rule is the
+  endpoint's own (admin, audited first, four an hour, one at a time, 202),
+  and the audit rows' `provider` is the configured `settings.erp.type` when
+  there is no connection block. Generic over the capability: another
+  stored-credential adapter that turns `supports_status_sync` on needs no
+  change here. The ERP panel's "Check payments now" button is still drawn
+  only for an OAuth connection, so for NetSuite the endpoint is reached
+  through the API.
 - **Not verified live (#654).** The `vendorPayment` body and `eid:` /
   `DELETE` on it, the `NextTransactionLineLink` join and its `foreignamount`
   sign, `transaction.lastmodifieddate` / `TO_DATE`, and whether applying or
@@ -779,7 +793,11 @@ live-claim refusals and §386's recorded-cash rule apply unchanged.
 
 Tests: `backend/tests/test_netsuite_status_sync_adapter.py` (the adapter
 against fake-erp in process), `test_erp_status_sync.py` § NetSuite sweep
-(tenant selection, the mark, another account's mark, Merge leftovers).
+(tenant selection, the mark, another account's mark, Merge leftovers) and the
+on-request pass (opted in runs, opted out / under Merge refused),
+`test_erp_oauth.py` § status sync on request (NetSuite 202 / 409 / admin-only).
+End to end: `frontend/tests-e2e/erp/netsuite-status-sync.spec.ts` (a person's
+payment, a partial payment, a deleted write-back, a re-run, the opt-in off).
 
 ### Live QuickBooks contract check
 
