@@ -190,10 +190,16 @@ def reported_payment_parts(parts: Sequence[RailPart]) -> tuple[RailPart, ...]:
 #:   moved past the point a void can be applied.
 #: * ``settled_no_payment`` — a status read shows nothing owing and no payment
 #:   behind it (a credit applied or a write-off in the ERP, §303, §532).
+#: * ``paid_while_scheduled`` — the generic webhook or the polling sweep read
+#:   the bill paid while FeohLedger's own payment has not completed (§533).
+#: * ``partly_paid`` — the polling sweep read the bill partly paid in the ERP,
+#:   which FeohLedger never writes back to on that route (§533).
 ERP_REPORT_PAID_NOT_RECORDED = "paid_not_recorded"
 ERP_REPORT_SETTLED_SHORT = "settled_short"
 ERP_REPORT_VOIDED_AFTER_POST = "voided_after_post"
 ERP_REPORT_SETTLED_NO_PAYMENT = "settled_no_payment"
+ERP_REPORT_PAID_WHILE_SCHEDULED = "paid_while_scheduled"
+ERP_REPORT_PARTLY_PAID = "partly_paid"
 
 #: How each ERP adapter is named to an AP user. An adapter missing here reads
 #: as "your ERP" — never its raw registry key.
@@ -260,6 +266,7 @@ async def open_erp_reconciliation_exception(
     finding: dict,
     exception_type: str = ERP_RECONCILIATION_EXCEPTION_TYPE,
     erp_report: dict | None = None,
+    same_kind: bool = False,
 ) -> bool:
     """Open ONE reconciliation exception for human review, PII-free.
 
@@ -267,6 +274,13 @@ async def open_erp_reconciliation_exception(
     already exists for the invoice, so distinct ERP events (or a webhook and the
     sweep reporting the same change) never pile up duplicates. Returns whether
     one was opened.
+
+    With ``same_kind`` only a live row of the same type AND the same
+    ``erp_report["kind"]`` skips it (decisions §533). The generic webhook and
+    the status polling sweep report each change once (an event id, a recorded
+    read), so a report swallowed by an UNRELATED live row of the same type is
+    never repeated: once a person resolves that row, nothing would block the
+    run for the fact this report carried.
 
     A ``paid_not_recorded`` report goes through :func:`_keep_erp_paid_report`
     instead, which keeps at most ONE live such row per invoice and refreshes it.
@@ -288,7 +302,8 @@ async def open_erp_reconciliation_exception(
             exception_type=exception_type,
             erp_report=erp_report,
         )
-    if await _live_of_type(db, invoice.id, exception_type):
+    kind = (erp_report or {}).get("kind") if same_kind else None
+    if await _live_of_type(db, invoice.id, exception_type, kind=kind):
         return False
     await _create_reconciliation(
         db,
@@ -301,14 +316,19 @@ async def open_erp_reconciliation_exception(
     return True
 
 
-async def _live_of_type(db: AsyncSession, invoice_id: uuid.UUID, exception_type: str) -> bool:
-    existing = await db.execute(
-        select(func.count()).where(
-            APException.invoice_id == invoice_id,
-            APException.exception_type == exception_type,
-            APException.status.in_(("open", "escalated")),
-        )
+async def _live_of_type(
+    db: AsyncSession, invoice_id: uuid.UUID, exception_type: str, *, kind: str | None = None
+) -> bool:
+    """Is an open or escalated exception of ``exception_type`` live on the
+    invoice — of that ``erp_report["kind"]`` too, when one is given?"""
+    query = select(func.count()).where(
+        APException.invoice_id == invoice_id,
+        APException.exception_type == exception_type,
+        APException.status.in_(("open", "escalated")),
     )
+    if kind is not None:
+        query = query.where(APException.erp_report["kind"].astext == kind)
+    existing = await db.execute(query)
     return (existing.scalar() or 0) > 0
 
 

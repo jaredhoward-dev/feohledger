@@ -75,9 +75,9 @@ def _fake_tenant_session_factory(invoice, *, existing_recon_count: int = 0, sett
     On the ``payment_scheduled → paid`` edge the handler then issues one more
     ``execute`` — the settling-payment lookup that feeds ``settlement_coverage``
     — which returns ``settling_payment`` (``None`` = no completed payment, so
-    the coverage check is skipped and the transition applies). If the coverage
-    verdict is non-covering it issues a FURTHER ``execute`` — the
-    open-``erp_reconciliation``-exception dedup count — returning
+    the invoice is held behind a blocking exception, decisions §533). If there
+    is none, or the coverage verdict is non-covering, it issues a FURTHER
+    ``execute`` — the live-exception-of-that-kind dedup count — returning
     ``existing_recon_count``.
 
     The ``side_effect`` list is exact, so a stand-in invoice that omits a field
@@ -172,7 +172,7 @@ async def _post(
     `existing_recon_count` seeds the open-`erp_reconciliation`-exception dedup
     count the reconciliation path reads; `settling_payment` is the completed
     `Payment` the `payment_scheduled → paid` settlement-coverage check finds
-    (default `None` = no completed payment, check skipped).
+    (default `None` = no completed payment: held, decisions §533).
 
     Returns (result, tenant_db, transition_calls) where transition_calls records
     the args every `transition_invoice` invocation received (empty if the guard
@@ -545,10 +545,16 @@ def _payment(*, settled_amount, amount="1000.00", settled_currency="USD"):
 
 
 @pytest.mark.asyncio
-async def test_permitted_transition_scheduled_to_paid_applies(fake_redis):
-    """`payment_scheduled → paid` is a canonical edge (ERP reports paid). With no
-    completed payment on file the settlement-coverage check is skipped and the
-    transition applies + commits as before."""
+async def test_scheduled_to_paid_is_held_while_our_payment_is_in_flight(fake_redis):
+    """`payment_scheduled → paid` is a canonical edge, but with NO completed
+    payment on file the ERP's `paid` is not ours: `payment_erp_sync` writes
+    nothing back to a generic ERP, so the bill was paid there while our rail
+    payment (or a live card) is still in flight. Moving to `paid` would hide
+    the double payment, so the invoice is held behind ONE blocking
+    `payment_reconciliation` exception and not transitioned (decisions §533)."""
+    from app.models.exception import Exception as APException
+    from app.services.payment_gates import PAYMENT_BLOCKING_EXCEPTION_TYPES
+
     org = _org_with_erp_secret("erp-secret")
     invoice = SimpleNamespace(
         id=uuid.uuid4(),
@@ -562,9 +568,52 @@ async def test_permitted_transition_scheduled_to_paid_applies(fake_redis):
     )
 
     assert result is None
-    assert len(transition_calls) == 1
-    assert transition_calls[0]["target"] is InvoiceStatus.paid
-    assert invoice.status is InvoiceStatus.paid
+    assert transition_calls == []
+    assert invoice.status is InvoiceStatus.payment_scheduled
+    added = [a.args[0] for a in db.add.call_args_list if isinstance(a.args[0], APException)]
+    assert len(added) == 1
+    exc = added[0]
+    assert exc.exception_type == "payment_reconciliation"
+    assert exc.exception_type in PAYMENT_BLOCKING_EXCEPTION_TYPES
+    assert exc.description_code == "exception.erp_paid_while_scheduled"
+    assert exc.erp_report == {
+        "kind": "paid_while_scheduled",
+        "erp_type": "generic",
+        "erp_document_id": "doc_1",
+        "event_id": "ev_paid2",
+        "invoice_status": "payment_scheduled",
+    }
+    db.commit.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_scheduled_paid_in_flight_does_not_pile_up_a_second_exception(fake_redis):
+    """A distinct later `paid` delivery while the same kind of row is live
+    changes nothing, so nothing is committed."""
+    from app.models.exception import Exception as APException
+
+    org = _org_with_erp_secret("erp-secret")
+    invoice = SimpleNamespace(
+        id=uuid.uuid4(),
+        correlation_id=uuid.uuid4(),
+        currency="USD",
+        status=InvoiceStatus.payment_scheduled,
+    )
+
+    result, db, transition_calls = await _post(
+        org=org,
+        invoice=invoice,
+        status_value="paid",
+        event_id="ev_paid_again_in_flight",
+        existing_recon_count=1,
+    )
+
+    assert result is None
+    assert transition_calls == []
+    assert invoice.status is InvoiceStatus.payment_scheduled
+    added = [a.args[0] for a in db.add.call_args_list if isinstance(a.args[0], APException)]
+    assert added == []
+    db.commit.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -643,8 +692,9 @@ async def test_scheduled_to_paid_is_held_when_the_rail_settled_short(fake_redis)
 
 @pytest.mark.asyncio
 async def test_scheduled_to_paid_short_does_not_pile_up_a_second_exception(fake_redis):
-    """If an open `erp_reconciliation` exception already exists for the invoice,
-    a redelivered short-settlement `paid` must not open a second one."""
+    """If an open `erp_reconciliation` exception of the same kind already
+    exists for the invoice, a redelivered short-settlement `paid` must not open
+    a second one — and, having changed nothing, commits nothing (§533)."""
     from app.models.exception import Exception as APException
 
     org = _org_with_erp_secret("erp-secret")
@@ -670,7 +720,7 @@ async def test_scheduled_to_paid_short_does_not_pile_up_a_second_exception(fake_
     # dedup — no second Exception row
     added = [a.args[0] for a in db.add.call_args_list if isinstance(a.args[0], APException)]
     assert added == []
-    db.commit.assert_awaited()
+    db.commit.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------

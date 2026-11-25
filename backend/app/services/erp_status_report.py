@@ -26,8 +26,10 @@ from app.models.invoice import Invoice, InvoiceStatus
 from app.models.payment import Payment
 from app.services.erp_status_sync import (
     ERP_PAID_RECORDABLE,
+    ERP_REPORT_PAID_WHILE_SCHEDULED,
     ERP_REPORT_SETTLED_SHORT,
     ERP_REPORT_VOIDED_AFTER_POST,
+    PAYMENT_RECONCILIATION_EXCEPTION_TYPE,
     erp_finding,
     withdraw_erp_paid_reports,
 )
@@ -37,6 +39,7 @@ from app.services.erp_status_sync import (
 from app.services.erp_status_sync import (
     record_erp_reported_payment as _record_erp_reported_payment,
 )
+from app.services.invoice_warning_catalog import exception_finding
 from app.services.payment_settlement import settlement_coverage
 from app.services.workflow_engine import VALID_TRANSITIONS, transition_invoice
 
@@ -59,13 +62,16 @@ ERP_STATUS_MAP = {
 }
 
 #: :func:`apply_erp_status_report` outcomes. Everything but ``NOOP`` changed
-#: the session and must be committed by the caller.
+#: the session and must be committed by the caller. A flag a live row of the
+#: same kind already raised changes nothing, so it is ``NOOP`` (or
+#: ``WITHDRAWN``), never counted as applied.
 NOOP = "noop"
 TRANSITIONED = "transitioned"
 PAYMENT_RECORDED = "payment_recorded"
 EXCEPTION_OPENED = "exception_opened"
 WITHDRAWN = "withdrawn"
 HELD_SETTLED_SHORT = "held_settled_short"
+HELD_PAID_WHILE_SCHEDULED = "held_paid_while_scheduled"
 
 
 async def apply_erp_status_report(
@@ -113,7 +119,7 @@ async def apply_erp_status_report(
         # transition stays a pure no-op — turning them all into exceptions
         # would be noise.
         if target_status is InvoiceStatus.failed:
-            await raise_erp_reconciliation_exception(
+            opened = await raise_erp_reconciliation_exception(
                 db,
                 invoice,
                 org_id=org_id,
@@ -122,7 +128,9 @@ async def apply_erp_status_report(
                 erp_document_id=erp_document_id,
                 event_id=event_id,
             )
-            return EXCEPTION_OPENED
+            if opened:
+                return EXCEPTION_OPENED
+            return WITHDRAWN if withdrawn else NOOP
         if target_status is InvoiceStatus.paid and current in ERP_PAID_RECORDABLE:
             # The ERP paid an invoice FeohLedger never paid — the ERP-led half
             # of the no-rail model (issue #517). The state machine has no
@@ -155,6 +163,14 @@ async def apply_erp_status_report(
     # then 409, so the documented exit is gone. Run the SAME check off the SAME
     # persisted figure (`Payment.settled_amount`) and take the
     # reconciliation-exception path on a non-covering verdict.
+    #
+    # With NO completed payment the ERP's `paid` is not ours at all: this route
+    # and the polling sweep serve adapters `payment_erp_sync` writes nothing
+    # back to, so the bill was paid in the ERP while our own rail payment (or a
+    # live virtual card, which books no `Payment`) is still in flight. Moving
+    # to `paid` would hide the double payment and walk around the coverage
+    # hold above. Hold instead, behind a payment-blocking exception, exactly
+    # as the QuickBooks sync does (`apply_bill_report`, decisions §533).
     if target_status is InvoiceStatus.paid and current == InvoiceStatus.payment_scheduled:
         settling = (
             await db.execute(
@@ -167,35 +183,55 @@ async def apply_erp_status_report(
                 .limit(1)
             )
         ).scalar_one_or_none()
-        if settling is not None:
-            coverage = settlement_coverage(
-                settled_amount=settling.settled_amount,
-                settled_currency=settling.settled_currency,
-                target_amount=settling.amount,
-                target_currency=invoice.currency,
-                source_amount=settling.source_amount,
-                source_currency=settling.source_currency,
-                settled_amount_unstorable=settling.settled_amount_unstorable,
+        if settling is None:
+            report = {
+                "kind": ERP_REPORT_PAID_WHILE_SCHEDULED,
+                "erp_type": erp_type,
+                "erp_document_id": erp_document_id,
+                "event_id": str(event_id) if event_id else None,
+                "invoice_status": current.value,
+            }
+            if source is not None:
+                report["source"] = source
+            opened = await _open_erp_reconciliation_exception(
+                db,
+                invoice,
+                org_id=org_id,
+                exception_type=PAYMENT_RECONCILIATION_EXCEPTION_TYPE,
+                finding=exception_finding("erp_paid_while_scheduled"),
+                erp_report=report,
+                same_kind=True,
             )
-            if not coverage.completes_invoice:
-                await _open_erp_reconciliation_exception(
-                    db,
-                    invoice,
-                    org_id=org_id,
-                    finding=erp_finding("erp_settled_short", erp_type),
-                    erp_report={
-                        "kind": ERP_REPORT_SETTLED_SHORT,
-                        "erp_type": erp_type,
-                        "erp_document_id": erp_document_id,
-                        "event_id": str(event_id) if event_id else None,
-                        "payment_id": str(settling.id),
-                        "coverage_state": coverage.state,
-                        "shortfall": (
-                            str(coverage.shortfall) if coverage.shortfall is not None else None
-                        ),
-                    },
-                )
-                return HELD_SETTLED_SHORT
+            return HELD_PAID_WHILE_SCHEDULED if opened else NOOP
+        coverage = settlement_coverage(
+            settled_amount=settling.settled_amount,
+            settled_currency=settling.settled_currency,
+            target_amount=settling.amount,
+            target_currency=invoice.currency,
+            source_amount=settling.source_amount,
+            source_currency=settling.source_currency,
+            settled_amount_unstorable=settling.settled_amount_unstorable,
+        )
+        if not coverage.completes_invoice:
+            opened = await _open_erp_reconciliation_exception(
+                db,
+                invoice,
+                org_id=org_id,
+                finding=erp_finding("erp_settled_short", erp_type),
+                erp_report={
+                    "kind": ERP_REPORT_SETTLED_SHORT,
+                    "erp_type": erp_type,
+                    "erp_document_id": erp_document_id,
+                    "event_id": str(event_id) if event_id else None,
+                    "payment_id": str(settling.id),
+                    "coverage_state": coverage.state,
+                    "shortfall": (
+                        str(coverage.shortfall) if coverage.shortfall is not None else None
+                    ),
+                },
+                same_kind=True,
+            )
+            return HELD_SETTLED_SHORT if opened else NOOP
 
     # PII guard: never splat the raw ERP `details` payload into the append-only
     # audit row — the ERP may include vendor bank/tax/address fields.
@@ -227,7 +263,7 @@ async def raise_erp_reconciliation_exception(
     erp_status: str,
     erp_document_id: str | None,
     event_id,
-) -> None:
+) -> bool:
     """Open an ``erp_reconciliation`` Exception when the ERP reports an invoice
     VOIDED/CANCELLED (``→ failed``) that we've already advanced past the point
     where ``→ failed`` is a legal transition (``sent_to_erp`` /
@@ -236,9 +272,10 @@ async def raise_erp_reconciliation_exception(
     auto-transition the invoice. (A payment the ERP reported earlier and
     FeohLedger could not record has already been withdrawn by
     :func:`apply_erp_status_report`, which does so for every non-`Paid`
-    status — decisions §319.) Idempotent while one is open or escalated.
+    status — decisions §319.) Idempotent while one of the same kind is open or
+    escalated (decisions §533). Returns whether one was opened.
     """
-    await _open_erp_reconciliation_exception(
+    return await _open_erp_reconciliation_exception(
         db,
         invoice,
         org_id=org_id,
@@ -251,4 +288,5 @@ async def raise_erp_reconciliation_exception(
             "event_id": str(event_id) if event_id else None,
             "invoice_status": invoice.status.value,
         },
+        same_kind=True,
     )
