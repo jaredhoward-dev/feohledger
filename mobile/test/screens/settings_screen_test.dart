@@ -263,13 +263,20 @@ void main() {
   // shown to a role the API refuses is a guaranteed 403 on first paint, and a
   // row hidden from a role the API admits is a dead end.
 
-  /// Scroll the settings list to the bottom so every lazily-built row is in the
-  /// tree before asserting on what is and isn't there.
-  Future<void> scrollToBottom(WidgetTester tester) async {
-    for (var i = 0; i < 6; i++) {
-      await tester.drag(find.byType(ListView), const Offset(0, -300));
-      await tester.pumpAndSettle();
-    }
+  /// Bring the Procurement and Administration sections into the built part of
+  /// the list before asserting on what is and isn't there.
+  ///
+  /// Not "scroll to the bottom": the list builds rows near the viewport only,
+  /// and rows below Administration (Help, biometric unlock, Sign Out) are tall enough
+  /// that the bottom of the list leaves both sections scrolled out of the tree
+  /// — which fails a `findsOneWidget` and, worse, passes a `findsNothing`
+  /// vacuously. Pinning the Procurement header to the top of the viewport
+  /// keeps it and everything up to the end of Administration built.
+  Future<void> scrollToSections(WidgetTester tester) async {
+    final procurement = find.text('Procurement');
+    await tester.scrollUntilVisible(procurement, 200);
+    await tester.ensureVisible(procurement);
+    await tester.pumpAndSettle();
   }
 
   testWidgets('every role gets Procurement → Quality Inspections',
@@ -278,9 +285,11 @@ void main() {
     // point is not role-gated; the record affordance inside the screen is.
     for (final roles in [['ap_clerk'], ['cfo'], ['admin']]) {
       await _loginAs(roles: roles);
+      // A fresh screen per role, so each pass scrolls from the top.
+      await tester.pumpWidget(const SizedBox());
       await tester.pumpWidget(wrap());
       await tester.pump();
-      await scrollToBottom(tester);
+      await scrollToSections(tester);
 
       expect(find.text('Procurement'), findsOneWidget, reason: '$roles');
       expect(
@@ -329,7 +338,7 @@ void main() {
 
     await tester.pumpWidget(wrap());
     await tester.pump();
-    await scrollToBottom(tester);
+    await scrollToSections(tester);
 
     expect(find.text('Administration'), findsOneWidget);
     expect(find.widgetWithText(ListTile, 'User Management'), findsOneWidget);
@@ -353,7 +362,7 @@ void main() {
 
     await tester.pumpWidget(wrap());
     await tester.pump();
-    await scrollToBottom(tester);
+    await scrollToSections(tester);
 
     expect(find.text('Administration'), findsOneWidget);
     expect(
@@ -372,7 +381,7 @@ void main() {
 
     await tester.pumpWidget(wrap());
     await tester.pump();
-    await scrollToBottom(tester);
+    await scrollToSections(tester);
 
     expect(
       find.widgetWithText(ListTile, 'Adaptive Workflows'),
@@ -388,7 +397,7 @@ void main() {
 
     await tester.pumpWidget(wrap());
     await tester.pump();
-    await scrollToBottom(tester);
+    await scrollToSections(tester);
 
     expect(find.text('Administration'), findsNothing);
     expect(
