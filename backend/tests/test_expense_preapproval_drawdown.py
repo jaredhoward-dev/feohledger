@@ -15,7 +15,9 @@ from decimal import Decimal
 
 from sqlalchemy import select, update
 
-from app.models.expense import Expense
+from app.models.expense import Expense, ExpensePreapproval, PreapprovalStatus
+from app.models.workflow import AuditLog
+from app.services.expense_preapproval_cover import assign_cover
 
 
 async def _policy(c, category: str, above: str = "100.00") -> None:
@@ -298,3 +300,251 @@ async def test_list_shows_the_draw_down_and_pending_has_no_remaining(realdb):
     assert _money(items[pid]["drawn_amount"]) == Decimal("120.50")
     assert _money(items[pid]["remaining_amount"]) == Decimal("379.50")
     assert items[pending["id"]]["remaining_amount"] is None
+
+
+# ---------------------------------------------------------------------------
+# §570 — draws in the audit trail, assignment that finds a fit, lock order
+# ---------------------------------------------------------------------------
+
+
+async def _audit_details(realdb, action: str, rid: str) -> dict:
+    async with realdb.sessionmaker("a")() as s:
+        rows = (
+            (
+                await s.execute(
+                    select(AuditLog.details).where(
+                        AuditLog.action == action, AuditLog.entity_id == uuid.UUID(rid)
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+    assert len(rows) == 1, rows
+    return rows[0]
+
+
+async def _link_to_report(realdb, pid: str, rid: str) -> None:
+    async with realdb.sessionmaker("a")() as s:
+        await s.execute(
+            update(ExpensePreapproval)
+            .where(ExpensePreapproval.id == uuid.UUID(pid))
+            .values(expense_report_id=uuid.UUID(rid))
+        )
+        await s.commit()
+
+
+async def test_submit_audits_the_draws_and_reject_audits_the_release(realdb):
+    category = f"cat-{uuid.uuid4().hex[:6]}"
+    async with realdb.client(key="a", role="ap_manager") as c:
+        await _policy(c, category)
+    pid = await _approved(realdb, category=category, amount="500.00")
+
+    async with realdb.client(key="a", role="ap_clerk") as c:
+        rid, (eid_big, eid_small) = await _report(c, category, "120.25", "50.00")
+        assert (await c.post(f"/api/expense-reports/{rid}/submit")).status_code == 200
+
+    expected = [
+        {"expense_id": eid_big, "preapproval_id": pid, "amount": "120.25", "currency": "USD"}
+    ]
+    # Only the line that needed cover drew; the 50.00 one is under the threshold.
+    assert (await _audit_details(realdb, "expense_report.submitted", rid))["draws"] == expected
+
+    async with realdb.client(key="a", role="ap_manager") as c:
+        assert (await c.post(f"/api/expense-reports/{rid}/reject")).status_code == 200
+    details = await _audit_details(realdb, "expense_report.rejected", rid)
+    assert details["released"] == expected
+    assert "reason" not in details
+    # The columns are wiped; the trail still says what was drawn and returned.
+    async with realdb.client(key="a", role="ap_clerk") as c:
+        assert (await c.get(f"/api/expenses/{eid_big}")).json()["preapproval_id"] is None
+
+
+async def test_a_report_with_no_draws_audits_empty_lists(realdb):
+    async with realdb.client(key="a", role="ap_clerk") as c:
+        rid, _ = await _report(c, f"cat-{uuid.uuid4().hex[:6]}", "20.00")
+        assert (await c.post(f"/api/expense-reports/{rid}/submit")).status_code == 200
+    assert (await _audit_details(realdb, "expense_report.submitted", rid))["draws"] == []
+    async with realdb.client(key="a", role="ap_manager") as c:
+        resp = await c.post(f"/api/expense-reports/{rid}/reject", json={"reason": "no"})
+        assert resp.status_code == 200
+    assert await _audit_details(realdb, "expense_report.rejected", rid) == {
+        "released": [],
+        "reason": "no",
+    }
+
+
+async def test_the_larger_line_takes_the_estimate_raised_for_the_report(realdb):
+    """P1 = 500 raised for this report, P2 = 300 matching the category; lines
+    300 then 500. The old first-come assignment gave the 300 to P1 (raised for
+    this report, so preferred) and then had nowhere to put the 500."""
+    category = f"cat-{uuid.uuid4().hex[:6]}"
+    async with realdb.client(key="a", role="ap_manager") as c:
+        await _policy(c, category)
+    p1 = await _approved(realdb, category=f"other-{uuid.uuid4().hex[:6]}", amount="500.00")
+    p2 = await _approved(realdb, category=category, amount="300.00")
+
+    async with realdb.client(key="a", role="ap_clerk") as c:
+        rid, (eid_300, eid_500) = await _report(c, category, "300.00", "500.00")
+        await _link_to_report(realdb, p1, rid)
+        resp = await c.post(f"/api/expense-reports/{rid}/submit")
+        assert resp.status_code == 200, resp.text
+        assert (await c.get(f"/api/expenses/{eid_500}")).json()["preapproval_id"] == p1
+        assert (await c.get(f"/api/expenses/{eid_300}")).json()["preapproval_id"] == p2
+        assert _money((await _pre(c, p1))["remaining_amount"]) == Decimal("0.00")
+        assert _money((await _pre(c, p2))["remaining_amount"]) == Decimal("0.00")
+
+
+async def test_an_exact_fit_best_fit_misses_is_found(realdb):
+    """600 + 400 against lines 300, 300, 200, 200: best-fit puts the first 300
+    in the 400 and strands a 200; the bounded exact search finds 300+300 / 200+200."""
+    category = f"cat-{uuid.uuid4().hex[:6]}"
+    async with realdb.client(key="a", role="ap_manager") as c:
+        await _policy(c, category)
+    pa = await _approved(realdb, category=category, amount="600.00")
+    pb = await _approved(realdb, category=category, amount="400.00")
+
+    async with realdb.client(key="a", role="ap_clerk") as c:
+        rid, _ = await _report(c, category, "300.00", "300.00", "200.00", "200.00")
+        resp = await c.post(f"/api/expense-reports/{rid}/submit")
+        assert resp.status_code == 200, resp.text
+        assert _money((await _pre(c, pa))["remaining_amount"]) == Decimal("0.00")
+        assert _money((await _pre(c, pb))["remaining_amount"]) == Decimal("0.00")
+
+
+async def test_fx_is_locked_before_the_preapproval_rows(realdb, monkeypatch):
+    """The FX call happens before the draw takes its `FOR UPDATE` locks, so a
+    slow provider never holds other submits on the same estimate."""
+    import app.api.expenses as expenses_api
+
+    calls: list[str] = []
+    real_fx = expenses_api.lock_report_reporting_amount
+    real_draw = expenses_api.draw_cover_for_lines
+
+    async def fx_spy(*args, **kwargs):
+        calls.append("fx")
+        return await real_fx(*args, **kwargs)
+
+    async def draw_spy(*args, **kwargs):
+        calls.append("draw")
+        return await real_draw(*args, **kwargs)
+
+    monkeypatch.setattr(expenses_api, "lock_report_reporting_amount", fx_spy)
+    monkeypatch.setattr(expenses_api, "draw_cover_for_lines", draw_spy)
+
+    category = f"cat-{uuid.uuid4().hex[:6]}"
+    async with realdb.client(key="a", role="ap_manager") as c:
+        await _policy(c, category)
+    await _approved(realdb, category=category, amount="500.00")
+    async with realdb.client(key="a", role="ap_clerk") as c:
+        rid, _ = await _report(c, category, "400.00")
+        assert (await c.post(f"/api/expense-reports/{rid}/submit")).status_code == 200
+    assert calls == ["fx", "draw"]
+
+
+async def test_a_preapproval_decided_away_before_the_lock_covers_nothing(realdb, monkeypatch):
+    """The locked rows are re-read (``populate_existing``) and re-checked: a
+    pre-approval the submitting session already holds as ``approved``, flipped
+    to ``rejected`` between the candidate query and the lock, covers nothing —
+    the stale in-session copy would otherwise have waved the line through."""
+    import app.api.expenses as expenses_api
+    import app.services.expense_preapproval_cover as cover_mod
+
+    category = f"cat-{uuid.uuid4().hex[:6]}"
+    async with realdb.client(key="a", role="ap_manager") as c:
+        await _policy(c, category)
+    pid = await _approved(realdb, category=category, amount="500.00")
+    real_draw = cover_mod.draw_cover_for_lines
+
+    async def draw_with_a_race(db, report, lines):
+        # The session holds the row as approved…
+        held = await db.get(ExpensePreapproval, uuid.UUID(pid))
+        assert held.status == PreapprovalStatus.approved
+        real_execute = db.execute
+        seen = 0
+
+        async def execute(*args, **kwargs):
+            nonlocal seen
+            result = await real_execute(*args, **kwargs)
+            seen += 1
+            if seen == 1:  # …the candidate query has run; now it is decided away.
+                async with realdb.sessionmaker("a")() as s:
+                    await s.execute(
+                        update(ExpensePreapproval)
+                        .where(ExpensePreapproval.id == uuid.UUID(pid))
+                        .values(status=PreapprovalStatus.rejected)
+                    )
+                    await s.commit()
+            return result
+
+        monkeypatch.setattr(db, "execute", execute)
+        try:
+            return await real_draw(db, report, lines)
+        finally:
+            monkeypatch.setattr(db, "execute", real_execute)
+
+    monkeypatch.setattr(expenses_api, "draw_cover_for_lines", draw_with_a_race)
+    async with realdb.client(key="a", role="ap_clerk") as c:
+        rid, _ = await _report(c, category, "400.00")
+        resp = await c.post(f"/api/expense-reports/{rid}/submit")
+        assert resp.status_code == 422, resp.text
+        assert _codes(resp) == {"preapproval_required"}
+
+
+# --- the assignment itself, without a database -----------------------------
+
+
+def _ids(n: int) -> list[uuid.UUID]:
+    return [uuid.UUID(int=i + 1) for i in range(n)]
+
+
+def test_assign_best_fit_decreasing_places_the_large_line_first():
+    p1, p2 = _ids(2)
+    l300, l500 = uuid.UUID(int=101), uuid.UUID(int=102)
+    got = assign_cover(
+        [(l300, Decimal("300"), [p1, p2]), (l500, Decimal("500"), [p1])],
+        {p1: Decimal("500"), p2: Decimal("300")},
+    )
+    assert got == {l500: p1, l300: p2}
+
+
+def test_assign_preference_breaks_a_best_fit_tie():
+    p1, p2 = _ids(2)
+    line = uuid.UUID(int=101)
+    remaining = {p1: Decimal("500"), p2: Decimal("500")}
+    assert assign_cover([(line, Decimal("100"), [p2, p1])], remaining) == {line: p2}
+    assert assign_cover([(line, Decimal("100"), [p1, p2])], remaining) == {line: p1}
+
+
+def _bfd_trap():
+    pa, pb = _ids(2)
+    lines = [
+        (uuid.UUID(int=100 + i), Decimal(a), [pa, pb])
+        for i, a in enumerate(["300", "300", "200", "200"])
+    ]
+    return lines, {pa: Decimal("600"), pb: Decimal("400")}
+
+
+def test_assign_exact_search_finds_what_best_fit_misses():
+    lines, remaining = _bfd_trap()
+    got = assign_cover(lines, remaining)
+    assert len(got) == 4
+    pa, pb = _ids(2)
+    for pid, cap in ((pa, Decimal("600")), (pb, Decimal("400"))):
+        assert sum(a for lid, a, _ in lines if got[lid] == pid) <= cap
+
+
+def test_assign_past_the_search_bound_falls_back_to_best_fit():
+    """Documented limit (§570): a report larger than the search bound, or one
+    the step budget runs out on, keeps best-fit's answer — one line refused."""
+    lines, remaining = _bfd_trap()
+    assert len(assign_cover(lines, remaining, max_lines=3)) == 3
+    assert len(assign_cover(lines, remaining, max_steps=1)) == 3
+
+
+def test_assign_infeasible_keeps_best_fit_and_is_deterministic():
+    (p,) = _ids(1)
+    lines = [(uuid.UUID(int=101), Decimal("300"), [p]), (uuid.UUID(int=102), Decimal("300"), [p])]
+    first = assign_cover(lines, {p: Decimal("500")})
+    assert first == {uuid.UUID(int=101): p}
+    assert assign_cover(lines, {p: Decimal("500")}) == first

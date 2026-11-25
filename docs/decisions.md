@@ -29789,3 +29789,40 @@ reads each bill once; a truncated listing narrows the window and moves nothing
 else; a failed window does not advance; the narrowest window fails);
 `test_merge_dev_adapter.py` (the feed's `deleted` and `modified_before`, no
 bound without `until`, a naive `until` refused before any call).
+
+## 570. Pre-approval draws are audited, assigned best-fit-decreasing with a bounded exact search, and locked after the FX call (§563 follow-up, round 48)
+
+**The findings.** A review of §563 found four things. (1) The draw lived only
+in two mutable columns that a reject wipes, and neither the submit nor the
+reject audit row recorded it, so the trail could not say an estimate had ever
+been drawn. (2) Assignment was first-come in entry order with "raised for this
+report" preferred, so P1 = 500 (for this report) and P2 = 300 (category) against
+lines 300 then 500 gave the 300 to P1 and refused the 500 — a report with a
+valid assignment was refused. (3) The pre-approval `FOR UPDATE` locks were held
+across `lock_report_reporting_amount`, an FX provider call, so a slow provider
+stalled every other submit drawing on the same estimate. (4) The locked rows
+were not re-read, so a stale identity-map copy could be judged as `approved`.
+
+**Decision.** (1) `expense_report.submitted` carries `draws` and
+`expense_report.rejected` carries `released`, each
+`[{expense_id, preapproval_id, amount, currency}]` with exact Decimal strings,
+written in the same transaction (`expense_preapproval_cover.draw_records`;
+`release_draw` returns what it cleared). (2) `assign_cover` is best-fit
+decreasing — largest line first, smallest leftover balance first, the old
+preference as the tie-break — and, when that leaves a line out of a report with
+at most 8 lines needing cover, a depth-first exact search capped at 20,000
+steps. The search is bounded because the problem is bin packing: past the
+bound best-fit's answer stands and a line some other assignment could cover is
+refused. That is the documented limit, not a silent one; the alternatives
+(unbounded search, or splitting a line across estimates) were rejected — the
+first makes submit's latency unbounded under row locks, the second breaks
+§563's whole-line rule. (3) The FX lock runs before the draw; it depends only
+on the total, and a refused submit rolls it back with everything else. (4) The
+lock query uses `populate_existing` and drops a row no longer `approved`.
+
+**Tests.** `backend/tests/test_expense_preapproval_drawdown.py` (draws and
+releases in the audit rows, empty lists when nothing drew; the 500/300 example;
+the 600 + 400 case best-fit misses; the search bound and step cap fall back to
+best-fit; FX before the draw by a spy; a pre-approval decided away between the
+candidate query and the lock covers nothing — verified to fail without the
+re-read).

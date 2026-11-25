@@ -24,7 +24,10 @@ The rules, in one place:
   ``requires_preapproval_above`` threshold is not charged to the budget, so a
   run of small receipts cannot exhaust the estimate the large one needs.
 * **Whole-line cover** — a line is covered by one pre-approval or not at all;
-  it is never split across two estimates.
+  it is never split across two estimates. Which estimate is :func:`assign_cover`
+  (best-fit decreasing, then a bounded exact search — §570).
+* **Audited** — the submit audit row lists every draw and the reject row every
+  release (:func:`draw_records`), since the columns themselves are mutable.
 * **Concurrency** — :func:`draw_cover_for_lines` locks every candidate
   pre-approval ``FOR UPDATE`` (ordered by id, so two submits never deadlock)
   before reading the drawn sums, so two reports submitted at once cannot both
@@ -146,6 +149,79 @@ async def advisory_cover(db: AsyncSession, expense: Expense) -> Decimal | None:
     return max(remaining_of(p, drawn.get(p.id)) for p in candidates)
 
 
+# An exact search is tried only when best-fit leaves a line uncovered, only for
+# a report this small, and only for this many search steps — so a pathological
+# report costs a bounded amount of work and then falls back to best-fit.
+EXACT_SEARCH_MAX_LINES = 8
+EXACT_SEARCH_MAX_STEPS = 20_000
+
+
+def assign_cover(
+    lines: list[tuple[uuid.UUID, Decimal, list[uuid.UUID]]],
+    remaining: dict[uuid.UUID, Decimal],
+    *,
+    max_lines: int = EXACT_SEARCH_MAX_LINES,
+    max_steps: int = EXACT_SEARCH_MAX_STEPS,
+) -> dict[uuid.UUID, uuid.UUID]:
+    """Choose one pre-approval per line (§570). Pure and deterministic.
+
+    ``lines`` is ``(line_id, amount, candidate ids in preference order)`` in a
+    stable order; ``remaining`` is each candidate's balance. Returns
+    ``line_id → preapproval_id`` for the lines that get cover.
+
+    1. **Best-fit decreasing**: lines largest first; each takes the candidate
+       that fits with the SMALLEST balance left over, preference order breaking
+       ties. A line nothing fits is left out and the rest still get cover.
+    2. If that leaves a line out and the report has at most ``max_lines``
+       lines needing cover, an **exact search** (depth-first, same orders) looks
+       for an assignment covering every line, giving up after ``max_steps``. If
+       it finds one, that is the answer; otherwise best-fit's stands — so a
+       report refused here has no full assignment, or is too large to search.
+    """
+    order = sorted(
+        range(len(lines)), key=lambda i: (-lines[i][1], i)
+    )  # largest first, stable on the caller's order
+    rank = {i: {pid: n for n, pid in enumerate(lines[i][2])} for i in range(len(lines))}
+
+    def fits(i: int, left: dict[uuid.UUID, Decimal]) -> list[uuid.UUID]:
+        amount = lines[i][1]
+        options = [pid for pid in lines[i][2] if pid in left and left[pid] >= amount]
+        return sorted(options, key=lambda pid: (left[pid] - amount, rank[i][pid]))
+
+    greedy: dict[uuid.UUID, uuid.UUID] = {}
+    left = dict(remaining)
+    for i in order:
+        options = fits(i, left)
+        if options:
+            greedy[lines[i][0]] = options[0]
+            left[options[0]] -= lines[i][1]
+    if len(greedy) == len(lines) or len(lines) > max_lines:
+        return greedy
+
+    steps = 0
+    chosen: dict[uuid.UUID, uuid.UUID] = {}
+    left = dict(remaining)
+
+    def search(pos: int) -> bool:
+        nonlocal steps
+        if pos == len(order):
+            return True
+        i = order[pos]
+        for pid in fits(i, left):
+            steps += 1
+            if steps > max_steps:
+                return False
+            left[pid] -= lines[i][1]
+            chosen[lines[i][0]] = pid
+            if search(pos + 1):
+                return True
+            left[pid] += lines[i][1]
+            del chosen[lines[i][0]]
+        return False
+
+    return dict(chosen) if search(0) else greedy
+
+
 async def draw_cover_for_lines(
     db: AsyncSession, report: ExpenseReport, lines: list[Expense]
 ) -> dict[str, Decimal]:
@@ -154,10 +230,13 @@ async def draw_cover_for_lines(
     (``str(expense.id) → drawn``). A line no balance can cover is left
     unlinked and absent from the map, so the engine raises
     ``preapproval_required`` for it and the caller's 422 rolls the whole
-    transaction back — draws included.
+    transaction back — draws included. Which line goes where is
+    :func:`assign_cover`'s choice.
 
     Every candidate pre-approval is locked ``FOR UPDATE`` in id order before
-    any balance is read, so concurrent submits serialise on the shared rows."""
+    any balance is read, so concurrent submits serialise on the shared rows.
+    The locked rows are re-read (``populate_existing``) and one no longer
+    ``approved`` once the lock is held covers nothing."""
     for line in lines:
         release_draw(line)
     if not lines:
@@ -188,10 +267,15 @@ async def draw_cover_for_lines(
                 .where(ExpensePreapproval.id.in_(candidate_ids))
                 .order_by(ExpensePreapproval.id)
                 .with_for_update()
+                # Overwrite any copy the identity map already holds: the status
+                # and estimate judged below are the ones read under the lock.
+                .execution_options(populate_existing=True)
             )
         )
         .scalars()
         .all()
+        # Cancelled (or otherwise decided away) while we waited for the lock.
+        if p.status == PreapprovalStatus.approved
     }
     # Read AFTER the lock: under READ COMMITTED this statement sees every draw
     # a concurrent submit committed while we waited. The report's own lines are
@@ -200,28 +284,64 @@ async def draw_cover_for_lines(
         db, locked.keys(), exclude_expense_ids=[line.id for line in lines]
     )
 
-    cover: dict[str, Decimal] = {}
     ordered = sorted(
         lines,
         key=lambda e: (e.created_at.timestamp() if e.created_at else 0.0, str(e.id)),
     )
-    for line in ordered:
+    by_id = {line.id: line for line in ordered}
+    assignment = assign_cover(
+        [
+            (
+                line.id,
+                Decimal(line.amount),
+                [
+                    p.id
+                    for p in sorted(
+                        (locked[i] for i in per_line[line.id] if i in locked),
+                        key=_preference_key(line),
+                    )
+                ],
+            )
+            for line in ordered
+        ],
+        {pid: remaining_of(p, drawn.get(pid)) for pid, p in locked.items()},
+    )
+
+    cover: dict[str, Decimal] = {}
+    for line_id, pid in assignment.items():
+        line = by_id[line_id]
         amount = Decimal(line.amount)
-        options = sorted(
-            (locked[i] for i in per_line[line.id] if i in locked),
-            key=_preference_key(line),
-        )
-        for p in options:
-            if remaining_of(p, drawn.get(p.id)) >= amount:
-                line.preapproval_id = p.id
-                line.preapproval_drawn_amount = amount
-                drawn[p.id] = drawn.get(p.id, ZERO) + amount
-                cover[str(line.id)] = amount
-                break
+        line.preapproval_id = pid
+        line.preapproval_drawn_amount = amount
+        cover[str(line.id)] = amount
     return cover
 
 
-def release_draw(expense: Expense) -> None:
-    """Clear a line's draw — it no longer consumes its pre-approval."""
+def draw_record(expense: Expense) -> dict | None:
+    """The audit form of a line's draw, or ``None`` if it draws nothing.
+    Amounts are exact Decimal strings (§570)."""
+    if expense.preapproval_id is None or expense.preapproval_drawn_amount is None:
+        return None
+    return {
+        "expense_id": str(expense.id),
+        "preapproval_id": str(expense.preapproval_id),
+        "amount": str(Decimal(expense.preapproval_drawn_amount)),
+        # The draw is in the line's own currency, which is the estimate's (a
+        # pre-approval in another currency never covers it).
+        "currency": normalize_currency(expense.currency),
+    }
+
+
+def draw_records(expenses: Iterable[Expense]) -> list[dict]:
+    """Every draw among ``expenses``, ordered by expense id."""
+    records = [r for r in (draw_record(e) for e in expenses) if r is not None]
+    return sorted(records, key=lambda r: r["expense_id"])
+
+
+def release_draw(expense: Expense) -> dict | None:
+    """Clear a line's draw — it no longer consumes its pre-approval. Returns
+    what it held (:func:`draw_record`), for the caller's audit row."""
+    record = draw_record(expense)
     expense.preapproval_id = None
     expense.preapproval_drawn_amount = None
+    return record

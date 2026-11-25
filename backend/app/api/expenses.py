@@ -107,6 +107,7 @@ from app.services.expense_policy import (
 from app.services.expense_preapproval_cover import (
     advisory_cover,
     draw_cover_for_lines,
+    draw_records,
     release_draw,
 )
 from app.services.fx_adapters import UnknownFxProviderError, get_fx_adapter
@@ -1824,6 +1825,39 @@ async def submit_report(
         for line_entity_id in lines_by_entity
     }
 
+    # Lock the total into the org reporting currency — the figure the CFO gate
+    # reads at approval. Done BEFORE the pre-approval draw below (§570): the
+    # total does not depend on the draws, and the draw holds `FOR UPDATE` locks
+    # on shared pre-approval rows until commit, so a slow FX provider called
+    # after it would stall every other submit drawing on the same estimate. A
+    # refused submit rolls this back with everything else. Best-effort: an FX
+    # outage leaves it NULL and the gate then fails CLOSED (CFO required), so a
+    # failure here never lets a report through with less scrutiny.
+    reporting_currency = resolve_reporting_currency(org.settings)
+    submit_fx_adapter = _fx_adapter_for(org)
+    if conversion_requires_rate_source(
+        source_currency=report.currency,
+        target_currency=reporting_currency,
+        fx_adapter=submit_fx_adapter,
+    ):
+        # No usable rate source for a pair that genuinely needs one is the same
+        # outcome as an FX outage, which `lock_report_reporting_amount` already
+        # models: clear the figure and let `report_amount_for_gate` treat the
+        # missing number as OVER the threshold, so the CFO gate fails closed.
+        clear_report_reporting_amount(report)
+    else:
+        # Same pair-first rule as `_lock_line_conversion`, shared rather than
+        # restated. A report already filed in the org's reporting currency locks
+        # at rate 1 with no provider call, so a tenant whose `settings.fx.provider`
+        # names no registered adapter now gets a complete stored snapshot instead
+        # of NULL columns and a `reporting_total: null` in this endpoint's own
+        # audit row. Nothing about the gate changes — `report_amount_for_gate`
+        # already fell back to `total_amount` for that pair — this closes the
+        # hole in what is RECORDED.
+        await lock_report_reporting_amount(
+            report, reporting_currency=reporting_currency, fx_adapter=submit_fx_adapter
+        )
+
     # Draw the lines that need a pre-approval down against one (decisions
     # §563). First pass with NO cover finds them — a line under every
     # `requires_preapproval_above` is never charged to the budget — then each is
@@ -1868,35 +1902,6 @@ async def submit_report(
     for child in report.expenses:
         child.status = ExpenseStatus.submitted
 
-    # Lock the total into the org reporting currency — the figure the CFO gate
-    # reads at approval. Best-effort: an FX outage leaves it NULL and the gate
-    # then fails CLOSED (CFO required), so a failure here never lets a report
-    # through with less scrutiny.
-    reporting_currency = resolve_reporting_currency(org.settings)
-    submit_fx_adapter = _fx_adapter_for(org)
-    if conversion_requires_rate_source(
-        source_currency=report.currency,
-        target_currency=reporting_currency,
-        fx_adapter=submit_fx_adapter,
-    ):
-        # No usable rate source for a pair that genuinely needs one is the same
-        # outcome as an FX outage, which `lock_report_reporting_amount` already
-        # models: clear the figure and let `report_amount_for_gate` treat the
-        # missing number as OVER the threshold, so the CFO gate fails closed.
-        clear_report_reporting_amount(report)
-    else:
-        # Same pair-first rule as `_lock_line_conversion`, shared rather than
-        # restated. A report already filed in the org's reporting currency locks
-        # at rate 1 with no provider call, so a tenant whose `settings.fx.provider`
-        # names no registered adapter now gets a complete stored snapshot instead
-        # of NULL columns and a `reporting_total: null` in this endpoint's own
-        # audit row. Nothing about the gate changes — `report_amount_for_gate`
-        # already fell back to `total_amount` for that pair — this closes the
-        # hole in what is RECORDED.
-        await lock_report_reporting_amount(
-            report, reporting_currency=reporting_currency, fx_adapter=submit_fx_adapter
-        )
-
     await dispatch_audit(
         db,
         correlation_id=uuid.uuid4(),
@@ -1915,6 +1920,9 @@ async def submit_report(
             ),
             "reporting_currency": report.reporting_currency,
             "expense_count": len(report.expenses),
+            # The pre-approval draws this submit recorded (§563): the columns
+            # holding them are wiped by a reject, so the trail keeps them.
+            "draws": draw_records(report.expenses),
         },
     )
     await db.commit()
@@ -2009,11 +2017,19 @@ async def reject_report(
         raise refusal.http()
 
     report.status = ExpenseReportStatus.rejected
+    released: list[dict] = []
     for child in report.expenses:
         child.status = ExpenseStatus.draft
         # A draft line draws nothing: hand its share of the pre-approval back
-        # so a corrected re-submit (or another claim) can use it (§563).
-        release_draw(child)
+        # so a corrected re-submit (or another claim) can use it (§563), and
+        # record what was handed back in the same transaction (§570).
+        record = release_draw(child)
+        if record is not None:
+            released.append(record)
+    released.sort(key=lambda r: r["expense_id"])
+    reject_details: dict = {"released": released}
+    if body and body.reason:
+        reject_details["reason"] = body.reason
 
     await dispatch_audit(
         db,
@@ -2023,7 +2039,7 @@ async def reject_report(
         action="expense_report.rejected",
         entity_type="expense_report",
         entity_id=report.id,
-        details={"reason": body.reason} if body and body.reason else None,
+        details=reject_details,
     )
     await db.commit()
     fresh = await _get_report_or_404(db, report.id)
