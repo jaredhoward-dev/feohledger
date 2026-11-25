@@ -1368,27 +1368,6 @@ covered the one page or shape it was written for. #646 / §318 closed the
 QuickBooks half with recorded shapes and a live check; these are the
 user-visible halves still open.
 
-- [ ] **(c) The layout-shift budget covers thirty-three pages.**
-      `tests-e2e/reactivity/layout-stability.spec.ts` is table-driven
-      (`LIST_PAGES`, plus `TAB_PAGES` for a second tab's table): the dashboard
-      and thirty-two list pages are opened with every API response delayed,
-      held to a cumulative layout shift under 0.1, and the twenty-nine
-      `fixed` tables (both /goods-receipts tabs included) also have their
-      header columns' x positions checked. Still in `NOT_LIST_PAGES`, each
-      with its reason: /admin/partner (the e2e tenant is not a partner, so the
-      children table never renders). /discounts and /tax are measured
-      and locale-sized (KPI qualifier lines reserved with `KpiCard
-      reserveSub`, /discounts' currency notes in a one-line slot, /tax's
-      toolbar and table drawn from first paint with the box-allocation panel
-      below the table). **Durable fix:** the /gl-accounts pattern
-      (`fixed`, locale-sized `<th>` widths under a page wrapper, the table
-      mounted from first paint with DataTable's loading row) is what moved
-      /goods-receipts, /audit, /admin/webhooks, /adaptive, /admin?tab=roles,
-      /discounts and /tax across (/audit and /admin/webhooks also reserve the
-      upper table's height, scrolling under a sticky header; Roles reserves
-      its four system-role rows); a partner fixture tenant for
-      /admin/partner; then move it into `LIST_PAGES`. **Trigger:** the next
-      polish pass on that page.
 - [ ] **(c) No scripted "first customer" release rehearsal.** The 2026-10-22
       walkthrough — sign up, connect QuickBooks, sync the chart and vendors,
       enter an invoice, approve it, push it, pay the bill in QuickBooks, watch

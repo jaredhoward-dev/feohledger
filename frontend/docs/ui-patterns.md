@@ -278,17 +278,21 @@ grid page instead of hand-rolling `<div class="grid-container"><table>`:
   /recurring, /vendor-statements, /positive-pay, /experiments, /workflows,
   the users directory, both Roles tables, /admin/entities, /admin/api-keys,
   /admin/access-review, /admin/webhooks (both tables), the /audit trail,
-  /adaptive's suggestions, both /goods-receipts tabs, the /discounts offers
-  and the /tax 1099 table are converted,
-  /admin/entities, /admin/api-keys, /admin/access-review, the Roles tab and
-  the inspections tab by mounting the table from first paint with DataTable's own loading row rather than swapping a
+  /adaptive's suggestions, both /goods-receipts tabs, the /discounts offers,
+  the /tax 1099 table and the /admin/partner children table are converted,
+  /admin/entities, /admin/api-keys, /admin/access-review, the Roles tab,
+  the inspections tab and /admin/partner by mounting the table from first paint with DataTable's own loading row rather than swapping a
   separate loading block for it. Size each fixed column to the widest string
   in any of the six locales, not the English one; `tests-e2e/reactivity/layout-stability.spec.ts` holds each to a
   cumulative layout shift under 0.1 with production-like API latency and
   checks a `fixed` table's header x positions. A new sidebar page fails that
   spec until it is in its `LIST_PAGES` or `NOT_LIST_PAGES`; a page's second
   tab with its own table goes in `TAB_PAGES` (`?tab=` href), since a sidebar
-  link only ever opens the first.
+  link only ever opens the first. A page whose table the e2e tenant cannot
+  fill (/admin/partner: the tenant is not a partner) is answered there by a
+  `PAGE_FIXTURES` route stub, for both checks, rather than left unmeasured.
+  A page with a "you have none of these" state shows it as the table's own
+  empty row (DataTable's `empty`), not as a block swapped in for the table.
 - **Never make a `<td>` / `<th>` `display: flex` (or grid).** It stops being a
   table cell: the column no longer sizes it, so content overflows the table,
   and its border drifts out of line with the row. Lay out inline children with

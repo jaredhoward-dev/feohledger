@@ -245,7 +245,8 @@ const LIST_PAGES: ListPage[] = [
 	{ href: '/admin/webhooks', fixedTable: '.subs-table table' },
 	{ href: '/audit', fixedTable: '.audit-trail table' },
 	{ href: '/discounts', fixedTable: '.offers-table table' },
-	{ href: '/tax', fixedTable: '.tax-table table' }
+	{ href: '/tax', fixedTable: '.tax-table table' },
+	{ href: '/admin/partner', fixedTable: '.partner-table table' }
 ];
 
 /**
@@ -293,7 +294,8 @@ const LOCALE_SIZED = new Set([
 	'/admin/webhooks',
 	'/audit',
 	'/discounts',
-	'/tax'
+	'/tax',
+	'/admin/partner'
 ]);
 
 /**
@@ -332,13 +334,11 @@ const OVERFLOW_LOCALES = ['de', 'es', 'fr', 'pt-BR', 'ja'] as const;
 
 /**
  * Sidebar destinations deliberately outside the budget, each with its reason.
- * "Unmeasured list page" entries are list pages the budget does not cover yet
- * (docs/followups.md § "The layout-shift budget covers thirty-three pages"): moving
- * one into `LIST_PAGES` is the whole change once its reason is fixed.
+ * A list page belongs in `LIST_PAGES`, not here: a page whose table the e2e
+ * tenant cannot fill is measured against a fixture (`PAGE_FIXTURES`), as
+ * /admin/partner is.
  */
 const NOT_LIST_PAGES: Record<string, string> = {
-	'/admin/partner':
-		'Unmeasured: the e2e tenant is not a partner, so the page settles on its "not a partner" state and the children table never renders — see docs/followups.md',
 	'/assistant': 'A conversation, not a list',
 	'/cfo': 'Charts and KPI cards, not a list',
 	'/cash-flow': 'A planning workspace, not a list',
@@ -424,6 +424,56 @@ async function headerXs(table: Locator): Promise<number[]> {
 	return table.locator('thead th').evaluateAll((ths) => ths.map((th) => th.getBoundingClientRect().x));
 }
 
+/** /admin/partner's children table: a partner with one child per plan tier,
+ *  one carrying a 63-character slug (the longest a slug may be) and one with
+ *  no brand name (the "—" cell). The e2e tenant is not a partner, so without
+ *  this the page settles on its empty row and no child row is measured. */
+const PARTNER_OVERVIEW = {
+	organization_id: '00000000-0000-4000-8000-000000000430',
+	name: 'Layout Fixture Partner',
+	is_partner: true,
+	children: [
+		{
+			id: '00000000-0000-4000-8000-000000000431',
+			name: 'Layout Fixture Subsidiary Holdings International',
+			slug: 'layout-fixture-subsidiary-holdings-international-and-partners-x',
+			plan: 'growth',
+			product_name: 'Layout Fixture Accounts Payable Suite'
+		},
+		{
+			id: '00000000-0000-4000-8000-000000000432',
+			name: 'Layout Fixture Retail',
+			slug: 'layout-fixture-retail',
+			plan: 'scale',
+			product_name: ''
+		},
+		{
+			id: '00000000-0000-4000-8000-000000000433',
+			name: 'Layout Fixture Startup',
+			slug: 'layout-fixture-startup',
+			plan: 'free',
+			product_name: 'Fixture AP'
+		}
+	]
+};
+
+/**
+ * Responses a measured page needs that the e2e tenant cannot give, answered
+ * by route interception for both the layout-shift budget and the per-locale
+ * check (the latter answers more pages' lists inline below).
+ */
+const PAGE_FIXTURES: Record<string, (page: Page) => Promise<void>> = {
+	'/admin/partner': async (page) => {
+		await page.route(
+			(url) => url.pathname === '/api/partner',
+			(route) =>
+				route.request().method() === 'GET'
+					? route.fulfill({ json: PARTNER_OVERVIEW })
+					: route.fallback()
+		);
+	}
+};
+
 test.describe('list pages stay within the layout-shift budget', () => {
 	test('every sidebar page is classified as a measured list page or not', () => {
 		const measured = new Set(LIST_PAGES.map((p) => p.href));
@@ -450,6 +500,9 @@ test.describe('list pages stay within the layout-shift budget', () => {
 
 	for (const { href, fixedTable } of MEASURED_PAGES) {
 		test(`${href}: cumulative layout shift stays under ${CLS_BUDGET}`, async ({ page }) => {
+			// Registered before `delayApi`, so the delay (the later route, run
+			// first) still holds the fixture's answer behind the gate.
+			await PAGE_FIXTURES[href]?.(page);
 			await observeLayoutShifts(page);
 			await page.goto(START);
 			await expect(page.locator('h1').first()).toBeVisible();
@@ -966,6 +1019,7 @@ test.describe('fixed list tables fit their longest locale', () => {
 								: route.fallback()
 					);
 				}
+				await PAGE_FIXTURES[href]?.(page);
 				const widest = WIDEST_ROW[href];
 				if (widest) await patchFirstRow(page, widest.pathname, widest.patch);
 				await page.addInitScript((lc) => localStorage.setItem('feoh_locale', lc), locale);
@@ -1004,6 +1058,13 @@ test.describe('fixed list tables fit their longest locale', () => {
 				}
 				if (href === '/tax') {
 					await expect(table.locator('.badge.chip-warn')).toHaveCount(4);
+				}
+				if (href === '/admin/partner') {
+					await expect(table.locator('tbody tr')).toHaveCount(PARTNER_OVERVIEW.children.length);
+					// Arm the first Detach: its confirm label is the widest thing an
+					// actions cell holds (fr "Confirmer le détachement").
+					await table.locator('td.actions button').first().click();
+					await expect(table.locator('td.actions button.armed')).toHaveCount(1);
 				}
 				if (label === '/payments cards') {
 					for (const status of CARD_STATUSES) {

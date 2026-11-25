@@ -25567,3 +25567,29 @@ the Privacy Policy is written for suppliers and nothing showed it to them.
 plane would hold ids it cannot resolve or erase against, and the portal's
 auth never touches the control plane. *Reusing the `legal_acceptance_required`
 code*: its message asks for the Terms, which a supplier is not asked for.
+
+## 501. /admin/partner's "not a partner" state is the children table's empty row (round 39)
+
+**Context.** /admin/partner was the last sidebar list page outside the
+layout-shift budget. It drew a `LoadingState` block, then swapped in either the
+children table or a separate "not a partner" note once `GET /api/partner`
+answered, so the page moved on every visit, whichever state it settled on.
+
+**Decision.** The children table is mounted from first paint (`fixed`, with
+DataTable's "Loading…" row) and the "not a partner" copy is that table's
+`empty` message when `is_partner` is false. `is_partner` is derived from
+administering at least one child (`backend/app/api/partner.py`), so a
+non-partner and a partner with no children are the same population: the empty
+row is the honest place for it, and it keeps the page still for both the
+standalone tenants that are most visitors and the partners. The column widths
+are sized to the longest locale, the actions column to the armed confirm
+label (fr "Confirmer le détachement"), so arming Detach never overprints. The
+layout spec answers `/api/partner` with a partner fixture (`PAGE_FIXTURES`)
+rather than seeding a partner tenant: the page needs nothing but that one
+response.
+
+**Rejected.** *Keeping the separate note and reserving its height*: the note
+and the table differ in height by the row count, so no fixed reservation fits
+both. *Seeding a real parent/child link in the e2e tenant*: it would change
+what every other partner spec sees (they assert the standalone state and the
+cross-tenant 404) for a measurement a route stub gives exactly.
