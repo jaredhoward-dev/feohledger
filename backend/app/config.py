@@ -709,6 +709,13 @@ class Settings(BaseSettings):
     # needs a generous per-IP cap — high enough for real typing, low enough to
     # stop wire-speed namespace enumeration / DB amplification.
     slug_check_rate_limit_per_hour: int = 120
+    # Self-service "email me my workspace address" (`api/workspace_lookup.py`,
+    # decisions §518): the same per-IP and per-address shape as signup's
+    # verification email, on budgets of its own so neither flow spends the
+    # other's. The per-address cap is what stops an attacker rotating IPs from
+    # filling one person's inbox.
+    workspace_lookup_rate_limit_per_hour: int = Field(default=5, ge=1)
+    workspace_lookup_email_rate_limit_per_hour: int = Field(default=3, ge=1)
 
     # Master switch for the Redis-backed rate limiter at
     # ``app/services/rate_limit.py``. Defaults to True so deployed envs

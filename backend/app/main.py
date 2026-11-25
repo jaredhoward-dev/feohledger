@@ -80,6 +80,7 @@ from app.api import (
     workflow,
     workflow_definitions,
     workflow_experiments,
+    workspace_lookup,
 )
 from app.api.v1 import router as public_v1_router
 from app.api.v1_openapi import router as public_v1_openapi_router
@@ -654,6 +655,8 @@ app.include_router(organization_close.router, prefix="/api")
 app.include_router(partner.router, prefix="/api")
 app.include_router(payments.router, prefix="/api")
 app.include_router(signup.router, prefix="/api")
+# Public "email me my workspace address" (decisions §518).
+app.include_router(workspace_lookup.router, prefix="/api")
 app.include_router(auth_sso.router, prefix="/api")
 app.include_router(auth_saml.router, prefix="/api")
 app.include_router(billing.router, prefix="/api")
