@@ -2792,20 +2792,49 @@ Any user can set a delegate who receives their approval assignments while they a
 - **Set a delegate:** `POST /api/auth/delegation` with `{delegate_to_id, until}` — `until` is an ISO datetime after which delegation automatically expires.
 - **Check status:** `GET /api/auth/delegation` — returns the current delegation (delegate user, expiry) or empty if none is active.
 - **Clear:** `DELETE /api/auth/delegation` — removes the delegation immediately.
+- **Who can be named:** `GET /api/auth/delegation/candidates` — the active
+  colleagues in the caller's organization, other than the caller, who hold
+  `invoice.approve` (id and display name only). It and `POST` share one
+  eligibility test (`api/auth._can_approve`), so the picker never offers someone
+  the write refuses.
+
+**The screen** is **Profile → Out of office** (`/profile?section=delegation`,
+`frontend/src/lib/components/profile/DelegationPanel.svelte`): every signed-in
+employee sees it, because the endpoint is gated on sign-in alone. There is one
+delegation per person and it starts when saved — the model has an end
+(`delegate_until`) but no start date, so the panel asks only for the last day
+away and the delegation ends at the start of the following day in the reader's
+time zone.
 
 When a reviewer is OOO (has an active, non-expired delegation), approval assignments auto-route to their delegate. The audit trail records both the original assignee (`WorkflowStep.original_assigned_to`) and the delegate who actually performed the action.
 
-**Delegation is routing, not a privilege grant** — the delegate still needs
-`invoice.approve` to act on what lands in their queue, so delegating to a
-lower-privileged colleague confers nothing.
+**Delegation is routing, not a privilege grant.** The delegate acts as
+themselves: their own roles, their own approval limits (the step's max-amount
+and CFO gates read the *acting* user's roles, `review._enforce_approval_thresholds`)
+and their own segregation-of-duties set (`approval_chain.check_segregation` is
+checked against the delegate's id — so they still cannot approve an invoice
+they uploaded, keyed, received goods for or inspected). What a delegation adds
+is routing: `review.assign_reviewer` hands the delegator's new assignments to
+the delegate, and `approval_chain.check_level_approver` accepts the active
+delegate of a named approver on a `specific` step or chain level. The delegator
+stays authorized too. Only invoice approval routes this way — exception
+assignment and expense reports do not read the delegation.
 
-What `POST` refuses, and why:
+A delegate who holds no `invoice.approve` (an ap_clerk) is refused
+(decisions §511): an invoice routed to them would sit with someone who can
+never act on it.
+
+What `POST` refuses, and why (each a coded refusal — `delegation_invalid_id`,
+`delegation_self`, `delegation_until_invalid`, `delegation_until_past`,
+`delegation_delegate_not_found`, `delegation_delegate_cannot_approve` — stated
+in the reader's language by `frontend/src/lib/api/authRefusals.ts`):
 
 | Input | Result |
 |---|---|
 | `delegate_to_id` that isn't a UUID, or an unparseable `until` | `422`. Both used to escape the handler as a bare `ValueError`, i.e. a 500 on ordinary bad input. |
 | `until` already in the past | `422` — it would leave the caller believing they are out of office while `resolve_assignee`'s `delegate_until > now` test never fires. |
 | A **deactivated** delegate | `404` (same opaque answer as unknown / other-org). `review.assign_reviewer` reassigns the invoice unconditionally, so approvals would land on an account that can never sign in and the invoice would sit owned by nobody. |
+| A delegate without `invoice.approve` | `422` `delegation_delegate_cannot_approve` — the routed invoice would be stranded. |
 | `until` with no timezone | Accepted, interpreted as **UTC**. A naive value handed to the `timestamptz` column is read in the DB *session's* timezone, while every consumer compares against `now(UTC)` — so the same wall-clock string meant a different expiry depending on server config. |
 
 Setting and clearing a delegate each write a PII-free audit row

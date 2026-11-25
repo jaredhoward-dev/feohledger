@@ -26100,3 +26100,35 @@ read already serves; the prefix is in the reveal dialog and every audit row,
 which is where an operator matches a token to its mint. *Keeping the
 post-commit audit*: a provisioning credential minted with no row is worse than
 a refused mint.
+
+## 511. Out-of-office delegation is a profile panel, and a delegate must already be able to approve (round 41)
+
+**Context.** `GET/POST/DELETE /api/auth/delegation` shipped with no screen
+(`docs/followups.md`, "Settings with a backend and no screen"). The endpoint is
+gated on sign-in alone and writes the CALLER's own row (`User.delegate_to_id` /
+`delegate_until`), so it is a personal setting, not an organization one. It
+accepted any active same-org colleague as delegate, on the reasoning that
+routing confers no privilege. True, but `review.assign_reviewer` hands the
+invoice to the delegate unconditionally, so naming an ap_clerk (no
+`invoice.approve`) parked every routed approval with someone who could never
+act on it: the dead end `GET /api/invoices/assignable-reviewers` already
+refuses to offer. Its refusals were bare English strings.
+
+**Decision.** The screen is **Profile → Out of office**, shown to every signed-in
+employee because the endpoint accepts every one, not an `/organization` panel.
+`POST` now refuses a delegate without `invoice.approve` (`422`
+`delegation_delegate_cannot_approve`), and a new
+`GET /api/auth/delegation/candidates` lists exactly who it accepts; both read
+one predicate, `api/auth._can_approve`, through `effective_permissions`, so a
+custom role granted the permission qualifies. Every refusal is coded
+(`delegation_*`) and stated by `authRefusals.ts`. The model has an end and no
+start, so the panel offers no start date rather than invent one the server
+would ignore: it asks for the last day away and sends the start of the next day
+in the reader's time zone as `until`. Set and clear were already audited
+(`auth.delegation.set` / `.cleared`), so no new audit row was needed.
+
+**Rejected.** A start date (a scheduled delegation) would need a column and a
+migration for a feature nobody has asked for; the panel says the delegation
+starts when saved. Restricting who may *delegate* to approvers would restate a
+rule the endpoint does not hold; a non-approver's delegation is harmless, since
+nothing routes to them.

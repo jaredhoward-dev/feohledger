@@ -183,7 +183,7 @@ export const PAGE_HELP: Record<string, PageHelp> = {
 		summary: 'Check that background jobs are running: when each last ran, what happened and whether any has stalled.'
 	},
 	'/profile': {
-		summary: 'Your own account: name, password, language, two-factor sign-in, passkeys, signed-in devices and notifications.',
+		summary: 'Your own account: name, password, language, two-factor sign-in, passkeys, signed-in devices, out of office and notifications.',
 		guide: 'secure-your-account'
 	},
 	'/notifications': {

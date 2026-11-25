@@ -11,6 +11,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
 from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from app.api.deps import (
     create_access_token_with_jti,
@@ -18,7 +19,7 @@ from app.api.deps import (
     get_authenticated_user,
     get_current_user,
 )
-from app.api.permissions import effective_permissions
+from app.api.permissions import PERM_INVOICE_APPROVE, effective_permissions
 from app.api.refusals import (
     MFA_CHALLENGE_INVALID_DETAIL,
     MFA_CODE_INVALID_DETAIL,
@@ -2326,6 +2327,35 @@ class DelegationResponse(BaseModel):
     is_active: bool = False
 
 
+class DelegateCandidateResponse(BaseModel):
+    """Who the caller may name as their delegate: id and display name only,
+    the same minimal projection as `/api/invoices/assignable-reviewers`."""
+
+    id: str
+    full_name: str
+
+
+# The coded refusals `POST /api/auth/delegation` answers with, so `/profile`
+# states each in the reader's language (`frontend/src/lib/api/authRefusals.ts`).
+DELEGATION_INVALID_ID = "delegation_invalid_id"
+DELEGATION_SELF = "delegation_self"
+DELEGATION_UNTIL_INVALID = "delegation_until_invalid"
+DELEGATION_UNTIL_PAST = "delegation_until_past"
+DELEGATION_DELEGATE_NOT_FOUND = "delegation_delegate_not_found"
+DELEGATION_DELEGATE_CANNOT_APPROVE = "delegation_delegate_cannot_approve"
+
+
+def _can_approve(candidate: User) -> bool:
+    """Whether `candidate` could act on an approval routed to them.
+
+    The one eligibility test for a delegate, read by both the candidate list
+    and `set_delegation`, so the picker can never offer someone the write would
+    refuse. Resolved through `effective_permissions`, so a custom role granted
+    `invoice.approve` qualifies and an ap_clerk does not (decisions §511).
+    """
+    return PERM_INVOICE_APPROVE in effective_permissions(candidate.roles)
+
+
 @router.get("/delegation", response_model=DelegationResponse)
 async def get_delegation(
     db: AsyncSession = Depends(get_control_db),
@@ -2350,6 +2380,32 @@ async def get_delegation(
     )
 
 
+@router.get("/delegation/candidates", response_model=list[DelegateCandidateResponse])
+async def list_delegate_candidates(
+    db: AsyncSession = Depends(get_control_db),
+    user: User = Depends(get_current_user),
+):
+    """The colleagues `POST /api/auth/delegation` would accept as the caller's
+    delegate: active, in the caller's organization, not the caller, and able to
+    approve (`_can_approve`). Readable by everyone who may delegate — any
+    signed-in employee — so it carries only id and display name."""
+    rows = await db.execute(
+        select(User)
+        .options(selectinload(User.roles))
+        .where(
+            User.organization_id == user.organization_id,
+            User.is_active.is_(True),
+            User.id != user.id,
+        )
+        .order_by(User.full_name)
+    )
+    return [
+        DelegateCandidateResponse(id=str(candidate.id), full_name=candidate.full_name)
+        for candidate in rows.scalars().all()
+        if _can_approve(candidate)
+    ]
+
+
 def _parse_delegate_until(raw: str) -> datetime:
     """Parse the `until` instant, or raise a 422.
 
@@ -2371,12 +2427,15 @@ def _parse_delegate_until(raw: str) -> datetime:
     except (TypeError, ValueError) as exc:
         raise HTTPException(
             status_code=422,
-            detail="`until` must be an ISO-8601 datetime.",
+            detail=coded_refusal(DELEGATION_UNTIL_INVALID, "`until` must be an ISO-8601 datetime."),
         ) from exc
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=UTC)
     if parsed <= datetime.now(UTC):
-        raise HTTPException(status_code=422, detail="`until` must be in the future.")
+        raise HTTPException(
+            status_code=422,
+            detail=coded_refusal(DELEGATION_UNTIL_PAST, "`until` must be in the future."),
+        )
     return parsed
 
 
@@ -2390,17 +2449,25 @@ async def set_delegation(
 
     Who receives your approval assignments is an access-control fact, so the
     change is audited (PII-free — ids and the window only). It is not a
-    privilege grant: the delegate still has to hold `invoice.approve` to act, so
-    delegating to a lower-privileged colleague routes work to them without
-    conferring anything.
+    privilege grant: the delegate acts with their own roles, limits and
+    segregation-of-duties set. And it is refused for a delegate who could not
+    approve at all (no `invoice.approve`): `review.assign_reviewer` would hand
+    them the invoice regardless, and it would sit with someone who can never
+    act on it (decisions §511).
     """
     try:
         delegate_id = uuid.UUID(body.delegate_to_id)
     except (TypeError, ValueError) as exc:
         # An unparseable id is a validation error, not a 500.
-        raise HTTPException(status_code=422, detail="`delegate_to_id` must be a UUID.") from exc
+        raise HTTPException(
+            status_code=422,
+            detail=coded_refusal(DELEGATION_INVALID_ID, "`delegate_to_id` must be a UUID."),
+        ) from exc
     if delegate_id == user.id:
-        raise HTTPException(status_code=422, detail="Cannot delegate to yourself.")
+        raise HTTPException(
+            status_code=422,
+            detail=coded_refusal(DELEGATION_SELF, "Cannot delegate to yourself."),
+        )
 
     until = _parse_delegate_until(body.until)
 
@@ -2409,10 +2476,24 @@ async def set_delegation(
     # `review.assign_reviewer` reassigns the invoice to them unconditionally, so
     # every routed approval would land on an account that can never open it, and
     # the invoice sits in the queue owned by nobody.
-    result = await db.execute(select(User).where(User.id == delegate_id))
+    result = await db.execute(
+        select(User).options(selectinload(User.roles)).where(User.id == delegate_id)
+    )
     delegate = result.scalar_one_or_none()
     if not delegate or delegate.organization_id != user.organization_id or not delegate.is_active:
-        raise HTTPException(status_code=404, detail="Delegate user not found.")
+        raise HTTPException(
+            status_code=404,
+            detail=coded_refusal(DELEGATION_DELEGATE_NOT_FOUND, "Delegate user not found."),
+        )
+    if not _can_approve(delegate):
+        raise HTTPException(
+            status_code=422,
+            detail=coded_refusal(
+                DELEGATION_DELEGATE_CANNOT_APPROVE,
+                "That colleague cannot approve invoices, so approvals routed to them "
+                "could never be acted on.",
+            ),
+        )
 
     user.delegate_to_id = delegate_id
     user.delegate_until = until

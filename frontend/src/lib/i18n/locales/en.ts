@@ -387,6 +387,36 @@ export const en = {
 	'privacyDsar.unmaskedNotice':
 		'Bank details in this export are unmasked. Handle it accordingly.',
 
+	// Profile → Out of office (delegation) card; the authRefusal.delegation* keys are the
+	// POST /api/auth/delegation coded refusals (api/authRefusals.ts).
+	'profile.delegation.heading': "Out of office",
+	'profile.delegation.hint': "While you are away, invoices assigned to you for approval go to a colleague instead. It starts as soon as you save it and ends after the last day you choose.",
+	'profile.delegation.limits': "Your delegate approves as themselves: within their own approval limits, and never an invoice they uploaded, received the goods for or inspected. You can still approve these invoices too.",
+	'profile.delegation.statusOn': "On: invoices for your approval go to {name} through {date}.",
+	'profile.delegation.statusOff': "Off: invoices for your approval come to you.",
+	'profile.delegation.statusEnded': "Off: your delegation to {name} ended on {date}.",
+	'profile.delegation.delegate': "Delegate",
+	'profile.delegation.choose': "Choose a colleague",
+	'profile.delegation.lastDay': "Last day away",
+	'profile.delegation.lastDayHint': "Ends at the start of the next day, in your time zone.",
+	'profile.delegation.noCandidates': "No colleague who can approve invoices is available to delegate to.",
+	'profile.delegation.turnOn': "Turn on",
+	'profile.delegation.update': "Update",
+	'profile.delegation.end': "End now",
+	'profile.delegation.saved': "Out of office is on.",
+	'profile.delegation.cleared': "Out of office is off.",
+	'profile.delegation.loadFailed': "Couldn't load your out-of-office setting.",
+	'profile.delegation.saveFailed': "Couldn't save your out-of-office setting.",
+	'profile.delegation.endFailed': "Couldn't turn off out of office.",
+	'profile.delegation.delegateRequired': "Choose a delegate.",
+	'profile.delegation.lastDayRequired': "Choose your last day away, today or later.",
+	'authRefusal.delegationInvalidId': "That delegate could not be found. Choose a colleague from the list.",
+	'authRefusal.delegationSelf': "You can't delegate your approvals to yourself.",
+	'authRefusal.delegationUntilInvalid': "Choose a valid last day away.",
+	'authRefusal.delegationUntilPast': "Your last day away has already passed. Choose today or a later day.",
+	'authRefusal.delegationDelegateNotFound': "That colleague is no longer an active user in your organization. Choose someone else.",
+	'authRefusal.delegationDelegateCannotApprove': "That colleague can't approve invoices, so approvals sent to them could never be acted on. Choose someone who can.",
+
 	// Profile → Signed-in devices card
 	'profile.sessions.heading': 'Signed-in devices',
 	'profile.sessions.hint':

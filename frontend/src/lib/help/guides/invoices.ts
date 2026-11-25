@@ -317,6 +317,28 @@ export const INVOICE_GUIDES: Guide[] = [
 				]
 			},
 			{
+				heading: 'When you are away',
+				blocks: [
+					{
+						type: 'steps',
+						items: [
+							'Open {ui:shell.profileAndSecurity} and click {ui:profile.delegation.heading}.',
+							'Choose a {ui:profile.delegation.delegate}. Only active colleagues who can approve invoices are listed.',
+							'Pick your {ui:profile.delegation.lastDay} and click {ui:profile.delegation.turnOn}. It starts straight away and ends at the start of the next day. Click {ui:profile.delegation.end} to stop it early.'
+						]
+					},
+					{
+						type: 'p',
+						text: 'While it is on, invoices assigned to you for approval go to your delegate instead, and where an approval step or chain level names you, your delegate can approve in your place. Invoices already assigned to you stay with you, and you can still approve too.'
+					},
+					{
+						type: 'note',
+						tone: 'caution',
+						text: '**Your delegate approves as themselves.** Their own [[cfo-gate|CFO sign-off]] and maximum-amount limits apply, and they still can\'t approve an invoice they brought in, received the goods for or inspected ([[segregation-of-duties]]).'
+					}
+				]
+			},
+			{
 				heading: 'Approve several at once',
 				blocks: [
 					{

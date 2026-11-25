@@ -347,6 +347,36 @@ export const messages = {
 	'privacyDsar.unmaskedNotice':
 		'Los datos bancarios de esta exportación no están enmascarados. Trátela en consecuencia.',
 
+	// Profile → Out of office (delegation) card; the authRefusal.delegation* keys are the
+	// POST /api/auth/delegation coded refusals (api/authRefusals.ts).
+	'profile.delegation.heading': "Fuera de la oficina",
+	'profile.delegation.hint': "Mientras estás fuera, las facturas que se te asignen para aprobación se envían a un compañero. Empieza en cuanto lo guardas y termina después del último día que elijas.",
+	'profile.delegation.limits': "Tu delegado aprueba en su propio nombre: dentro de sus propios límites de aprobación y nunca una factura que haya subido, cuya mercancía haya recibido o que haya inspeccionado. Tú también puedes seguir aprobando estas facturas.",
+	'profile.delegation.statusOn': "Activado: las facturas para tu aprobación van a {name} hasta el {date}, inclusive.",
+	'profile.delegation.statusOff': "Desactivado: las facturas para tu aprobación te llegan a ti.",
+	'profile.delegation.statusEnded': "Desactivado: tu delegación en {name} terminó el {date}.",
+	'profile.delegation.delegate': "Delegado",
+	'profile.delegation.choose': "Elige un compañero",
+	'profile.delegation.lastDay': "Último día fuera",
+	'profile.delegation.lastDayHint': "Termina al inicio del día siguiente, en tu zona horaria.",
+	'profile.delegation.noCandidates': "No hay ningún compañero que pueda aprobar facturas disponible para delegar.",
+	'profile.delegation.turnOn': "Activar",
+	'profile.delegation.update': "Actualizar",
+	'profile.delegation.end': "Terminar ahora",
+	'profile.delegation.saved': "Fuera de la oficina activado.",
+	'profile.delegation.cleared': "Fuera de la oficina desactivado.",
+	'profile.delegation.loadFailed': "No se pudo cargar tu ajuste de fuera de la oficina.",
+	'profile.delegation.saveFailed': "No se pudo guardar tu ajuste de fuera de la oficina.",
+	'profile.delegation.endFailed': "No se pudo desactivar fuera de la oficina.",
+	'profile.delegation.delegateRequired': "Elige un delegado.",
+	'profile.delegation.lastDayRequired': "Elige tu último día fuera, hoy o más adelante.",
+	'authRefusal.delegationInvalidId': "No se encontró ese delegado. Elige un compañero de la lista.",
+	'authRefusal.delegationSelf': "No puedes delegar tus aprobaciones en ti mismo.",
+	'authRefusal.delegationUntilInvalid': "Elige un último día fuera válido.",
+	'authRefusal.delegationUntilPast': "Tu último día fuera ya pasó. Elige hoy o un día posterior.",
+	'authRefusal.delegationDelegateNotFound': "Ese compañero ya no es un usuario activo de tu organización. Elige a otra persona.",
+	'authRefusal.delegationDelegateCannotApprove': "Ese compañero no puede aprobar facturas, así que las aprobaciones que se le envíen nunca podrían resolverse. Elige a alguien que pueda.",
+
 	'profile.sessions.heading': 'Dispositivos con sesión abierta',
 	'profile.sessions.hint':
 		'Todos los navegadores y apps con sesión abierta en su cuenta ahora mismo. Si no reconoce alguno — o inició sesión en un dispositivo que ya no tiene — ciérrelo aquí. Deja de funcionar de inmediato.',

@@ -20,6 +20,12 @@ rewrites `Invoice.assigned_to_id`). Three things were wrong with it:
 Plus: changing who receives approval assignments is an access-control fact and
 went unaudited, alone among the mutations in this module.
 
+And a delegate who cannot approve at all (no `invoice.approve`, e.g. an
+ap_clerk) was accepted: every routed approval then sat with someone who could
+never act on it. `GET /api/auth/delegation/candidates` offers exactly the
+colleagues the write accepts (decisions §511). Every refusal is coded, so
+`/profile` states it in the reader's language.
+
 Driven directly against the handlers with a real control session.
 """
 
@@ -33,8 +39,13 @@ import pytest_asyncio
 from fastapi import HTTPException
 from sqlalchemy import delete, select
 
-from app.api.auth import SetDelegateRequest, clear_delegation, set_delegation
-from app.models.user import User
+from app.api.auth import (
+    SetDelegateRequest,
+    clear_delegation,
+    list_delegate_candidates,
+    set_delegation,
+)
+from app.models.user import Role, User, UserRole
 
 pytestmark = pytest.mark.asyncio
 
@@ -58,7 +69,12 @@ async def delegation_users(realdb, monkeypatch):
     org_id = realdb.info("a").org_id
     created: list[uuid.UUID] = []
 
-    async def _make(*, is_active: bool = True, org: uuid.UUID | None = None) -> User:
+    async def _make(
+        *,
+        is_active: bool = True,
+        org: uuid.UUID | None = None,
+        role: str | None = "ap_manager",
+    ) -> User:
         user_id = uuid.uuid4()
         async with mk() as s:
             row = User(
@@ -71,6 +87,19 @@ async def delegation_users(realdb, monkeypatch):
                 must_change_password=False,
             )
             s.add(row)
+            await s.flush()
+            if role is not None:
+                system_role = (
+                    (
+                        await s.execute(
+                            select(Role).where(Role.name == role, Role.organization_id.is_(None))
+                        )
+                    )
+                    .scalars()
+                    .first()
+                )
+                assert system_role is not None, role
+                s.add(UserRole(user_id=user_id, role_id=system_role.id))
             await s.commit()
         created.append(user_id)
         async with mk() as s:
@@ -79,6 +108,7 @@ async def delegation_users(realdb, monkeypatch):
     yield mk, _make, audits
 
     async with mk() as s:
+        await s.execute(delete(UserRole).where(UserRole.user_id.in_(created)))
         await s.execute(delete(User).where(User.id.in_(created)))
         await s.commit()
 
@@ -96,6 +126,58 @@ async def test_malformed_delegate_id_is_422_not_500(delegation_users):
                 SetDelegateRequest(delegate_to_id="not-a-uuid", until=_future()), s, caller
             )
     assert exc.value.status_code == 422
+    assert exc.value.detail["code"] == "delegation_invalid_id"
+
+
+async def test_self_delegation_is_a_coded_422(delegation_users):
+    mk, make, _ = delegation_users
+    caller = await make()
+    async with mk() as s:
+        with pytest.raises(HTTPException) as exc:
+            await set_delegation(
+                SetDelegateRequest(delegate_to_id=str(caller.id), until=_future()), s, caller
+            )
+    assert exc.value.status_code == 422
+    assert exc.value.detail["code"] == "delegation_self"
+
+
+async def test_delegate_who_cannot_approve_is_refused(delegation_users):
+    """An ap_clerk holds no `invoice.approve`: approvals routed to them would
+    sit with someone who can never act on them."""
+    mk, make, audits = delegation_users
+    caller = await make()
+    clerk = await make(role="ap_clerk")
+    async with mk() as s:
+        stored = await s.get(User, caller.id)
+        with pytest.raises(HTTPException) as exc:
+            await set_delegation(
+                SetDelegateRequest(delegate_to_id=str(clerk.id), until=_future()), s, stored
+            )
+    assert exc.value.status_code == 422
+    assert exc.value.detail["code"] == "delegation_delegate_cannot_approve"
+    async with mk() as s:
+        assert (await s.get(User, caller.id)).delegate_to_id is None
+    assert audits == []
+
+
+async def test_candidates_are_exactly_who_the_write_accepts(delegation_users, realdb):
+    """Active, same org, not the caller, able to approve — the picker must
+    never offer someone `set_delegation` would refuse."""
+    mk, make, _ = delegation_users
+    caller = await make()
+    approver = await make(role="cfo")
+    clerk = await make(role="ap_clerk")
+    inactive = await make(is_active=False)
+    other_org = await make(org=realdb.info("b").org_id)
+
+    async with mk() as s:
+        rows = await list_delegate_candidates(s, caller)
+    ids = {r.id for r in rows}
+    assert str(approver.id) in ids
+    for excluded in (caller, clerk, inactive, other_org):
+        assert str(excluded.id) not in ids
+    # Minimal projection: nothing beyond id + display name.
+    assert set(rows[0].model_dump()) == {"id", "full_name"}
 
 
 async def test_malformed_until_is_422_not_500(delegation_users):
@@ -107,6 +189,7 @@ async def test_malformed_until_is_422_not_500(delegation_users):
                 SetDelegateRequest(delegate_to_id=str(delegate.id), until="tomorrow"), s, caller
             )
     assert exc.value.status_code == 422
+    assert exc.value.detail["code"] == "delegation_until_invalid"
 
 
 async def test_past_until_is_refused(delegation_users):
@@ -121,6 +204,7 @@ async def test_past_until_is_refused(delegation_users):
                 SetDelegateRequest(delegate_to_id=str(delegate.id), until=past), s, caller
             )
     assert exc.value.status_code == 422
+    assert exc.value.detail["code"] == "delegation_until_past"
 
 
 async def test_deactivated_delegate_is_refused(delegation_users):
@@ -133,6 +217,7 @@ async def test_deactivated_delegate_is_refused(delegation_users):
                 SetDelegateRequest(delegate_to_id=str(delegate.id), until=_future()), s, caller
             )
     assert exc.value.status_code == 404
+    assert exc.value.detail["code"] == "delegation_delegate_not_found"
 
 
 async def test_cross_org_delegate_is_refused(delegation_users, realdb):
