@@ -948,6 +948,7 @@ assertion has to be true. Two honest failure states rather than a misleading
 | `failure_reason` | When |
 |---|---|
 | `card_already_charged` | the occupying card is `charged`/`completed` — its funds already moved, under a *different* payment |
+| `card_authorized_before` | the occupying card is unspent again because its authorization lapsed (decisions §544), but it was authorized once (`first_authorized_at`), and a single-use card is closed at the provider by that. Retry-safe: cancel it (the void accepts it) and the re-send mints a fresh card (decisions §549) |
 | `card_already_issued_insufficient_limit` | the card is live and unspent but its `amount_limit` is below this payment's amount |
 | `card_issuance_conflict` | the contended live-card slot was empty on re-read (the winner cancelled its card in between) — surfaced for AP rather than silently re-calling the provider |
 
@@ -1562,9 +1563,16 @@ with `/settlement/accept` and `/void` as the exits. A card no run payment owns
 authorization needs no undo on the payment: it never counted, and nothing is
 re-dispatched. Since decisions §544 a reversal or expiry returns the card
 itself to `active` with no charged figure (a `card.authorization_lapsed` audit
-row), so a void or a reissue can close it; a decline leaves a `charged` card
+row), so a void can close it; a re-run refuses to converge onto it
+(`card_authorized_before`, decisions §549); a decline leaves a `charged` card
 as it is. The leg stays `in_flight` throughout, and a clearing that arrives
-after the hold lapsed still settles the card and records the leg.
+after the hold lapsed still settles the card and records the leg. A clearing
+that arrives after the card was **cancelled** (the payment voided, the invoice
+perhaps paid on another rail) records nothing on any payment: it writes
+`card.settled_after_cancel` and opens a payment-blocking
+`payment_reconciliation` exception on the invoice (decisions §549). Only a
+name in the provider's explicit event map is a stage at all (§549); anything
+else changes nothing.
 
 ##### A figure the column cannot hold
 

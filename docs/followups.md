@@ -1389,6 +1389,32 @@ user-visible halves still open.
 ### Surfaced by round 45 (2026-11-25, round PR #771, decisions §536–§543)
 
 
+### Surfaced by round 46 (2026-11-25, round PR #771, decisions §544–§549)
+
+- [ ] **(c) Apply a lapse that arrives before its authorization.** The card
+      webhook applies a reversal or expiry only to a `charged` card (decisions
+      §544). Delivered out of order — the lapse first, then its authorization
+      — the lapse is inert on an `active` card and the late authorization then
+      leaves the card `charged` with its hold already released. It fails
+      closed (a void is refused as `card_already_charged`, a re-run as spent),
+      but the card and the invoice are stuck until someone reconciles by hand.
+      **Durable fix:** remember a lapse per provider transaction token (the
+      Lithic transaction `token`, Nium's `authCode`) and, when an authorization
+      for that transaction arrives, apply the lapse instead of charging.
+      **Trigger:** the first out-of-order delivery seen from a provider, or the
+      per-transaction id parsing that §544 deferred landing.
+- [ ] **(c) Record a further clearing on an already-settled card.** The
+      settlement branch completes a card once; a later Lithic clearing on a
+      `completed` card (an incremental capture, a second force post) matches
+      no branch, so spend after the first settlement is never written onto the
+      card or the run's payment, and no rebate or reconciliation flag follows.
+      **Durable fix:** on a settlement for a `completed` card, add the cleared
+      amount to `amount_charged` and the run payment's `settled_amount`
+      (idempotent per transaction token), re-judge coverage (an over-settled
+      leg opens the settlement-discrepancy flag), and audit it. **Trigger:**
+      the first incremental capture seen on a live Lithic program, or a
+      merchant category that captures in parts (lodging, fuel) going live.
+
 ### Surfaced by round 12 (2026-11-15, round PR #716, decisions §410–§421)
 
 
