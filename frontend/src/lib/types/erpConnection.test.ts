@@ -30,6 +30,7 @@ import {
 	secretIsSaved,
 	selectedProviderKey,
 	statusSyncNowOffered,
+	storedErpStatusSyncNowOffered,
 	statusSyncStartedKey,
 	type ErpProvider
 } from './erpConnection';
@@ -856,6 +857,38 @@ describe('statusSyncNowOffered', () => {
 			statusSyncNowOffered('xero', { ...live, needs_reconnect: true, connected: false })
 		).toBe(false);
 		expect(statusSyncNowOffered('xero', null)).toBe(false);
+	});
+});
+
+describe('storedErpStatusSyncNowOffered', () => {
+	const netsuite = { key: 'netsuite', auth: 'credentials' } as const;
+	// A stored-credential ERP has no OAuth block: the status says "not
+	// connected" and still carries the tenant's verdict (decisions §549).
+	const available = status({ status_sync_available: true });
+
+	it('offers the check on the saved ERP while the server says a pass would run', () => {
+		expect(storedErpStatusSyncNowOffered(netsuite, 'netsuite', available)).toBe(true);
+	});
+
+	it('offers nothing on a refusal, or with no verdict', () => {
+		const refused = status({
+			status_sync_available: false,
+			status_sync_refusal: 'status_sync_unsupported'
+		});
+		expect(storedErpStatusSyncNowOffered(netsuite, 'netsuite', refused)).toBe(false);
+		expect(storedErpStatusSyncNowOffered(netsuite, 'netsuite', status())).toBe(false);
+		expect(storedErpStatusSyncNowOffered(netsuite, 'netsuite', null)).toBe(false);
+	});
+
+	it('offers nothing for an ERP the saved configuration does not name', () => {
+		expect(storedErpStatusSyncNowOffered(netsuite, 'sage_intacct', available)).toBe(false);
+		expect(storedErpStatusSyncNowOffered(netsuite, null, available)).toBe(false);
+	});
+
+	it('leaves an OAuth ERP to its connection', () => {
+		expect(
+			storedErpStatusSyncNowOffered({ key: 'xero', auth: 'oauth' }, 'xero', available)
+		).toBe(false);
 	});
 });
 
