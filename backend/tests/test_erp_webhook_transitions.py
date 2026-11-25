@@ -535,6 +535,7 @@ def _payment(*, settled_amount, amount="1000.00", settled_currency="USD"):
     return SimpleNamespace(
         id=uuid.uuid4(),
         status="completed",
+        method="ach",
         amount=Decimal(amount),
         settled_amount=None if settled_amount is None else Decimal(settled_amount),
         settled_currency=settled_currency,

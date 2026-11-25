@@ -168,8 +168,17 @@ async def test_a_settled_payment_is_written_back_against_its_bill(realdb):
 
 async def test_a_card_payment_uses_the_card_account(realdb):
     await _configure(realdb)
-    run_id, _, _ = await _seed(realdb, method="virtual_card")
+    run_id, _, pay_id = await _seed(realdb, method="virtual_card")
     adapter = FakeQbo()
+    # Uncharged, the card leg has moved nothing: no write-back (decisions §537).
+    await _sync(realdb, run_id, adapter)
+    adapter.post_payment.assert_not_awaited()
+    # The card webhook writes the charge onto the leg; the next pass writes back.
+    async with realdb.sessionmaker("a")() as s:
+        payment = await s.get(Payment, pay_id)
+        payment.settled_amount = Decimal("100.00")
+        payment.settled_currency = "USD"
+        await s.commit()
     await _sync(realdb, run_id, adapter)
     (payload,) = adapter.post_payment.await_args.args
     assert payload.card is True and payload.pay_from_account_erp_id == "41"

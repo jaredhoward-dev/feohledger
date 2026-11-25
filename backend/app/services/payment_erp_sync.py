@@ -69,7 +69,8 @@ from app.services.credential_crypto import CredentialCryptoError
 from app.services.erp_status_sync import live_erp_report_of_kind
 from app.services.exception_service import create_exception
 from app.services.invoice_warning_catalog import exception_finding
-from app.services.payment_settlement import settlement_coverage
+from app.services.payment_settlement import COVERAGE_IN_FLIGHT
+from app.services.payment_settlement_record import payment_coverage
 from app.services.provider_credentials import provider_config
 
 logger = logging.getLogger(__name__)
@@ -422,15 +423,16 @@ async def _sync_one_leg(
             # exits: accept it as final (`POST /api/payments/{id}/settlement/accept`)
             # or void and re-pay (`POST /api/payments/{id}/void`, which accepts a
             # `payment_scheduled` invoice).
-            coverage = settlement_coverage(
-                settled_amount=payment.settled_amount,
-                settled_currency=payment.settled_currency,
-                target_amount=payment.amount,
-                target_currency=invoice.currency,
-                source_amount=payment.source_amount,
-                source_currency=payment.source_currency,
-                settled_amount_unstorable=payment.settled_amount_unstorable,
-            )
+            #
+            # A run's card leg is `completed` from the moment its card is
+            # minted, but nothing moves until the vendor charges it:
+            # `payment_coverage` reads the card and says `in_flight`, which is
+            # a skip (like a `submitted` ACH), not a hold. The card webhook
+            # re-dispatches this pass when the charge lands (decisions §537).
+            coverage = await payment_coverage(db, payment, invoice.currency)
+            if coverage.state == COVERAGE_IN_FLIGHT:
+                await db.commit()
+                return _SKIPPED, False
             if not coverage.completes_invoice:
                 logger.info(
                     "[payment-sync] holding invoice for payment %s: settlement %s (shortfall %s)",

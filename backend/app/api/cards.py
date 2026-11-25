@@ -1222,7 +1222,10 @@ async def card_webhook(provider: str, request: Request):
                 is_auth, is_settled = _classify_card_event(event_type)
 
                 from app.services.audit_dispatch import dispatch_audit
+                from app.services.payment_settlement_record import record_card_spend
 
+                # The run payment this charge pays, once written (§537).
+                spent_payment = None
                 if is_auth and card.status in ("created", "sent", "active"):
                     prior_status = card.status
                     card.status = "charged"
@@ -1231,6 +1234,9 @@ async def card_webhook(provider: str, request: Request):
                     )
                     card.charged_at = datetime.now(UTC)
                     card.merchant_name = merchant
+                    # Money moved: the run's card leg now carries what was
+                    # charged, so coverage reads a real figure (decisions §537).
+                    spent_payment = await record_card_spend(db, card)
                     # A charge is a money-state transition — leave an
                     # append-only audit row. Amount serialises as a string
                     # Decimal (never float); no PAN ever enters the trail.
@@ -1266,6 +1272,9 @@ async def card_webhook(provider: str, request: Request):
                         # the spend rollups and the corporate-card feed all read,
                         # and after settlement the settled figure is the true one.
                         card.amount_charged = settled_amount
+                    # The settled figure replaces the authorized one on the run
+                    # payment too (decisions §537).
+                    spent_payment = await record_card_spend(db, card)
 
                     # Create rebate at the org's negotiated rate (not a hardcoded
                     # 1%), quantized to cents — the rate field was documented on
@@ -1324,6 +1333,16 @@ async def card_webhook(provider: str, request: Request):
                     )
 
                 await db.commit()
+                if spent_payment is not None and spent_payment.payment_run_id is not None:
+                    # The payment sync skipped this leg while its card was
+                    # uncharged; now that money moved, run it again so the
+                    # invoice reaches `paid` (or the short-settlement hold).
+                    # Idempotent per leg, as the ACH webhook's re-dispatch is.
+                    from app.services.payment_erp_sync import dispatch_payment_sync
+
+                    await dispatch_payment_sync(
+                        spent_payment.payment_run_id, uuid.UUID(str(org_obj.id))
+                    )
                 return
 
             except Exception:
