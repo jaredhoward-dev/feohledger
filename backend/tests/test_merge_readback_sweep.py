@@ -41,7 +41,11 @@ from app.models.organization import Organization
 from app.models.workflow import WorkflowDefinition, WorkflowInstance
 from app.services import merge_readback_sweep as sweep
 from app.services.erp_adapters.base import ErpCallBudgetExhausted
-from app.services.erp_adapters.merge_dev import MergeDevAdapter, merge_bill_report
+from app.services.erp_adapters.merge_dev import (
+    MergeChangeFeed,
+    MergeDevAdapter,
+    merge_bill_report,
+)
 
 TENANT = "a"
 NOW = datetime(2026, 11, 25, 12, 0, tzinfo=UTC)
@@ -70,22 +74,26 @@ def _bill(bill_id: str, status: str = "OPEN") -> dict:
 
 @pytest.fixture
 def merge(monkeypatch):
-    """Merge's side: ``feed`` is what the change feed lists, ``bills`` what a
-    read answers (a dict, or an exception to raise); ``since`` and ``read``
-    record the calls."""
+    """Merge's side: ``feed`` is what the change feed lists (``deleted`` the
+    ones it reports ``remote_was_deleted``), ``bills`` what a read answers (a
+    dict, or an exception to raise); ``since``, ``until`` and ``read`` record
+    the calls."""
 
     class _Merge:
         feed: list[str] = []
+        deleted: set[str] = set()
         bills: dict[str, object] = {}
         since: list[datetime] = []
+        until: list[datetime | None] = []
         read: list[str] = []
 
     m = _Merge()
-    m.feed, m.bills, m.since, m.read = [], {}, [], []
+    m.feed, m.deleted, m.bills, m.since, m.until, m.read = [], set(), {}, [], [], []
 
-    async def _changed(self, since):
+    async def _changed(self, since, until=None):
         m.since.append(since)
-        return list(m.feed)
+        m.until.append(until)
+        return MergeChangeFeed(bills=list(m.feed), deleted=frozenset(m.deleted))
 
     async def _report(self, bill_id):
         m.read.append(bill_id)
@@ -94,7 +102,7 @@ def merge(monkeypatch):
             raise value
         return merge_bill_report(value)
 
-    monkeypatch.setattr(MergeDevAdapter, "changed_bills", _changed)
+    monkeypatch.setattr(MergeDevAdapter, "bill_change_feed", _changed)
     monkeypatch.setattr(MergeDevAdapter, "bill_report", _report)
     return m
 
@@ -279,11 +287,11 @@ async def test_a_bill_stamped_just_before_the_cursor_is_still_read(realdb, merge
     stamped = NOW - timedelta(minutes=3)
     visible: dict[str, datetime] = {}
 
-    async def _changed(self, since):
+    async def _changed(self, since, until=None):
         merge.since.append(since)
-        return [b for b, at in visible.items() if at > since]
+        return MergeChangeFeed(bills=[b for b, at in visible.items() if at > since])
 
-    monkeypatch.setattr(MergeDevAdapter, "changed_bills", _changed)
+    monkeypatch.setattr(MergeDevAdapter, "bill_change_feed", _changed)
 
     await sweep.run_merge_readback_once(now=NOW)
     assert merge.read == [] and await _exceptions(realdb, inv_id) == []
@@ -303,11 +311,11 @@ async def test_with_no_overlap_the_late_stamped_bill_would_be_missed(realdb, mer
     _inv_id, bill = await _pushed(realdb)
     visible: dict[str, datetime] = {}
 
-    async def _changed(self, since):
+    async def _changed(self, since, until=None):
         merge.since.append(since)
-        return [b for b, at in visible.items() if at > since]
+        return MergeChangeFeed(bills=[b for b, at in visible.items() if at > since])
 
-    monkeypatch.setattr(MergeDevAdapter, "changed_bills", _changed)
+    monkeypatch.setattr(MergeDevAdapter, "bill_change_feed", _changed)
 
     await sweep.run_merge_readback_once(now=NOW)
     visible[bill] = NOW - timedelta(minutes=3)
@@ -398,14 +406,253 @@ async def test_a_failed_listing_moves_nothing(realdb, merge, monkeypatch):
 
     await _merge_tenant(realdb)
 
-    async def _refused(self, since):
+    async def _refused(self, since, until=None):
         raise ErpListingIncomplete("merge_dev", "invoices", ListingGap.fetch_failed)
 
-    monkeypatch.setattr(MergeDevAdapter, "changed_bills", _refused)
+    monkeypatch.setattr(MergeDevAdapter, "bill_change_feed", _refused)
     result = await sweep.run_merge_readback_once(now=NOW)
 
     assert result.failures == 1
     assert await _cursor(realdb) == {}
+
+
+# ---------------------------------------------------------------------------
+# deletions the listing reports (decisions §567)
+# ---------------------------------------------------------------------------
+
+
+async def test_a_deletion_the_listing_reports_is_flagged_when_the_read_404s(realdb, merge):
+    """Merge documents ``remote_was_deleted`` on the listing, not what the
+    single read answers for a deleted bill. A 404 there must not lose it."""
+    from app.services.erp_adapters.merge_dev import MergeBillNotFound
+
+    await _merge_tenant(realdb)
+    inv_id, bill = await _pushed(realdb, InvoiceStatus.approved)
+    merge.feed = [bill]
+    merge.deleted = {bill}
+    merge.bills[bill] = MergeBillNotFound(bill)
+
+    result = await sweep.run_merge_readback_once(now=NOW)
+
+    assert result.bills_deleted_by_listing == 1
+    assert result.bills_not_found == 0
+    assert result.bills_applied == 1
+    [row] = await _exceptions(realdb, inv_id)
+    assert row.exception_type == "payment_reconciliation"
+    assert await _cursor(realdb) == {"through": NOW.isoformat(), "pending": []}
+
+
+async def test_a_listed_deletion_is_still_read_and_a_restored_bill_is_not_flagged(realdb, merge):
+    """The read comes first: a bill the listing called deleted that Merge
+    now answers as open was restored, and is applied as it reads."""
+    await _merge_tenant(realdb)
+    inv_id, bill = await _pushed(realdb, InvoiceStatus.approved)
+    merge.feed = [bill]
+    merge.deleted = {bill}
+
+    result = await sweep.run_merge_readback_once(now=NOW)
+
+    assert merge.read == [bill]
+    assert result.bills_deleted_by_listing == 0
+    assert await _exceptions(realdb, inv_id) == []
+
+
+async def test_a_404_alone_is_not_a_deletion(realdb, merge):
+    """The control: the same 404 for a bill the listing did NOT call deleted
+    flags nothing (§399)."""
+    from app.services.erp_adapters.merge_dev import MergeBillNotFound
+
+    await _merge_tenant(realdb)
+    inv_id, bill = await _pushed(realdb, InvoiceStatus.approved)
+    merge.feed = [bill]
+    merge.bills[bill] = MergeBillNotFound(bill)
+
+    result = await sweep.run_merge_readback_once(now=NOW)
+
+    assert result.bills_not_found == 1 and result.bills_deleted_by_listing == 0
+    assert await _exceptions(realdb, inv_id) == []
+
+
+async def test_a_listed_deletion_survives_a_failed_read_in_the_cursor(realdb, merge):
+    from app.services.erp_adapters.merge_dev import MergeBillNotFound
+
+    await _merge_tenant(realdb)
+    inv_id, bill = await _pushed(realdb, InvoiceStatus.approved)
+    merge.feed = [bill]
+    merge.deleted = {bill}
+    merge.bills[bill] = RuntimeError("HTTP 502")
+
+    await sweep.run_merge_readback_once(now=NOW)
+    assert await _cursor(realdb) == {
+        "through": NOW.isoformat(),
+        "pending": [bill],
+        "deleted": [bill],
+    }
+
+    # Next tick reads it from the cursor, with no new listing.
+    merge.bills[bill] = MergeBillNotFound(bill)
+    await sweep.run_merge_readback_once(now=NOW + timedelta(minutes=15))
+    assert len(merge.since) == 1
+    [row] = await _exceptions(realdb, inv_id)
+    assert row.exception_type == "payment_reconciliation"
+    assert await _cursor(realdb) == {"through": NOW.isoformat(), "pending": []}
+
+
+async def test_a_listed_deletion_applied_twice_flags_once(realdb, merge):
+    from app.services.erp_adapters.merge_dev import MergeBillNotFound
+
+    await _merge_tenant(realdb)
+    inv_id, bill = await _pushed(realdb, InvoiceStatus.approved)
+    merge.feed = [bill]
+    merge.deleted = {bill}
+    merge.bills[bill] = MergeBillNotFound(bill)
+
+    await sweep.run_merge_readback_once(now=NOW)
+    # Merge lists it again (the overlap re-reads it).
+    second = await sweep.run_merge_readback_once(now=NOW + timedelta(minutes=15))
+
+    assert second.bills_deleted_by_listing == 1
+    assert second.bills_applied == 0
+    assert len(await _exceptions(realdb, inv_id)) == 1
+
+
+# ---------------------------------------------------------------------------
+# a long feed is read window by window (decisions §567)
+# ---------------------------------------------------------------------------
+
+
+def _windowed_feed(merge, monkeypatch, stamps: dict[str, datetime], cap: int):
+    """A feed that honours ``(since, until)`` and, like ``_list_complete``,
+    refuses a listing longer than ``cap`` as truncated."""
+    from app.services.erp_adapters.base import ErpListingIncomplete, ListingGap
+
+    async def _changed(self, since, until=None):
+        merge.since.append(since)
+        merge.until.append(until)
+        rows = [b for b, at in stamps.items() if at > since and (until is None or at < until)]
+        if len(rows) > cap:
+            raise ErpListingIncomplete("merge_dev", "invoices", ListingGap.truncated)
+        return MergeChangeFeed(bills=rows)
+
+    monkeypatch.setattr(MergeDevAdapter, "bill_change_feed", _changed)
+
+
+async def test_a_long_feed_advances_window_by_window_across_ticks(realdb, merge, monkeypatch):
+    await _merge_tenant(realdb)
+    start = NOW - timedelta(hours=48)
+    # Four bills, one every 12 hours; Merge "can" list at most one at a time.
+    pushed = [await _pushed(realdb) for _ in range(4)]
+    stamps = {bill: start + timedelta(hours=6 + 12 * i) for i, (_, bill) in enumerate(pushed)}
+    for _, bill in pushed:
+        merge.bills[bill] = _bill(bill, "VOID")
+    _windowed_feed(merge, monkeypatch, stamps, cap=1)
+
+    tick = NOW
+    for _ in range(12):
+        await sweep.run_merge_readback_once(now=tick)
+        tick += timedelta(minutes=15)
+        if "window_minutes" not in await _cursor(realdb) and len(merge.read) == 4:
+            break
+
+    # The first listing was too long and unbounded; the ones after it asked a
+    # bounded window, and the last one, caught up, asked with no bound again.
+    assert merge.until[0] is None
+    assert merge.until[1] is not None
+    assert merge.until[-1] is None
+    # Every bill was read, each exactly once, and every invoice flagged once.
+    assert sorted(merge.read) == sorted(b for _, b in pushed)
+    for inv_id, _ in pushed:
+        assert len(await _exceptions(realdb, inv_id)) == 1
+    # Caught up: the bound and the window are gone.
+    cursor = await _cursor(realdb)
+    assert "window_minutes" not in cursor and cursor["pending"] == []
+
+
+async def test_a_too_long_listing_narrows_the_window_and_moves_nothing_else(
+    realdb, merge, monkeypatch
+):
+    await _merge_tenant(realdb)
+    (_, a), (_, b) = await _pushed(realdb), await _pushed(realdb)
+    stamps = {a: NOW - timedelta(hours=40), b: NOW - timedelta(hours=10)}
+    _windowed_feed(merge, monkeypatch, stamps, cap=1)
+
+    result = await sweep.run_merge_readback_once(now=NOW)
+
+    assert result.windows_narrowed == 1 and result.failures == 0
+    assert merge.read == []
+    assert await _cursor(realdb) == {"window_minutes": 48 * 60 // 2}
+
+    # The next tick asks only the first half of the lookback.
+    later = NOW + timedelta(minutes=15)
+    await sweep.run_merge_readback_once(now=later)
+    since = later - timedelta(hours=48)
+    assert merge.since[-1] == since
+    assert merge.until[-1] == since + timedelta(minutes=24 * 60)
+    assert merge.read == [a]
+    assert await _cursor(realdb) == {
+        "through": (since + timedelta(minutes=24 * 60)).isoformat(),
+        "pending": [],
+        "listed_at": later.isoformat(),
+        "window_minutes": 48 * 60,
+    }
+
+
+async def test_a_failed_window_does_not_advance(realdb, merge, monkeypatch):
+    from app.services.erp_adapters.base import ErpListingIncomplete, ListingGap
+
+    await _merge_tenant(realdb)
+    through = NOW - timedelta(hours=30)
+    async with realdb.control_sessionmaker()() as s:
+        org = await s.get(Organization, realdb.info(TENANT).org_id)
+        cursor = {
+            "through": through.isoformat(),
+            "pending": [],
+            "listed_at": (NOW - timedelta(hours=1)).isoformat(),
+            "window_minutes": 120,
+        }
+        org.settings = {**org.settings, sweep.CURSOR_KEY: cursor}
+        flag_modified(org, "settings")
+        await s.commit()
+
+    async def _refused(self, since, until=None):
+        merge.since.append(since)
+        merge.until.append(until)
+        raise ErpListingIncomplete("merge_dev", "payments", ListingGap.fetch_failed)
+
+    monkeypatch.setattr(MergeDevAdapter, "bill_change_feed", _refused)
+    result = await sweep.run_merge_readback_once(now=NOW)
+
+    # A past window is asked from its end less a second, bounded by the window.
+    assert merge.since == [through - timedelta(seconds=1)]
+    assert merge.until == [through - timedelta(seconds=1) + timedelta(minutes=120)]
+    assert result.failures == 1 and result.windows_narrowed == 0
+    assert await _cursor(realdb) == cursor
+
+
+async def test_at_the_narrowest_window_a_too_long_listing_fails(realdb, merge, monkeypatch):
+    from app.services.erp_adapters.base import ErpListingIncomplete, ListingGap
+
+    await _merge_tenant(realdb)
+    async with realdb.control_sessionmaker()() as s:
+        org = await s.get(Organization, realdb.info(TENANT).org_id)
+        cursor = {
+            "through": (NOW - timedelta(hours=3)).isoformat(),
+            "pending": [],
+            "listed_at": (NOW - timedelta(hours=1)).isoformat(),
+            "window_minutes": 1,
+        }
+        org.settings = {**org.settings, sweep.CURSOR_KEY: cursor}
+        flag_modified(org, "settings")
+        await s.commit()
+
+    async def _too_long(self, since, until=None):
+        raise ErpListingIncomplete("merge_dev", "invoices", ListingGap.truncated)
+
+    monkeypatch.setattr(MergeDevAdapter, "bill_change_feed", _too_long)
+    result = await sweep.run_merge_readback_once(now=NOW)
+
+    assert result.failures == 1 and result.windows_narrowed == 0
+    assert await _cursor(realdb) == cursor
 
 
 # ---------------------------------------------------------------------------

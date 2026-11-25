@@ -3096,10 +3096,10 @@ write-error guides (read 2026-11-13). Reasoning: `docs/decisions.md` §399.
   budget is spent for a tenant whose data key is cold, §408 / §525 / §527) is
   lost to Merge, which never redelivers a 204. The `merge-readback` sweep
   (`services/merge_readback_sweep`, `FEOH_MERGE_READBACK_SWEEP_ENABLED`, off by
-  default) is the backstop: per Merge tenant it asks `changed_bills(since)` for
-  the bills Merge changed after the tenant's cursor
-  (`Organization.settings.erp_merge_readback`: `through`, the moment the last
-  listing started, and `pending`, that listing's bills not yet applied; a first
+  default) is the backstop: per Merge tenant it asks `bill_change_feed(since,
+  until)` for the bills Merge changed after the tenant's cursor
+  (`Organization.settings.erp_merge_readback`: `through`, the end of the last
+  completed listing, and `pending`, that listing's bills not yet applied; a first
   pass looks back `FEOH_MERGE_READBACK_SWEEP_LOOKBACK_HOURS`; later passes ask
   from `through` less `FEOH_MERGE_READBACK_SWEEP_OVERLAP_MINUTES`, default 10,
   since `through` is our clock and a bill Merge stamped just before it by skew
@@ -3112,9 +3112,26 @@ write-error guides (read 2026-11-13). Reasoning: `docs/decisions.md` §399.
   A failed read, or the call budget, ends the pass with that bill still
   pending; a failed listing moves nothing. The cursor is written under the org
   row lock only if it is still what the pass read, so two replicas move it
-  once, and applying a bill twice changes nothing. A 404 is not read as gone
-  (the route reads it so only for `Invoice.removed`). Credentials that cannot
+  once, and applying a bill twice changes nothing. Credentials that cannot
   be opened skip the tenant with an error log that carries no exception text.
+- **Deletions and long feeds in the read-back sweep (decisions §567).**
+  Merge documents `remote_was_deleted` on the listing (asked with
+  `include_deleted_data=true`) but not what `GET /invoices/{id}` answers for a
+  record deleted in the ERP. So the feed also returns the bills the invoice
+  listing reports deleted, the sweep keeps them in the cursor (`deleted`), and
+  still reads each first: a 200 is applied as read (a restored bill is not
+  flagged), a 404 for a bill the listing called deleted applies `deleted`, as
+  the route does for a 404 on `Invoice.removed`, and a 404 for any other bill
+  is not read as gone. A listing longer than `SYNC_LISTING_MAX_ROWS`
+  (`ErpListingIncomplete`, truncated) moves nothing but halves the span it
+  asked into the cursor's `window_minutes`; the next tick lists only that
+  window (`modified_before`), a completed window moves `through` to its end
+  and doubles the next, and the one that reaches now drops the bound. Merge
+  documents no page order, so no part of a truncated listing is kept. A past
+  window is re-asked from its end less a second (`listed_at` keeps when it
+  was listed, for the §543 overlap); at one minute the window narrows no
+  further and the tenant fails each tick. Primary sources and dates:
+  decisions §567.
 - **No status sync, and why (decisions §504).** Read against the same spec on
   2026-11-24: Merge's `Payment` is `POST` / `GET` / `PATCH` only (no `DELETE`
   or void), and neither `Payment` nor `PaymentRequest` has a memo or reference

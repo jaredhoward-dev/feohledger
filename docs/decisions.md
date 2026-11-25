@@ -29488,3 +29488,78 @@ themselves, with the assignment left in place. Frontend:
 `tests-e2e/invoices/review-verdict.spec.ts` (buttons and note shown, approve
 accepted). Docs: `backend/docs/workflow-design.md` § Who Can Review,
 `docs/authentication.md` § delegation, the approve-invoices help guide.
+
+## 567. The Merge read-back sweep takes deletions from the listing and reads a long feed in narrowing windows (§540 follow-up, round 48)
+
+**Context.** The `merge-readback` sweep (§540) had two holes, tracked in
+`docs/followups.md`. (1) It learned a bill's state only from the single read
+`GET /invoices/{id}`, and dropped a 404 as "not found, not gone": so if Merge
+answers 404 for a record deleted in the ERP, the deletion reached FeohLedger
+only by the `Invoice.removed` webhook, the very channel the sweep backs up.
+(2) A feed longer than `SYNC_LISTING_MAX_ROWS` since the cursor raised
+`ErpListingIncomplete` (truncated) on every tick, so the tenant never moved
+again.
+
+**What Merge documents** (read 2026-11-25):
+
+* `remote_was_deleted` on the Invoice model: "Indicates whether or not this
+  object has been deleted in the third party platform", with full-coverage
+  deletion detection a premium add-on (https://docs.merge.dev/accounting/invoices/).
+* `include_deleted_data` is a list parameter on `GET /accounting/v1/invoices`;
+  the docs do not say whether deleted rows are left out without it, nor
+  whether a deletion moves `modified_at` (https://docs.merge.dev/openapi/accounting.json).
+* The retrieve endpoint documents only a 200; nothing says what it answers for
+  a record deleted in the ERP.
+* `modified_after` / `modified_before`: objects "synced by Merge after / before
+  this date time". `page_size` at most 100, a `next` cursor, and "all query
+  parameters, aside from `cursor` and `page_size`, [must] remain consistent
+  across pagination". No ordering of results is documented
+  (https://docs.merge.dev/basics/pagination/).
+* `{common_model}.removed` webhooks exist, and Merge says to "implement polling
+  and don't rely entirely on notification webhooks"
+  (https://docs.merge.dev/merge-unified/reading-data/webhooks/merge-webhooks.md).
+
+**Decision (1).** `MergeDevAdapter.bill_change_feed(since, until)` returns the
+feed's bills and, separately, the ones the invoice listing reports
+`remote_was_deleted` (asked with `include_deleted_data=true`, as before).
+`changed_bills` stays the base contract, the feed's `bills`. The sweep keeps
+the listed deletions in its cursor (`deleted`, beside `pending`) and still
+reads each bill first: a 200 is applied as read, so a bill restored since the
+listing is not flagged; a 404 for a bill the listing called deleted applies
+`deleted`, exactly as the webhook does for a 404 on an `Invoice.removed`
+delivery (§399); a 404 for any other bill is still not read as gone. A 404 is
+never the evidence; Merge's own `remote_was_deleted` is. Passing
+`include_deleted_data` on the single read was the alternative the follow-up
+named; it was not taken because the docs do not list it as a retrieve
+parameter, and an ignored parameter would have looked like a fix.
+
+**Decision (2).** The cursor gains `window_minutes`. A truncated listing moves
+nothing but halves the span it asked into `window_minutes` (by the same
+compare-and-swap) and ends the tenant's pass; the next tick asks
+`(since, since + window)` with `modified_before`. A completed window moves
+`through` to its end and doubles the window; the one that reaches now asks with
+no bound and drops the key. Merge documents no page order, so no part of a
+truncated listing can be kept: narrowing is the only way to make it whole. A
+window in the past is asked from its end less one second (Merge's filters are
+whole seconds), not less the overlap of §543, which covers a mark set at our
+own clock's now; the mark's listing time is kept as `listed_at` when it
+differs, and the next listing starts at the earlier of the two, so a window
+always advances. At one minute the window narrows no further and the tenant
+fails each tick, logged, as before; more than `SYNC_LISTING_MAX_ROWS` changes
+synced in one minute is a case for a person. One listing a tick, checked
+against the call budget first, as before.
+
+**Not done.** Neither behaviour has been run against a real Merge sandbox; the
+fake ERP models the open case (a 404 on retrieve for a bill the listing still
+carries deleted, set by `__set-status` `retrieve_gone`) rather than a
+documented one. The cursor's new keys are written only while they say
+something, so an existing cursor reads unchanged.
+
+**Tests.** `backend/tests/test_merge_readback_sweep.py` (a listed deletion is
+flagged when the read 404s; a listed deletion that reads open is not; a bare
+404 flags nothing; a listed deletion survives a failed read in the cursor;
+re-applying flags once; a long feed advances window by window across ticks and
+reads each bill once; a truncated listing narrows the window and moves nothing
+else; a failed window does not advance; the narrowest window fails);
+`test_merge_dev_adapter.py` (the feed's `deleted` and `modified_before`, no
+bound without `until`, a naive `until` refused before any call).
