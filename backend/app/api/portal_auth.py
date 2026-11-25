@@ -391,7 +391,7 @@ async def _portal_me_response(
 
 @router.get("/me", response_model=PortalMeResponse)
 async def portal_me(
-    vu: VendorUser = Depends(get_authenticated_vendor_user),  # legal gate exempt (§505)
+    vu: VendorUser = Depends(get_authenticated_vendor_user),
     db: AsyncSession = Depends(get_tenant_db),
 ):
     vendor = (
@@ -440,7 +440,7 @@ PORTAL_LEGAL_ACKNOWLEDGEMENT_RATE_LIMIT_PER_MINUTE = 10
 async def portal_acknowledge_legal(
     body: PortalLegalAcknowledgementRequest,
     request: Request,
-    vu: VendorUser = Depends(get_authenticated_vendor_user),  # legal gate exempt (§505)
+    vu: VendorUser = Depends(get_authenticated_vendor_user),
     db: AsyncSession = Depends(get_tenant_db),
 ):
     """Record the signed-in supplier's acknowledgement of the Privacy Policy in force.
@@ -488,7 +488,7 @@ async def portal_acknowledge_legal(
 @router.post("/change-password", response_model=PortalMeResponse)
 async def portal_change_password(
     body: PortalChangePasswordRequest,
-    vu: VendorUser = Depends(get_authenticated_vendor_user),  # legal gate exempt (§505)
+    vu: VendorUser = Depends(get_authenticated_vendor_user),
     db: AsyncSession = Depends(get_tenant_db),
     authorization: str | None = Header(default=None),
 ):

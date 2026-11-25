@@ -2092,7 +2092,7 @@ async def revoke_my_other_sessions(user: User = Depends(get_current_user)):
 
 @router.get("/me", response_model=UserResponse)
 async def get_me(
-    user: User = Depends(get_authenticated_user),  # legal gate exempt (§505)
+    user: User = Depends(get_authenticated_user),
     db: AsyncSession = Depends(get_control_db),
 ):
     org = await _load_user_org(db, user.organization_id)
@@ -2107,7 +2107,7 @@ LEGAL_ACCEPTANCE_RATE_LIMIT_PER_MINUTE = 10
 async def accept_legal_documents(
     body: LegalAcceptanceRequest,
     request: Request,
-    user: User = Depends(get_authenticated_user),  # legal gate exempt (§505)
+    user: User = Depends(get_authenticated_user),
     db: AsyncSession = Depends(get_control_db),
 ):
     """Record the caller's acceptance of the Terms / Privacy versions in force.
@@ -2288,7 +2288,7 @@ async def update_me(
 @router.post("/change-password", response_model=UserResponse)
 async def change_password(
     body: ChangePasswordRequest,
-    user: User = Depends(get_authenticated_user),  # legal gate exempt (§505)
+    user: User = Depends(get_authenticated_user),
     db: AsyncSession = Depends(get_control_db),
 ):
     """Change password for the authenticated user.
