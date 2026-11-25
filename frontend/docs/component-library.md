@@ -508,3 +508,20 @@ a definition as JSON). All wrap the shared `ui/Modal.svelte` and call the
   preselected; submitting with no choice states it in `role="alert"` and focuses the first option.
   Focus moves to the heading on mount. It makes no calls: the panel does
   (`#lib/api/erpConnection.ts`).
+- **The page-state panels** (decisions §526): `GettingStartedPanel`, `CompanyProfilePanel`,
+  `InvoiceDefaultsPanel`, `BrandingPanel`, `CustomDomainsPanel`, `ChatNotificationsPanel`,
+  `EmailIntakePanel`, `ResidencyPanel`, `ExtractionPanel`, `PaymentsPanel`, `CardsPanel`,
+  `SecurityPanel`, `SsoPanel`, `FraudRulesPanel`, `DataSyncPanel`, `PlanPanel`. Unlike the
+  self-loading panels above, each is a **view** over state the `/organization` page owns: its
+  fields arrive as one bound object typed in `panelState.ts` (`bind:fields={company}`; Payments
+  also binds `nacha`, the credential panels the shared `secretClear` map), so an unsaved edit
+  survives a switch to another section — the panel unmounts, the page does not
+  (`tests-e2e/organization/section-nav.spec.ts`). Loads, saves, connection tests, armed
+  confirms and their window-click disarm stay in the page and come down as values and callbacks
+  (`saving` / `onsave`, `testing` / `testResult` / `ontest`, …). The page renders every one inside
+  its single `<fieldset disabled={readOnly}>`, the whole read-only mode. Each carries a copy of the
+  page's panel CSS it uses (Svelte scopes a page's `<style>` to the page); `CustomDomainsPanel`
+  and `ResidencyPanel` take the page's `intro` snippet, shared with the load-failure branch the
+  page renders outside the fieldset. `panelState.ts` also holds what a panel and the page's save
+  both read: `CARD_REGIONS` / `cardAutoProvider`, `EXTRACTION_PROVIDERS` /
+  `extractionProviderLabel`, `FraudRules`, `ResidencyAlignment`.

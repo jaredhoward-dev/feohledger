@@ -4,10 +4,7 @@
 	import { api, ApiError } from '#lib/api.ts';
 	import { toast } from '#lib/components/ui/Toast.svelte';
 	import PageHeader from '#lib/components/ui/PageHeader.svelte';
-	import Badge from '#lib/components/ui/Badge.svelte';
 	import SecretReveal from '#lib/components/ui/SecretReveal.svelte';
-	import SecretField from '#lib/components/ui/SecretField.svelte';
-	import CredentialResetPrompt from '#lib/components/organization/CredentialResetPrompt.svelte';
 	import { CREDENTIAL_BLOCK_UNOPENABLE } from '#lib/api/codedRefusals.ts';
 	import {
 		getProviderCredentials,
@@ -19,15 +16,12 @@
 		type ProviderCredentialStatus
 	} from '#lib/types/providerCredentials.ts';
 	import SettingsRail from '#lib/components/ui/SettingsRail.svelte';
-	import CurrencyInput from '#lib/components/ui/CurrencyInput.svelte';
 	import { normalizeCurrencyCode, currencyCodeProblem } from '#lib/utils/currencyCode.ts';
-	import { m, currentLocale } from '#lib/i18n/store.svelte.ts';
-	import { planCodeLabel } from '#lib/types/planFeatures.ts';
+	import { m } from '#lib/i18n/store.svelte.ts';
 	import LoadingState from '#lib/components/ui/LoadingState.svelte';
 	import { auth } from '#lib/stores/auth.svelte.ts';
 	import { orgCurrency } from '#lib/stores/orgSettings.svelte.ts';
 	import type { MessageKey } from '#lib/i18n/messages.ts';
-	import { formatDate } from '#lib/utils/time.ts';
 	import {
 		getChatNotifications,
 		revokeChatWebhook,
@@ -35,23 +29,13 @@
 		updateChatNotifications
 	} from '#lib/api/chatNotifications.ts';
 	import { getEmailIntake, rotateEmailIntakeToken } from '#lib/api/emailIntake.ts';
-	import {
-		CHAT_EVENT_LABELS,
-		CHAT_PROVIDER_LABELS,
-		type ChatNotificationStatus
-	} from '#lib/types/chatNotifications.ts';
+	import type { ChatNotificationStatus } from '#lib/types/chatNotifications.ts';
 	import { getSsoSettings, updateSsoSettings } from '#lib/api/ssoSettings.ts';
-	import { ssoFieldLabels, ssoRefusalText } from '#lib/api/ssoRefusal.ts';
-	import {
-		SSO_PROVIDER_LABELS,
-		type SsoProtocol,
-		type SsoSettingsStatus
-	} from '#lib/types/ssoSettings.ts';
+	import { ssoRefusalText } from '#lib/api/ssoRefusal.ts';
+	import type { SsoSettingsStatus } from '#lib/types/ssoSettings.ts';
 	import { formatList } from '#lib/utils/list.ts';
-	import PlanUpgradeNotice from '#lib/components/ui/PlanUpgradeNotice.svelte';
 	import LoadError from '#lib/components/ui/LoadError.svelte';
 	import { errorMessage } from '#lib/utils/apiError.ts';
-	import SetupChecklist from '#lib/components/ui/SetupChecklist.svelte';
 	import { setupStepDone, setupStepHref, type SetupStepId } from '#lib/utils/onboarding.ts';
 	import type { OnboardingResponse } from '#lib/types/analytics.ts';
 	import ErpConnectionPanel from '#lib/components/organization/ErpConnectionPanel.svelte';
@@ -61,20 +45,47 @@
 	import LineTotalCheckPanel from '#lib/components/organization/LineTotalCheckPanel.svelte';
 	import MatchRulesPanel from '#lib/components/organization/MatchRulesPanel.svelte';
 	import AgentAutonomyPanel from '#lib/components/organization/AgentAutonomyPanel.svelte';
+	import CompanyProfilePanel from '#lib/components/organization/CompanyProfilePanel.svelte';
+	import EmailIntakePanel from '#lib/components/organization/EmailIntakePanel.svelte';
+	import ChatNotificationsPanel from '#lib/components/organization/ChatNotificationsPanel.svelte';
+	import CustomDomainsPanel from '#lib/components/organization/CustomDomainsPanel.svelte';
+	import ResidencyPanel from '#lib/components/organization/ResidencyPanel.svelte';
+	import SsoPanel from '#lib/components/organization/SsoPanel.svelte';
+	import PaymentsPanel from '#lib/components/organization/PaymentsPanel.svelte';
+	import FraudRulesPanel from '#lib/components/organization/FraudRulesPanel.svelte';
+	import ExtractionPanel from '#lib/components/organization/ExtractionPanel.svelte';
+	import BrandingPanel from '#lib/components/organization/BrandingPanel.svelte';
+	import CardsPanel from '#lib/components/organization/CardsPanel.svelte';
+	import SecurityPanel from '#lib/components/organization/SecurityPanel.svelte';
+	import PlanPanel from '#lib/components/organization/PlanPanel.svelte';
+	import DataSyncPanel from '#lib/components/organization/DataSyncPanel.svelte';
+	import GettingStartedPanel from '#lib/components/organization/GettingStartedPanel.svelte';
+	import InvoiceDefaultsPanel from '#lib/components/organization/InvoiceDefaultsPanel.svelte';
+	import {
+		cardAutoProvider,
+		extractionProviderLabel,
+		type BrandingFields,
+		type CardsFields,
+		type ChatFields,
+		type CompanyFields,
+		type ExtractionFields,
+		type NachaFields,
+		type PaymentsFields,
+		type ResidencyAlignment,
+		type SsoFields,
+		type FraudRules,
+		type InvoiceDefaultsFields
+	} from '#lib/components/organization/panelState.ts';
 	import { withoutOwnedFraudKeys } from '#lib/types/orgControls.ts';
 	import type { StoredErpConfig } from '#lib/types/erpConnection.ts';
 	import {
 		FEATURE_ERP_INTEGRATIONS,
-		FEATURE_ERP_MERGE,
-		FEATURE_SSO,
-		FEATURE_SSO_ENFORCEMENT
+		FEATURE_ERP_MERGE
 	} from '#lib/types/planFeatures.ts';
 	import {
 		NACHA_FIELD_LABEL_KEYS,
-		NACHA_OFFSET_ACCOUNT_TYPES,
 		nachaForSave,
-		nachaProblems,
-		type PaymentExecutionMode
+		nachaProblems
 	} from '#lib/types/paymentExecution.ts';
 
 	interface CompanyProfile {
@@ -93,24 +104,6 @@
 		number_prefix: string;
 		default_gl_account: string;
 		default_cost_center: string;
-	}
-
-	interface FraudRules {
-		round_amount_enabled: boolean;
-		future_date_enabled: boolean;
-		bank_change_enabled: boolean;
-		stat_anomaly_enabled: boolean;
-		rush_payment_enabled: boolean;
-		new_vendor_large_enabled: boolean;
-		personal_email_enabled: boolean;
-		llm_anomaly_enabled: boolean;
-		round_amount_min: string;
-		rush_payment_max_days: number;
-		new_vendor_max_age_days: number;
-		new_vendor_large_amount: string;
-		stat_anomaly_sigma: number;
-		stat_anomaly_min_history: number;
-		personal_email_domains: string[];
 	}
 
 	interface OrgSettings {
@@ -141,47 +134,25 @@
 	// fallback branch read "Loading…" forever after a failed load (#635).
 	let orgLoadFailed = $state(false);
 	// Editable fields
-	let name = $state('');
-	let address = $state('');
-	let phone = $state('');
-	let website = $state('');
-	let taxId = $state('');
-	let vatNumber = $state('');
-	let companiesHouseNumber = $state('');
-	let currency = $state('USD');
-	// The stored default is the user's choice, never re-seeded; marking it
-	// touched once loaded also shows a malformed stored code as an error.
-	let currencyTouched = $state(false);
-	let paymentTerms = $state('Net 30');
-	// The stored value is the English term the backend and the ERP exports
-	// read, so it stays the option's `value`; only the label is localized.
-	const PAYMENT_TERMS = [
-		'Due on Receipt',
-		'Net 10',
-		'Net 15',
-		'Net 30',
-		'Net 45',
-		'Net 60',
-		'Net 90',
-		'2/10 Net 30'
-	] as const;
-	// A term saved through the API (or before this list) that is not one of the
-	// presets is still offered, so the select shows what is actually stored
-	// rather than a blank box that silently overwrites it on the next save.
-	const paymentTermOptions = $derived(
-		(PAYMENT_TERMS as readonly string[]).includes(paymentTerms)
-			? [...PAYMENT_TERMS]
-			: [...PAYMENT_TERMS, paymentTerms]
-	);
-	function paymentTermLabel(term: string): string {
-		if (term === 'Due on Receipt') return m('org.defaults.terms.dueOnReceipt');
-		if (term === '2/10 Net 30') return m('org.defaults.terms.twoTenNet30');
-		const net = /^Net (\d+)$/.exec(term);
-		return net ? m('org.defaults.terms.net', { days: Number(net[1]) }) : term;
-	}
-	let numberPrefix = $state('INV-');
-	let defaultGl = $state('');
-	let defaultCostCenter = $state('');
+	// Each panel's fields are one object, owned here and bound into the panel
+	// component, so an unsaved edit survives a panel switch (`panelState.ts`).
+	let company = $state<CompanyFields>({
+		name: '',
+		address: '',
+		phone: '',
+		website: '',
+		taxId: '',
+		vatNumber: '',
+		companiesHouseNumber: ''
+	});
+	let invoiceDefaults = $state<InvoiceDefaultsFields>({
+		currency: 'USD',
+		currencyTouched: false,
+		paymentTerms: 'Net 30',
+		numberPrefix: 'INV-',
+		defaultGl: '',
+		defaultCostCenter: ''
+	});
 	// Provider credentials are write-only (`/api/organization/credentials`). Each
 	// secret input on the payments, cards and extraction panels (the ERP panel keeps its own,
 	// `ErpConnectionPanel`) starts EMPTY and holds
@@ -250,20 +221,24 @@
 		}
 	}
 	// Extraction
-	let extractionProgramType = $state('platform');
-	let extractionProvider = $state('claude_vision');
-	let extractionApiKey = $state('');
-	let extractionAwsKeyId = $state('');
-	let extractionAwsSecret = $state('');
-	let extractionAwsRegion = $state('us-east-1');
+	let extractionFields = $state<ExtractionFields>({
+		programType: 'platform',
+		provider: 'claude_vision',
+		apiKey: '',
+		awsKeyId: '',
+		awsSecret: '',
+		awsRegion: 'us-east-1',
+		ollamaUrl: 'http://localhost:11434',
+		ollamaModel: 'llama3.2-vision:11b',
+		keyInvalid: false
+	});
 	let savingExtraction = $state(false);
 	// The provider the stored key belongs to — as loaded, then as last saved
 	// (`null`: the block names none). A save that changes it drops the sealed
 	// key server-side (`extraction_secrets_to_drop`, decisions §444), so the
 	// key field reads "stored" only while the dropdown still shows this one.
 	let extractionSavedProvider = $state<string | null>(null);
-	let extractionKeyInvalid = $state(false);
-	const extractionProviderChanged = $derived(extractionProvider !== extractionSavedProvider);
+	const extractionProviderChanged = $derived(extractionFields.provider !== extractionSavedProvider);
 	const extractionKeyStored = (path: string): boolean =>
 		!extractionProviderChanged && isStored('extraction', path);
 	// A key is stored for the saved provider, and this save would drop it.
@@ -278,10 +253,6 @@
 			: provider === 'claude_vision' || provider === 'openai_vision'
 				? 'api_key'
 				: null;
-	const extractionProviderLabel = (provider: string): string =>
-		provider === 'ollama'
-			? m('org.extraction.providerOllama')
-			: (EXTRACTION_PROVIDERS.find((p) => p.value === provider)?.name ?? provider);
 	let testingExtraction = $state(false);
 	let extractionTestResult = $state<{ success: boolean; message: string } | null>(null);
 
@@ -290,13 +261,13 @@
 		extractionTestResult = null;
 		try {
 			extractionTestResult = await api.post<{ success: boolean; message: string }>('/api/organization/test-extraction', {
-				provider: extractionProgramType === 'platform' ? 'claude_vision' : extractionProvider,
-				api_key: extractionApiKey,
-				aws_access_key_id: extractionAwsKeyId,
-				aws_secret_access_key: extractionAwsSecret,
-				aws_region: extractionAwsRegion,
-				base_url: extractionOllamaUrl,
-				model: extractionOllamaModel,
+				provider: extractionFields.programType === 'platform' ? 'claude_vision' : extractionFields.provider,
+				api_key: extractionFields.apiKey,
+				aws_access_key_id: extractionFields.awsKeyId,
+				aws_secret_access_key: extractionFields.awsSecret,
+				aws_region: extractionFields.awsRegion,
+				base_url: extractionFields.ollamaUrl,
+				model: extractionFields.ollamaModel,
 			});
 		} catch (err) {
 			extractionTestResult = { success: false, message: errorMessage(err, m('org.toast.testFailed')) };
@@ -305,64 +276,21 @@
 		}
 	}
 
-	// Product names, not copy, except Ollama's "(local)" note, which is keyed
-	// (`extractionProviderLabel`).
-	const EXTRACTION_PROVIDERS = [
-		{ value: 'claude_vision', name: 'Claude Vision (Anthropic)' },
-		{ value: 'openai_vision', name: 'GPT-4V (OpenAI)' },
-		{ value: 'aws_textract', name: 'AWS Textract' },
-		{ value: 'ollama', name: 'Ollama' },
-	];
-	// Product and model names, not copy: they read the same in every locale.
-	const MODERN_TREASURY = 'Modern Treasury';
-	const OLLAMA_MODELS = [
-		{ value: 'llama3.2-vision:11b', name: 'Llama 3.2 Vision 11B' },
-		{ value: 'llama3.2-vision:90b', name: 'Llama 3.2 Vision 90B' },
-		{ value: 'llava:13b', name: 'LLaVA 13B' },
-		{ value: 'llava:34b', name: 'LLaVA 34B' }
-	];
-	let extractionOllamaUrl = $state('http://localhost:11434');
-	let extractionOllamaModel = $state('llama3.2-vision:11b');
 	// Cards
-	let cardsEnabled = $state(false);
-	let cardsProgramType = $state('platform');
-	let cardsProvider = $state('');
-	let cardsRegion = $state('US');
-	let cardsApiKey = $state('');
-	let cardsClientId = $state('');
-	let cardsClientSecret = $state('');
-	let cardsCustomerHashId = $state('');
-	let cardsWalletHashId = $state('');
-	let cardsExpiryDays = $state(30);
-	let cardsSandbox = $state(true);
+	let cardsFields = $state<CardsFields>({
+		enabled: false,
+		programType: 'platform',
+		provider: '',
+		region: 'US',
+		apiKey: '',
+		clientId: '',
+		clientSecret: '',
+		customerHashId: '',
+		walletHashId: '',
+		expiryDays: 30,
+		sandbox: true
+	});
 	let savingCards = $state(false);
-	// `value` is the stored card-program region (the backend keeps `UK`, not
-	// ISO's `GB`); `iso` is what Intl names in the reader's language.
-	const CARD_REGIONS = [
-		{ value: 'US', iso: 'US', eu: false, default_provider: 'lithic' },
-		{ value: 'UK', iso: 'GB', eu: false, default_provider: 'lithic' },
-		{ value: 'DE', iso: 'DE', eu: true, default_provider: 'lithic' },
-		{ value: 'FR', iso: 'FR', eu: true, default_provider: 'lithic' },
-		{ value: 'NL', iso: 'NL', eu: true, default_provider: 'lithic' },
-		{ value: 'ZA', iso: 'ZA', eu: false, default_provider: 'nium' },
-		{ value: 'AU', iso: 'AU', eu: false, default_provider: 'nium' },
-		{ value: 'SG', iso: 'SG', eu: false, default_provider: 'nium' },
-		{ value: 'HK', iso: 'HK', eu: false, default_provider: 'nium' },
-		{ value: 'IN', iso: 'IN', eu: false, default_provider: 'nium' },
-		{ value: 'CA', iso: 'CA', eu: false, default_provider: 'nium' },
-		{ value: 'AE', iso: 'AE', eu: false, default_provider: 'nium' },
-		{ value: 'JP', iso: 'JP', eu: false, default_provider: 'nium' },
-	];
-	const regionNames = $derived(new Intl.DisplayNames([currentLocale()], { type: 'region' }));
-	function cardRegionLabel(r: (typeof CARD_REGIONS)[number]): string {
-		const country = regionNames.of(r.iso) ?? r.value;
-		return r.eu ? m('org.cards.regionEu', { country }) : country;
-	}
-
-	let autoProvider = $derived(
-		CARD_REGIONS.find(r => r.value === cardsRegion)?.default_provider ?? 'nium'
-	);
-	let effectiveProvider = $derived(cardsProvider || autoProvider);
 	// ── Read-only mode for non-admins ───────────────────────────────────
 	// Every mutating endpoint behind this page is `require_roles(ROLE_ADMIN)`
 	// — the server is and stays the authority. What was missing was any
@@ -381,8 +309,6 @@
 	// control that would be refused for the upgrade prompt. What a save would
 	// turn OFF is never gated, so a downgraded tenant can still switch SSO or
 	// "require SSO" off.
-	const ssoEntitled = $derived(auth.hasFeature(FEATURE_SSO));
-	const ssoEnforcementEntitled = $derived(auth.hasFeature(FEATURE_SSO_ENFORCEMENT));
 	const erpEntitled = $derived(auth.hasFeature(FEATURE_ERP_INTEGRATIONS));
 	const erpMergeEntitled = $derived(auth.hasFeature(FEATURE_ERP_MERGE));
 
@@ -597,36 +523,40 @@
 		try {
 			const data = await api.get<OrgResponse>('/api/organization');
 			org = data;
-			name = data.name;
-			address = data.settings.company.address;
-			phone = data.settings.company.phone;
-			website = data.settings.company.website;
-			taxId = data.settings.company.tax_id;
-			vatNumber = data.settings.company.vat_registration_number ?? '';
-			companiesHouseNumber = data.settings.company.companies_house_number ?? '';
-			currency = data.settings.invoice_defaults.currency;
-			currencyTouched = true;
-			paymentTerms = data.settings.invoice_defaults.payment_terms;
-			numberPrefix = data.settings.invoice_defaults.number_prefix;
-			defaultGl = data.settings.invoice_defaults.default_gl_account;
-			defaultCostCenter = data.settings.invoice_defaults.default_cost_center;
+			company = {
+				name: data.name,
+				address: data.settings.company.address,
+				phone: data.settings.company.phone,
+				website: data.settings.company.website,
+				taxId: data.settings.company.tax_id,
+				vatNumber: data.settings.company.vat_registration_number ?? '',
+				companiesHouseNumber: data.settings.company.companies_house_number ?? ''
+			};
+			invoiceDefaults = {
+				currency: data.settings.invoice_defaults.currency,
+				currencyTouched: true,
+				paymentTerms: data.settings.invoice_defaults.payment_terms,
+				numberPrefix: data.settings.invoice_defaults.number_prefix,
+				defaultGl: data.settings.invoice_defaults.default_gl_account,
+				defaultCostCenter: data.settings.invoice_defaults.default_cost_center
+			};
 			// Cards
 			const cards = (data.settings as unknown as Record<string, unknown>).cards as Record<string, unknown> | undefined;
 			if (cards) {
-				cardsEnabled = (cards.enabled as boolean) ?? false;
-				cardsProgramType = (cards.program_type as string) || 'platform';
-				cardsProvider = (cards.provider as string) || '';
-				cardsRegion = (cards.region as string) || 'US';
-				cardsClientId = (cards.client_id as string) || '';
-				cardsCustomerHashId = (cards.customer_hash_id as string) || '';
-				cardsWalletHashId = (cards.wallet_hash_id as string) || '';
-				cardsExpiryDays = (cards.default_expiry_days as number) || 30;
+				cardsFields.enabled = (cards.enabled as boolean) ?? false;
+				cardsFields.programType = (cards.program_type as string) || 'platform';
+				cardsFields.provider = (cards.provider as string) || '';
+				cardsFields.region = (cards.region as string) || 'US';
+				cardsFields.clientId = (cards.client_id as string) || '';
+				cardsFields.customerHashId = (cards.customer_hash_id as string) || '';
+				cardsFields.walletHashId = (cards.wallet_hash_id as string) || '';
+				cardsFields.expiryDays = (cards.default_expiry_days as number) || 30;
 				// A stored block with no `sandbox` key runs LIVE: the card adapters
 				// read `config.get("sandbox", False)`. Showing it as testing made the
 				// next save silently move the block to sandbox (and, since §464,
 				// drop its keys). A block never configured keeps the declared
 				// default above.
-				cardsSandbox = typeof cards.sandbox === 'boolean' ? cards.sandbox : false;
+				cardsFields.sandbox = typeof cards.sandbox === 'boolean' ? cards.sandbox : false;
 			}
 			// Security (MFA enforcement)
 			const mfaCfg = (data.settings as unknown as Record<string, unknown>).mfa as
@@ -649,42 +579,42 @@
 				| undefined;
 			if (pmt) {
 				loadPaymentsExtras(pmt);
-				paymentsProvider = (pmt.provider as string) || 'mock';
+				paymentsFields.provider = (pmt.provider as string) || 'mock';
 				paymentsProgramType = (pmt.program_type as string) || 'byok';
-				paymentsOrgId = (pmt.org_id as string) || '';
-				paymentsOriginatingAccount = (pmt.originating_account_id as string) || '';
-				paymentsSandbox = (pmt.sandbox as boolean) ?? true;
-				paymentsCfoThreshold = (pmt.cfo_approval_above as number | null) ?? null;
+				paymentsFields.orgId = (pmt.org_id as string) || '';
+				paymentsFields.originatingAccount = (pmt.originating_account_id as string) || '';
+				paymentsFields.sandbox = (pmt.sandbox as boolean) ?? true;
+				paymentsFields.cfoThreshold = (pmt.cfo_approval_above as number | null) ?? null;
 			}
 			// Extraction
 			const extraction = (data.settings as unknown as Record<string, unknown>).extraction as Record<string, unknown> | undefined;
 			if (extraction) {
-				extractionProgramType = (extraction.program_type as string) || 'platform';
-				extractionProvider = (extraction.provider as string) || 'claude_vision';
+				extractionFields.programType = (extraction.program_type as string) || 'platform';
+				extractionFields.provider = (extraction.provider as string) || 'claude_vision';
 				extractionSavedProvider =
 					typeof extraction.provider === 'string' && extraction.provider.trim()
 						? extraction.provider.trim()
 						: null;
 				// The BYOK key / AWS secret are sealed and never read back: their
 				// fields start empty ("leave blank to keep"), like every SecretField.
-				extractionAwsKeyId = (extraction.aws_access_key_id as string) || '';
-				extractionAwsRegion = (extraction.aws_region as string) || 'us-east-1';
-				extractionOllamaUrl = (extraction.base_url as string) || 'http://localhost:11434';
-				extractionOllamaModel = (extraction.model as string) || 'llama3.2-vision:11b';
+				extractionFields.awsKeyId = (extraction.aws_access_key_id as string) || '';
+				extractionFields.awsRegion = (extraction.aws_region as string) || 'us-east-1';
+				extractionFields.ollamaUrl = (extraction.base_url as string) || 'http://localhost:11434';
+				extractionFields.ollamaModel = (extraction.model as string) || 'llama3.2-vision:11b';
 			}
 			// Branding (white-label)
 			const brandCfg = (data.settings as unknown as Record<string, unknown>).brand as
 				| Record<string, unknown>
 				| undefined;
 			if (brandCfg) {
-				brandProductName = (brandCfg.product_name as string) || '';
-				brandLogoUrl = (brandCfg.logo_url as string) || '';
-				brandAccentColor = (brandCfg.accent_color as string) || '';
-				brandAccentStrongColor = (brandCfg.accent_strong_color as string) || '';
-				brandSupportUrl = (brandCfg.support_url as string) || '';
-				brandLegalUrl = (brandCfg.legal_url as string) || '';
-				brandTenantUrlTemplate = (brandCfg.tenant_url_template as string) || '';
-				brandSsoCallbackBaseUrl = (brandCfg.sso_callback_base_url as string) || '';
+				branding.productName = (brandCfg.product_name as string) || '';
+				branding.logoUrl = (brandCfg.logo_url as string) || '';
+				branding.accentColor = (brandCfg.accent_color as string) || '';
+				branding.accentStrongColor = (brandCfg.accent_strong_color as string) || '';
+				branding.supportUrl = (brandCfg.support_url as string) || '';
+				branding.legalUrl = (brandCfg.legal_url as string) || '';
+				branding.tenantUrlTemplate = (brandCfg.tenant_url_template as string) || '';
+				branding.ssoCallbackBaseUrl = (brandCfg.sso_callback_base_url as string) || '';
 			}
 		} catch {
 			// In place, not a toast: the toast faded and left the loading line.
@@ -763,14 +693,18 @@
 	}
 
 	// Payments
-	let paymentsProvider = $state('mock');
+	// `mode` starts at "processor": see the execution-mode note below.
+	let paymentsFields = $state<PaymentsFields>({
+		mode: 'processor',
+		provider: 'mock',
+		apiKey: '',
+		orgId: '',
+		originatingAccount: '',
+		webhookSecret: '',
+		sandbox: true,
+		cfoThreshold: null
+	});
 	let paymentsProgramType = $state('byok'); // mock = no key; modern_treasury = byok keys
-	let paymentsApiKey = $state('');
-	let paymentsOrgId = $state('');
-	let paymentsOriginatingAccount = $state('');
-	let paymentsWebhookSecret = $state('');
-	let paymentsSandbox = $state(true);
-	let paymentsCfoThreshold = $state<number | null>(null);
 	let savingPayments = $state(false);
 
 	// --- Payment execution mode + NACHA bank file (issue #517) ----------------
@@ -780,17 +714,19 @@
 	// unless the admin changes it, rather than written as an explicit choice
 	// nobody made. An unknown stored value shows as record-only, which is what
 	// the server resolves it to (fail closed).
-	let paymentsMode = $state<PaymentExecutionMode>('processor');
 	let paymentsModeStored = $state<string | null>(null);
-	let nachaCompanyName = $state('');
-	let nachaCompanyId = $state('');
-	let nachaOdfiRouting = $state('');
-	let nachaBankName = $state('');
+	let nachaFields = $state<NachaFields>({
+		companyName: '',
+		companyId: '',
+		odfiRouting: '',
+		bankName: '',
+		offsetRouting: '',
+		offsetAccount: '',
+		offsetAccountType: ''
+	});
 	// The balanced-file offset account (decisions §432). The account number
 	// reads back masked (`****1234`), so the input starts blank with the mask as
 	// its placeholder; saving it blank keeps the stored number.
-	let nachaOffsetRouting = $state('');
-	let nachaOffsetAccount = $state('');
 	let nachaOffsetAccountMask = $state('');
 	// The stored offset's bank, while an account number is on file: a blank
 	// account is "keep it" only at that same bank (`nachaProblems`).
@@ -807,7 +743,6 @@
 					}
 				: null;
 	}
-	let nachaOffsetAccountType = $state('');
 	// Every OTHER key of the stored `settings.payments` block. The save is a
 	// shallow replace of the whole block, so a key this form does not manage —
 	// `require_run_segregation`, `home_currency`, anything newer than this
@@ -833,19 +768,19 @@
 		);
 		const mode = pmt.mode;
 		paymentsModeStored = typeof mode === 'string' ? mode : null;
-		paymentsMode =
+		paymentsFields.mode =
 			paymentsModeStored === null || paymentsModeStored === 'processor' ? 'processor' : 'record_only';
 		const nacha = (pmt.nacha ?? {}) as Record<string, unknown>;
-		nachaCompanyName = typeof nacha.company_name === 'string' ? nacha.company_name : '';
-		nachaCompanyId = typeof nacha.company_id === 'string' ? nacha.company_id : '';
-		nachaOdfiRouting = typeof nacha.odfi_routing === 'string' ? nacha.odfi_routing : '';
-		nachaBankName = typeof nacha.bank_name === 'string' ? nacha.bank_name : '';
-		nachaOffsetRouting = typeof nacha.offset_routing === 'string' ? nacha.offset_routing : '';
-		nachaOffsetAccount = '';
+		nachaFields.companyName = typeof nacha.company_name === 'string' ? nacha.company_name : '';
+		nachaFields.companyId = typeof nacha.company_id === 'string' ? nacha.company_id : '';
+		nachaFields.odfiRouting = typeof nacha.odfi_routing === 'string' ? nacha.odfi_routing : '';
+		nachaFields.bankName = typeof nacha.bank_name === 'string' ? nacha.bank_name : '';
+		nachaFields.offsetRouting = typeof nacha.offset_routing === 'string' ? nacha.offset_routing : '';
+		nachaFields.offsetAccount = '';
 		nachaOffsetAccountMask =
 			typeof nacha.offset_account === 'string' ? nacha.offset_account : '';
 		rememberNachaOnFile(nacha);
-		nachaOffsetAccountType =
+		nachaFields.offsetAccountType =
 			typeof nacha.offset_account_type === 'string' ? nacha.offset_account_type : '';
 	}
 	let testingPayments = $state(false);
@@ -858,11 +793,11 @@
 			paymentsTestResult = await api.post<{ success: boolean; message: string }>(
 				'/api/organization/test-payments',
 				{
-					provider: paymentsProvider,
-					api_key: paymentsApiKey,
-					org_id: paymentsOrgId,
-					originating_account_id: paymentsOriginatingAccount,
-					sandbox: paymentsSandbox,
+					provider: paymentsFields.provider,
+					api_key: paymentsFields.apiKey,
+					org_id: paymentsFields.orgId,
+					originating_account_id: paymentsFields.originatingAccount,
+					sandbox: paymentsFields.sandbox,
 				}
 			);
 		} catch (err) {
@@ -879,7 +814,7 @@
 	 *  it toasts once, when both have settled. */
 	async function patchOrg(partial: Record<string, unknown>) {
 		const data = await api.patch<OrgResponse>('/api/organization', {
-			...(partial.company ? { name: name.trim() } : {}),
+			...(partial.company ? { name: company.name.trim() } : {}),
 			settings: partial,
 		});
 		org = data;
@@ -895,10 +830,12 @@
 		try {
 			await patchSettings(m('org.section.companySaved'), {
 				company: {
-					address, phone, website,
-					tax_id: taxId,
-					vat_registration_number: vatNumber,
-					companies_house_number: companiesHouseNumber,
+					address: company.address,
+					phone: company.phone,
+					website: company.website,
+					tax_id: company.taxId,
+					vat_registration_number: company.vatNumber,
+					companies_house_number: company.companiesHouseNumber,
 					logo_url: org?.settings.company.logo_url ?? '',
 				},
 			});
@@ -912,27 +849,27 @@
 	async function saveDefaults() {
 		// The section has no <form>, so the field's own validity cannot block
 		// the save: refuse here with the same words the field shows.
-		const code = normalizeCurrencyCode(currency);
+		const code = normalizeCurrencyCode(invoiceDefaults.currency);
 		if (code === null) {
-			currencyTouched = true;
+			invoiceDefaults.currencyTouched = true;
 			toast(
-				currencyCodeProblem(currency) === 'required'
+				currencyCodeProblem(invoiceDefaults.currency) === 'required'
 					? m('common.currencyCode.required')
-					: m('common.currencyCode.invalid', { value: currency.trim() }),
+					: m('common.currencyCode.invalid', { value: invoiceDefaults.currency.trim() }),
 				'error'
 			);
 			return;
 		}
-		currency = code;
+		invoiceDefaults.currency = code;
 		savingDefaults = true;
 		try {
 			await patchSettings(m('org.section.defaultsSaved'), {
 				invoice_defaults: {
-					currency,
-					payment_terms: paymentTerms,
-					number_prefix: numberPrefix,
-					default_gl_account: defaultGl,
-					default_cost_center: defaultCostCenter,
+					currency: invoiceDefaults.currency,
+					payment_terms: invoiceDefaults.paymentTerms,
+					number_prefix: invoiceDefaults.numberPrefix,
+					default_gl_account: invoiceDefaults.defaultGl,
+					default_cost_center: invoiceDefaults.defaultCostCenter,
 				},
 			});
 			// `invoice_defaults.currency` is a rung of the reporting-currency
@@ -949,16 +886,16 @@
 	}
 
 	async function saveExtraction() {
-		const byok = extractionProgramType === 'byok';
+		const byok = extractionFields.programType === 'byok';
 		// Platform mode hides the provider dropdown: resend the saved one, so a
 		// choice the admin can no longer see cannot drop the stored key.
-		const provider = byok ? extractionProvider : (extractionSavedProvider ?? extractionProvider);
+		const provider = byok ? extractionFields.provider : (extractionSavedProvider ?? extractionFields.provider);
 		// Refuse a switch that would leave BYOK keyless: the stored key goes
 		// with the old provider, so the new one's must be typed in this save.
 		const needed = byok ? extractionSecretPath(provider) : null;
-		const typed = { api_key: extractionApiKey, aws_secret_access_key: extractionAwsSecret };
+		const typed = { api_key: extractionFields.apiKey, aws_secret_access_key: extractionFields.awsSecret };
 		if (extractionSwitchDropsKey && needed && typed[needed].trim() === '') {
-			extractionKeyInvalid = true;
+			extractionFields.keyInvalid = true;
 			toast(
 				m('org.extraction.switchNeedsKey', { provider: extractionProviderLabel(provider) }),
 				'error'
@@ -968,7 +905,7 @@
 				?.focus();
 			return;
 		}
-		extractionKeyInvalid = false;
+		extractionFields.keyInvalid = false;
 		savingExtraction = true;
 		try {
 			// Configuration first: a save that switches provider drops the old
@@ -976,12 +913,12 @@
 			// must be written after it.
 			await patchOrg({
 				extraction: {
-					program_type: extractionProgramType,
+					program_type: extractionFields.programType,
 					provider,
-					aws_access_key_id: extractionAwsKeyId,
-					aws_region: extractionAwsRegion,
-					base_url: extractionOllamaUrl,
-					model: extractionOllamaModel,
+					aws_access_key_id: extractionFields.awsKeyId,
+					aws_region: extractionFields.awsRegion,
+					base_url: extractionFields.ollamaUrl,
+					model: extractionFields.ollamaModel,
 				},
 			});
 			extractionSavedProvider = provider;
@@ -989,7 +926,7 @@
 			// dropped a key the page still believes is there.
 			await loadCredentials();
 			await saveSecrets('extraction', typed);
-			extractionApiKey = extractionAwsSecret = '';
+			extractionFields.apiKey = extractionFields.awsSecret = '';
 			toast(
 				m('org.toast.sectionSaved', { section: m('org.section.extractionSaved') }),
 				'success'
@@ -1008,19 +945,22 @@
 		try {
 			await patchOrg({
 				cards: {
-					enabled: cardsEnabled,
-					program_type: cardsProgramType,
-					provider: cardsProvider || autoProvider,
-					region: cardsRegion,
-					client_id: cardsClientId,
-					customer_hash_id: cardsCustomerHashId,
-					wallet_hash_id: cardsWalletHashId,
-					default_expiry_days: cardsExpiryDays,
-					sandbox: cardsSandbox,
+					enabled: cardsFields.enabled,
+					program_type: cardsFields.programType,
+					provider: cardsFields.provider || cardAutoProvider(cardsFields.region),
+					region: cardsFields.region,
+					client_id: cardsFields.clientId,
+					customer_hash_id: cardsFields.customerHashId,
+					wallet_hash_id: cardsFields.walletHashId,
+					default_expiry_days: cardsFields.expiryDays,
+					sandbox: cardsFields.sandbox,
 				},
 			});
-			await saveSecrets('cards', { api_key: cardsApiKey, client_secret: cardsClientSecret });
-			cardsApiKey = cardsClientSecret = '';
+			await saveSecrets('cards', {
+				api_key: cardsFields.apiKey,
+				client_secret: cardsFields.clientSecret
+			});
+			cardsFields.apiKey = cardsFields.clientSecret = '';
 			toast(m('org.toast.sectionSaved', { section: m('org.section.cardsSaved') }), 'success');
 			unopenable.cards = false;
 		} catch (err) {
@@ -1074,13 +1014,13 @@
 
 	async function savePayments() {
 		const nacha = nachaForSave({
-			company_name: nachaCompanyName,
-			company_id: nachaCompanyId,
-			odfi_routing: nachaOdfiRouting,
-			bank_name: nachaBankName,
-			offset_routing: nachaOffsetRouting,
-			offset_account: nachaOffsetAccount,
-			offset_account_type: nachaOffsetAccountType
+			company_name: nachaFields.companyName,
+			company_id: nachaFields.companyId,
+			odfi_routing: nachaFields.odfiRouting,
+			bank_name: nachaFields.bankName,
+			offset_routing: nachaFields.offsetRouting,
+			offset_account: nachaFields.offsetAccount,
+			offset_account_type: nachaFields.offsetAccountType
 		});
 		if (nacha) {
 			// The server 422s the same fields (`services/nacha.originator_problems`);
@@ -1099,23 +1039,23 @@
 			}
 		}
 		// Re-send an absent mode as absent unless the admin chose one.
-		const sendMode = paymentsModeStored !== null || paymentsMode !== 'processor';
+		const sendMode = paymentsModeStored !== null || paymentsFields.mode !== 'processor';
 		savingPayments = true;
 		try {
 			await patchOrg({
 				payments: {
 					...paymentsExtras,
-					...(sendMode ? { mode: paymentsMode } : {}),
+					...(sendMode ? { mode: paymentsFields.mode } : {}),
 					nacha,
-					provider: paymentsProvider,
+					provider: paymentsFields.provider,
 					program_type: paymentsProgramType,
-					org_id: paymentsOrgId,
-					originating_account_id: paymentsOriginatingAccount,
-					sandbox: paymentsSandbox,
-					cfo_approval_above: paymentsCfoThreshold,
+					org_id: paymentsFields.orgId,
+					originating_account_id: paymentsFields.originatingAccount,
+					sandbox: paymentsFields.sandbox,
+					cfo_approval_above: paymentsFields.cfoThreshold,
 				},
 			});
-			if (sendMode) paymentsModeStored = paymentsMode;
+			if (sendMode) paymentsModeStored = paymentsFields.mode;
 			// The typed offset account number is now on file: show it as the
 			// server does, masked, and clear the input.
 			const savedNacha = (
@@ -1126,12 +1066,12 @@
 			nachaOffsetAccountMask =
 				typeof savedNacha?.offset_account === 'string' ? savedNacha.offset_account : '';
 			rememberNachaOnFile(savedNacha);
-			nachaOffsetAccount = '';
+			nachaFields.offsetAccount = '';
 			await saveSecrets('payments', {
-				api_key: paymentsApiKey,
-				webhook_secret: paymentsWebhookSecret
+				api_key: paymentsFields.apiKey,
+				webhook_secret: paymentsFields.webhookSecret
 			});
-			paymentsApiKey = paymentsWebhookSecret = '';
+			paymentsFields.apiKey = paymentsFields.webhookSecret = '';
 			toast(m('org.toast.sectionSaved', { section: m('org.section.paymentsSaved') }), 'success');
 			unopenable.payments = false;
 		} catch (err) {
@@ -1142,37 +1082,19 @@
 		}
 	}
 
-	// `org.plan` is the live subscription's plan code (decisions §482); a
-	// negotiated plan the client has no name for shows its code.
-	const planLabel = (plan: string): string => planCodeLabel(plan, m);
-
 	// ── White-label branding ────────────────────────────────────────────
 	import { brand } from '#lib/stores/brand.svelte.ts';
-	import {
-		accentStrongContrast,
-		accentTextContrast,
-		THEME_NAMES
-	} from '#lib/stores/brandTheme.ts';
-	import { formatRatio, WCAG_AA_NORMAL } from '#lib/a11y/contrast.ts';
-	import FieldWarning from '#lib/components/ui/FieldWarning.svelte';
 
-	let brandProductName = $state('');
-	let brandLogoUrl = $state('');
-	let brandAccentColor = $state('');
-	let brandAccentStrongColor = $state('');
-	let brandSupportUrl = $state('');
-	let brandLegalUrl = $state('');
-	// Per-tenant base URL stamped into outbound emails (approval links, portal
-	// invites, signup confirmations). Empty ⇒ the platform default below.
-	// `{slug}` in the value is optional: substituted when present, used
-	// verbatim when not. See docs/white-label.md § Tenant URL.
-	let brandTenantUrlTemplate = $state('');
-	// Deliberately a SEPARATE field from the one above: this value is registered
-	// at the customer's IdP, so changing it is an operator-sequenced migration
-	// (add the new URI at the IdP first, verify a real login, then remove the
-	// old one) rather than a preference. Folding the two would mean fixing
-	// invite links silently breaks SSO.
-	let brandSsoCallbackBaseUrl = $state('');
+	let branding = $state<BrandingFields>({
+		productName: '',
+		logoUrl: '',
+		accentColor: '',
+		accentStrongColor: '',
+		supportUrl: '',
+		legalUrl: '',
+		tenantUrlTemplate: '',
+		ssoCallbackBaseUrl: ''
+	});
 	let savingBranding = $state(false);
 
 	// The PLATFORM default (`FEOH_TENANT_URL_TEMPLATE`), read from the public
@@ -1180,18 +1102,6 @@
 	// actually resolves to rather than describing it in the abstract. The org
 	// override is what we save; this is only ever displayed.
 	let platformTenantUrlTemplate = $state('');
-
-	/** Resolve a `{slug}` template against this tenant. */
-	function resolveTenantUrl(template: string): string {
-		const t = (template || '').trim();
-		if (!t) return '';
-		return t.replace(/\{slug\}/g, org?.slug ?? '');
-	}
-
-	const defaultTenantUrl = $derived(resolveTenantUrl(platformTenantUrlTemplate));
-	const effectiveTenantUrl = $derived(
-		resolveTenantUrl(brandTenantUrlTemplate) || defaultTenantUrl
-	);
 
 	async function loadPlatformTenantUrl() {
 		try {
@@ -1204,42 +1114,24 @@
 	}
 
 	const HEX_RE = /^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})$/;
-	// Default accent tokens (mirror src/app.css :root) so the color pickers show
-	// the live default when the org hasn't set one — without writing it back.
-	const DEFAULT_ACCENT = '#638cff';
-	const DEFAULT_ACCENT_STRONG = '#3f5fd6';
-
-	// The strong accent is written straight into the `--accent-strong` custom
-	// property, whose one contract is that white text sits on it. Warn while
-	// the field is still being edited; the backend accepts any valid hex and
-	// the brand is the tenant's call, so this advises rather than blocks.
-	const accentStrongRatio = $derived(accentStrongContrast(brandAccentStrongColor));
-	const accentStrongFails = $derived(
-		accentStrongRatio !== null && accentStrongRatio < WCAG_AA_NORMAL
-	);
-	// `accent_color` is also small text (links, the active tab), and no colour
-	// reads at 4.5:1 on both palettes' surfaces. Each theme shows the least
-	// shade of it that does (`themeAccent`, decisions §478); say so per theme,
-	// with the shade, so the change to the brand is never silent.
-	const accentText = $derived(accentTextContrast(brandAccentColor));
 
 	async function saveBranding() {
 		// Client-side validation mirroring the backend BrandConfig guards, so a
 		// typo surfaces inline instead of as a 422.
-		if (brandAccentColor.trim() && !HEX_RE.test(brandAccentColor.trim())) {
+		if (branding.accentColor.trim() && !HEX_RE.test(branding.accentColor.trim())) {
 			toast(m('org.branding.toast.accentInvalid'), 'error');
 			return;
 		}
-		if (brandAccentStrongColor.trim() && !HEX_RE.test(brandAccentStrongColor.trim())) {
+		if (branding.accentStrongColor.trim() && !HEX_RE.test(branding.accentStrongColor.trim())) {
 			toast(m('org.branding.toast.accentStrongInvalid'), 'error');
 			return;
 		}
 		for (const [label, val] of [
-			[m('org.branding.label.logoUrl'), brandLogoUrl],
-			[m('org.branding.label.supportUrl'), brandSupportUrl],
-			[m('org.branding.label.legalUrl'), brandLegalUrl],
-			[m('org.branding.label.tenantUrl'), brandTenantUrlTemplate],
-			[m('org.branding.label.ssoCallback'), brandSsoCallbackBaseUrl],
+			[m('org.branding.label.logoUrl'), branding.logoUrl],
+			[m('org.branding.label.supportUrl'), branding.supportUrl],
+			[m('org.branding.label.legalUrl'), branding.legalUrl],
+			[m('org.branding.label.tenantUrl'), branding.tenantUrlTemplate],
+			[m('org.branding.label.ssoCallback'), branding.ssoCallbackBaseUrl],
 		] as const) {
 			if (val.trim() && !/^https?:\/\//i.test(val.trim())) {
 				toast(m('org.branding.toast.urlInvalid', { label }), 'error');
@@ -1249,19 +1141,19 @@
 		savingBranding = true;
 		try {
 			await api.put('/api/organization/branding', {
-				product_name: brandProductName.trim(),
-				logo_url: brandLogoUrl.trim(),
-				accent_color: brandAccentColor.trim(),
-				accent_strong_color: brandAccentStrongColor.trim(),
-				support_url: brandSupportUrl.trim(),
-				legal_url: brandLegalUrl.trim(),
-				tenant_url_template: brandTenantUrlTemplate.trim(),
+				product_name: branding.productName.trim(),
+				logo_url: branding.logoUrl.trim(),
+				accent_color: branding.accentColor.trim(),
+				accent_strong_color: branding.accentStrongColor.trim(),
+				support_url: branding.supportUrl.trim(),
+				legal_url: branding.legalUrl.trim(),
+				tenant_url_template: branding.tenantUrlTemplate.trim(),
 				// Sent explicitly on every save. The backend carries an OMITTED
 				// value forward precisely so a client that doesn't know about this
 				// field can't wipe an IdP-registered callback; since this panel
 				// does know about it, sending the current value keeps "clear the
 				// box and save" working as the documented rollback.
-				sso_callback_base_url: brandSsoCallbackBaseUrl.trim(),
+				sso_callback_base_url: branding.ssoCallbackBaseUrl.trim(),
 			});
 			// Refresh the live brand store so the sidebar logo/name + theme update
 			// without a reload.
@@ -1391,12 +1283,6 @@
 	// see whether the platform is physically honouring it yet. Nothing on this
 	// panel blocks; the region never moves data by itself.
 	// See docs/data-residency.md.
-	interface ResidencyAlignment {
-		status: string; // "aligned" | "misaligned" | "unknown"
-		aligned: boolean | null; // null ⇔ status "unknown" — never read as yes
-		deployed_region: string | null;
-		reason: string | null;
-	}
 	interface ResidencyResponse {
 		region: string;
 		default_region: string;
@@ -1404,15 +1290,6 @@
 		placement: Record<string, string>;
 		alignment: ResidencyAlignment;
 	}
-
-	// Region tokens come from the server; their display names are ours.
-	const REGION_LABEL_KEYS: Record<string, MessageKey> = {
-		us: 'org.residency.region.us',
-		eu: 'org.residency.region.eu',
-		uk: 'org.residency.region.uk',
-		ca: 'org.residency.region.ca',
-		au: 'org.residency.region.au'
-	};
 
 	let residencyRegion = $state(''); // the select's bound value
 	let residencySavedRegion = $state(''); // last persisted effective region
@@ -1423,14 +1300,6 @@
 	let loadingResidency = $state(true);
 	let residencyError = $state('');
 	let savingResidency = $state(false);
-
-	// An unmapped token renders as itself rather than vanishing — the server
-	// owns the supported set, so a region added there stays selectable here.
-	function regionLabel(token: string | null): string {
-		if (!token) return '';
-		const key = REGION_LABEL_KEYS[token];
-		return key ? m(key) : token.toUpperCase();
-	}
 
 	function applyResidency(data: ResidencyResponse) {
 		residencyRegion = data.region;
@@ -1474,23 +1343,6 @@
 		}
 	}
 
-	const alignmentMessage = $derived.by(() => {
-		const a = residencyAlignment;
-		if (!a) return '';
-		if (a.status === 'aligned') {
-			return m('org.residency.alignment.aligned', { region: regionLabel(a.deployed_region) });
-		}
-		if (a.status === 'misaligned') {
-			return m('org.residency.alignment.misaligned', {
-				configured: regionLabel(residencySavedRegion),
-				deployed: regionLabel(a.deployed_region)
-			});
-		}
-		return a.reason === 'deployed_region_unrecognised'
-			? m('org.residency.alignment.unknownUnrecognised')
-			: m('org.residency.alignment.unknownUnset');
-	});
-
 	async function removeCustomDomain(host: string) {
 		// Two-click arm/confirm so a stray click can't drop a live domain.
 		if (confirmRemoveDomain !== host) {
@@ -1510,42 +1362,24 @@
 	// draft the admin is currently typing. Don't add one.
 	// See backend/docs/notifications.md § Rotating the webhook URL.
 	let chat = $state<ChatNotificationStatus | null>(null);
-	let chatEnabled = $state(false);
-	let chatProvider = $state('mock');
-	let chatEvents = $state<Record<string, boolean>>({});
+	let chatFields = $state<ChatFields>({ enabled: false, provider: 'mock', events: {}, newWebhook: '' });
 	let loadingChat = $state(true);
 	let chatError = $state('');
 	let savingChat = $state(false);
-	let newChatWebhook = $state('');
 	let savingChatWebhook = $state(false);
 	let confirmRemoveChatWebhook = $state(false);
 
 	function applyChat(data: ChatNotificationStatus) {
 		chat = data;
-		chatEnabled = data.enabled;
-		chatProvider = data.provider ?? 'mock';
+		chatFields.enabled = data.enabled;
+		chatFields.provider = data.provider ?? 'mock';
 		// A missing per-event key means "on" (the backend's opt-out default), so
 		// materialize the full map here rather than letting an unchecked box
 		// mean "unset".
-		chatEvents = Object.fromEntries(
+		chatFields.events = Object.fromEntries(
 			(data.supported_events ?? []).map((e) => [e, data.events?.[e] ?? true])
 		);
 	}
-
-	function chatProviderLabel(token: string): string {
-		return CHAT_PROVIDER_LABELS[token] ?? token;
-	}
-
-	function chatEventLabel(token: string): string {
-		return CHAT_EVENT_LABELS[token] ?? token;
-	}
-
-	// Chat on, a real provider selected, no webhook stored → the adapter fails
-	// closed and silently posts nothing. Surface that rather than let the panel
-	// read as configured.
-	const chatWebhookMissing = $derived(
-		!!chat && chat.enabled && chat.provider !== 'mock' && !chat.webhook_configured
-	);
 
 	$effect(() => {
 		// Its own effect, the same shape as the email-intake one below and for the
@@ -1586,9 +1420,9 @@
 			// `webhook_configured`, which this save deliberately does not touch.
 			applyChat(
 				await updateChatNotifications({
-					enabled: chatEnabled,
-					provider: chatProvider,
-					events: chatEvents
+					enabled: chatFields.enabled,
+					provider: chatFields.provider,
+					events: chatFields.events
 				})
 			);
 			toast(m('org.chat.toast.saved'), 'success');
@@ -1600,7 +1434,7 @@
 	}
 
 	async function saveChatWebhook() {
-		const url = newChatWebhook.trim();
+		const url = chatFields.newWebhook.trim();
 		if (!url) {
 			toast(m('org.chat.webhook.toast.empty'), 'error');
 			return;
@@ -1610,7 +1444,7 @@
 			applyChat(await rotateChatWebhook(url));
 			// Drop the credential from component state the moment it is stored —
 			// it is never re-fetchable, so keeping it around buys nothing.
-			newChatWebhook = '';
+			chatFields.newWebhook = '';
 			toast(m('org.chat.webhook.toast.saved'), 'success');
 		} catch (err) {
 			toast(errorMessage(err, m('org.chat.webhook.toast.saveFailed')), 'error');
@@ -1654,55 +1488,42 @@
 	let ssoLoadError = $state('');
 	let ssoSaveError = $state('');
 	let savingSso = $state(false);
-	let ssoEnabled = $state(false);
-	let ssoOnly = $state(false);
-	let ssoProtocol = $state<SsoProtocol>('oidc');
-	let ssoProvider = $state('oidc');
-	let ssoDomains = $state('');
-	let ssoDiscoveryUrl = $state('');
-	let ssoClientId = $state('');
-	let ssoNewClientSecret = $state('');
-	let ssoClearClientSecret = $state(false);
-	let ssoIdpEntityId = $state('');
-	let ssoIdpSsoUrl = $state('');
-	let ssoIdpCert = $state('');
-	let ssoIdpSloUrl = $state('');
-	let ssoSpEntityId = $state('');
-
-	const SSO_PROVIDERS = Object.keys(SSO_PROVIDER_LABELS);
-
-	function ssoProviderLabel(token: string): string {
-		return token === 'oidc' || token === 'saml'
-			? m('orgSso.provider.generic')
-			: (SSO_PROVIDER_LABELS[token] ?? token);
-	}
+	let ssoFields = $state<SsoFields>({
+		enabled: false,
+		only: false,
+		protocol: 'oidc',
+		provider: 'oidc',
+		domains: '',
+		discoveryUrl: '',
+		clientId: '',
+		newClientSecret: '',
+		clearClientSecret: false,
+		idpEntityId: '',
+		idpSsoUrl: '',
+		idpCert: '',
+		idpSloUrl: '',
+		spEntityId: ''
+	});
 
 	function applySso(data: SsoSettingsStatus) {
 		sso = data;
-		ssoEnabled = data.enabled;
-		ssoOnly = data.sso_only;
-		ssoProtocol = data.protocol;
-		ssoProvider = data.provider ?? data.protocol;
+		ssoFields.enabled = data.enabled;
+		ssoFields.only = data.sso_only;
+		ssoFields.protocol = data.protocol;
+		ssoFields.provider = data.provider ?? data.protocol;
 		// A list of machine identifiers re-split on save, so a literal comma
 		// separator — not `formatList` (see `utils/list.ts`).
-		ssoDomains = data.allowed_email_domains.join(', ');
-		ssoDiscoveryUrl = data.discovery_url ?? '';
-		ssoClientId = data.client_id ?? '';
-		ssoNewClientSecret = '';
-		ssoClearClientSecret = false;
-		ssoIdpEntityId = data.idp_entity_id ?? '';
-		ssoIdpSsoUrl = data.idp_sso_url ?? '';
-		ssoIdpCert = data.idp_x509_cert ?? '';
-		ssoIdpSloUrl = data.idp_slo_url ?? '';
-		ssoSpEntityId = data.sp_entity_id ?? '';
+		ssoFields.domains = data.allowed_email_domains.join(', ');
+		ssoFields.discoveryUrl = data.discovery_url ?? '';
+		ssoFields.clientId = data.client_id ?? '';
+		ssoFields.newClientSecret = '';
+		ssoFields.clearClientSecret = false;
+		ssoFields.idpEntityId = data.idp_entity_id ?? '';
+		ssoFields.idpSsoUrl = data.idp_sso_url ?? '';
+		ssoFields.idpCert = data.idp_x509_cert ?? '';
+		ssoFields.idpSloUrl = data.idp_slo_url ?? '';
+		ssoFields.spEntityId = data.sp_entity_id ?? '';
 	}
-
-	// The server's own list of what the selected protocol still lacks, named by
-	// the labels this panel shows. Recomputed from the SAVED state, so it
-	// describes what sign-in sees now, not the unsaved form.
-	const ssoMissingLabels = $derived(
-		sso && sso.idp_config_missing.length ? ssoFieldLabels(sso.idp_config_missing, m) : null
-	);
 
 	$effect(() => {
 		// Same role gate as the chat panel: the GET is admin-only, so a clerk is
@@ -1737,27 +1558,27 @@
 		savingSso = true;
 		ssoSaveError = '';
 		try {
-			const secret = ssoNewClientSecret.trim();
+			const secret = ssoFields.newClientSecret.trim();
 			applySso(
 				await updateSsoSettings({
-					enabled: ssoEnabled,
-					sso_only: ssoOnly,
-					protocol: ssoProtocol,
-					provider: nullable(ssoProvider),
-					allowed_email_domains: ssoDomains
+					enabled: ssoFields.enabled,
+					sso_only: ssoFields.only,
+					protocol: ssoFields.protocol,
+					provider: nullable(ssoFields.provider),
+					allowed_email_domains: ssoFields.domains
 						.split(/[\s,]+/)
 						.map((d) => d.trim())
 						.filter(Boolean),
-					discovery_url: nullable(ssoDiscoveryUrl),
-					client_id: nullable(ssoClientId),
+					discovery_url: nullable(ssoFields.discoveryUrl),
+					client_id: nullable(ssoFields.clientId),
 					...(secret ? { client_secret: secret } : {}),
-					...(ssoClearClientSecret && !secret ? { clear_client_secret: true } : {}),
-					idp_entity_id: nullable(ssoIdpEntityId),
-					idp_sso_url: nullable(ssoIdpSsoUrl),
-					idp_x509_cert: nullable(ssoIdpCert),
+					...(ssoFields.clearClientSecret && !secret ? { clear_client_secret: true } : {}),
+					idp_entity_id: nullable(ssoFields.idpEntityId),
+					idp_sso_url: nullable(ssoFields.idpSsoUrl),
+					idp_x509_cert: nullable(ssoFields.idpCert),
 					idp_x509_cert_multi: sso.idp_x509_cert_multi,
-					sp_entity_id: nullable(ssoSpEntityId),
-					idp_slo_url: nullable(ssoIdpSloUrl)
+					sp_entity_id: nullable(ssoFields.spEntityId),
+					idp_slo_url: nullable(ssoFields.idpSloUrl)
 				})
 			);
 			toast(m('orgSso.toast.saved'), 'success');
@@ -1998,582 +1819,91 @@
 			     left behind. The server still enforces admin on every write. -->
 			<fieldset class="sections" disabled={readOnly}>
 				{#if section === 'getting-started'}
-					<section class="getting-started card">
-						<h2 id="org-getting-started-heading">{m('org.gettingStarted.title')}</h2>
-						<p class="card-hint">{m('org.gettingStarted.intro')}</p>
-						<!-- These were `#org-*` anchors into one long scroll. They now name
-						     the panel that owns each step directly; the old anchors still
-						     resolve, via `LEGACY_HASH_SECTIONS`, for the copies of them
-						     that exist outside this repo. -->
-						<SetupChecklist
-							steps={gettingStartedSteps}
-							labelledby="org-getting-started-heading"
-							testId="org-getting-started-steps"
-						/>
-					</section>
+					<GettingStartedPanel steps={gettingStartedSteps} />
 				{/if}
 
 				{#if section === 'company'}
-					<section class="card" id="org-company">
-						<h2>{m('org.section.company')}</h2>
-						<div class="form-grid">
-							<label>
-								<span>{m('org.company.name')}</span>
-								<input type="text" bind:value={name} />
-							</label>
-							<label>
-								<span>{m('org.company.taxId')}</span>
-								<input type="text" bind:value={taxId} placeholder={m('org.company.taxIdPlaceholder')} />
-							</label>
-							<label>
-								<span>{m('org.company.vatNumber')}</span>
-								<input type="text" bind:value={vatNumber} />
-							</label>
-							<label>
-								<span>{m('org.company.companiesHouseNumber')}</span>
-								<input type="text" bind:value={companiesHouseNumber} />
-							</label>
-							<label class="full-width">
-								<span>{m('org.company.address')}</span>
-								<textarea bind:value={address} rows="2" placeholder={m('org.company.addressPlaceholder')}></textarea>
-							</label>
-							<label>
-								<span>{m('org.company.phone')}</span>
-								<input type="tel" bind:value={phone} />
-							</label>
-							<label>
-								<span>{m('org.company.website')}</span>
-								<input type="url" bind:value={website} placeholder={'https://'} />
-							</label>
-						</div>
-						<div class="section-footer">
-							<button class="btn-save-section" disabled={savingProfile} onclick={saveProfile}>
-								{savingProfile ? m('org.common.saving') : m('org.company.save')}
-							</button>
-						</div>
-					</section>
+					<CompanyProfilePanel bind:fields={company} saving={savingProfile} onsave={saveProfile} />
 				{/if}
 
 				{#if section === 'defaults'}
-					<section class="card" id="org-defaults">
-						<h2>{m('org.section.defaults')}</h2>
-						<p class="card-hint">{m('org.defaults.hint')} <HelpTip term="reporting-currency" /></p>
-						<div class="form-grid">
-							<label>
-								<span>{m('org.defaults.currency')}</span>
-								<!-- Any ISO 4217 code: six hardcoded options left a PLN or
-								     ZAR organization unable to set its own default, which is
-								     also a rung of the reporting currency (decisions §381). -->
-								<CurrencyInput
-									bind:value={currency}
-									bind:touched={currencyTouched}
-									testid="org-default-currency"
-								/>
-							</label>
-							<label>
-								<span>{m('org.defaults.paymentTerms')}</span>
-								<select bind:value={paymentTerms}>
-									{#each paymentTermOptions as term (term)}
-										<option value={term}>{paymentTermLabel(term)}</option>
-									{/each}
-								</select>
-							</label>
-							<label>
-								<span>{m('org.defaults.numberPrefix')}</span>
-								<input type="text" bind:value={numberPrefix} placeholder={'INV-'} />
-							</label>
-							<label>
-								<span>{m('org.defaults.defaultGl')}</span>
-								<input type="text" bind:value={defaultGl} placeholder={m('org.defaults.defaultGlPlaceholder')} />
-							</label>
-							<label>
-								<span>{m('org.defaults.defaultCostCenter')}</span>
-								<input type="text" bind:value={defaultCostCenter} placeholder={m('org.defaults.defaultCostCenterPlaceholder')} />
-							</label>
-						</div>
-						<div class="section-footer">
-							<button class="btn-save-section" disabled={savingDefaults} onclick={saveDefaults}>
-								{savingDefaults ? m('org.common.saving') : m('org.defaults.save')}
-							</button>
-						</div>
-					</section>
+					<InvoiceDefaultsPanel bind:fields={invoiceDefaults} saving={savingDefaults} onsave={saveDefaults} />
 				{/if}
 
 				{#if section === 'branding'}
-					<section class="card" id="org-branding">
-						<h2>{m('org.section.branding')}</h2>
-						<p class="card-hint">
-							{m('org.branding.hint')}
-						</p>
-						<div class="form-grid">
-							<label>
-								<span>{m('org.branding.productName')}</span>
-								<input
-									type="text"
-									bind:value={brandProductName}
-									placeholder={m('org.branding.productNamePlaceholder')}
-									maxlength="120"
-								/>
-							</label>
-							<label>
-								<span>{m('org.branding.logoUrl')}</span>
-								<input
-									type="url"
-									bind:value={brandLogoUrl}
-									placeholder={m('org.branding.logoUrlPlaceholder')}
-								/>
-							</label>
-							<label>
-								<span>{m('org.branding.accentColor')}</span>
-								<span class="color-field">
-									<input
-										type="color"
-										aria-label={m('org.branding.accentColorPicker')}
-										value={brandAccentColor.trim() || DEFAULT_ACCENT}
-										oninput={(e) => (brandAccentColor = e.currentTarget.value)}
-									/>
-									<input
-										type="text"
-										bind:value={brandAccentColor}
-										placeholder={DEFAULT_ACCENT}
-									/>
-								</span>
-								{#each THEME_NAMES as theme (theme)}
-									{@const verdict = accentText?.[theme]}
-									<FieldWarning
-										show={!!verdict && !verdict.meetsAA}
-										testId={`accent-text-contrast-${theme}`}
-										message={m(
-											theme === 'light'
-												? 'org.branding.accentTextLight'
-												: 'org.branding.accentTextDark',
-											{
-												ratio: verdict ? formatRatio(verdict.ratio) : '',
-												applied: verdict?.applied ?? ''
-											}
-										)}
-									/>
-								{/each}
-							</label>
-							<label>
-								<span>{m('org.branding.accentStrong')}</span>
-								<span class="color-field">
-									<input
-										type="color"
-										aria-label={m('org.branding.accentStrongPicker')}
-										value={brandAccentStrongColor.trim() || DEFAULT_ACCENT_STRONG}
-										oninput={(e) => (brandAccentStrongColor = e.currentTarget.value)}
-									/>
-									<input
-										type="text"
-										bind:value={brandAccentStrongColor}
-										placeholder={DEFAULT_ACCENT_STRONG}
-									/>
-								</span>
-								<FieldWarning
-									show={accentStrongFails}
-									testId="accent-strong-contrast-warning"
-									message={m('common.contrastWarning', {
-										ratio: accentStrongRatio === null ? '' : formatRatio(accentStrongRatio)
-									})}
-								/>
-							</label>
-							<label>
-								<span>{m('org.branding.supportUrl')}</span>
-								<input
-									type="url"
-									bind:value={brandSupportUrl}
-									placeholder={m('org.branding.supportUrlPlaceholder')}
-								/>
-							</label>
-							<label>
-								<span>{m('org.branding.legalUrl')}</span>
-								<input
-									type="url"
-									bind:value={brandLegalUrl}
-									placeholder={m('org.branding.legalUrlPlaceholder')}
-								/>
-							</label>
-							<div class="full-width">
-								<label>
-									<span>{m('org.branding.tenantUrl')}</span>
-									<input
-										type="text"
-										bind:value={brandTenantUrlTemplate}
-										placeholder={defaultTenantUrl || m('org.branding.tenantUrlPlaceholder')}
-										autocomplete="off"
-										spellcheck="false"
-										aria-describedby="brand-tenant-url-hint"
-									/>
-								</label>
-								<p class="field-hint" id="brand-tenant-url-hint">
-									{m('org.branding.tenantUrlHint')}
-									<span class="tenant-url-effective" data-testid="tenant-url-effective">
-										{#if brandTenantUrlTemplate.trim()}
-											{m('org.branding.tenantUrlEffective', { url: effectiveTenantUrl })}
-										{:else if defaultTenantUrl}
-											{m('org.branding.tenantUrlDefault', { url: defaultTenantUrl })}
-										{:else}
-											{m('org.branding.tenantUrlDefaultUnknown')}
-										{/if}
-									</span>
-								</p>
-							</div>
-							<div class="full-width">
-								<label>
-									<span>{m('org.branding.ssoCallback')}</span>
-									<input
-										type="text"
-										bind:value={brandSsoCallbackBaseUrl}
-										placeholder={m('org.branding.ssoCallbackPlaceholder')}
-										autocomplete="off"
-										spellcheck="false"
-										aria-describedby="brand-sso-callback-hint"
-									/>
-								</label>
-								<p class="field-hint sso-callback-hint" id="brand-sso-callback-hint">
-									<strong>{m('org.branding.ssoCallbackWarning')}</strong>
-									{m('org.branding.ssoCallbackHint')}
-								</p>
-							</div>
-						</div>
-						<p class="card-hint">
-							{m('org.branding.strongHint')}
-						</p>
-						<div class="section-footer">
-							<button class="btn-save-section" disabled={savingBranding} onclick={saveBranding}>
-								{savingBranding ? m('org.common.saving') : m('org.branding.save')}
-							</button>
-						</div>
-					</section>
+					<BrandingPanel
+						bind:fields={branding}
+						slug={org?.slug ?? ''}
+						{platformTenantUrlTemplate}
+						saving={savingBranding}
+						onsave={saveBranding}
+					/>
 				{/if}
 
 				{#if section === 'custom-domains'}
-					<section class="card">
-						{@render customDomainsIntro()}
-
-						{#if loadingDomains}
-							<LoadingState label={m('org.customDomains.loading')} />
-						{:else}
-							{#if domainSaveError}
-								<p class="domain-error" role="alert" data-testid="custom-domain-error">
-									{domainSaveError}
-								</p>
-							{/if}
-							{#if customDomains.length === 0}
-								<p class="card-hint domain-empty">{m('org.customDomains.empty')}</p>
-							{:else}
-								<ul class="domain-list">
-									{#each customDomains as host (host)}
-										<li class="domain-row">
-											<span class="domain-name mono">{host}</span>
-											<span class="domain-remove">
-												<button
-													type="button"
-													class="btn-remove-domain"
-													class:armed={confirmRemoveDomain === host}
-													disabled={savingDomains}
-													aria-label={m('org.customDomains.removeAria', { host })}
-													onclick={() => removeCustomDomain(host)}
-												>
-													{confirmRemoveDomain === host ? m('org.customDomains.confirmRemove') : m('org.customDomains.remove')}
-												</button>
-											</span>
-										</li>
-									{/each}
-								</ul>
-							{/if}
-
-							<form
-								class="domain-add"
-								onsubmit={(e) => {
-									e.preventDefault();
-									addCustomDomain();
-								}}
-							>
-								<input
-									type="text"
-									bind:value={newDomain}
-									placeholder={m('org.customDomains.newPlaceholder')}
-									aria-label={m('org.customDomains.newAria')}
-									autocomplete="off"
-									spellcheck="false"
-								/>
-								<button type="submit" class="btn-save-section" disabled={savingDomains}>
-									{savingDomains ? m('org.customDomains.adding') : m('org.customDomains.add')}
-								</button>
-							</form>
-						{/if}
-					</section>
+					<CustomDomainsPanel
+						bind:newDomain
+						intro={customDomainsIntro}
+						domains={customDomains}
+						loading={loadingDomains}
+						saving={savingDomains}
+						saveError={domainSaveError}
+						confirmRemove={confirmRemoveDomain}
+						onremove={removeCustomDomain}
+						onadd={addCustomDomain}
+					/>
 				{/if}
 
 				{#if section === 'chat'}
-					<section class="card">
-						<h2>{m('org.section.chat')}</h2>
-						<p class="card-hint">{m('org.chat.hint')}</p>
-
-						{#if !userLoaded || loadingChat}
-							<LoadingState label={m('org.chat.loading')} />
-						{:else if readOnly}
-							<!-- GET is admin-only, so nothing is fetched for a non-admin and
-							     there is nothing to show. Say that, exactly as the Email
-							     Intake panel does, instead of rendering a 403 the reader
-							     cannot act on. -->
-							<p class="card-hint" data-testid="chat-admin-only">
-								{m('org.chat.adminOnly')}
-							</p>
-						{:else if chatError}
-							<LoadError message={chatError} onretry={loadChat} testId="chat-load-error" />
-						{:else if chat}
-							<div class="form-grid">
-								<label class="switch-row">
-									<input type="checkbox" bind:checked={chatEnabled} />
-									<span>{m('org.chat.enabled')}</span>
-								</label>
-								<label>
-									{m('org.chat.provider')}
-									<select bind:value={chatProvider}>
-										{#each chat.supported_providers as p (p)}
-											<option value={p}>{chatProviderLabel(p)}</option>
-										{/each}
-									</select>
-								</label>
-							</div>
-
-							<fieldset class="chat-events">
-								<legend>{m('org.chat.events')}</legend>
-								<p class="card-hint">{m('org.chat.eventsHint')}</p>
-								{#each chat.supported_events as ev (ev)}
-									<label class="switch-row">
-										<input
-											type="checkbox"
-											checked={chatEvents[ev] ?? true}
-											onchange={(e) =>
-												(chatEvents = {
-													...chatEvents,
-													[ev]: (e.currentTarget as HTMLInputElement).checked
-												})}
-										/>
-										<span>{chatEventLabel(ev)}</span>
-									</label>
-								{/each}
-							</fieldset>
-
-							<div class="section-footer">
-								<button class="btn-save-section" disabled={savingChat} onclick={saveChat}>
-									{savingChat ? m('org.common.saving') : m('org.chat.save')}
-								</button>
-							</div>
-
-							<h3 class="chat-subhead">{m('org.chat.webhook.title')}</h3>
-							<p class="card-hint">{m('org.chat.webhook.hint')}</p>
-
-							{#if chatWebhookMissing}
-								<p class="chat-warning" role="alert">
-									{m('org.chat.webhook.missingWarning', {
-										provider: chatProviderLabel(chat.provider ?? '')
-									})}
-								</p>
-							{/if}
-
-							<div class="chat-webhook-status">
-								{#if chat.webhook_configured}
-									<span class="chat-webhook-set">
-										{chat.webhook_host
-											? m('org.chat.webhook.configured', { host: chat.webhook_host })
-											: m('org.chat.webhook.configuredUnknownHost')}
-									</span>
-									<span class="chat-webhook-remove">
-										<button
-											type="button"
-											class="btn-remove-domain"
-											class:armed={confirmRemoveChatWebhook}
-											disabled={savingChatWebhook}
-											aria-label={savingChatWebhook
-												? undefined
-												: confirmRemoveChatWebhook
-													? m('org.chat.webhook.confirmRemoveAria')
-													: m('org.chat.webhook.removeAria')}
-											onclick={removeChatWebhook}
-										>
-											{confirmRemoveChatWebhook
-												? m('org.chat.webhook.confirmRemove')
-												: m('org.chat.webhook.remove')}
-										</button>
-									</span>
-								{:else}
-									<span class="card-hint">{m('org.chat.webhook.notConfigured')}</span>
-								{/if}
-							</div>
-
-							<form
-								class="domain-add"
-								onsubmit={(e) => {
-									e.preventDefault();
-									saveChatWebhook();
-								}}
-							>
-								<input
-									type="text"
-									bind:value={newChatWebhook}
-									placeholder={m('org.chat.webhook.placeholder')}
-									aria-label={m('org.chat.webhook.inputAria')}
-									autocomplete="off"
-									spellcheck="false"
-								/>
-								<button type="submit" class="btn-save-section" disabled={savingChatWebhook}>
-									{savingChatWebhook
-										? m('org.chat.webhook.saving')
-										: chat.webhook_configured
-											? m('org.chat.webhook.replace')
-											: m('org.chat.webhook.set')}
-								</button>
-							</form>
-							<p class="card-hint">{m('org.chat.webhook.rotateHint')}</p>
-						{/if}
-					</section>
+					<ChatNotificationsPanel
+						bind:fields={chatFields}
+						status={chat}
+						{readOnly}
+						{userLoaded}
+						loading={loadingChat}
+						loadError={chatError}
+						onretry={loadChat}
+						saving={savingChat}
+						onsave={saveChat}
+						savingWebhook={savingChatWebhook}
+						confirmRemoveWebhook={confirmRemoveChatWebhook}
+						onsetwebhook={saveChatWebhook}
+						onremovewebhook={removeChatWebhook}
+					/>
 				{/if}
 
 				{#if section === 'email-intake'}
-					<section class="card" id="org-email-intake">
-						<div class="help-row">
-							<h2>{m('org.section.emailIntake')}</h2>
-							<HelpTip term="email-intake" />
-						</div>
-						<p class="card-hint">{m('org.emailIntake.hint')}</p>
-
-						{#if !userLoaded || loadingIntake}
-							<LoadingState label={m('org.emailIntake.loading')} />
-						{:else if readOnly}
-							<!-- GET is admin-only. Say that, rather than firing a request
-							     that 403s and rendering a load failure nobody can act on. -->
-							<p class="card-hint" data-testid="email-intake-admin-only">
-								{m('org.emailIntake.adminOnly')}
-							</p>
-						{:else if intakeError}
-							<LoadError message={intakeError} onretry={loadEmailIntake} testId="email-intake-error" />
-						{:else if intakeUnavailable}
-							<!-- Proven: a token exists and the server still renders no
-							     address, which only happens when the platform has no
-							     intake domain. No rotate control here — it would mint
-							     another token that still addresses nothing. -->
-							<p class="intake-unavailable" data-testid="email-intake-unavailable">
-								{m('org.emailIntake.unavailable')}
-							</p>
-						{:else if intakeUnprovisioned}
-							<p class="card-hint" data-testid="email-intake-unprovisioned">
-								{m('org.emailIntake.notProvisioned')}
-							</p>
-							<button
-								type="button"
-								class="btn-save-section"
-								disabled={rotatingIntake}
-								onclick={generateIntakeAddress}
-							>
-								{rotatingIntake
-									? m('org.emailIntake.generating')
-									: m('org.emailIntake.generate')}
-							</button>
-						{:else}
-							<p class="intake-address-label">{m('org.emailIntake.addressLabel')}</p>
-							<div class="intake-address-row">
-								<code class="intake-address mono" data-testid="email-intake-address"
-									>{intakeAddress}</code
-								>
-								<button
-									type="button"
-									class="btn-save-section"
-									aria-label={intakeCopied ? undefined : m('org.emailIntake.copyAria')}
-									onclick={copyIntakeAddress}
-								>
-									{intakeCopied ? m('org.emailIntake.copied') : m('org.emailIntake.copy')}
-								</button>
-							</div>
-							<p class="card-hint">{m('org.emailIntake.secretHint')}</p>
-
-							{#if confirmRotateIntake}
-								<p class="intake-rotate-warning" role="alert" data-testid="email-intake-rotate-warning">
-									{m('org.emailIntake.rotateWarning')}
-								</p>
-							{/if}
-							<span class="intake-rotate">
-								<button
-									type="button"
-									class="btn-remove-domain"
-									class:armed={confirmRotateIntake}
-									disabled={rotatingIntake}
-									aria-label={rotatingIntake
-										? undefined
-										: confirmRotateIntake
-											? m('org.emailIntake.rotateConfirmAria')
-											: m('org.emailIntake.rotateAria')}
-									onclick={rotateIntakeAddress}
-								>
-									{rotatingIntake
-										? m('org.emailIntake.rotating')
-										: confirmRotateIntake
-											? m('org.emailIntake.rotateConfirm')
-											: m('org.emailIntake.rotate')}
-								</button>
-							</span>
-						{/if}
-					</section>
+					<EmailIntakePanel
+						{readOnly}
+						{userLoaded}
+						loading={loadingIntake}
+						loadError={intakeError}
+						onretry={loadEmailIntake}
+						unavailable={intakeUnavailable}
+						unprovisioned={intakeUnprovisioned}
+						address={intakeAddress}
+						copied={intakeCopied}
+						oncopy={copyIntakeAddress}
+						rotating={rotatingIntake}
+						confirmRotate={confirmRotateIntake}
+						ongenerate={generateIntakeAddress}
+						onrotate={rotateIntakeAddress}
+					/>
 				{/if}
 
 				{#if section === 'residency'}
-					<section class="card">
-						{@render residencyIntro()}
-
-						{#if loadingResidency}
-							<LoadingState label={m('org.residency.loading')} />
-						{:else}
-							<div class="form-grid">
-								<label>
-									<span>{m('org.residency.regionLabel')}</span>
-									<select bind:value={residencyRegion}>
-										{#each residencyRegions as token (token)}
-											<option value={token}>
-												{token === residencyDefault
-													? m('org.residency.regionDefault', { region: regionLabel(token) })
-													: regionLabel(token)}
-											</option>
-										{/each}
-									</select>
-								</label>
-							</div>
-
-							{#if residencyPlacement.db_cluster}
-								<p class="card-hint residency-placement">
-									{m('org.residency.placement', {
-										cluster: residencyPlacement.db_cluster,
-										bucket: residencyPlacement.s3_bucket ?? ''
-									})}
-								</p>
-							{/if}
-
-							{#if residencyAlignment}
-								<div
-									class="residency-alignment"
-									class:ok={residencyAlignment.status === 'aligned'}
-									class:warn={residencyAlignment.status === 'misaligned'}
-								>
-									<strong>{m('org.residency.alignment.title')}</strong>
-									<p>{alignmentMessage}</p>
-									<p class="residency-advisory">{m('org.residency.alignment.advisory')}</p>
-								</div>
-							{/if}
-
-							<div class="section-footer">
-								<button
-									class="btn-save-section"
-									disabled={savingResidency || residencyRegion === residencySavedRegion}
-									onclick={saveResidency}
-								>
-									{savingResidency ? m('org.common.saving') : m('org.residency.save')}
-								</button>
-							</div>
-						{/if}
-					</section>
+					<ResidencyPanel
+						bind:region={residencyRegion}
+						intro={residencyIntro}
+						loading={loadingResidency}
+						savedRegion={residencySavedRegion}
+						defaultRegion={residencyDefault}
+						regions={residencyRegions}
+						placement={residencyPlacement}
+						alignment={residencyAlignment}
+						saving={savingResidency}
+						onsave={saveResidency}
+					/>
 				{/if}
 
 				{#if section === 'extraction'}
@@ -2611,143 +1941,20 @@
 					     getting down to one. That key's declared non-admin consumer is the
 					     workflow builder's ERP hint, which still reads it.
 					     decisions §153. -->
-					<section class="card">
-						<div class="help-row">
-							<h2>{m('org.section.extraction')}</h2>
-							<HelpTip term="extraction" />
-						</div>
-						<p class="card-hint">{m('org.extraction.hint')}</p>
-						{#if readOnly}
-							<p class="card-hint" data-testid="extraction-admin-only">
-								{m('org.readOnly.sectionAdminOnly')}
-							</p>
-						{:else}
-							<div class="form-grid">
-								<label>
-									<span>{m('org.extraction.program')}</span>
-									<select bind:value={extractionProgramType}>
-										<option value="platform">{m('org.extraction.programPlatform')}</option>
-										<option value="byok">{m('org.extraction.programByok')}</option>
-									</select>
-								</label>
-								{#if extractionProgramType === 'byok'}
-									<label>
-										<span>{m('org.extraction.provider')}</span>
-										<select bind:value={extractionProvider}>
-											{#each EXTRACTION_PROVIDERS as p}
-												<option value={p.value}>{extractionProviderLabel(p.value)}</option>
-											{/each}
-										</select>
-									</label>
-								{:else}
-									<label>
-										<span>{m('org.extraction.provider')}</span>
-										<input type="text" value="Claude Vision (Anthropic)" disabled />
-									</label>
-								{/if}
-							</div>
-
-							{#if extractionProgramType === 'platform'}
-								<p class="card-hint after-control">{m('org.extraction.platformHint')}</p>
-							{:else if extractionProvider === 'claude_vision' || extractionProvider === 'openai_vision'}
-								<div class="form-grid">
-									<SecretField
-										id="extraction-api-key"
-										label={extractionProvider === 'claude_vision' ? m('org.extraction.anthropicKey') : m('org.extraction.openaiKey')}
-										bind:value={extractionApiKey}
-										bind:clear={secretClear['extraction.api_key']}
-										configured={extractionKeyStored('api_key')}
-										placeholder={'sk-...'}
-										testId="extraction-api-key"
-										required={extractionSwitchDropsKey}
-										invalid={extractionKeyInvalid}
-										oninput={() => (extractionKeyInvalid = false)}
-										describedBy={extractionSwitchDropsKey ? 'extraction-switch-hint' : undefined}
-									/>
-								</div>
-								{#if extractionSwitchDropsKey}
-									<p class="card-hint" id="extraction-switch-hint" data-testid="extraction-switch-hint">
-										{m('org.extraction.switchDropsKey', { provider: extractionProviderLabel(extractionProvider) })}
-									</p>
-								{/if}
-							{:else if extractionProvider === 'aws_textract'}
-								<div class="form-grid">
-									<label>
-										<span>{m('org.extraction.awsKeyId')}</span>
-										<input
-											type="text"
-											bind:value={extractionAwsKeyId}
-											autocomplete="off"
-											spellcheck="false"
-										/>
-									</label>
-									<SecretField
-										id="extraction-aws-secret"
-										label={m('org.extraction.awsSecret')}
-										bind:value={extractionAwsSecret}
-										bind:clear={secretClear['extraction.aws_secret_access_key']}
-										configured={extractionKeyStored('aws_secret_access_key')}
-										testId="extraction-aws-secret"
-										required={extractionSwitchDropsKey}
-										invalid={extractionKeyInvalid}
-										oninput={() => (extractionKeyInvalid = false)}
-										describedBy={extractionSwitchDropsKey ? 'extraction-switch-hint' : undefined}
-									/>
-									<label>
-										<span>{m('org.extraction.awsRegion')}</span>
-										<input type="text" bind:value={extractionAwsRegion} placeholder={'us-east-1'} />
-									</label>
-								</div>
-								{#if extractionSwitchDropsKey}
-									<p class="card-hint" id="extraction-switch-hint" data-testid="extraction-switch-hint">
-										{m('org.extraction.switchDropsKey', { provider: extractionProviderLabel(extractionProvider) })}
-									</p>
-								{/if}
-							{:else if extractionProvider === 'ollama'}
-								<div class="form-grid">
-									<label>
-										<span>{m('org.extraction.ollamaUrl')}</span>
-										<input type="url" bind:value={extractionOllamaUrl} placeholder={'http://localhost:11434'} />
-									</label>
-									<label>
-										<span>{m('org.extraction.model')}</span>
-										<select bind:value={extractionOllamaModel}>
-											{#each OLLAMA_MODELS as model (model.value)}
-												<option value={model.value}>{model.name}</option>
-											{/each}
-										</select>
-									</label>
-								</div>
-								<p class="card-hint after-control">{m('org.extraction.ollamaHint')} <code>{`brew install ollama && ollama pull ${extractionOllamaModel}`}</code></p>
-							{/if}
-
-							{#if unopenable.extraction && auth.isAdmin}
-								<CredentialResetPrompt
-									block="extraction"
-									oncleared={(status) => onCredentialsCleared('extraction', status)}
-								/>
-							{/if}
-							<div class="erp-test-row">
-								<button class="btn-save-section" disabled={savingExtraction} onclick={saveExtraction}>
-									{savingExtraction ? m('org.common.saving') : m('org.extraction.save')}
-								</button>
-								<button class="btn-test" disabled={testingExtraction} onclick={testExtraction}>
-									{testingExtraction ? m('org.common.testing') : m('org.common.testConnection')}
-								</button>
-								<!-- Always mounted, so the result is announced when it arrives
-								     (WCAG 4.1.3): a live region inserted together with its text
-								     is not read by every screen reader. -->
-								<span
-									class="test-result"
-									role="status"
-									class:success={extractionTestResult?.success === true}
-									class:failure={extractionTestResult?.success === false}
-								>
-									{extractionTestResult?.message ?? ''}
-								</span>
-							</div>
-						{/if}
-					</section>
+					<ExtractionPanel
+						bind:fields={extractionFields}
+						bind:secretClear
+						{readOnly}
+						keyStored={extractionKeyStored}
+						switchDropsKey={extractionSwitchDropsKey}
+						unopenable={unopenable.extraction ?? false}
+						oncleared={(status) => onCredentialsCleared('extraction', status)}
+						saving={savingExtraction}
+						onsave={saveExtraction}
+						testing={testingExtraction}
+						testResult={extractionTestResult}
+						ontest={testExtraction}
+					/>
 				{/if}
 
 				{#if section === 'erp'}
@@ -2768,627 +1975,60 @@
 				{/if}
 
 				{#if section === 'payments'}
-					<section class="card" id="org-payments">
-						<div class="help-row">
-							<h2>{m('org.section.payments')}</h2>
-							<HelpTip term="payment-rail" />
-						</div>
-						<p class="card-hint">
-							{m('org.payments.hint')}
-						</p>
-						{#if readOnly}
-							<p class="card-hint" data-testid="payments-admin-only">
-								{m('org.readOnly.sectionAdminOnly')}
-							</p>
-						{:else}
-							<div class="form-grid">
-								<label>
-									<span>{m('org.payments.mode')}</span>
-									<select
-										bind:value={paymentsMode}
-										aria-describedby="org-payments-mode-hint"
-										data-testid="payments-mode"
-									>
-										<option value="processor">{m('org.payments.modeProcessor')}</option>
-										<option value="record_only">{m('org.payments.modeRecordOnly')}</option>
-									</select>
-								</label>
-							</div>
-							<p class="card-hint" id="org-payments-mode-hint">
-								{m('org.payments.modeHint')}
-								<HelpTip term="record-only" />
-							</p>
-
-							{#if paymentsMode === 'record_only'}
-								<div class="help-row">
-									<h3 class="chat-subhead">{m('org.payments.nachaHeading')}</h3>
-									<HelpTip term="nacha-file" />
-								</div>
-								<p class="card-hint" id="org-payments-nacha-hint">{m('org.payments.nachaHint')}</p>
-								<div class="form-grid" data-testid="payments-nacha">
-									<label>
-										<span>{m('org.payments.nachaField.companyName')}</span>
-										<input
-											type="text"
-											bind:value={nachaCompanyName}
-											maxlength="16"
-											autocomplete="off"
-											aria-describedby="org-payments-nacha-hint"
-										/>
-									</label>
-									<label>
-										<span>{m('org.payments.nachaField.companyId')}</span>
-										<input
-											type="text"
-											bind:value={nachaCompanyId}
-											maxlength="10"
-											autocomplete="off"
-											aria-describedby="org-payments-nacha-hint"
-										/>
-									</label>
-									<label>
-										<span>{m('org.payments.nachaField.odfiRouting')}</span>
-										<input
-											type="text"
-											inputmode="numeric"
-											bind:value={nachaOdfiRouting}
-											maxlength="9"
-											autocomplete="off"
-											aria-describedby="org-payments-nacha-hint"
-										/>
-									</label>
-									<label>
-										<span>{m('org.payments.nachaField.bankName')}</span>
-										<input
-											type="text"
-											bind:value={nachaBankName}
-											maxlength="23"
-											autocomplete="off"
-											aria-describedby="org-payments-nacha-hint"
-										/>
-									</label>
-								</div>
-								<p class="card-hint" id="org-payments-nacha-offset-hint">
-									{m('org.payments.nachaOffsetHint')}
-								</p>
-								<div class="form-grid" data-testid="payments-nacha-offset">
-									<label>
-										<span>{m('org.payments.nachaField.offsetRouting')}</span>
-										<input
-											type="text"
-											inputmode="numeric"
-											bind:value={nachaOffsetRouting}
-											maxlength="9"
-											autocomplete="off"
-											aria-describedby="org-payments-nacha-offset-hint"
-										/>
-									</label>
-									<div>
-										<label>
-											<span>{m('org.payments.nachaField.offsetAccount')}</span>
-											<input
-												type="text"
-												bind:value={nachaOffsetAccount}
-												maxlength="20"
-												autocomplete="off"
-												placeholder={nachaOffsetAccountMask || undefined}
-												aria-describedby={nachaOffsetAccountMask
-													? 'org-payments-nacha-offset-hint org-payments-nacha-offset-onfile'
-													: 'org-payments-nacha-offset-hint'}
-											/>
-										</label>
-										<!-- The placeholder alone was the only sign an account is on
-										     file: it vanishes on focus and is no accessible
-										     description. Visible text outside the <label> (so it is
-										     not swallowed into the name), tied to the input. -->
-										{#if nachaOffsetAccountMask}
-											<p
-												class="field-hint"
-												id="org-payments-nacha-offset-onfile"
-												data-testid="payments-nacha-offset-onfile"
-											>
-												{m('org.payments.nachaOffsetOnFile', { mask: nachaOffsetAccountMask })}
-											</p>
-										{/if}
-									</div>
-									<label>
-										<!-- Named by its label text alone: a <select> inside its
-										     <label> otherwise takes the chosen option into its name
-										     ("Offset account type None"). -->
-										<span id="org-payments-nacha-offset-type-label"
-											>{m('org.payments.nachaField.offsetAccountType')}</span
-										>
-										<select
-											bind:value={nachaOffsetAccountType}
-											aria-labelledby="org-payments-nacha-offset-type-label"
-											aria-describedby="org-payments-nacha-offset-hint"
-										>
-											<option value="">{m('org.payments.nachaOffsetTypeNone')}</option>
-											{#each NACHA_OFFSET_ACCOUNT_TYPES as type (type)}
-												<option value={type}>
-													{type === 'savings'
-														? m('org.payments.nachaOffsetType.savings')
-														: m('org.payments.nachaOffsetType.checking')}
-												</option>
-											{/each}
-										</select>
-									</label>
-								</div>
-							{/if}
-
-							<div class="form-grid">
-								<label>
-									<span>{m('org.payments.provider')}</span>
-									<select bind:value={paymentsProvider}>
-										<option value="mock">{m('org.payments.providerMock')}</option>
-										<option value="modern_treasury">{MODERN_TREASURY}</option>
-									</select>
-								</label>
-							</div>
-
-							{#if paymentsProvider === 'modern_treasury'}
-								<div class="form-grid">
-									<label>
-										<span>{m('org.payments.orgId')}</span>
-										<input type="text" bind:value={paymentsOrgId} placeholder={'org_...'} />
-									</label>
-									<SecretField
-										id="payments-api-key"
-										label={m('org.payments.apiKey')}
-										bind:value={paymentsApiKey}
-										bind:clear={secretClear['payments.api_key']}
-										configured={isStored('payments', 'api_key')}
-										testId="payments-api-key"
-									/>
-									<label>
-										<span>{m('org.payments.originatingAccount')}</span>
-										<input type="text" bind:value={paymentsOriginatingAccount} placeholder={m('org.payments.originatingAccountPlaceholder')} />
-									</label>
-									<SecretField
-										id="payments-webhook-secret"
-										label={m('org.payments.webhookSecret')}
-										bind:value={paymentsWebhookSecret}
-										bind:clear={secretClear['payments.webhook_secret']}
-										configured={isStored('payments', 'webhook_secret')}
-										placeholder={m('org.payments.webhookSecretPlaceholder')}
-										testId="payments-webhook-secret"
-									/>
-									<label class="switch-row">
-										<input type="checkbox" bind:checked={paymentsSandbox} />
-										<span>{m('org.payments.sandbox')}</span>
-									</label>
-								</div>
-								<p class="card-hint">
-									{m('org.payments.webhookHint')}
-									<code>{org.created_at ? `${window.location.origin.replace(window.location.host, org.slug + '.' + window.location.host)}/api/payments/webhook/${org.slug}/modern_treasury` : '...'}</code>
-								</p>
-							{/if}
-
-							<div class="form-grid">
-								<label>
-									<span>{m('org.payments.cfoThreshold', { currency: orgCurrency.label })}</span>
-									<input
-										type="number"
-										min="0"
-										step="100"
-										placeholder={m('org.payments.cfoThresholdPlaceholder')}
-										value={paymentsCfoThreshold ?? ''}
-										oninput={(e) => {
-											const v = (e.currentTarget as HTMLInputElement).value;
-											paymentsCfoThreshold = v ? parseFloat(v) : null;
-										}}
-									/>
-								</label>
-							</div>
-							<p class="card-hint">
-								{m('org.payments.cfoHint')}
-								<HelpTip term="cfo-gate" />
-								<HelpTip term="reporting-currency" />
-							</p>
-
-							{#if unopenable.payments && auth.isAdmin}
-								<CredentialResetPrompt
-									block="payments"
-									oncleared={(status) => onCredentialsCleared('payments', status)}
-								/>
-							{/if}
-							<div class="section-footer">
-								<button class="btn-save-section" disabled={savingPayments} onclick={savePayments}>
-									{savingPayments ? m('org.common.saving') : m('org.payments.save')}
-								</button>
-								<button class="btn-test" disabled={testingPayments || paymentsProvider === 'mock'} onclick={testPayments}>
-									{testingPayments ? m('org.common.testing') : m('org.common.testConnection')}
-								</button>
-								<!-- Always mounted, so the result is announced when it arrives
-								     (WCAG 4.1.3): a live region inserted together with its text
-								     is not read by every screen reader. -->
-								<span
-									class="test-result"
-									role="status"
-									class:success={paymentsTestResult?.success === true}
-									class:failure={paymentsTestResult?.success === false}
-								>
-									{paymentsTestResult?.message ?? ''}
-								</span>
-							</div>
-						{/if}
-					</section>
+					<PaymentsPanel
+						bind:fields={paymentsFields}
+						bind:nacha={nachaFields}
+						bind:secretClear
+						offsetAccountMask={nachaOffsetAccountMask}
+						{org}
+						{readOnly}
+						{isStored}
+						unopenable={unopenable.payments ?? false}
+						oncleared={(status) => onCredentialsCleared('payments', status)}
+						saving={savingPayments}
+						onsave={savePayments}
+						testing={testingPayments}
+						testResult={paymentsTestResult}
+						ontest={testPayments}
+					/>
 				{/if}
 
 				{#if section === 'cards'}
-					<section class="card">
-						<div class="help-row">
-							<h2>{m('org.section.cards')}</h2>
-							<HelpTip term="virtual-card" />
-						</div>
-						<p class="card-hint">{m('org.cards.hint')}</p>
-						{#if readOnly}
-							<p class="card-hint" data-testid="cards-admin-only">
-								{m('org.readOnly.sectionAdminOnly')}
-							</p>
-						{:else}
-							<div class="form-grid">
-								<label>
-									<span>{m('org.cards.enabled')}</span>
-									<select bind:value={cardsEnabled}>
-										<option value={false}>{m('org.cards.disabled')}</option>
-										<option value={true}>{m('org.cards.enabledOn')}</option>
-									</select>
-								</label>
-								<label>
-									<span>{m('org.cards.program')}</span>
-									<select bind:value={cardsProgramType}>
-										<option value="platform">{m('org.cards.programPlatform')}</option>
-										<option value="byok">{m('org.cards.programByok')}</option>
-									</select>
-								</label>
-								<label>
-									<span>{m('org.cards.region')}</span>
-									<select bind:value={cardsRegion}>
-										{#each CARD_REGIONS as r (r.value)}
-											<option value={r.value}>{cardRegionLabel(r)}</option>
-										{/each}
-									</select>
-								</label>
-								<label>
-									<span>{m('org.cards.expiryDays')}</span>
-									<input type="number" min="1" max="90" bind:value={cardsExpiryDays} />
-								</label>
-							</div>
-
-							{#if cardsEnabled && cardsProgramType === 'platform'}
-								<p class="card-hint after-control">{m('org.cards.platformHint', { provider: autoProvider === 'lithic' ? 'Lithic' : 'Nium' })}</p>
-							{/if}
-
-							{#if cardsEnabled && cardsProgramType === 'byok'}
-								<div class="form-grid">
-									<label>
-										<span>{m('org.cards.provider')}</span>
-										<select bind:value={cardsProvider}>
-											<option value="">{m('org.cards.providerAuto', { provider: autoProvider === 'lithic' ? 'Lithic' : 'Nium' })}</option>
-											<option value="lithic">{m('org.cards.providerLithic')}</option>
-											<option value="nium">{m('org.cards.providerNium')}</option>
-										</select>
-									</label>
-								</div>
-
-								{#if effectiveProvider === 'lithic'}
-									<div class="form-grid">
-										<SecretField
-											id="cards-api-key"
-											label={m('org.cards.lithicApiKey')}
-											bind:value={cardsApiKey}
-											bind:clear={secretClear['cards.api_key']}
-											configured={isStored('cards', 'api_key')}
-											placeholder={'api-key-...'}
-											testId="cards-api-key"
-										/>
-										<label>
-											<span>{m('org.cards.sandboxMode')}</span>
-											<select bind:value={cardsSandbox}>
-												<option value={true}>{m('org.cards.sandboxTesting')}</option>
-												<option value={false}>{m('org.cards.production')}</option>
-											</select>
-										</label>
-									</div>
-								{:else if effectiveProvider === 'nium'}
-									<div class="form-grid">
-										<label>
-											<span>{m('org.cards.clientId')}</span>
-											<input type="text" bind:value={cardsClientId} />
-										</label>
-										<SecretField
-											id="cards-client-secret"
-											label={m('org.cards.clientSecret')}
-											bind:value={cardsClientSecret}
-											bind:clear={secretClear['cards.client_secret']}
-											configured={isStored('cards', 'client_secret')}
-											testId="cards-client-secret"
-										/>
-										<label>
-											<span>{m('org.cards.customerHashId')}</span>
-											<input type="text" bind:value={cardsCustomerHashId} />
-										</label>
-										<label>
-											<span>{m('org.cards.walletHashId')}</span>
-											<input type="text" bind:value={cardsWalletHashId} />
-										</label>
-										<label>
-											<span>{m('org.cards.sandboxMode')}</span>
-											<select bind:value={cardsSandbox}>
-												<option value={true}>{m('org.cards.sandboxTesting')}</option>
-												<option value={false}>{m('org.cards.production')}</option>
-											</select>
-										</label>
-									</div>
-								{/if}
-							{/if}
-
-							{#if unopenable.cards && auth.isAdmin}
-								<CredentialResetPrompt
-									block="cards"
-									oncleared={(status) => onCredentialsCleared('cards', status)}
-								/>
-							{/if}
-							<div class="section-footer">
-								<button class="btn-save-section" disabled={savingCards} onclick={saveCards}>
-									{savingCards ? m('org.common.saving') : m('org.cards.save')}
-								</button>
-							</div>
-						{/if}
-					</section>
+					<CardsPanel
+						bind:fields={cardsFields}
+						bind:secretClear
+						{readOnly}
+						{isStored}
+						unopenable={unopenable.cards ?? false}
+						oncleared={(status) => onCredentialsCleared('cards', status)}
+						saving={savingCards}
+						onsave={saveCards}
+					/>
 				{/if}
 
 				{#if section === 'security'}
-					<section class="card">
-						<h2>{m('org.section.security')}</h2>
-						<p class="card-hint">
-							{m('org.security.hint')}
-						</p>
-						{#if readOnly}
-							<p class="card-hint" data-testid="security-admin-only">
-								{m('org.readOnly.sectionAdminOnly')}
-							</p>
-						{:else}
-							<label class="switch-row">
-								<input type="checkbox" bind:checked={mfaRequired} />
-								<span>{m('org.security.requireMfa')}</span>
-							</label>
-
-							{#if mfaRequired && !mfaEnforcementActive}
-								<p class="mfa-enforcement-warning" role="alert" data-testid="mfa-enforcement-inactive">
-									{m('org.security.mfaEnforcementInactive')}
-								</p>
-							{/if}
-
-							<div class="section-footer">
-								<button class="btn-save-section" disabled={savingSecurity} onclick={saveSecurity}>
-									{savingSecurity ? m('org.common.saving') : m('org.security.save')}
-								</button>
-							</div>
-						{/if}
-					</section>
+					<SecurityPanel
+						bind:mfaRequired
+						enforcementActive={mfaEnforcementActive}
+						{readOnly}
+						saving={savingSecurity}
+						onsave={saveSecurity}
+					/>
 				{/if}
 
 				{#if section === 'sso'}
-					<section class="card" data-testid="sso-panel">
-						<h2>{m('orgSso.title')}</h2>
-						<p class="card-hint">{m('orgSso.hint')}</p>
-
-						{#if !userLoaded || loadingSso}
-							<LoadingState label={m('orgSso.loading')} />
-						{:else if readOnly}
-							<p class="card-hint" data-testid="sso-admin-only">
-								{m('org.readOnly.sectionAdminOnly')}
-							</p>
-						{:else if ssoLoadError}
-							<LoadError message={ssoLoadError} onretry={loadSso} testId="sso-load-error" />
-						{:else if sso}
-							{#if sso.password_sign_in_closed}
-								<p class="sso-status" data-testid="sso-status-closed">
-									{m('orgSso.status.passwordClosed')}
-								</p>
-							{:else if sso.enabled && sso.idp_config_missing.length}
-								<p class="chat-warning" role="alert" data-testid="sso-status-incomplete">
-									{ssoMissingLabels
-										? m('orgSso.status.incomplete', { fields: formatList(ssoMissingLabels) })
-										: m('orgSso.status.incompleteUnknown')}
-								</p>
-							{/if}
-
-							{#if !ssoEntitled}
-								<PlanUpgradeNotice feature={FEATURE_SSO} testId="sso-plan-upgrade" />
-							{/if}
-
-							<div class="form-grid">
-								<label class="switch-row full-width">
-									<!-- Off is always allowed; ON needs the plan. -->
-									<input
-										type="checkbox"
-										bind:checked={ssoEnabled}
-										disabled={!ssoEntitled && !ssoEnabled}
-										data-testid="sso-enabled-toggle"
-									/>
-									<span>{m('orgSso.enabled')}</span>
-								</label>
-								<label>
-									<span>{m('orgSso.field.protocol')}</span>
-									<select bind:value={ssoProtocol}>
-										<option value="oidc">{m('orgSso.protocol.oidc')}</option>
-										<option value="saml">{m('orgSso.protocol.saml')}</option>
-									</select>
-								</label>
-								<label>
-									<span>{m('orgSso.field.provider')}</span>
-									<select bind:value={ssoProvider}>
-										{#each SSO_PROVIDERS as p (p)}
-											<option value={p}>{ssoProviderLabel(p)}</option>
-										{/each}
-									</select>
-								</label>
-
-								{#if ssoProtocol === 'oidc'}
-									<label class="full-width">
-										<span>{m('orgSso.field.discoveryUrl')}</span>
-										<input
-											type="url"
-											bind:value={ssoDiscoveryUrl}
-											placeholder={'https://example.okta.com/.well-known/openid-configuration'}
-											autocomplete="off"
-											spellcheck="false"
-										/>
-									</label>
-									<label>
-										<span>{m('orgSso.field.clientId')}</span>
-										<input
-											type="text"
-											bind:value={ssoClientId}
-											autocomplete="off"
-											spellcheck="false"
-										/>
-									</label>
-									<div>
-										<label>
-											<span>{m('orgSso.field.clientSecret')}</span>
-											<input
-												type="password"
-												bind:value={ssoNewClientSecret}
-												placeholder={sso.client_secret_configured
-													? m('orgSso.secret.keepPlaceholder')
-													: ''}
-												autocomplete="new-password"
-												spellcheck="false"
-												aria-describedby="sso-secret-hint"
-												data-testid="sso-client-secret"
-											/>
-										</label>
-										<p class="field-hint" id="sso-secret-hint">
-											{sso.client_secret_configured
-												? m('orgSso.secret.configured')
-												: m('orgSso.secret.notConfigured')}
-										</p>
-										{#if sso.client_secret_configured}
-											<label class="switch-row">
-												<input type="checkbox" bind:checked={ssoClearClientSecret} />
-												<span>{m('orgSso.secret.clear')}</span>
-											</label>
-										{/if}
-									</div>
-								{:else}
-									<label class="full-width">
-										<span>{m('orgSso.field.idpEntityId')}</span>
-										<input
-											type="text"
-											bind:value={ssoIdpEntityId}
-											autocomplete="off"
-											spellcheck="false"
-										/>
-									</label>
-									<label class="full-width">
-										<span>{m('orgSso.field.idpSsoUrl')}</span>
-										<input
-											type="url"
-											bind:value={ssoIdpSsoUrl}
-											autocomplete="off"
-											spellcheck="false"
-										/>
-									</label>
-									<label class="full-width">
-										<span>{m('orgSso.field.idpCert')}</span>
-										<textarea
-											bind:value={ssoIdpCert}
-											rows="4"
-											spellcheck="false"
-											placeholder={'-----BEGIN CERTIFICATE-----'}
-										></textarea>
-									</label>
-									<label>
-										<span>{m('orgSso.field.idpSloUrl')}</span>
-										<input
-											type="url"
-											bind:value={ssoIdpSloUrl}
-											autocomplete="off"
-											spellcheck="false"
-										/>
-									</label>
-									<label>
-										<span>{m('orgSso.field.spEntityId')}</span>
-										<input
-											type="text"
-											bind:value={ssoSpEntityId}
-											placeholder={sso.saml_sp_entity_id}
-											autocomplete="off"
-											spellcheck="false"
-										/>
-									</label>
-								{/if}
-
-								<div class="full-width">
-									<label>
-										<span>{m('orgSso.field.allowedDomains')}</span>
-										<input
-											type="text"
-											bind:value={ssoDomains}
-											placeholder={'example.com, example.co.uk'}
-											autocomplete="off"
-											spellcheck="false"
-											aria-describedby="sso-domains-hint"
-										/>
-									</label>
-									<p class="field-hint" id="sso-domains-hint">{m('orgSso.domainsHint')}</p>
-								</div>
-							</div>
-
-							<h3 class="chat-subhead">{m('orgSso.register.title')}</h3>
-							<p class="card-hint">{m('orgSso.register.hint')}</p>
-							<dl class="sso-register">
-								{#if ssoProtocol === 'oidc'}
-									<dt>{m('orgSso.register.redirectUri')}</dt>
-									<dd><code>{sso.oidc_redirect_uri}</code></dd>
-								{:else}
-									<dt>{m('orgSso.register.acsUrl')}</dt>
-									<dd><code>{sso.saml_acs_url}</code></dd>
-									<dt>{m('orgSso.register.spEntityId')}</dt>
-									<dd><code>{sso.saml_sp_entity_id}</code></dd>
-								{/if}
-							</dl>
-
-							<div class="sso-only-row">
-								<label class="switch-row">
-									<input
-										type="checkbox"
-										bind:checked={ssoOnly}
-										disabled={!ssoEnforcementEntitled && !ssoOnly}
-										aria-describedby="sso-only-hint"
-										data-testid="sso-only-toggle"
-									/>
-									<span>{m('orgSso.ssoOnly')}</span>
-								</label>
-								<p class="field-hint" id="sso-only-hint">{m('orgSso.ssoOnlyHint')}</p>
-								{#if ssoEntitled && !ssoEnforcementEntitled}
-									<PlanUpgradeNotice
-										feature={FEATURE_SSO_ENFORCEMENT}
-										testId="sso-only-plan-upgrade"
-									/>
-								{/if}
-							</div>
-
-							{#if ssoSaveError}
-								<p class="chat-error" role="alert" data-testid="sso-save-error">{ssoSaveError}</p>
-							{/if}
-
-							<div class="section-footer">
-								<button
-									class="btn-save-section"
-									disabled={savingSso}
-									onclick={saveSso}
-									data-testid="sso-save"
-								>
-									{savingSso ? m('org.common.saving') : m('orgSso.save')}
-								</button>
-							</div>
-						{/if}
-					</section>
+					<SsoPanel
+						bind:fields={ssoFields}
+						status={sso}
+						{readOnly}
+						{userLoaded}
+						loading={loadingSso}
+						loadError={ssoLoadError}
+						onretry={loadSso}
+						saveError={ssoSaveError}
+						saving={savingSso}
+						onsave={saveSso}
+					/>
 				{/if}
 
 				{#if section === 'scim'}
@@ -3396,257 +2036,22 @@
 				{/if}
 
 				{#if section === 'fraud'}
-					{#if readOnly || fraud}
-						<section class="card">
-							<h2>{m('org.section.fraud')}</h2>
-							<p class="card-hint">
-								{m('org.fraud.hint')}
-								<HelpTip term="exception" />
-							</p>
-							{#if readOnly}
-								<p class="card-hint" data-testid="fraud-admin-only">
-									{m('org.readOnly.sectionAdminOnly')}
-								</p>
-							{:else if fraud}
-								<div class="fraud-grid">
-									<label class="switch-row">
-										<input type="checkbox" bind:checked={fraud.round_amount_enabled} />
-										<span>
-											<strong>{m('org.fraud.roundAmount')}</strong>
-											<span class="rule-hint">
-												{m('org.fraud.roundAmountHint', { min: fraud.round_amount_min })}
-											</span>
-										</span>
-									</label>
-									<div class="threshold-row">
-										<label>
-											<span>{m('org.fraud.minAmount')}</span>
-											<input
-												type="number"
-												min="0"
-												step="100"
-												bind:value={fraud.round_amount_min}
-												disabled={!fraud.round_amount_enabled}
-											/>
-										</label>
-									</div>
-
-									<label class="switch-row">
-										<input type="checkbox" bind:checked={fraud.future_date_enabled} />
-										<span>
-											<strong>{m('org.fraud.futureDate')}</strong>
-											<span class="rule-hint">
-												{m('org.fraud.futureDateHint')}
-											</span>
-										</span>
-									</label>
-
-									<label class="switch-row">
-										<input type="checkbox" bind:checked={fraud.rush_payment_enabled} />
-										<span>
-											<strong>{m('org.fraud.rushPayment')}</strong>
-											<span class="rule-hint">
-												{m('org.fraud.rushPaymentHint')}
-											</span>
-										</span>
-									</label>
-									<div class="threshold-row">
-										<label>
-											<span>{m('org.fraud.maxDays')}</span>
-											<input
-												type="number"
-												min="0"
-												max="30"
-												bind:value={fraud.rush_payment_max_days}
-												disabled={!fraud.rush_payment_enabled}
-											/>
-										</label>
-									</div>
-
-									<label class="switch-row">
-										<input type="checkbox" bind:checked={fraud.new_vendor_large_enabled} />
-										<span>
-											<strong>{m('org.fraud.newVendorLarge')}</strong>
-											<span class="rule-hint">
-												{m('org.fraud.newVendorLargeHint', { amount: fraud.new_vendor_large_amount, days: fraud.new_vendor_max_age_days })}
-											</span>
-										</span>
-									</label>
-									<div class="threshold-row">
-										<label>
-											<span>{m('org.fraud.vendorAge')}</span>
-											<input
-												type="number"
-												min="1"
-												bind:value={fraud.new_vendor_max_age_days}
-												disabled={!fraud.new_vendor_large_enabled}
-											/>
-										</label>
-										<label>
-											<span>{m('org.fraud.largeThreshold')}</span>
-											<input
-												type="number"
-												min="0"
-												step="500"
-												bind:value={fraud.new_vendor_large_amount}
-												disabled={!fraud.new_vendor_large_enabled}
-											/>
-										</label>
-									</div>
-
-									<label class="switch-row">
-										<input type="checkbox" bind:checked={fraud.bank_change_enabled} />
-										<span>
-											<strong>{m('org.fraud.bankChange')}</strong>
-											<span class="rule-hint">
-												{m('org.fraud.bankChangeHint')}
-											</span>
-										</span>
-									</label>
-
-									<label class="switch-row">
-										<input type="checkbox" bind:checked={fraud.personal_email_enabled} />
-										<span>
-											<strong>{m('org.fraud.personalEmail')}</strong>
-											<span class="rule-hint">
-												{m('org.fraud.personalEmailHint')}
-											</span>
-										</span>
-									</label>
-									<div class="threshold-row">
-										<label class="full">
-											<span>{m('org.fraud.personalEmailDomains')}</span>
-											<textarea
-												rows="4"
-												bind:value={personalEmailDomainsText}
-												disabled={!fraud.personal_email_enabled}
-											></textarea>
-										</label>
-									</div>
-
-									<label class="switch-row">
-										<input type="checkbox" bind:checked={fraud.stat_anomaly_enabled} />
-										<span>
-											<strong>{m('org.fraud.statAnomaly')}</strong>
-											<span class="rule-hint">
-												{m('org.fraud.statAnomalyHint')}
-											</span>
-										</span>
-									</label>
-									<div class="threshold-row">
-										<label>
-											<span>{m('org.fraud.sigma')}</span>
-											<input
-												type="number"
-												min="0.5"
-												step="0.1"
-												bind:value={fraud.stat_anomaly_sigma}
-												disabled={!fraud.stat_anomaly_enabled}
-											/>
-										</label>
-										<label>
-											<span>{m('org.fraud.minPriorInvoices')}</span>
-											<input
-												type="number"
-												min="2"
-												bind:value={fraud.stat_anomaly_min_history}
-												disabled={!fraud.stat_anomaly_enabled}
-											/>
-										</label>
-									</div>
-
-									<label class="switch-row">
-										<input type="checkbox" bind:checked={fraud.llm_anomaly_enabled} />
-										<span>
-											<strong>{m('org.fraud.llmAnomaly')}</strong>
-											<span class="rule-hint">
-												{m('org.fraud.llmAnomalyHint')}
-											</span>
-										</span>
-									</label>
-								</div>
-
-								<div class="section-footer">
-									<button
-										type="button"
-										class="btn-link"
-										onclick={resetFraudToDefaults}
-										disabled={savingFraud}
-									>
-										{m('org.fraud.resetDefaults')}
-									</button>
-									<button
-										class="btn-save-section"
-										disabled={savingFraud}
-										onclick={saveFraud}
-									>
-										{savingFraud ? m('org.common.saving') : m('org.fraud.save')}
-									</button>
-								</div>
-							{/if}
-						</section>
-					{/if}
+					<FraudRulesPanel
+						bind:rules={fraud}
+						bind:personalEmailDomainsText
+						{readOnly}
+						saving={savingFraud}
+						onsave={saveFraud}
+						onreset={resetFraudToDefaults}
+					/>
 				{/if}
 
 				{#if section === 'data-sync'}
-					<!-- Data Sync is a SIGNPOST, not a second set of sync buttons.
-					     Each of the three ERP-synced data sets now has its own page
-					     carrying its own Sync-from-ERP action gated on `auth.isManager`
-					     — `/gl-accounts` (new), `/purchase-orders`, `/vendors` — which
-					     matches every one of those endpoints' real gate
-					     (admin | ap_manager). The two buttons that used to live here
-					     were admin-only by virtue of this route's nav gate, said nothing
-					     about which entity's chart they would write into, and reported
-					     into a bare <span> with no list to refresh; the vendors row had
-					     already been a link for exactly that reason. Three links is one
-					     vocabulary for one fact (decisions §153's objection to a panel
-					     growing a second shape, and §161 for the call).
-					     It keeps its place because this is where the ERP connection is
-					     configured, so "now where do I pull it?" is asked here. -->
-					<section class="card">
-						<div class="help-row">
-							<h2>{m('org.section.dataSync')}</h2>
-							<HelpTip term="erp-sync" />
-						</div>
-						<p class="card-hint">{m('org.dataSync.hint')}</p>
-
-						<div class="sync-grid">
-							<div class="sync-item">
-								<div class="sync-info">
-									<span class="sync-name">{m('org.dataSync.coa')}</span>
-									<span class="sync-desc">{m('org.dataSync.coaDesc')}</span>
-								</div>
-								<a href="/gl-accounts" class="btn-outline">{m('org.dataSync.manageCoa')}</a>
-							</div>
-
-							<div class="sync-item">
-								<div class="sync-info">
-									<span class="sync-name">{m('org.dataSync.pos')}</span>
-									<span class="sync-desc">{m('org.dataSync.posDesc')}</span>
-								</div>
-								<a href="/purchase-orders" class="btn-outline">{m('org.dataSync.managePos')}</a>
-							</div>
-
-							<div class="sync-item">
-								<div class="sync-info">
-									<span class="sync-name">{m('org.dataSync.vendors')}</span>
-									<span class="sync-desc">{m('org.dataSync.vendorsDesc')}</span>
-								</div>
-								<a href="/vendors" class="btn-outline">{m('org.dataSync.manageVendors')}</a>
-							</div>
-						</div>
-					</section>
+					<DataSyncPanel />
 				{/if}
 
 				{#if section === 'plan'}
-					<section class="card plan-card">
-						<h2>{m('org.section.plan')}</h2>
-						<div class="plan-info">
-							<Badge tone="accent" variant="plan-badge">{planLabel(org.plan)}</Badge>
-							<span class="plan-slug">{m('org.plan.tenant')} <code>{org.slug}</code></span>
-							<span class="plan-date">{m('org.plan.created', { date: formatDate(org.created_at, '—', { month: 'long', day: 'numeric', year: 'numeric' }) })}</span>
-						</div>
-					</section>
+					<PlanPanel {org} />
 				{/if}
 
 				{#if section === 'match-rules'}
@@ -3753,56 +2158,6 @@
 		color: var(--muted-on-tint);
 	}
 
-	.intake-address-label {
-		font-size: 0.72rem;
-		text-transform: uppercase;
-		letter-spacing: 0.04em;
-		color: var(--text-muted);
-		margin: 0 0 6px;
-	}
-
-	.intake-address-row {
-		display: flex;
-		align-items: stretch;
-		gap: 8px;
-		margin-bottom: 12px;
-	}
-
-	.intake-address {
-		flex: 1;
-		background: var(--bg);
-		border: 1px solid var(--border);
-		border-radius: 4px;
-		padding: 8px 12px;
-		font-size: 0.9rem;
-		word-break: break-all;
-		/* One click selects the whole address — it is copied by hand whenever
-		   the clipboard API is unavailable. */
-		user-select: all;
-	}
-
-	/* The armed rotate's explanation. Tinted-badge recipe: the -tint
-	   background with its matching -on-tint text, never the base token. */
-	.intake-rotate-warning {
-		margin: 0 0 10px;
-		padding: 10px 12px;
-		border-radius: 6px;
-		font-size: 0.82rem;
-		background: var(--warning-tint);
-		color: var(--warning-on-tint);
-	}
-
-	/* "This deployment has no intake domain" — a standing fact about the
-	   install, not something the reader did wrong. */
-	.intake-unavailable {
-		margin: 0;
-		padding: 10px 12px;
-		border-radius: 6px;
-		font-size: 0.82rem;
-		background: var(--muted-tint);
-		color: var(--muted-on-tint);
-	}
-
 	.card {
 		background: var(--surface);
 		border: 1px solid var(--border);
@@ -3810,7 +2165,10 @@
 		padding: 20px 24px;
 	}
 
-	.card h2 {
+	/* `:global(.card)`: the intro snippets (`customDomainsIntro`,
+	   `residencyIntro`) render this page's <h2> inside a panel component's
+	   card, which carries the component's scope, not this page's. */
+	:global(.card) h2 {
 		font-size: 1rem;
 		font-weight: 600;
 		margin: 0 0 4px;
@@ -3820,669 +2178,5 @@
 		font-size: 0.82rem;
 		color: var(--text-muted);
 		margin: 0 0 14px;
-	}
-
-	/* A hint under the provider picker it qualifies, not at the top of a card. */
-	.card-hint.after-control {
-		margin-top: 10px;
-	}
-
-	/* First-time-admin wayfinding — links jump to the sections a new tenant
-	   configures first. Purely a shortcut; nothing is hidden. */
-	.getting-started {
-		border-color: var(--accent);
-	}
-
-	.form-grid {
-		display: grid;
-		grid-template-columns: 1fr 1fr;
-		gap: 14px;
-		margin-top: 14px;
-	}
-
-	.full-width {
-		grid-column: 1 / -1;
-	}
-
-	/* Per-field explanation sitting OUTSIDE the <label> (it is referenced by
-	   aria-describedby instead), so it describes the control without being
-	   swallowed into its accessible name. */
-	.field-hint {
-		font-size: 0.78rem;
-		color: var(--text-muted);
-		margin: 6px 0 0;
-		line-height: 1.5;
-	}
-
-	.tenant-url-effective {
-		display: block;
-		color: var(--text);
-	}
-
-	label {
-		display: flex;
-		flex-direction: column;
-		gap: 4px;
-	}
-
-	/* The field label only — not the .color-field wrapper span (reset below). */
-	label > span:first-child {
-		font-size: 0.78rem;
-		font-weight: 500;
-		color: var(--text-muted);
-		text-transform: uppercase;
-		letter-spacing: 0.03em;
-	}
-
-	/* Branding color picker: native swatch + hex text input side by side. */
-	.color-field {
-		display: flex;
-		align-items: center;
-		gap: 8px;
-		text-transform: none;
-		letter-spacing: normal;
-	}
-
-	.color-field input[type='color'] {
-		width: 40px;
-		height: 36px;
-		padding: 2px;
-		flex-shrink: 0;
-		cursor: pointer;
-	}
-
-	.color-field input[type='text'] {
-		flex: 1;
-	}
-
-	/* Custom domains */
-	.domain-list {
-		list-style: none;
-		margin: 4px 0 16px;
-		padding: 0;
-		display: flex;
-		flex-direction: column;
-		gap: 6px;
-	}
-
-	.domain-row {
-		display: flex;
-		align-items: center;
-		justify-content: space-between;
-		gap: 12px;
-		padding: 8px 12px;
-		background: var(--bg);
-		border: 1px solid var(--border);
-		border-radius: 4px;
-	}
-
-	.domain-name {
-		font-size: 0.9rem;
-		word-break: break-all;
-	}
-
-	.residency-placement {
-		font-family: var(--font-mono);
-		margin: 12px 0 0;
-	}
-
-	/* Advisory verdict box. Tinted-badge recipe: each tone takes its own
-	   -tint background with the matching -on-tint text (never the base token,
-	   which lands under 4.5:1 once composited over the tint). Unknown — the
-	   deliberately non-committal state — is the muted default. */
-	.residency-alignment {
-		margin-top: 14px;
-		padding: 10px 12px;
-		border-radius: 6px;
-		font-size: 0.82rem;
-		background: var(--muted-tint);
-		color: var(--muted-on-tint);
-	}
-
-	.residency-alignment.ok {
-		background: var(--success-tint);
-		color: var(--success-on-tint);
-	}
-
-	.residency-alignment.warn {
-		background: var(--warning-tint);
-		color: var(--warning-on-tint);
-	}
-
-	.residency-alignment strong {
-		display: block;
-		margin-bottom: 4px;
-	}
-
-	.residency-alignment p {
-		margin: 0;
-	}
-
-	/* Inherits the box's calibrated colour — a muted token here would be
-	   judged against the bare surface, not the tint it actually sits on. */
-	.residency-advisory {
-		margin-top: 6px;
-		font-size: 0.78rem;
-	}
-
-	.btn-remove-domain {
-		flex-shrink: 0;
-		padding: 4px 12px;
-		font-size: 0.82rem;
-		border: 1px solid var(--border);
-		border-radius: 4px;
-		background: transparent;
-		color: var(--text);
-		cursor: pointer;
-	}
-
-	.btn-remove-domain:hover:not(:disabled),
-	.btn-remove-domain.armed {
-		/* --danger-strong, not --danger: this armed state is a fill carrying
-		   white text, and the old #e5484d fallback was 3.91:1. */
-		border-color: var(--danger-strong);
-		color: #fff;
-		background: var(--danger-strong);
-	}
-
-	.btn-remove-domain:disabled {
-		opacity: 0.6;
-		cursor: default;
-	}
-
-	.domain-add {
-		display: flex;
-		align-items: center;
-		gap: 8px;
-	}
-
-	.domain-add input {
-		flex: 1;
-	}
-
-	/* An in-panel save refusal (a domain add, an SSO save). A panel's failed
-	   LOAD is `ui/LoadError` instead, which carries the Retry this line had no
-	   room for. */
-	.domain-error,
-	.chat-error {
-		color: var(--danger);
-		font-size: 0.88rem;
-		margin: 4px 0 12px;
-	}
-
-	/* "Enabled for a real provider but no webhook stored" — the adapter fails
-	   closed and posts nothing, so this is a live misconfiguration, not an
-	   error the user just caused. Tinted-badge recipe: the -tint background
-	   with its matching -on-tint text, never the base token. */
-	.chat-warning {
-		margin: 4px 0 12px;
-		padding: 10px 12px;
-		border-radius: 6px;
-		font-size: 0.82rem;
-		background: var(--warning-tint);
-		color: var(--warning-on-tint);
-	}
-
-	/* SSO-only in force: a state, not a problem — the success tint recipe. */
-	.sso-status {
-		margin: 4px 0 12px;
-		padding: 10px 12px;
-		border-radius: 6px;
-		font-size: 0.82rem;
-		background: var(--success-tint);
-		color: var(--success-on-tint);
-	}
-
-	/* What the admin pastes into the IdP. Long URLs wrap rather than push the
-	   card past a 320px viewport (WCAG 1.4.10). */
-	.sso-register {
-		display: grid;
-		grid-template-columns: max-content 1fr;
-		gap: 6px 14px;
-		margin: 0 0 16px;
-		font-size: 0.85rem;
-	}
-
-	.sso-register dt {
-		color: var(--text-muted);
-	}
-
-	.sso-register dd {
-		margin: 0;
-		min-width: 0;
-	}
-
-	.sso-register code {
-		font-family: var(--font-mono);
-		overflow-wrap: anywhere;
-	}
-
-	.sso-only-row {
-		margin: 4px 0 8px;
-	}
-
-	.chat-subhead {
-		margin: 20px 0 4px;
-		font-size: 0.95rem;
-		font-weight: 600;
-		color: var(--text);
-	}
-
-	.chat-events {
-		border: 1px solid var(--border);
-		border-radius: 6px;
-		padding: 12px 14px;
-		margin: 14px 0 0;
-		display: flex;
-		flex-direction: column;
-		gap: 8px;
-	}
-
-	.chat-events legend {
-		padding: 0 6px;
-		font-size: 0.82rem;
-		font-weight: 600;
-		color: var(--text-muted);
-		text-transform: uppercase;
-		letter-spacing: 0.04em;
-	}
-
-	.chat-events .card-hint {
-		margin: 0 0 4px;
-	}
-
-	.chat-webhook-status {
-		display: flex;
-		align-items: center;
-		justify-content: space-between;
-		gap: 12px;
-		margin: 8px 0 12px;
-		flex-wrap: wrap;
-	}
-
-	.chat-webhook-set {
-		font-size: 0.88rem;
-		color: var(--text);
-	}
-
-	.domain-empty {
-		margin-bottom: 12px;
-	}
-
-	/* The TEXT-entry recipe, carved away from the three controls it also
-	   reached but was never written for. Svelte scopes this to
-	   `.card.svelte-x input:where(.svelte-x)`, which outranks the global
-	   control base in `app.css`.
-
-	   checkbox/radio: `background:` is a SHORTHAND — it reset
-	   `background-image`, the drawn tick, so the twelve `.switch-row` toggles
-	   rendered identically checked and unchecked.
-
-	   color: adding those two `:not()`s took this selector from 0-0-1 to
-	   0-2-1, which TIES `.color-field input[type='color']` (also 0-2-1) — and
-	   on a tie the later rule wins, so `width: 100%` started beating the
-	   swatch's own `width: 40px`. The branding swatch grew to the full 478px
-	   column and squeezed its sibling hex field to 22px, under the WCAG 2.2 AA
-	   SC 2.5.8 24px floor (caught by `tests-e2e/a11y/axe.spec.ts`). A native
-	   colour swatch is not a text entry: it wants neither this padding nor
-	   this width, so it is carved out rather than out-specified. */
-	input:not([type='checkbox']):not([type='radio']):not([type='color']),
-	select,
-	textarea {
-		background: var(--bg);
-		border: 1px solid var(--border);
-		border-radius: 4px;
-		padding: 8px 10px;
-		font-size: 0.88rem;
-		color: var(--text);
-		font-family: inherit;
-		width: 100%;
-		box-sizing: border-box;
-	}
-
-	textarea {
-		resize: vertical;
-	}
-
-	/* Same carve-out: `outline: none` here would strip the checkbox/radio
-	   focus ring `app.css` draws for them (WCAG 2.4.7). */
-	input:not([type='checkbox']):not([type='radio']):focus,
-	select:focus,
-	textarea:focus {
-		outline: none;
-		border-color: var(--accent);
-		box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 15%, transparent);
-	}
-
-	.plan-card h2 {
-		margin-bottom: 12px;
-	}
-
-	.plan-info {
-		display: flex;
-		align-items: center;
-		gap: 16px;
-	}
-
-	.plan-slug {
-		font-size: 0.82rem;
-		color: var(--text-muted);
-	}
-
-	.plan-slug code {
-		background: var(--bg);
-		padding: 2px 6px;
-		border-radius: 3px;
-		font-size: 0.8rem;
-	}
-
-	.plan-date {
-		font-size: 0.82rem;
-		color: var(--text-muted);
-	}
-
-	.section-footer {
-		display: flex;
-		/* Same reason as `.erp-test-row` below: this row carries a Save button, an
-		   optional Test button and an optional result message, all of them
-		   `white-space: nowrap`. Without a wrap the row cannot shrink below its
-		   own max-content width and pushes the whole document sideways at 320px
-		   — WCAG 1.4.10. The `gap` replaces the spacing the buttons used to get
-		   for free from sitting on one line. */
-		flex-wrap: wrap;
-		justify-content: flex-start;
-		gap: 12px;
-		margin-top: 16px;
-		padding-top: 14px;
-		border-top: 1px solid var(--border);
-	}
-
-	.btn-save-section {
-		padding: 8px 18px;
-		border-radius: 6px;
-		border: none;
-		background: var(--accent-strong);
-		color: #fff;
-		font-size: 0.85rem;
-		font-weight: 500;
-		cursor: pointer;
-		font-family: inherit;
-		white-space: nowrap;
-	}
-
-	.btn-save-section:hover:not(:disabled) {
-		opacity: 0.85;
-	}
-
-	.btn-save-section:disabled {
-		opacity: 0.5;
-		cursor: not-allowed;
-	}
-
-	.erp-test-row {
-		display: flex;
-		align-items: center;
-		/* Wraps because `.btn-test` is `white-space: nowrap` (142px) and sits
-		   beside a result message: without this the row could not shrink and
-		   pushed the whole page into a horizontal scrollbar at 320px — WCAG
-		   1.4.10, the same failure the section tab bar had. Caught when the
-		   reflow guard started visiting a grouped route. */
-		flex-wrap: wrap;
-		gap: 12px;
-		margin-top: 16px;
-		padding-top: 14px;
-		border-top: 1px solid var(--border);
-	}
-
-	.btn-test {
-		padding: 8px 18px;
-		border-radius: 6px;
-		border: 1px solid var(--border);
-		background: var(--surface);
-		color: var(--text-muted);
-		font-size: 0.85rem;
-		font-weight: 500;
-		cursor: pointer;
-		font-family: inherit;
-		white-space: nowrap;
-	}
-
-	.btn-test:hover:not(:disabled) {
-		border-color: var(--accent);
-		color: var(--accent);
-	}
-
-	.btn-test:disabled {
-		opacity: 0.5;
-		cursor: not-allowed;
-	}
-
-	.test-result {
-		font-size: 0.85rem;
-		font-weight: 500;
-	}
-
-	.test-result.success {
-		color: var(--success);
-	}
-
-	.test-result.failure {
-		color: var(--danger);
-	}
-
-	.sync-grid {
-		display: flex;
-		flex-direction: column;
-		gap: 12px;
-		margin-top: 14px;
-	}
-
-	.sync-item {
-		display: flex;
-		align-items: center;
-		/* The description and its action cannot share a line at 320px, so the
-		   action drops below the description instead of pushing the document
-		   sideways (WCAG 1.4.10). */
-		flex-wrap: wrap;
-		gap: 12px;
-		padding: 10px 12px;
-		background: var(--bg);
-		border-radius: 6px;
-	}
-
-	.sync-info {
-		flex: 1;
-		/* `flex: 1` leaves `min-width: auto`, so this column refuses to shrink
-		   below its longest word plus the action beside it. Zero lets it give
-		   way and the text wrap. */
-		min-width: 0;
-		display: flex;
-		flex-direction: column;
-		gap: 2px;
-	}
-
-	.sync-name {
-		font-size: 0.88rem;
-		font-weight: 500;
-		color: var(--text);
-	}
-
-	.sync-desc {
-		font-size: 0.78rem;
-		color: var(--text-muted);
-	}
-
-	.btn-outline {
-		padding: 8px 18px;
-		border-radius: 6px;
-		border: 1px solid var(--border);
-		background: var(--surface);
-		color: var(--text-muted);
-		font-size: 0.85rem;
-		font-weight: 500;
-		cursor: pointer;
-		font-family: inherit;
-		/* Deliberately NOT `white-space: nowrap` (unlike `.btn-test`, whose label
-		   is two short words). These labels name their destination — "Manage on
-		   Chart of Accounts page" is 265px — so a nowrap label is wider than a
-		   320px viewport's whole content column and no amount of wrapping the
-		   ROW can rescue it: the item would still overflow on its own line.
-		   Letting the label wrap is what makes the page reflow (WCAG 1.4.10).
-		   At every width where the label fits, shrink-to-fit keeps it on one
-		   line, so nothing changes above ~460px. */
-		text-decoration: none;
-		display: inline-block;
-		text-align: center;
-	}
-
-	.btn-outline:hover:not(:disabled) {
-		border-color: var(--accent);
-		color: var(--accent);
-	}
-
-	.btn-outline:disabled {
-		opacity: 0.5;
-		cursor: not-allowed;
-	}
-
-	label.switch-row {
-		flex-direction: row;
-		align-items: center;
-		gap: 10px;
-		font-size: 0.9rem;
-		color: var(--text);
-		cursor: pointer;
-	}
-
-	label.switch-row span {
-		font-size: 0.9rem;
-		font-weight: 400;
-		color: var(--text);
-		text-transform: none;
-		letter-spacing: normal;
-	}
-
-	label.switch-row input[type='checkbox'] {
-		width: 16px;
-		height: 16px;
-		accent-color: var(--accent);
-		cursor: pointer;
-		flex-shrink: 0;
-	}
-
-	.mfa-enforcement-warning {
-		color: var(--warning-on-tint);
-		font-size: 0.82rem;
-		font-weight: 600;
-		margin: 8px 0 0;
-	}
-
-	/* --- Fraud detection panel --- */
-
-	.fraud-grid {
-		display: flex;
-		flex-direction: column;
-		gap: 14px;
-	}
-
-	.fraud-grid label.switch-row {
-		align-items: flex-start;
-	}
-
-	.fraud-grid .rule-hint {
-		display: block;
-		margin-top: 2px;
-		font-size: 0.8rem;
-		color: var(--text-muted);
-		font-weight: 400;
-	}
-
-	.threshold-row {
-		display: grid;
-		grid-template-columns: repeat(2, minmax(180px, 1fr));
-		gap: 12px;
-		margin-left: 26px; /* align under the switch label */
-		margin-bottom: 4px;
-	}
-
-	.threshold-row label {
-		display: flex;
-		flex-direction: column;
-		gap: 4px;
-	}
-
-	.threshold-row label.full {
-		grid-column: 1 / -1;
-	}
-
-	.threshold-row label span {
-		font-size: 0.72rem;
-		font-weight: 500;
-		color: var(--text-muted);
-		text-transform: uppercase;
-		letter-spacing: 0.04em;
-	}
-
-	/* Text-entry recipe. No checkbox sits under this selector today, but it
-	   outranks the global control base in `app.css`, so the carve-out keeps a
-	   later one from losing its tick (`background:` resets the drawn mark). */
-	.threshold-row input:not([type='checkbox']):not([type='radio']),
-	.threshold-row textarea {
-		background: var(--bg);
-		border: 1px solid var(--border);
-		border-radius: 4px;
-		padding: 8px 10px;
-		font-size: 0.88rem;
-		color: var(--text);
-		font-family: inherit;
-	}
-
-	.threshold-row textarea {
-		resize: vertical;
-		font-family: 'SF Mono', 'Cascadia Code', monospace;
-		font-size: 0.82rem;
-	}
-
-	.threshold-row input:not([type='checkbox']):not([type='radio']):focus,
-	.threshold-row textarea:focus {
-		outline: none;
-		border-color: var(--accent);
-		box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 15%, transparent);
-	}
-
-	.threshold-row input:disabled,
-	.threshold-row textarea:disabled {
-		opacity: 0.5;
-		cursor: not-allowed;
-	}
-
-	.btn-link {
-		background: none;
-		border: none;
-		color: var(--text-muted);
-		font-size: 0.85rem;
-		cursor: pointer;
-		font-family: inherit;
-		padding: 0;
-		margin-right: auto;
-	}
-
-	.btn-link:hover:not(:disabled) {
-		color: var(--accent);
-	}
-
-	@media (max-width: 600px) {
-		.form-grid {
-			grid-template-columns: 1fr;
-		}
-
-		.threshold-row {
-			grid-template-columns: 1fr;
-		}
-
-		.sso-register {
-			grid-template-columns: 1fr;
-		}
-
 	}
 </style>

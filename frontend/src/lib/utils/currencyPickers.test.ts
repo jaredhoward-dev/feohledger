@@ -75,7 +75,7 @@ describe('currency entry fields', () => {
 	it('every money-entry currency field uses CurrencyInput', () => {
 		for (const path of [
 			'/src/routes/credit-memos/+page.svelte',
-			'/src/routes/organization/+page.svelte',
+			'/src/lib/components/organization/InvoiceDefaultsPanel.svelte',
 			'/src/routes/bank-reconciliation/ImportStatementModal.svelte',
 			'/src/lib/components/modals/VendorStatementReconModal.svelte',
 			'/src/lib/components/modals/CreateInvoiceModal.svelte',
