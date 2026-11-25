@@ -64,6 +64,7 @@ from app.tenant import (
     get_tenant,
     get_tenant_db,
 )
+from app.utils.currency_code import iso_currency_or_none
 
 logger = logging.getLogger(__name__)
 
@@ -345,8 +346,9 @@ def _nium_amount(body: dict):
     if fields is None:
         return None, None
     amount_field, currency_field = fields
-    currency = str(body.get(currency_field) or "").strip().upper() or None
-    return body.get(amount_field), currency
+    # A currency that is not a usable ISO 4217 code is treated as absent, and an
+    # absent currency is refused downstream (decisions §557).
+    return body.get(amount_field), iso_currency_or_none(body.get(currency_field))
 
 
 def _normalize_charge_amount(
