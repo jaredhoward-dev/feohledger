@@ -231,6 +231,7 @@ async def lifespan(app: FastAPI):
     from app.services.erp_status_poll_sweep import run_status_poll_sweep_loop
     from app.services.erp_status_sync import run_status_sync_loop
     from app.services.extraction_reaper import run_reaper_loop
+    from app.services.merge_readback_sweep import run_merge_readback_loop
     from app.services.payment_reconciler import run_reconciler_loop
     from app.services.qms_sync import run_qms_sync_loop
     from app.services.recurring_invoices import run_recurring_invoices_loop
@@ -398,6 +399,14 @@ async def lifespan(app: FastAPI):
     if settings.erp_status_poll_sweep_enabled:
         status_poll_task = start_sweep(run_status_poll_sweep_loop(), name="erp-status-poll")
 
+    # Merge.dev bill read-back (decisions §540): the backstop for the Merge
+    # webhook, which drops a delivery it cannot verify. Reads back the pushed
+    # bills Merge's change feed lists and applies them with the webhook's own
+    # reconciler.
+    merge_readback_task: asyncio.Task | None = None
+    if settings.merge_readback_sweep_enabled:
+        merge_readback_task = start_sweep(run_merge_readback_loop(), name="merge-readback")
+
     try:
         yield
     finally:
@@ -424,6 +433,7 @@ async def lifespan(app: FastAPI):
             auto_send_task,
             budget_retry_task,
             status_poll_task,
+            merge_readback_task,
         ):
             if task is not None:
                 task.cancel()

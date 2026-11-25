@@ -2656,6 +2656,7 @@ Scale (§256, §281).
 | ERP config UI in org settings | Done (catalogue-driven, write-only secrets) |
 | Post-ERP statuses (posted_in_erp, payment_scheduled, paid) | Done |
 | Polling job for status sync | Done — `erp-status-poll` sweep, § Polling job (decisions §528) |
+| Merge.dev read-back of bills the webhook missed | Done — `merge-readback` sweep, § Merge.dev: idempotency, refusals, region and webhook (decisions §540) |
 | OAuth authorization-code connect flow (`services/erp_oauth`) | Done — § Connecting an OAuth ERP |
 | QuickBooks Online direct adapter | Done (Phases 1–2) — `quickbooks-online-adapter.md`; webhooks and BillPayment write-back still scoped |
 | Remaining direct adapters (SAP, Epicor, etc.) | Use Merge.dev |
@@ -2828,6 +2829,26 @@ write-error guides (read 2026-11-13). Reasoning: `docs/decisions.md` §399.
   tenant slug. Nor does it accept the generic shape for a Merge tenant under
   any `erp_type`: Merge holds that key, and the generic route trusts the body
   (§ Webhook endpoint above).
+- **Read-back sweep (decisions §540).** A delivery the route drops before
+  verifying (the tenant's credentials cannot be opened, or the source's unseal
+  budget is spent for a tenant whose data key is cold, §408 / §525 / §527) is
+  lost to Merge, which never redelivers a 204. The `merge-readback` sweep
+  (`services/merge_readback_sweep`, `FEOH_MERGE_READBACK_SWEEP_ENABLED`, off by
+  default) is the backstop: per Merge tenant it asks `changed_bills(since)` for
+  the bills Merge changed after the tenant's cursor
+  (`Organization.settings.erp_merge_readback`: `through`, the moment the last
+  listing started, and `pending`, that listing's bills not yet applied; a first
+  pass looks back `FEOH_MERGE_READBACK_SWEEP_LOOKBACK_HOURS`), keeps the ones an
+  invoice was pushed as (`_bills_we_posted`, the route's own filter), and reads
+  each back and applies it exactly as the route does (`bill_report` →
+  `apply_bill_report`, marked `source: reconciliation_sweep`). At most
+  `FEOH_MERGE_READBACK_SWEEP_BATCH_SIZE` reads a tick; the rest stays pending.
+  A failed read, or the call budget, ends the pass with that bill still
+  pending; a failed listing moves nothing. The cursor is written under the org
+  row lock only if it is still what the pass read, so two replicas move it
+  once, and applying a bill twice changes nothing. A 404 is not read as gone
+  (the route reads it so only for `Invoice.removed`). Credentials that cannot
+  be opened skip the tenant with an error log that carries no exception text.
 - **No status sync, and why (decisions §504).** Read against the same spec on
   2026-11-24: Merge's `Payment` is `POST` / `GET` / `PATCH` only (no `DELETE`
   or void), and neither `Payment` nor `PaymentRequest` has a memo or reference
@@ -2848,7 +2869,9 @@ write-error guides (read 2026-11-13). Reasoning: `docs/decisions.md` §399.
   Two more things stand between that and a sweep: the sweep selects tenants by
   their OAuth block (`settings.erp.oauth.provider`), which a Merge tenant has
   none of, and `bill_report` states no `paid_amount`, so an ERP payment would be
-  recorded at the figure owed here (`docs/followups.md`).
+  recorded at the figure owed here (`docs/followups.md`). The `merge-readback`
+  sweep above reads the same feed, but only to apply bill reports through the
+  webhook's reconciler; it is not a status sync and writes nothing back.
 
 ## Sage Intacct direct adapter (`sage_intacct`)
 

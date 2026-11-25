@@ -27391,3 +27391,69 @@ a voided-back `approved` invoice whose ERP shows `paid` is recorded and
 leaves the run nothing to pay; with a live card it is refused behind a
 blocking row; an `approved` invoice with no document is never read. The three
 in-flight hold tests assert the new code.
+
+## 540. A dropped Merge.dev webhook is backstopped by a read-back sweep of the bills we pushed, through the webhook's own reconciler (§408 / §525 / §527 follow-up, round 45)
+
+**Problem.** The Merge webhook (`POST /api/erp/webhook/merge_dev/{slug}`)
+answers a delivery it cannot verify with the same silent 204 as a forgery: when
+the tenant's credentials cannot be opened, or the source's unseal budget is
+spent for a tenant whose data key is cold (§408, §525, §527). Merge never
+redelivers a 204, and a pushed Merge invoice is already `done` (§504), so a bill
+voided or deleted behind Merge was never flagged. §528 backstopped the generic
+route only.
+
+**Decision.** A sweep, `services/merge_readback_sweep` (`merge-readback`,
+`FEOH_MERGE_READBACK_SWEEP_ENABLED`, off by default; interval 15 min, batch 50
+reads per tenant, first-pass lookback 48 h). Per Merge tenant it lists
+`MergeDevAdapter.changed_bills(since)`, keeps the bills an invoice was pushed as
+(`erp_status_sync._bills_we_posted`, `by_reference=True`, the webhook's own
+pre-read filter), reads each back with `bill_report` and applies it with
+`erp_status_sync.apply_bill_report` — the reconciler the webhook, QuickBooks
+and Xero use. No forked logic: a bill means the same whichever channel carried
+it. Rows are marked `source: reconciliation_sweep` (`event_id` None), as the
+QuickBooks / Xero sweep's are.
+
+* **Cursor.** `Organization.settings["erp_merge_readback"] = {through,
+  pending}`: `through` is the moment the last listing started, `pending` that
+  listing's matched bills not yet applied. Not `settings.erp.oauth` (where the
+  QuickBooks / Xero mark `status_sync_through` lives): a Merge tenant has no
+  OAuth block. Not inside `settings.erp`: that block is the adapter config and
+  the input to the connection's realm. A missing cursor (first pass, or one an
+  org-settings writer dropped) reads the lookback window, and re-applying is
+  harmless.
+* **Moves only past what was applied.** Pending bills are read in order, at most
+  the batch a tick, before any new listing. A read that fails, a read the call
+  budget refuses (`ErpCallBudgetExhausted`) or a paused budget
+  (`call_budget().usage()`, None for Merge today) ends the pass with that bill
+  and the rest still pending. A failed listing moves nothing.
+* **Replica-safe by compare-and-swap.** The cursor is written under the org row
+  lock (the settings-writer rule) only if it still equals what the pass read; a
+  second replica finds it moved and writes nothing. The apply is idempotent on
+  its own (`apply_bill_report` judges under the invoice row lock; flags dedupe
+  while live, by kind, §535), so two replicas applying one listing flag once.
+* **404.** Not read as gone: only Merge's `Invoice.removed` says that (§399),
+  and the change feed carries no event. `VOID` and `remote_was_deleted` are
+  Merge's positive answers and are flagged.
+* **Credentials.** A tenant whose block cannot be opened is logged as an error
+  without the exception text and skipped; the others carry on.
+
+**Rejected.** *Polling each pushed bill's status, as §528 does*: a Merge push
+closes at `done`, so the candidate set is every bill ever pushed, unbounded.
+*A full read-back fallback when the feed is too long* (QuickBooks' answer to a
+CDC gap): the same unbounded set. *Advancing the cursor at listing time and
+dropping a failed read*: a bill whose read failed would never be read again
+until it changed. *A per-delivery dedup key shared with the webhook*: Merge's
+key includes the linked account and hook event from the body, which the feed
+does not carry; the reconciler's own idempotency is enough, with one accepted
+residue — a flag a person resolves between the webhook's apply and the sweep's
+read of the same change is opened again once, as with the QuickBooks / Xero
+webhook and sweep. *Making Merge a status-sync adapter*: §504 stands; this
+sweep writes nothing back.
+
+**Guard.** `tests/test_merge_readback_sweep.py` (real Postgres; Merge's feed and
+reads stubbed): a missed void and a deleted bill are flagged; unchanged and
+unpushed bills change nothing (the latter is not read); two ticks and two
+replicas flag once; a failed read and a capped batch keep bills pending and the
+next listing asks from the last; a failed listing, a paused budget and a
+refusing budget move nothing; unopenable credentials are skipped without the
+exception text; off by default, registered in `sweep_health` and `main`.

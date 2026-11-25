@@ -980,9 +980,10 @@ class MergeDevAdapter(ErpAdapter):
         The whole listing or a raise (:class:`ErpListingIncomplete`): a page
         Merge refuses, an unreadable body, or more than
         :data:`SYNC_LISTING_MAX_ROWS` rows. Bills only — the reports themselves
-        are read by :meth:`bill_report`. Not swept yet: the status-sync sweep
-        reads only adapters with ``supports_status_sync``, which Merge does
-        not have (decisions §504).
+        are read by :meth:`bill_report`. Read by the ``merge-readback`` sweep
+        (``services/merge_readback_sweep``, decisions §540), the backstop for a
+        dropped webhook delivery; the status-sync sweep reads only adapters
+        with ``supports_status_sync``, which Merge does not have (§504).
 
         ``since`` must be timezone-aware: ``astimezone`` would read a naive one
         as the host's local time and shift the window by its UTC offset, so a
