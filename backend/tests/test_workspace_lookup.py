@@ -6,7 +6,9 @@ The properties pinned here are the ones that make a public lookup safe:
 - every address gets the same status and body, and the response does not wait
   for anything only a known address does (lookup, send, audit);
 - only an active account's own mailbox is emailed, with its own sign-in page;
-- the per-IP and per-address budgets and the captcha refuse before any of that;
+- the per-IP budget, the captcha and the per-address budget refuse before any
+  of that, in that order, so only a solved captcha spends an address's budget
+  (decisions §553);
 - the submitted address never reaches a log line.
 
 Real HTTP surface + real Postgres via the `realdb` harness.
@@ -263,6 +265,71 @@ async def test_a_failed_captcha_is_refused(realdb, sent, account, monkeypatch):
     assert resp.status_code == 400
     assert resp.json()["detail"]["code"] == "captcha_failed"
     assert sent == []
+
+
+def _captcha_that_fails(monkeypatch) -> list[str | None]:
+    """Make every captcha fail; return the tokens it was asked to verify."""
+    from app.utils.hcaptcha import CaptchaError
+
+    seen: list[str | None] = []
+
+    async def _fail(token, ip):  # noqa: ARG001
+        seen.append(token)
+        raise CaptchaError("Captcha verification failed. Please try again.")
+
+    monkeypatch.setattr(lookup_mod, "verify_captcha", _fail)
+    return seen
+
+
+@pytest.mark.asyncio
+async def test_a_failed_captcha_spends_no_per_address_budget(realdb, sent, account, monkeypatch):
+    """§553: the per-address budget is checked AFTER the captcha, so a caller
+    who cannot solve it (rotating IPs, unsolved requests) cannot exhaust a
+    stranger's hourly lookups. Once solved, the owner still gets the full
+    budget, and the budget still caps them."""
+    monkeypatch.setattr(settings, "workspace_lookup_rate_limit_per_hour", 50)
+    monkeypatch.setattr(settings, "workspace_lookup_email_rate_limit_per_hour", 2)
+    user = await account()
+    with monkeypatch.context() as m:
+        _captcha_that_fails(m)
+        async with realdb.client(key=TENANT, role=None) as c:
+            failed = [
+                (
+                    await c.post(
+                        "/api/workspace-lookup", json={"email": user.email, "captcha_token": "x"}
+                    )
+                ).status_code
+                for _ in range(5)
+            ]
+    assert failed == [400] * 5
+    # The captcha passes now (no secret configured in the test env).
+    async with realdb.client(key=TENANT, role=None) as c:
+        solved = [
+            (await c.post("/api/workspace-lookup", json={"email": user.email})).status_code
+            for _ in range(3)
+        ]
+    await drain_detached()
+    assert solved == [200, 200, 429]
+    assert len(sent) == 2
+
+
+@pytest.mark.asyncio
+async def test_the_per_ip_budget_refuses_before_the_captcha(realdb, sent, monkeypatch):
+    """The per-IP budget stays first: a flood from one source is refused 429
+    without a captcha verification (an outbound hCaptcha call) per request."""
+    monkeypatch.setattr(settings, "workspace_lookup_rate_limit_per_hour", 2)
+    seen = _captcha_that_fails(monkeypatch)
+    async with realdb.client(key=TENANT, role=None) as c:
+        statuses = [
+            (
+                await c.post(
+                    "/api/workspace-lookup", json={"email": _unknown(), "captcha_token": "x"}
+                )
+            ).status_code
+            for _ in range(4)
+        ]
+    assert statuses == [400, 400, 429, 429]
+    assert seen == ["x", "x"]
 
 
 @pytest.mark.asyncio

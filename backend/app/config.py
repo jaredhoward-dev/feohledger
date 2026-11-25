@@ -1,3 +1,4 @@
+import ipaddress
 from decimal import Decimal
 
 from pydantic import Field, model_validator
@@ -6,6 +7,11 @@ from pydantic_settings import BaseSettings
 # Environment names that are NOT a deployed/production environment. In these,
 # safety guards (e.g. the captcha requirement) are relaxed for local dev + CI.
 _NON_DEPLOYED_ENVS = frozenset({"development", "dev", "local", "test", "ci"})
+
+#: FEOH_TRUSTED_PROXY_CIDRS' explicit "no proxy in front of the API" value —
+#: trust no X-Forwarded-For and key on the socket peer. Distinct from empty,
+#: which a deployed environment refuses (decisions §553).
+TRUSTED_PROXY_NONE = "none"
 
 # Every provider `app/services/extraction_adapters/` registers. Held as a
 # literal because config.py must not import the service layer (that would make
@@ -691,7 +697,9 @@ class Settings(BaseSettings):
     # and uses ``request.client.host`` for rate-limit / audit purposes, so
     # a hostile direct caller can't rotate IPs by spoofing the header.
     # Default empty → never trust XFF (matches local-dev with no proxy).
-    # Comma-separated list of CIDRs.
+    # Comma-separated list of CIDRs, or `none` (explicit: no proxy, key on the
+    # socket peer). A deployed env refuses to boot with it empty — behind a
+    # proxy that would make every per-IP limit global (decisions §553).
     trusted_proxy_cidrs: str = ""
 
     # Self-service signup
@@ -1298,30 +1306,30 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def _require_captcha_in_deployed_envs(self) -> "Settings":
-        # Fail fast at boot rather than silently shipping signup with captcha
-        # disabled — a 'fail open' captcha is an abuse hole on a public,
-        # tenant-creating endpoint. Only while that endpoint exists: with
-        # `signup_enabled` off every signup route 404s before reaching the
-        # captcha check, so demanding a secret would only make an operator hold
-        # a credential for a feature they turned off.
-        if self.is_deployed and self.signup_enabled and not self.hcaptcha_secret:
+        # Fail fast at boot rather than silently shipping a public endpoint
+        # with captcha disabled — a 'fail open' captcha is an abuse hole. Two
+        # public endpoints verify it: `/signup/start` (tenant-creating, behind
+        # `signup_enabled`) and `/workspace-lookup` (§518), which is served on
+        # every deployment because closing signup does not stop existing users
+        # forgetting their workspace. So the pair is required whenever the
+        # environment is deployed, signup open or closed (decisions §553).
+        if self.is_deployed and not self.hcaptcha_secret.strip():
             raise ValueError(
                 "FEOH_HCAPTCHA_SECRET must be set when FEOH_ENVIRONMENT is a deployed "
-                f"environment ({self.environment!r}) and self-service signup is on; "
-                "refusing to boot with captcha verification disabled on the public "
-                "signup endpoint. Set FEOH_SIGNUP_ENABLED=false to close signup instead."
+                f"environment ({self.environment!r}); refusing to boot with captcha "
+                "verification disabled on the public workspace-lookup (and, while "
+                "FEOH_SIGNUP_ENABLED is on, signup) endpoints."
             )
         # The other half of the pair. With the secret set the server verifies
-        # every signup, but the browser only renders the widget when
+        # every request, but the browser only renders the widget when
         # /api/public-config hands it a site key — so a missing key is a
-        # signup page whose every submit fails the captcha (#575: the
-        # post-deploy smoke check asserts the same thing from outside).
-        if self.is_deployed and self.signup_enabled and not self.hcaptcha_sitekey.strip():
+        # lookup (and signup) form whose every submit fails the captcha (#575:
+        # the post-deploy smoke check asserts the same thing from outside).
+        if self.is_deployed and not self.hcaptcha_sitekey.strip():
             raise ValueError(
                 "FEOH_HCAPTCHA_SITEKEY must be set when FEOH_ENVIRONMENT is a deployed "
-                f"environment ({self.environment!r}) and self-service signup is on; "
-                "without it /signup renders no captcha and every signup is refused. "
-                "Set FEOH_SIGNUP_ENABLED=false to close signup instead."
+                f"environment ({self.environment!r}); without it /find-workspace (and "
+                "/signup) render no captcha and every request is refused."
             )
         return self
 
@@ -1433,6 +1441,61 @@ class Settings(BaseSettings):
                 "change notices are emailed to every customer's administrators, and this "
                 "sweep is what sends them."
             )
+        return self
+
+    @model_validator(mode="after")
+    def _require_trusted_proxy_decision_in_deployed_envs(self) -> "Settings":
+        # Empty FEOH_TRUSTED_PROXY_CIDRS behind a proxy collapses every caller
+        # into the proxy's address, so every per-IP limit (login, signup,
+        # workspace lookup, the ERP webhook unseal budget) becomes one global
+        # bucket. A deployed env must therefore name its proxy's network, or
+        # say explicitly that it has none (`none`: no proxy, key on the socket
+        # peer). Empty is never read as either (decisions §553).
+        if not self.is_deployed:
+            return self
+        raw = self.trusted_proxy_cidrs.strip()
+        if not raw:
+            raise ValueError(
+                "FEOH_TRUSTED_PROXY_CIDRS must be set when FEOH_ENVIRONMENT is a deployed "
+                f"environment ({self.environment!r}): name the reverse proxy / load "
+                "balancer network whose X-Forwarded-For is trusted (e.g. the compose "
+                "subnet 172.28.0.0/16), or set it to 'none' if clients connect to the "
+                "API directly. Empty would collapse every client behind a proxy into one "
+                "rate-limit bucket."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_trusted_proxy_cidrs(self) -> "Settings":
+        # Every environment: a typo'd CIDR is never intended, and silently
+        # skipping it (as the resolver once did) leaves the deployment trusting
+        # less than its operator believes — the same global-bucket failure as
+        # empty. `none` is the explicit "no proxy" value and stands alone.
+        raw = self.trusted_proxy_cidrs.strip()
+        if not raw:
+            return self
+        if raw.lower() == TRUSTED_PROXY_NONE:
+            return self
+        entries = [e.strip() for e in raw.split(",") if e.strip()]
+        if not entries:
+            # "," alone would trust nothing, exactly as empty does — refused
+            # rather than read as a decision.
+            raise ValueError(
+                "FEOH_TRUSTED_PROXY_CIDRS names no CIDR; set the proxy network(s) or 'none'."
+            )
+        for entry in entries:
+            if entry.lower() == TRUSTED_PROXY_NONE:
+                raise ValueError(
+                    "FEOH_TRUSTED_PROXY_CIDRS: 'none' means no proxy and cannot be "
+                    "combined with CIDRs."
+                )
+            try:
+                ipaddress.ip_network(entry, strict=False)
+            except ValueError:
+                raise ValueError(
+                    f"FEOH_TRUSTED_PROXY_CIDRS entry {entry!r} is not a CIDR or address "
+                    "(comma-separated, e.g. '172.28.0.0/16,10.0.0.0/8', or 'none')."
+                ) from None
         return self
 
 

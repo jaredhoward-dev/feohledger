@@ -24,7 +24,7 @@ import uuid
 from fastapi import HTTPException, Request, status
 
 from app.api.refusals import coded_refusal
-from app.config import settings
+from app.config import TRUSTED_PROXY_NONE, settings
 from app.redis import get_redis
 
 KEY_PREFIX = "ratelimit:"
@@ -54,7 +54,10 @@ class RateLimitExceeded(HTTPException):
 
 def _trusted_proxy_networks() -> tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...]:
     raw = (settings.trusted_proxy_cidrs or "").strip()
-    if not raw:
+    # Empty (local dev) and the explicit `none` (a deployed API clients reach
+    # directly, decisions §553) both trust no proxy: the socket peer is the
+    # client. Only a deployed env distinguishes them, at boot (config.py).
+    if not raw or raw.lower() == TRUSTED_PROXY_NONE:
         return ()
     nets: list[ipaddress.IPv4Network | ipaddress.IPv6Network] = []
     for entry in raw.split(","):
@@ -64,9 +67,8 @@ def _trusted_proxy_networks() -> tuple[ipaddress.IPv4Network | ipaddress.IPv6Net
         try:
             nets.append(ipaddress.ip_network(entry, strict=False))
         except ValueError:
-            # Skip junk silently — a typo in config shouldn't crash the
-            # rate limiter, and any unknown CIDR means "don't trust XFF
-            # from anything", which is the safe default anyway.
+            # config.py refuses a junk entry at boot; skipping one here keeps
+            # a value patched in at runtime (tests) from crashing the limiter.
             continue
     return tuple(nets)
 

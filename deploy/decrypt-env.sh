@@ -111,16 +111,13 @@ else
 	*) die "PGSSLMODE='${SSLMODE}' would allow an unencrypted or unverified connection to the external database — use verify-full." ;;
 	esac
 fi
-# The hCaptcha pair is one of those boot checks only while self-service signup
-# is on (config.py _require_captcha_in_deployed_envs): the secret verifies each
-# signup, and the site key is what renders the widget — without it every
-# signup fails the captcha. With FEOH_SIGNUP_ENABLED false the signup routes
-# 404 and there is nothing for a captcha to protect. lib.sh's
-# feoh_signup_enabled mirrors the rule, including every spelling pydantic reads
-# as false, and smoke.sh asks it the same question after the deploy.
-if [ "$(feoh_signup_enabled .env.tmp)" = true ]; then
-	REQUIRED_VARS+=(FEOH_HCAPTCHA_SECRET FEOH_HCAPTCHA_SITEKEY)
-fi
+# The hCaptcha pair is one of those boot checks on every deployment (config.py
+# _require_captcha_in_deployed_envs, docs/decisions.md §553): the public
+# /api/workspace-lookup verifies it whether self-service signup is open or not,
+# and the site key is what renders the widget — without it every lookup (and
+# signup) fails the captcha. smoke.sh asks public-config for the key after the
+# deploy.
+REQUIRED_VARS+=(FEOH_HCAPTCHA_SECRET FEOH_HCAPTCHA_SITEKEY)
 MISSING=""
 for var in "${REQUIRED_VARS[@]}"; do
 	grep -Eq "^${var}=.+" .env.tmp || MISSING="$MISSING $var"

@@ -74,9 +74,9 @@ feoh_is_false() {
 # feoh_signup_enabled [<dotenv>] prints `true` or `false`: whether the API
 # configured by that file (default deploy/.env) serves self-service signup.
 # FEOH_SIGNUP_ENABLED defaults to true (config.py), so only a false spelling
-# closes it; the last line wins, as for compose. decrypt-env.sh (the captcha
-# keys are required exactly when it is on) and smoke.sh (what public-config
-# must report) both ask here, so they cannot disagree.
+# closes it; the last line wins, as for compose. smoke.sh asks here for what
+# public-config must report. (The captcha keys no longer follow it: the
+# workspace lookup needs them on every deployment, docs/decisions.md §553.)
 feoh_signup_enabled() {
 	local value
 	value=$(grep -E '^FEOH_SIGNUP_ENABLED=' "${1:-.env}" 2>/dev/null | tail -1 | cut -d= -f2- || true)

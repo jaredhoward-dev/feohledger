@@ -24,8 +24,9 @@
 #     this VM's Caddy issues for and proxies from CloudFront; a VM with none
 #     says so instead of checking one);
 #   - https://<api>/api/public-config reports signup exactly as configured,
-#     and a captcha site key whenever signup is on (and, given --sitekey or
-#     FEOH_HCAPTCHA_SITEKEY in deploy/.env, that key).
+#     and a captcha site key whether signup is on or not — /find-workspace's
+#     lookup needs one on every deployment (docs/decisions.md §553) — and,
+#     given --sitekey or FEOH_HCAPTCHA_SITEKEY in deploy/.env, that key.
 # Exit codes: 0 all passed, 1 a check failed, 2 bad usage or configuration.
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -114,9 +115,9 @@ if feoh_smoke_check "$API" /api/public-config "$CONFIG"; then
 		if got is not signup:
 		    print(f"reports signup_enabled={json.dumps(got)}, but the environment has it {'on' if signup else 'off'}")
 		key = cfg.get("hcaptcha_sitekey")
-		if signup and not (isinstance(key, str) and key.strip()):
-		    print("has no hcaptcha_sitekey while signup is on, so /signup renders no captcha and every signup fails")
-		elif signup and sitekey and key != sitekey:
+		if not (isinstance(key, str) and key.strip()):
+		    print("has no hcaptcha_sitekey, so /find-workspace (and /signup) render no captcha and every request fails")
+		elif sitekey and key != sitekey:
 		    print("serves a different hcaptcha_sitekey from the one configured")
 	PY
 	) || MISMATCH="could not be checked (python3 failed)"

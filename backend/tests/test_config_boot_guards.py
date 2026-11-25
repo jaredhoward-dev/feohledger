@@ -33,6 +33,7 @@ def test_deployed_env_refuses_default_secret_key():
             credential_kms_key_id="alias/test-app",
             hcaptcha_secret="hc",
             hcaptcha_sitekey="site-key",
+            trusted_proxy_cidrs="172.28.0.0/16",
             secret_key="change-me-in-production",
         )
 
@@ -45,6 +46,7 @@ def test_deployed_env_refuses_too_short_secret_key():
             credential_kms_key_id="alias/test-app",
             hcaptcha_secret="hc",
             hcaptcha_sitekey="site-key",
+            trusted_proxy_cidrs="172.28.0.0/16",
             secret_key="short",
         )
 
@@ -56,6 +58,7 @@ def test_deployed_env_accepts_a_strong_secret_key():
         credential_kms_key_id="alias/test-app",
         hcaptcha_secret="hc",
         hcaptcha_sitekey="site-key",
+        trusted_proxy_cidrs="172.28.0.0/16",
         secret_key=_GOOD_KEY,
         subprocessor_notices_enabled=True,
     )
@@ -82,6 +85,7 @@ def test_deployed_env_refuses_lithic_live_key_with_sandbox_on():
             credential_kms_key_id="alias/test-app",
             hcaptcha_secret="hc",
             hcaptcha_sitekey="site-key",
+            trusted_proxy_cidrs="172.28.0.0/16",
             secret_key=_GOOD_KEY,
             lithic_api_key="sk_live_abc",
             lithic_sandbox=True,
@@ -95,6 +99,7 @@ def test_deployed_env_accepts_lithic_live_key_with_sandbox_off():
         credential_kms_key_id="alias/test-app",
         hcaptcha_secret="hc",
         hcaptcha_sitekey="site-key",
+        trusted_proxy_cidrs="172.28.0.0/16",
         secret_key=_GOOD_KEY,
         lithic_api_key="sk_live_abc",
         lithic_sandbox=False,
@@ -111,6 +116,7 @@ def test_deployed_env_refuses_nium_creds_with_sandbox_on():
             credential_kms_key_id="alias/test-app",
             hcaptcha_secret="hc",
             hcaptcha_sitekey="site-key",
+            trusted_proxy_cidrs="172.28.0.0/16",
             secret_key=_GOOD_KEY,
             nium_client_id="nium_live",
             nium_sandbox=True,
@@ -126,6 +132,7 @@ def test_deployed_env_without_card_keys_ignores_sandbox_flag():
         credential_kms_key_id="alias/test-app",
         hcaptcha_secret="hc",
         hcaptcha_sitekey="site-key",
+        trusted_proxy_cidrs="172.28.0.0/16",
         secret_key=_GOOD_KEY,
         subprocessor_notices_enabled=True,
     )
@@ -151,6 +158,7 @@ def test_deployed_env_refuses_missing_credential_kms_key():
             email_provider="ses",
             hcaptcha_secret="hc",
             hcaptcha_sitekey="site-key",
+            trusted_proxy_cidrs="172.28.0.0/16",
             secret_key=_GOOD_KEY,
         )
 
@@ -162,6 +170,7 @@ def test_deployed_env_refuses_blank_credential_kms_key():
             email_provider="ses",
             hcaptcha_secret="hc",
             hcaptcha_sitekey="site-key",
+            trusted_proxy_cidrs="172.28.0.0/16",
             secret_key=_GOOD_KEY,
             credential_kms_key_id="   ",
         )
@@ -179,6 +188,7 @@ _DEPLOYED = {
     "credential_kms_key_id": "alias/test-app",
     "hcaptcha_secret": "hc",
     "hcaptcha_sitekey": "site-key",
+    "trusted_proxy_cidrs": "172.28.0.0/16",
     "secret_key": _GOOD_KEY,
     "payee_fingerprint_key": _GOOD_FINGERPRINT_KEY,
     "subprocessor_notices_enabled": True,
@@ -209,30 +219,89 @@ def test_local_dev_keeps_the_console_email_adapter():
     assert Settings(environment="development").email_provider == "console"
 
 
-# ── hCaptcha site key (deployed-env boot guard, #575) ─────────────────
+# ── hCaptcha pair (deployed-env boot guard, #575, decisions §553) ──────
 
 
 @pytest.mark.parametrize("sitekey", ["", "   "])
-def test_deployed_env_with_signup_open_refuses_a_missing_captcha_sitekey(sitekey):
-    # The secret alone verifies every signup server-side, but the widget only
+def test_deployed_env_refuses_a_missing_captcha_sitekey(sitekey):
+    # The secret alone verifies every request server-side, but the widget only
     # renders when /api/public-config hands the browser a site key: without
-    # one, every signup on a deployed stack fails the captcha. The post-deploy
-    # smoke check (deploy/smoke.sh) asserts the same thing from outside.
+    # one, every lookup (and signup) on a deployed stack fails the captcha. The
+    # post-deploy smoke check (deploy/smoke.sh) asserts the same from outside.
     with pytest.raises(ValidationError, match="FEOH_HCAPTCHA_SITEKEY"):
         Settings(**{**_DEPLOYED, "hcaptcha_sitekey": sitekey}, email_provider="ses")
 
 
-def test_deployed_env_with_signup_closed_needs_no_captcha_sitekey():
-    s = Settings(
-        **{**_DEPLOYED, "hcaptcha_secret": "", "hcaptcha_sitekey": ""},
-        email_provider="ses",
-        signup_enabled=False,
-    )
+@pytest.mark.parametrize("signup_enabled", [True, False])
+@pytest.mark.parametrize("secret", ["", "   "])
+def test_deployed_env_refuses_a_missing_captcha_secret_signup_open_or_closed(
+    signup_enabled, secret
+):
+    # /api/workspace-lookup is public and served whether signup is open or not
+    # (§518), so closing signup no longer waives the captcha (§553): an
+    # invite-only deployment would otherwise run the lookup with no captcha.
+    with pytest.raises(ValidationError, match="FEOH_HCAPTCHA_SECRET"):
+        Settings(
+            **{**_DEPLOYED, "hcaptcha_secret": secret},
+            email_provider="ses",
+            signup_enabled=signup_enabled,
+        )
+
+
+@pytest.mark.parametrize("missing", ["hcaptcha_secret", "hcaptcha_sitekey"])
+def test_deployed_env_with_signup_closed_still_needs_both_captcha_keys(missing):
+    with pytest.raises(ValidationError, match=f"FEOH_{missing.upper()}"):
+        Settings(**{**_DEPLOYED, missing: ""}, email_provider="ses", signup_enabled=False)
+
+
+def test_deployed_env_with_signup_closed_boots_with_both_captcha_keys():
+    s = Settings(**_DEPLOYED, email_provider="ses", signup_enabled=False)
     assert s.signup_enabled is False
 
 
-def test_local_dev_needs_no_captcha_sitekey():
-    assert Settings(environment="development").hcaptcha_sitekey == ""
+def test_local_dev_needs_no_captcha_keys():
+    # Guard rail 7: a fresh clone runs the lookup and signup with no captcha.
+    s = Settings(environment="development", hcaptcha_secret="", hcaptcha_sitekey="")
+    assert s.is_deployed is False
+
+
+# ── Trusted proxy decision (deployed-env boot guard, decisions §553) ─────
+
+
+@pytest.mark.parametrize("value", ["", "   "])
+def test_deployed_env_refuses_an_empty_trusted_proxy_setting(value):
+    # Empty behind a proxy collapses every caller into the proxy's address and
+    # makes every per-IP limit global. A deployed env must decide.
+    with pytest.raises(ValidationError, match="FEOH_TRUSTED_PROXY_CIDRS"):
+        Settings(**{**_DEPLOYED, "trusted_proxy_cidrs": value}, email_provider="ses")
+
+
+@pytest.mark.parametrize("value", ["none", "NONE", " None "])
+def test_deployed_env_accepts_the_explicit_no_proxy_opt_out(value):
+    s = Settings(**{**_DEPLOYED, "trusted_proxy_cidrs": value}, email_provider="ses")
+    assert s.trusted_proxy_cidrs == value
+
+
+@pytest.mark.parametrize("value", ["172.28.0.0/16", "10.0.0.0/8, 192.168.1.1", "fd00::/8,"])
+def test_deployed_env_accepts_proxy_cidrs(value):
+    s = Settings(**{**_DEPLOYED, "trusted_proxy_cidrs": value}, email_provider="ses")
+    assert s.trusted_proxy_cidrs == value
+
+
+@pytest.mark.parametrize("environment", ["production", "development"])
+@pytest.mark.parametrize(
+    "value", ["10.0.0.0/33", "not-a-cidr", "none,10.0.0.0/8", "10.0.0.0/8,none", ",", " , "]
+)
+def test_a_malformed_trusted_proxy_setting_is_refused_everywhere(environment, value):
+    # A typo is never intended; skipping it silently would trust less than the
+    # operator believes. `none` stands alone. Refused locally too.
+    base = _DEPLOYED if environment == "production" else {"environment": "development"}
+    with pytest.raises(ValidationError, match="FEOH_TRUSTED_PROXY_CIDRS"):
+        Settings(**{**base, "trusted_proxy_cidrs": value}, email_provider="ses")
+
+
+def test_local_dev_needs_no_trusted_proxy_setting():
+    assert Settings(environment="development", trusted_proxy_cidrs="").trusted_proxy_cidrs == ""
 
 
 # ── Sub-processor change notices (deployed-env boot guard, decisions §321) ──
@@ -320,3 +389,21 @@ def test_the_day_one_rehearsal_env_passes_every_deployed_boot_guard(monkeypatch)
     s = Settings(_env_file=None)
     assert s.is_deployed
     assert s.subprocessor_notices_enabled is True
+
+
+# ── Every deploy path decides the trusted proxy (decisions §553) ─────────
+
+
+def test_the_vm_compose_stack_defaults_the_trusted_proxy_to_its_caddy_subnet():
+    # The single-VM stack's api service gets FEOH_TRUSTED_PROXY_CIDRS from
+    # compose's `${...:-default}`, which also replaces an EMPTY value from the
+    # sops env — so the deployed boot guard can never see empty there. The
+    # default must name the pinned subnet Caddy lives on, and must pass the
+    # validator.
+    compose = (Path(__file__).resolve().parents[2] / "deploy" / "compose.prod.yml").read_text()
+    m = re.search(r"FEOH_TRUSTED_PROXY_CIDRS: \$\{FEOH_TRUSTED_PROXY_CIDRS:-([^}]+)\}", compose)
+    assert m, "compose.prod.yml no longer defaults FEOH_TRUSTED_PROXY_CIDRS with :-"
+    subnet = re.search(r"- subnet: (\S+)", compose)
+    assert subnet and m.group(1) == subnet.group(1)
+    s = Settings(**{**_DEPLOYED, "trusted_proxy_cidrs": m.group(1)}, email_provider="ses")
+    assert s.trusted_proxy_cidrs == "172.28.0.0/16"

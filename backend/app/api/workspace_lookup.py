@@ -8,7 +8,7 @@ mailbox itself, by email.
 
 **No existence oracle.** The route never reads the ``users`` table. It applies
 the abuse controls every address shares — the per-IP budget, the address-shape
-check, the per-address budget, the captcha — then hands the address to a
+check, the captcha, the per-address budget — then hands the address to a
 detached task (`utils/detached_tasks.spawn_detached`, the shape
 `/auth/forgot-password` uses) and returns. The lookup, the org read, the send
 and the audit row all happen in that task, after the response is on its way,
@@ -23,8 +23,16 @@ address has an account.
 ``FEOH_WORKSPACE_LOOKUP_EMAIL_RATE_LIMIT_PER_HOUR``) so one flow cannot spend
 the other's.
 
+**Only a solved captcha spends an address's budget** (decisions §553). The
+per-IP budget comes first (cheap, stops a flood from one source), then the
+captcha, then the per-address budget. With the address budget first, anyone
+could exhaust a stranger's hourly lookups with unsolved requests from rotating
+IPs and lock that person out of the flow.
+
 Not behind ``FEOH_SIGNUP_ENABLED``: closing signup on an invite-only deployment
-does not stop its existing users forgetting their workspace.
+does not stop its existing users forgetting their workspace. So the captcha is
+required on every deployed environment, signup open or not
+(``config.py::_require_captcha_in_deployed_envs``, §553).
 
 The address is never logged: failures are logged by user id and exception class.
 """
@@ -96,7 +104,16 @@ async def workspace_lookup(body: WorkspaceLookupRequest, request: Request):
             ),
         )
 
-    # 3. Per-ADDRESS budget, so an attacker rotating IPs cannot fill one
+    # 3. Captcha (skipped only when no secret is configured — local dev; a
+    #    deployed environment refuses to boot without one, §553). Before the
+    #    per-address budget, so an unsolved request cannot spend it.
+    client_ip = resolve_client_ip(request)
+    try:
+        await verify_captcha(body.captcha_token, client_ip)
+    except CaptchaError as exc:
+        raise HTTPException(status_code=400, detail=coded_refusal(exc.code, str(exc))) from exc
+
+    # 4. Per-ADDRESS budget, so an attacker rotating IPs cannot fill one
     #    person's inbox. Checked before any lookup, so a known and an unknown
     #    address spend and exhaust it identically.
     await check_rate_limit(
@@ -105,13 +122,6 @@ async def workspace_lookup(body: WorkspaceLookupRequest, request: Request):
         limit=settings.workspace_lookup_email_rate_limit_per_hour,
         window_seconds=3600,
     )
-
-    # 4. Captcha (skipped only when no secret is configured — local dev).
-    client_ip = resolve_client_ip(request)
-    try:
-        await verify_captcha(body.captcha_token, client_ip)
-    except CaptchaError as exc:
-        raise HTTPException(status_code=400, detail=coded_refusal(exc.code, str(exc))) from exc
 
     # 5. Everything that depends on whether the address has an account runs
     #    after the response. Spawned for EVERY address that got this far.
