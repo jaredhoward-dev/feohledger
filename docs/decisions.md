@@ -26710,3 +26710,44 @@ can reach the timeline — an exception, chat or vendor-adjacent row can — and
 second vocabulary in six more locales would drift from the first. *Dropping the
 overrides* and using the console's labels throughout: it would reword the
 timeline's existing rows for no gain.
+||||||| f0e8dbf52
+
+
+## 523. The e2e invoice teardown is one transaction that locks the invoices first (round 43)
+
+**Context.** `frontend/tests-e2e/fixtures/helpers.ts::deleteInvoicesWhere` ran
+some thirty `psql` statements, each in its own autocommit, deleting an
+invoice's children and then the invoice. A spec that resubmits an invoice ends
+while the extraction worker it re-queued is still raising exceptions, so a
+child committed between the child delete and the parent delete failed the
+parent delete on its FK: a red test after a green body
+(`docs/known-issues.md`, struck 2026-11-25).
+
+**Decision.** The teardown is one transaction (`tenantPsqlTransaction`:
+`psql --single-transaction -v ON_ERROR_STOP=1 -f -`) whose first statement is
+`SELECT count(*) FROM (SELECT id FROM invoices WHERE <predicate> FOR UPDATE)`.
+Every child insert takes `FOR KEY SHARE` on its parent for the FK check, and a
+status write takes the row lock; both conflict with `FOR UPDATE`. So a worker
+write either committed before the lock was granted, and the following
+statements (each on a fresh READ COMMITTED snapshot) delete what it wrote, or
+it waits for the commit and then fails its own FK check against a deleted
+invoice. Both orders were probed with two sessions on a scratch database. The
+payment-run and virtual-card sub-graphs are now statement builders
+(`paymentRunDeleteStatements`, `virtualCardDeleteStatements`) so they run
+inside that transaction; their standalone wrappers keep their old shape.
+
+**Accepted residue.** A worker that already holds a lock on a child row (say an
+open `workflow_instances` update) and then asks for the invoice's key-share lock
+can deadlock with the teardown; Postgres aborts one side. If that is the
+teardown, the whole transaction rolls back and the spec fails loudly with a
+deadlock error, rather than leaving a half-deleted graph. That is a real
+signal, not a flake to retry.
+
+**Rejected.** *Retrying the delete on an FK error*: it hides the race and leaves
+it to win on the retry too (root `CLAUDE.md` guard rail 4). *Waiting for the
+worker to go idle before cleanup*: no readiness signal exists for "every
+worker is done with this invoice", and a wait would be a sleep by another name.
+*`ON DELETE CASCADE` on the 16 foreign keys*: a schema change to the money
+ledger to serve a test helper, and cascades would make a wrong production
+delete silently thorough. *`SERIALIZABLE`*: turns the race into a
+serialization failure the helper would then have to retry.

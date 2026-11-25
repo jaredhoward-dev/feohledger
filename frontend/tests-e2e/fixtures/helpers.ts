@@ -578,6 +578,46 @@ export function tenantPsql(query: string, slug?: string): string {
 }
 
 /**
+ * Run `statements` against the worker's tenant database as ONE transaction:
+ * `psql --single-transaction` with `ON_ERROR_STOP`, so the first failure rolls
+ * every earlier statement back and throws, rather than leaving the teardown
+ * half done. Each statement still takes its own snapshot (READ COMMITTED), so
+ * a later one sees rows another session committed while an earlier one waited
+ * on a lock.
+ */
+export function tenantPsqlTransaction(statements: string[], slug?: string): string {
+	const db = `feoh_${slug ?? currentTenantSlug()}`;
+	const out = execFileSync(
+		'psql',
+		[
+			'-h',
+			'localhost',
+			'-U',
+			'postgres',
+			'-p',
+			'5432',
+			'-d',
+			db,
+			'-X',
+			'-q',
+			'-tA',
+			'-v',
+			'ON_ERROR_STOP=1',
+			'--single-transaction',
+			// `--single-transaction` wraps `-f` scripts only, so read stdin as one.
+			'-f',
+			'-'
+		],
+		{
+			env: { ...process.env, PGPASSWORD: 'postgres' },
+			input: statements.map((s) => `${s};\n`).join(''),
+			stdio: ['pipe', 'pipe', 'pipe']
+		}
+	);
+	return out.toString();
+}
+
+/**
  * A GL code any invoice in the worker's tenant may be coded to: an ACTIVE
  * account of the SHARED chart, which is in every entity's chart.
  *
@@ -728,14 +768,18 @@ export async function putProviderCredentials(
  * distinction `deleteInvoicesWhere` draws for `vendor_statement_recon_lines`.
  */
 function deleteVirtualCardsWhere(predicate: string, slug?: string): void {
+	for (const statement of virtualCardDeleteStatements(predicate)) tenantPsql(statement, slug);
+}
+
+/** The statements `deleteVirtualCardsWhere` runs, for a caller composing a transaction. */
+function virtualCardDeleteStatements(predicate: string): string[] {
 	const cards = `SELECT id FROM virtual_cards WHERE ${predicate}`;
-	tenantPsql(`DELETE FROM card_rebates WHERE virtual_card_id IN (${cards})`, slug);
-	tenantPsql(`DELETE FROM card_reveal_tokens WHERE card_id IN (${cards})`, slug);
-	tenantPsql(
+	return [
+		`DELETE FROM card_rebates WHERE virtual_card_id IN (${cards})`,
+		`DELETE FROM card_reveal_tokens WHERE card_id IN (${cards})`,
 		`UPDATE corporate_card_transactions SET virtual_card_id = NULL WHERE virtual_card_id IN (${cards})`,
-		slug
-	);
-	tenantPsql(`DELETE FROM virtual_cards WHERE ${predicate}`, slug);
+		`DELETE FROM virtual_cards WHERE ${predicate}`
+	];
 }
 
 /**
@@ -763,24 +807,24 @@ function deleteVirtualCardsWhere(predicate: string, slug?: string): void {
  * statement, so the order inside it does not matter.
  */
 export function deletePaymentRunsWhere(predicate: string, slug?: string): void {
+	for (const statement of paymentRunDeleteStatements(predicate)) tenantPsql(statement, slug);
+}
+
+/** The statements `deletePaymentRunsWhere` runs, for a caller composing a transaction. */
+function paymentRunDeleteStatements(predicate: string): string[] {
 	const runs = `SELECT id FROM payment_runs WHERE ${predicate}`;
 	const payments = `SELECT id FROM payments WHERE payment_run_id IN (${runs})`;
 
-	tenantPsql(`DELETE FROM bank_transactions WHERE matched_payment_id IN (${payments})`, slug);
-	deleteVirtualCardsWhere(`payment_id IN (${payments})`, slug);
-	// A retry outside the run may point at one of its payments.
-	tenantPsql(
+	return [
+		`DELETE FROM bank_transactions WHERE matched_payment_id IN (${payments})`,
+		...virtualCardDeleteStatements(`payment_id IN (${payments})`),
+		// A retry outside the run may point at one of its payments.
 		`UPDATE payments SET retry_of_payment_id = NULL WHERE retry_of_payment_id IN (${payments})`,
-		slug
-	);
-	tenantPsql(`DELETE FROM positive_pay_files WHERE payment_run_id IN (${runs})`, slug);
-
-	tenantPsql(
+		`DELETE FROM positive_pay_files WHERE payment_run_id IN (${runs})`,
 		`WITH doomed AS (${runs}), ` +
 			`gone AS (DELETE FROM payments WHERE payment_run_id IN (SELECT id FROM doomed)) ` +
-			`DELETE FROM payment_runs WHERE id IN (SELECT id FROM doomed)`,
-		slug
-	);
+			`DELETE FROM payment_runs WHERE id IN (SELECT id FROM doomed)`
+	];
 }
 
 /**
@@ -797,73 +841,75 @@ export function deletePaymentRunsWhere(predicate: string, slug?: string): void {
  * Deletes second-level children first, then every direct child, then the
  * invoices themselves. `predicate` is the WHERE clause body, so callers can
  * scope by id, `invoice_number LIKE`, `vendor_id`, or anything else.
+ *
+ * The whole teardown is ONE transaction that first locks the invoice rows
+ * (`SELECT … FOR UPDATE`), because the backend's own workers may still be
+ * writing children when a spec ends: a spec that resubmits an invoice finishes
+ * as soon as the UI shows it, while extraction is still raising exceptions.
+ * The lock makes that worker's write either land before the teardown reads
+ * the children or wait and then fail its FK check against a deleted invoice —
+ * never slip in between the child delete and the parent delete. Never retry
+ * this delete instead: a retry would hide the race, not close it.
  */
 export function deleteInvoicesWhere(predicate: string, slug?: string): void {
 	const ids = `SELECT id FROM invoices WHERE ${predicate}`;
 
-	// Second level — these reference a child, not the invoice.
-	tenantPsql(
-		`DELETE FROM workflow_steps WHERE instance_id IN (SELECT id FROM workflow_instances WHERE invoice_id IN (${ids}))`,
-		slug
-	);
-	tenantPsql(
-		`DELETE FROM supplier_chat_messages WHERE thread_id IN (SELECT id FROM supplier_chat_threads WHERE invoice_id IN (${ids}))`,
-		slug
-	);
-	tenantPsql(
-		`DELETE FROM bank_transactions WHERE matched_payment_id IN (SELECT id FROM payments WHERE invoice_id IN (${ids}))`,
-		slug
-	);
-	// A run holding ONLY these invoices' payments would be left an empty shell
-	// once they go, so it goes with them. A run that also pays another invoice
-	// keeps that invoice's payment and survives.
-	deletePaymentRunsWhere(
-		`id IN (SELECT payment_run_id FROM payments WHERE invoice_id IN (${ids})) ` +
-			`AND NOT EXISTS (SELECT 1 FROM payments other WHERE other.payment_run_id = payment_runs.id ` +
-			`AND other.invoice_id NOT IN (${ids}))`,
-		slug
-	);
-	// A card can hang off the payment or off the invoice, and carries children
-	// of its own — `deleteVirtualCardsWhere` owns that sub-graph for both this
-	// helper and `deleteVendorsWhere`.
-	deleteVirtualCardsWhere(
-		`payment_id IN (SELECT id FROM payments WHERE invoice_id IN (${ids})) OR invoice_id IN (${ids})`,
-		slug
-	);
+	tenantPsqlTransaction(
+		[
+			// Lock the invoices before touching any child. Every child insert takes
+			// FOR KEY SHARE on its parent invoice for the FK check, and a status
+			// write takes the row lock, so a backend worker still running on one
+			// of these invoices (a resubmit re-queues extraction, which raises
+			// exceptions after the UI has moved on) either committed before this
+			// lock was granted — and its rows are deleted below, each statement
+			// taking a fresh snapshot — or waits until this commits and then
+			// finds the invoice gone (decisions §523).
+			`SELECT count(*) FROM (${ids} FOR UPDATE) AS locked`,
 
-	// Direct children. `payments` is self-referential via `retry_of_payment_id`,
-	// so clear that link before deleting the rows.
-	tenantPsql(
-		`UPDATE payments SET retry_of_payment_id = NULL WHERE invoice_id IN (${ids})`,
-		slug
-	);
-	for (const table of [
-		'agent_decisions',
-		'credit_memos',
-		'discount_offers',
-		'exceptions',
-		'invoice_embeddings',
-		'invoice_extraction_results',
-		'invoice_line_items',
-		'payment_schedules',
-		'payments',
-		'peppol_transmissions',
-		'supplier_chat_threads',
-		'workflow_instances'
-	]) {
-		tenantPsql(`DELETE FROM ${table} WHERE invoice_id IN (${ids})`, slug);
-	}
-	tenantPsql(
-		`UPDATE vendor_statement_recon_lines SET matched_invoice_id = NULL WHERE matched_invoice_id IN (${ids})`,
-		slug
-	);
-	// An inter-company mirror points at its origin invoice.
-	tenantPsql(
-		`UPDATE invoices SET intercompany_mirror_id = NULL WHERE intercompany_mirror_id IN (${ids})`,
-		slug
-	);
+			// Second level — these reference a child, not the invoice.
+			`DELETE FROM workflow_steps WHERE instance_id IN (SELECT id FROM workflow_instances WHERE invoice_id IN (${ids}))`,
+			`DELETE FROM supplier_chat_messages WHERE thread_id IN (SELECT id FROM supplier_chat_threads WHERE invoice_id IN (${ids}))`,
+			`DELETE FROM bank_transactions WHERE matched_payment_id IN (SELECT id FROM payments WHERE invoice_id IN (${ids}))`,
+			// A run holding ONLY these invoices' payments would be left an empty
+			// shell once they go, so it goes with them. A run that also pays
+			// another invoice keeps that invoice's payment and survives.
+			...paymentRunDeleteStatements(
+				`id IN (SELECT payment_run_id FROM payments WHERE invoice_id IN (${ids})) ` +
+					`AND NOT EXISTS (SELECT 1 FROM payments other WHERE other.payment_run_id = payment_runs.id ` +
+					`AND other.invoice_id NOT IN (${ids}))`
+			),
+			// A card can hang off the payment or off the invoice, and carries
+			// children of its own — `virtualCardDeleteStatements` owns that
+			// sub-graph for both this helper and `deleteVendorsWhere`.
+			...virtualCardDeleteStatements(
+				`payment_id IN (SELECT id FROM payments WHERE invoice_id IN (${ids})) OR invoice_id IN (${ids})`
+			),
 
-	tenantPsql(`DELETE FROM invoices WHERE ${predicate}`, slug);
+			// Direct children. `payments` is self-referential via
+			// `retry_of_payment_id`, so clear that link before deleting the rows.
+			`UPDATE payments SET retry_of_payment_id = NULL WHERE invoice_id IN (${ids})`,
+			...[
+				'agent_decisions',
+				'credit_memos',
+				'discount_offers',
+				'exceptions',
+				'invoice_embeddings',
+				'invoice_extraction_results',
+				'invoice_line_items',
+				'payment_schedules',
+				'payments',
+				'peppol_transmissions',
+				'supplier_chat_threads',
+				'workflow_instances'
+			].map((table) => `DELETE FROM ${table} WHERE invoice_id IN (${ids})`),
+			`UPDATE vendor_statement_recon_lines SET matched_invoice_id = NULL WHERE matched_invoice_id IN (${ids})`,
+			// An inter-company mirror points at its origin invoice.
+			`UPDATE invoices SET intercompany_mirror_id = NULL WHERE intercompany_mirror_id IN (${ids})`,
+
+			`DELETE FROM invoices WHERE ${predicate}`
+		],
+		slug
+	);
 }
 
 /**
