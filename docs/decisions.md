@@ -26253,6 +26253,26 @@ GL-list Retry, outside-click disarm, focus on open and close, locale decimal
 separator) and the shared `AUDIT_UNWRITABLE_DETAIL` is imported rather than
 duplicated.
 
+## 513. A tracked entry is re-checked against the code before a round assigns it (round 42)
+
+**Problem.** Round 42 handed two lanes items that were already done. The
+known-issues entry "The run builder reads a missing invoice currency as USD"
+had been fixed by §457 (PR #732) a week earlier and never struck, and part 1
+of #693 (the zizmor findings) had been finished by #707 (§350, §365) while the
+issue still read as open. Both lanes found nothing to fix, struck the entry or
+corrected the issue, and stopped; the round lost two of its ten slots.
+
+**Decision.** Before a round assigns a `docs/followups.md` / `docs/known-issues.md`
+entry or an issue, the lead greps `docs/decisions.md` and the code the entry names
+for a later fix, and checks the issue thread for a closing PR. A fix that lands
+strikes or prunes its own entry in the same change; an entry that outlives its
+fix is the defect, not the next round's work.
+
+**Rejected.** *Letting lanes discover it*: the lane spends its time box proving a
+negative and the round runs short. *A guard that cross-references entries with
+decision numbers*: entries cite decisions for context as often as for a fix, so
+it could not tell a stale entry from a live one.
+
 ## 514. Blocked browser storage reads as signed out, through one guarded helper, and sign-in says so (round 42)
 
 **Problem.** Where a browser blocks site data for the origin, merely reading
