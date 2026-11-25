@@ -52,6 +52,7 @@ from app.api import (
     organization_close,
     organization_controls,
     organization_credentials,
+    organization_match_rules,
     organization_sso,
     partner,
     payments,
@@ -644,6 +645,9 @@ app.include_router(organization_credentials.router, prefix="/api")
 # Hangs off /api/organization/line-total-check and /exception-agents/autonomy —
 # the audited writers of those two single keys (decisions §502).
 app.include_router(organization_controls.router, prefix="/api")
+# Hangs off /api/organization/match-rules — the audited writer of
+# settings.matching, PO-match tolerance per vendor / commodity (decisions §512).
+app.include_router(organization_match_rules.router, prefix="/api")
 # Hangs off /api/organization/close — an administrator closing an unused
 # workspace (services/workspace_closure, decisions §306).
 app.include_router(organization_close.router, prefix="/api")
