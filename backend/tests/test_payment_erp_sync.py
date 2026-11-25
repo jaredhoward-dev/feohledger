@@ -1190,14 +1190,32 @@ async def test_an_uncharged_card_leg_is_skipped_not_paid(realdb, card_status):
     assert await _invoice_status(realdb, invoice_id) == InvoiceStatus.payment_scheduled
 
 
-@pytest.mark.parametrize("card_status", ["charged", "completed"])
-async def test_a_card_leg_charged_in_full_reaches_paid(realdb, card_status):
+async def test_an_authorized_card_leg_is_still_skipped_not_paid(realdb):
+    """Decisions §544: a card authorized for the full amount (`charged`) has
+    moved no money — the authorization can still be reversed or expire — so
+    the leg stays in flight until the charge settles."""
+    from app.models.virtual_card import VirtualCard
+
+    await _set_org_erp(realdb, "a", {"type": "mock", "integration_method": "direct"})
+    run_id, invoice_id, card_id = await _seed_card_leg_run(realdb, card_status="active")
+    async with realdb.sessionmaker("a")() as s:
+        card = await s.get(VirtualCard, card_id)
+        card.status, card.amount_charged = "charged", Decimal("500.00")
+        await s.commit()
+
+    result = await _sync_payments(run_id, realdb.info("a").org_id)
+
+    assert (result.skipped, result.synced, result.held, result.transitioned) == (1, 0, 0, 0)
+    assert await _invoice_status(realdb, invoice_id) == InvoiceStatus.payment_scheduled
+
+
+async def test_a_card_leg_settled_in_full_reaches_paid(realdb):
     await _set_org_erp(realdb, "a", {"type": "mock", "integration_method": "direct"})
     run_id, invoice_id, card_id = await _seed_card_leg_run(realdb, card_status="active")
     await _sync_payments(run_id, realdb.info("a").org_id)
     assert await _invoice_status(realdb, invoice_id) == InvoiceStatus.payment_scheduled
 
-    await _charge(realdb, card_id, status=card_status, amount="500.00")
+    await _charge(realdb, card_id, status="completed", amount="500.00")
     result = await _sync_payments(run_id, realdb.info("a").org_id)
 
     assert result.transitioned == 1

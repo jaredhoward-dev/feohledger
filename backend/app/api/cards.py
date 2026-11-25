@@ -1253,9 +1253,10 @@ async def card_webhook(provider: str, request: Request):
                     )
                     card.charged_at = datetime.now(UTC)
                     card.merchant_name = merchant
-                    # Money moved: the run's card leg now carries what was
-                    # charged, so coverage reads a real figure (decisions §537).
-                    spent_payment = await record_card_spend(db, card)
+                    # Nothing is written onto the run's card leg here: an
+                    # authorization is a hold the network can still reverse or
+                    # let expire, not money moved, so the leg stays in flight
+                    # until the settlement below (decisions §544).
                     # A charge is a money-state transition — leave an
                     # append-only audit row. Amount serialises as a string
                     # Decimal (never float); no PAN ever enters the trail.
@@ -1291,8 +1292,8 @@ async def card_webhook(provider: str, request: Request):
                         # the spend rollups and the corporate-card feed all read,
                         # and after settlement the settled figure is the true one.
                         card.amount_charged = settled_amount
-                    # The settled figure replaces the authorized one on the run
-                    # payment too (decisions §537).
+                    # Money moved: the settled figure is written onto the run's
+                    # card leg, the only figure it counts (decisions §537, §544).
                     spent_payment = await record_card_spend(db, card)
 
                     # Create rebate at the org's negotiated rate (not a hardcoded
@@ -1354,9 +1355,12 @@ async def card_webhook(provider: str, request: Request):
                 await db.commit()
                 if spent_payment is not None and spent_payment.payment_run_id is not None:
                     # The payment sync skipped this leg while its card was
-                    # uncharged; now that money moved, run it again so the
+                    # unsettled; now that money moved, run it again so the
                     # invoice reaches `paid` (or the short-settlement hold).
                     # Idempotent per leg, as the ACH webhook's re-dispatch is.
+                    # Bounded: it only schedules the pass on this loop
+                    # (`asyncio.create_task`), so no ERP latency reaches the
+                    # provider's response, and it runs after the commit.
                     from app.services.payment_erp_sync import dispatch_payment_sync
 
                     await dispatch_payment_sync(

@@ -89,10 +89,14 @@ def _app():
 
 
 @pytest.mark.parametrize("secret", [None, _TENANT_SECRET])
-async def test_the_simulator_charges_a_mock_card_through_the_real_webhook(realdb, secret):
+async def test_the_simulator_authorizes_a_mock_card_through_the_real_webhook(realdb, secret):
     """With or without a tenant secret, the signed event goes through the
-    handler: the card is charged, the charge is written onto the run payment
-    (`record_card_spend`) and the run's payment sync is dispatched."""
+    handler and the card is authorized (`charged`). An authorization is a hold,
+    not money moved (decisions §544): nothing is written onto the run payment
+    and no payment sync is dispatched, so the leg stays in flight."""
+    from app.services.payment_settlement import COVERAGE_IN_FLIGHT
+    from app.services.payment_settlement_record import payment_coverage
+
     await _cards(realdb, secret=secret)
     card_id, token, pay_id = await _run_card_leg(realdb)
 
@@ -107,7 +111,36 @@ async def test_the_simulator_charges_a_mock_card_through_the_real_webhook(realdb
     assert result.card_status == "charged" and result.amount_charged == Decimal("100.00")
     async with realdb.sessionmaker(TENANT)() as s:
         payment = await s.get(Payment, pay_id)
+        coverage = await payment_coverage(s, payment, "USD")
+    assert payment.settled_amount is None
+    assert coverage.state == COVERAGE_IN_FLIGHT
+    dispatched.assert_not_awaited()
+
+
+@pytest.mark.parametrize("secret", [None, _TENANT_SECRET])
+async def test_settle_charges_the_run_payment_in_full_and_dispatches_once(realdb, secret):
+    """`--settle` is the laptop's path to `paid`: the settled figure lands on
+    the run payment, coverage reads `covered`, and the sync is dispatched once
+    (by the settlement, not the authorization)."""
+    from app.services.payment_settlement import COVERAGE_COVERED
+    from app.services.payment_settlement_record import payment_coverage
+
+    await _cards(realdb, secret=secret)
+    card_id, token, pay_id = await _run_card_leg(realdb)
+
+    with patch(
+        "app.services.payment_erp_sync.dispatch_payment_sync", new=AsyncMock()
+    ) as dispatched:
+        result = await sim.simulate_mock_card_charge(
+            _app(), slug=realdb.info(TENANT).slug, card_ref=token, settle=True
+        )
+
+    assert result.card_status == "completed"
+    async with realdb.sessionmaker(TENANT)() as s:
+        payment = await s.get(Payment, pay_id)
+        coverage = await payment_coverage(s, payment, "USD")
     assert (payment.settled_amount, payment.settled_currency) == (Decimal("100.00"), "USD")
+    assert coverage.state == COVERAGE_COVERED
     dispatched.assert_awaited_once()
 
 

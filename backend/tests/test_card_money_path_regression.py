@@ -768,42 +768,173 @@ async def _post_card_event(realdb, event_type: str, token: str, amount: str) -> 
     return resp.status_code
 
 
-async def test_a_charge_on_a_run_card_leg_is_written_onto_its_payment(realdb):
-    """Decisions §537: a run's card leg is `completed` from the mint, but its
-    money moves at the charge. The webhook writes the charged figure onto the
-    leg's payment (the settled one replacing the authorized one) and re-runs
-    the payment sync, which skipped the leg while the card was uncharged."""
+async def _post_card_event_id(realdb, event_type: str, token: str, amount: str, event_id: str):
+    body = json.dumps(
+        {
+            "eventType": event_type,
+            "webhookId": event_id,
+            "cardHashId": token,
+            "amount": amount,
+            "merchantName": "Acme Fuel",
+        }
+    ).encode("utf-8")
+    async with realdb.client(key=TENANT, role=None) as c:
+        resp = await c.post(
+            "/api/cards/webhook/nium",
+            content=body,
+            headers={"Content-Type": "application/json", "Webhook-Signature": _sign(body)},
+        )
+    return resp.status_code
+
+
+async def _run_card_leg(realdb, amount=Decimal("100.00")):
+    """A run's card leg as the run's execution leaves it: the payment
+    `completed`, its card issued (`active`) and linked to it."""
     org_id = realdb.info(TENANT).org_id
     mk = realdb.sessionmaker(TENANT)
     token = f"tok_{uuid.uuid4().hex[:12]}"
-    inv = await _seed_invoice(mk, org_id, amount=Decimal("100.00"))
-    run_id, pay_id = await _seed_run(mk, org_id, inv, amount=Decimal("100.00"), creator_id=None)
+    inv = await _seed_invoice(mk, org_id, amount=amount)
+    run_id, pay_id = await _seed_run(mk, org_id, inv, amount=amount, creator_id=None)
     async with mk() as s:
         await s.execute(
             Payment.__table__.update().where(Payment.id == pay_id).values(status="completed")
         )
-        card = _card_row(
-            inv, org_id, provider_card_id=token, limit=Decimal("100.00"), provider="nium"
-        )
+        card = _card_row(inv, org_id, provider_card_id=token, limit=amount, provider="nium")
         card.payment_id = pay_id
         s.add(card)
         await s.commit()
     await _set_card_settings(realdb, org_id)
+    return org_id, run_id, pay_id, token
+
+
+async def _leg(realdb, pay_id):
+    """The run payment and its coverage, read the way the money callers read it."""
+    from app.services.payment_settlement_record import payment_coverage
+
+    async with realdb.sessionmaker(TENANT)() as s:
+        payment = await s.get(Payment, pay_id)
+        return payment, (await payment_coverage(s, payment, "USD")).state
+
+
+async def test_an_authorization_alone_leaves_the_run_card_leg_in_flight(realdb):
+    """Decisions §544: an authorization is a hold the network can still reverse
+    or let expire — no money moved. The card reads `charged`, but nothing is
+    written onto the run payment, coverage is `in_flight`, and the payment
+    sync is not dispatched (it would only skip the leg)."""
+    _org_id, _run_id, pay_id, token = await _run_card_leg(realdb)
 
     with patch(
         "app.services.payment_erp_sync.dispatch_payment_sync", new=AsyncMock()
     ) as dispatched:
         assert await _post_card_event(realdb, "authorization.approved", token, "100.00") == 204
-        async with mk() as s:
-            payment = await s.get(Payment, pay_id)
-        assert (payment.settled_amount, payment.settled_currency) == (Decimal("100.00"), "USD")
-        dispatched.assert_awaited_once_with(run_id, org_id)
 
+    payment, state = await _leg(realdb, pay_id)
+    assert payment.settled_amount is None and payment.settled_currency is None
+    assert state == "in_flight"
+    dispatched.assert_not_awaited()
+
+
+async def test_the_settlement_writes_the_charge_onto_its_payment_and_dispatches_once(realdb):
+    """Decisions §537 / §544: the settlement is the money. Its figure is written
+    onto the leg's payment, coverage judges it (here short: 90 of 100), and the
+    run's payment sync is re-dispatched exactly once, with the run and org."""
+    org_id, run_id, pay_id, token = await _run_card_leg(realdb)
+
+    with patch(
+        "app.services.payment_erp_sync.dispatch_payment_sync", new=AsyncMock()
+    ) as dispatched:
+        assert await _post_card_event(realdb, "authorization.approved", token, "100.00") == 204
+        dispatched.assert_not_awaited()
         assert await _post_card_event(realdb, "transaction.settled", token, "90.00") == 204
-        async with mk() as s:
-            payment = await s.get(Payment, pay_id)
-        assert payment.settled_amount == Decimal("90.00")
-        assert dispatched.await_count == 2
+
+    dispatched.assert_awaited_once_with(run_id, org_id)
+    payment, state = await _leg(realdb, pay_id)
+    assert (payment.settled_amount, payment.settled_currency) == (Decimal("90.00"), "USD")
+    assert state == "short"
+
+
+async def test_a_full_settlement_covers_the_leg(realdb):
+    _org_id, _run_id, pay_id, token = await _run_card_leg(realdb)
+
+    with patch("app.services.payment_erp_sync.dispatch_payment_sync", new=AsyncMock()):
+        assert await _post_card_event(realdb, "authorization.approved", token, "100.00") == 204
+        assert await _post_card_event(realdb, "transaction.settled", token, "100.00") == 204
+
+    payment, state = await _leg(realdb, pay_id)
+    assert payment.settled_amount == Decimal("100.00")
+    assert state == "covered"
+
+
+@pytest.mark.parametrize(
+    "follow_up", ["authorization.reversal", "authorization.expired", "authorization.declined"]
+)
+async def test_a_reversed_or_expired_authorization_never_counts_as_paid(realdb, follow_up):
+    """The case §544 exists for: an authorization that is then reversed,
+    expires or is declined moved no money. The leg was never counted (the
+    authorization wrote nothing), so it stays in flight; nothing to undo."""
+    _org_id, _run_id, pay_id, token = await _run_card_leg(realdb)
+
+    with patch(
+        "app.services.payment_erp_sync.dispatch_payment_sync", new=AsyncMock()
+    ) as dispatched:
+        assert await _post_card_event(realdb, "authorization.approved", token, "100.00") == 204
+        assert await _post_card_event(realdb, follow_up, token, "100.00") == 204
+
+    payment, state = await _leg(realdb, pay_id)
+    assert payment.settled_amount is None
+    assert state == "in_flight"
+    dispatched.assert_not_awaited()
+
+
+async def test_a_figure_stamped_at_the_authorization_does_not_count_until_settled(realdb):
+    """A leg whose payment carries a figure while its card is only authorized
+    (what the §537 build wrote at the authorization, before §544) reads
+    `in_flight`: only the card's settlement is evidence of money moved."""
+    _org_id, _run_id, pay_id, token = await _run_card_leg(realdb)
+    with patch("app.services.payment_erp_sync.dispatch_payment_sync", new=AsyncMock()):
+        assert await _post_card_event(realdb, "authorization.approved", token, "100.00") == 204
+    async with realdb.sessionmaker(TENANT)() as s:
+        await s.execute(
+            Payment.__table__.update()
+            .where(Payment.id == pay_id)
+            .values(settled_amount=Decimal("100.00"), settled_currency="USD")
+        )
+        await s.commit()
+
+    _payment, state = await _leg(realdb, pay_id)
+    assert state == "in_flight"
+
+
+async def test_a_replayed_settlement_records_once_and_dispatches_once(realdb):
+    """The same delivery twice (the provider's retry): deduped by event id, so
+    the figure is written once and the sync is dispatched once."""
+    org_id, run_id, pay_id, token = await _run_card_leg(realdb)
+    settle_id = str(uuid.uuid4())
+
+    with patch(
+        "app.services.payment_erp_sync.dispatch_payment_sync", new=AsyncMock()
+    ) as dispatched:
+        assert await _post_card_event(realdb, "authorization.approved", token, "100.00") == 204
+        for _ in range(2):
+            assert (
+                await _post_card_event_id(realdb, "transaction.settled", token, "100.00", settle_id)
+                == 204
+            )
+
+    dispatched.assert_awaited_once_with(run_id, org_id)
+    payment, _ = await _leg(realdb, pay_id)
+    assert payment.settled_amount == Decimal("100.00")
+    async with realdb.sessionmaker(TENANT)() as s:
+        rebates = (
+            (
+                await s.execute(
+                    select(CardRebate).join(VirtualCard).where(VirtualCard.payment_id == pay_id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+    assert len(rebates) == 1
 
 
 async def test_a_charge_on_a_card_no_run_payment_owns_writes_no_payment(realdb):
