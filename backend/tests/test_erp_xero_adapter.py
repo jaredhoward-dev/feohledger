@@ -573,6 +573,53 @@ def test_existing_bill_with_a_different_total_is_refused_not_adopted(token):
     assert result.message == "Xero post refused: duplicate_document_number"
 
 
+@pytest.mark.parametrize("total", [1150.0, 99.0])
+def test_existing_bill_on_a_shared_key_is_never_adopted(token, total):
+    """Another invoice carries this supplier + number (``bill_key_shared``,
+    set by ``services/erp``), so the found bill may be its own: refused with
+    a code, not adopted at the approved total, and no second bill created
+    (decisions §572). Not ``not_posted``: an earlier attempt of ours may have
+    created it."""
+    existing = {
+        "InvoiceID": "inv-other",
+        "InvoiceNumber": "SUP-1001",
+        "Type": "ACCPAY",
+        "Total": total,
+    }
+    with patch("httpx.AsyncClient") as cm:
+        client = _client(cm)
+        client.get = _get_router(lookup=_resp(200, {"Invoices": [existing]}))
+        client.put = AsyncMock(side_effect=AssertionError("must not create a second bill"))
+        client.post = AsyncMock(side_effect=AssertionError("must not write"))
+        result = _run(_adapter().post_invoice(_payload(bill_key_shared=True)))
+    assert result.success is False
+    assert result.erp_document_id is None
+    assert result.refusal_code == "erp_bill_key_shared"
+    assert result.message == "Xero post refused: erp_bill_key_shared"
+    assert result.retryable is False
+    assert result.not_posted is False
+    client.put.assert_not_awaited()
+
+
+def test_a_shared_key_with_no_bill_on_it_still_creates(token):
+    """Refusing adoption is not refusing the push: with nothing on the key
+    there is nothing to adopt, so the bill is created as usual (§572)."""
+    with patch("httpx.AsyncClient") as cm:
+        client = _client(cm)
+        client.get = _get_router(
+            lookup=_resp(200, {"Invoices": []}),
+            accounts=_resp(200, _accounts()),
+            bills={"inv-1": {"InvoiceID": "inv-1", "Status": "AUTHORISED", "Total": 1150.0}},
+        )
+        client.put = AsyncMock(
+            return_value=_resp(200, {"Invoices": [{"InvoiceID": "inv-1", "Total": 1150.0}]})
+        )
+        result = _run(_adapter().post_invoice(_payload(bill_key_shared=True)))
+    assert result.success
+    assert result.erp_document_id == "inv-1"
+    client.put.assert_awaited_once()
+
+
 # ---------------------------------------------------------------------------
 # post_invoice: the organisation ShortCode for the deep link (decisions §354)
 # ---------------------------------------------------------------------------

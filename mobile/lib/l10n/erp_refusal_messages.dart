@@ -101,6 +101,7 @@ final Map<String, _Sentence> _providerSentences = {
   'payment_exceeds_balance': (l, p) => l.erpRefusalPaymentExceedsBalance(p),
   'bill_payment_voided': (l, p) => l.erpRefusalBillPaymentVoided(p),
   'payments_scope_missing': (l, p) => l.erpRefusalPaymentsScopeMissing(p),
+  'erp_bill_key_shared': (l, p) => l.erpRefusalBillKeyShared(p),
 };
 
 /// The refusals raised outside an adapter, which name no provider.

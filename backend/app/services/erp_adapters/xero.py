@@ -151,6 +151,11 @@ CURRENCY_MISMATCH = "currency_mismatch"
 PERIOD_CLOSED = "period_closed"
 VENDOR_INACTIVE = "vendor_inactive"
 ACCOUNT_INACTIVE = "account_inactive"
+#: The pre-create lookup found a live bill on this supplier + number while
+#: another invoice in the tenant carries the same pair (``payload.bill_key_shared``):
+#: the bill may be that invoice's, so it is not adopted and none is created
+#: (decisions §572). A person decides which invoice the bill is.
+ERP_BILL_KEY_SHARED = "erp_bill_key_shared"
 #: A vendor-link search by tax number puts the number in the query string
 #: (``where=TaxNumber==...``), and httpx logs every request URL at INFO: the
 #: query of any logged URL naming the field is redacted (a tax id never
@@ -413,7 +418,14 @@ class XeroAdapter(OAuthErpAdapter):
 
     async def _find_existing_bill(self, client, headers, payload: InvoicePayload):
         """Pre-create idempotency lookup: the first of :meth:`_matching_bills`.
-        Returns ``(response, bill | None)``."""
+        Returns ``(response, bill | None)``.
+
+        The key names a supplier's invoice number, not one FeohLedger invoice,
+        so the push adopts the found bill only when no other invoice in the
+        tenant shares it (``payload.bill_key_shared`` false, set by
+        ``services/erp`` from ``erp_bill_void.shared_lookup_keys``, the rule
+        the orphan-bill lookup applies); otherwise it refuses
+        ``erp_bill_key_shared`` (decisions §572)."""
         resp, bills = await self._matching_bills(client, headers, payload)
         return resp, (bills[0] if bills else None)
 
@@ -560,6 +572,11 @@ class XeroAdapter(OAuthErpAdapter):
                 # Fail closed: without the lookup we cannot rule out a duplicate.
                 return _failure(lookup)
             if existing is not None:
+                if payload.bill_key_shared:
+                    # Another invoice carries this supplier + number, so the
+                    # bill may be its own: never adopted as this invoice's,
+                    # and no second bill is created beside it (§572).
+                    return erp_refusal(PROVIDER, ERP_BILL_KEY_SHARED)
                 if _decimal(existing.get("Total")) == payload.amount:
                     return ErpPostResult(
                         success=True,

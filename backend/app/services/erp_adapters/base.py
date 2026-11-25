@@ -117,6 +117,13 @@ class InvoicePayload:
     #: sync waits for a sync after it before re-creating (Merge.dev, decisions
     #: §405). None when no earlier attempt is unknown.
     outcome_unknown_since: datetime | None = None
+    #: Set by ``services/erp`` when the adapter's bill key is not unique to one
+    #: invoice (:attr:`ErpAdapter.bill_lookup_key_shared`) and another invoice
+    #: in the tenant shares this one's (``erp_bill_void.shared_lookup_keys``,
+    #: the rule the orphan-bill lookup applies). The adapter's pre-create
+    #: lookup then never adopts a bill it finds on that key as this invoice's:
+    #: it could be the other invoice's (decisions §572).
+    bill_key_shared: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -367,6 +374,8 @@ ERP_REFUSAL_CODES: frozenset[str] = frozenset(
         "bill_payment_voided",
         # Xero: a connection consented before `accounting.payments` (§415)
         "payments_scope_missing",
+        # Xero: a bill found on a supplier + number another invoice shares (§572)
+        "erp_bill_key_shared",
     }
 )
 

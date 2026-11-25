@@ -2519,6 +2519,11 @@ class AppLocalizationsDe extends AppLocalizations {
   }
 
   @override
+  String erpRefusalBillKeyShared(String provider) {
+    return '$provider hat bereits eine Rechnung mit diesem Lieferanten und dieser Rechnungsnummer, und eine andere Rechnung in FeohLedger hat denselben Lieferanten und dieselbe Nummer. Daher wurde diese Rechnung in $provider nicht mit dieser Rechnung verknüpft und keine zweite angelegt. Prüfen Sie in $provider, zu welcher Rechnung sie gehört. Ist die Nummer dieser Rechnung falsch, korrigieren Sie sie und versuchen Sie es erneut; andernfalls fragen Sie einen Administrator, wie weiter vorzugehen ist.';
+  }
+
+  @override
   String erpRefusalExceptionBlocksExport(String type) {
     return 'Diese Rechnung hat eine offene Ausnahme ($type). Lösen oder verwerfen Sie sie unter Ausnahmen und senden Sie die Rechnung dann an das ERP.';
   }

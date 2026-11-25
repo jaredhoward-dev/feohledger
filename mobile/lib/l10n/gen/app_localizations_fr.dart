@@ -2533,6 +2533,11 @@ class AppLocalizationsFr extends AppLocalizations {
   }
 
   @override
+  String erpRefusalBillKeyShared(String provider) {
+    return '$provider contient déjà une facture de ce fournisseur avec ce numéro, et une autre facture dans FeohLedger a le même fournisseur et le même numéro ; cette facture n\'a donc pas été rattachée à celle-ci et aucune seconde facture n\'a été créée. Vérifiez dans $provider à quelle facture elle correspond. Si le numéro de cette facture est erroné, corrigez-le et réessayez ; sinon, demandez à un administrateur comment procéder.';
+  }
+
+  @override
   String erpRefusalExceptionBlocksExport(String type) {
     return 'Cette facture a une exception ouverte ($type). Résolvez-la ou rejetez-la dans Exceptions, puis envoyez la facture à l\'ERP.';
   }
