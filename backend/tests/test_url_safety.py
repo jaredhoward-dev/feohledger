@@ -551,6 +551,11 @@ _APP = Path(__file__).resolve().parents[1] / "app"
 #: in a guarded module fails, so a new call site there has to adopt
 #: ``url_safety.pinned_async_client`` or be argued for here.
 _PLAIN_CLIENT_ALLOWED: dict[str, tuple[int, str]] = {
+    "services/mock_card_simulator.py": (
+        1,
+        "an in-process httpx.ASGITransport client against this app's own ASGI "
+        "callable: no socket, no DNS, no outbound host (decisions §541)",
+    ),
     "services/erp_adapters/dynamics_365_bc.py": (
         8,
         "base_url is allowlisted to api.businesscentral.dynamics.com and the token "

@@ -19,7 +19,7 @@ Authorization: Bearer <jwt_token>
 - `/api/auth/login`, `/api/auth/mfa/challenge/email`, `/api/auth/mfa/verify` — pre-login flow, gated by password + challenge token
 - `/api/auth/sso/*` — OIDC handshake
 - `/api/scim/v2/*` — uses per-tenant SCIM bearer (validated inside the handler)
-- `/api/signup/*`, `/api/public-config`, `/api/health` — public
+- `/api/signup/*`, `/api/workspace-lookup`, `/api/public-config`, `/api/health` — public (`/api/workspace-lookup` is captcha'd and rate-limited per IP and per address, and answers every address alike; decisions §518)
 - `/api/cards/webhook/{provider}`, `/api/erp/webhook/{erp_type}` — provider-signed webhooks
 
 ### Tenant Routing
@@ -240,6 +240,8 @@ All three answer a bare `404` when `FEOH_SIGNUP_ENABLED` is off — before valid
 | `POST` | `/api/invoices/{id}/resubmit`     | admin/manager/cfo/ap_clerk | Resubmit after rejection. 409 `invoice_not_resubmittable` unless `rejected` |
 | `POST` | `/api/invoices/{id}/send-to-erp`  | admin/manager/cfo | Transition to `sending_to_erp` and dispatch (local thread or SQS). Only from `approved`: otherwise a coded 409 `invoice_not_erp_sendable` (`params.status`) |
 | `POST` | `/api/invoices/{id}/retry-erp`    | admin/manager/cfo | Retry a failed ERP push. Only an approved invoice at `failed`: otherwise a coded 409 `invoice_not_erp_retryable` (`params.status`) |
+| `GET` | `/api/invoices/{id}/erp-orphan-bill` | `payment.void` | Name the bill a failed push may have left in the ERP by the adapter's read-only idempotency lookup (mock, QuickBooks Online). Only a `failed` invoice naming no bill whose push is possibly posted (409 `erp_lookup_not_failed`). `{found, bill}`; 409 `erp_lookup_unsupported`, 502 `erp_lookup_failed` (never read as none). Audited `invoice.erp_orphan_bill_looked_up`. Decisions §556 |
+| `POST` | `/api/invoices/{id}/void-erp-orphan-bill` | `payment.void` | Body `{erp_document_id, reason}`. Voids that bill through the flag void's three-step flow (marker, positive status read, the lookup re-run: 409 `erp_void_not_found` if it no longer names the id). Invoice stays `failed`. 201, or 200 `replayed: true`. Same `erp_void_*` refusals as `/api/exceptions/{id}/void-erp-bill`. While it runs, `send-to-erp` / `retry-erp` answer 409 `erp_void_in_progress`. Decisions §556 |
 | `POST` | `/api/invoices/{id}/complete`     | admin/manager/cfo/clerk | Advance to the next workflow step based on the snapshot. Only from `new` or `approved` — any other status is a coded 409 `invoice_not_completable` (`params.status`); it used to close `sent_to_erp` / `posted_in_erp` / `paid` to `done` (`POST /bulk/status → done` now refuses those rows too, decisions §357). Where it would close the invoice to `done` (no approval step on a `new` one, no ERP step on an `approved` one), a live payment or virtual card on it is a coded 409 `payment_blocks_completion` (`params.claim` `payment` / `virtual_card`). A clerk only submits a `new` invoice (403 `invoice_entry_window_closed`). Blank required fields are a coded 422, `invoice_required_fields_missing` with `params.fields` |
 | `GET`  | `/api/invoices/{id}/review-actions` | * | The caller's verdict on each modal action — `{approve, reject, complete, send_to_erp, retry_erp, resubmit, manage_file, edit_financials}`, each `null` or the coded refusal the POST would answer with (`backend/docs/api-surface.md` § action verdicts) |
 | `GET`  | `/api/invoices/{id}/audit-log`    | * | Full audit trail (with actor names) |
@@ -381,6 +383,7 @@ All exception endpoints require `admin/manager`.
 | `GET`  | `/api/exceptions/summary`         | Chip tallies — counts by status, `by_type`, `by_severity` — over the same filters, each tally ignoring only its own dimension |
 | `POST` | `/api/exceptions/{id}/resolve`    | Body `{resolution, action}` (`resolve`/`escalate`/`dismiss`). Resolving or dismissing a payment-blocking exception also re-attempts recording a payment the ERP reported for the invoice and FeohLedger could not record, through the same gates (decisions §319) |
 | `POST` | `/api/exceptions/{id}/record-erp-payment` | `payment.record_external`. Body `{method?, reference, paid_on, amount?}`, pre-filled by the client from the row's `erp_report`; `method` may be omitted only on a row whose `erp_payment_split_stands` is true (422 `erp_payment_method_required` otherwise, decisions §413). On a row whose `erp_report.kind` is `paid_not_recorded`: resolves it as the caller and records the payment outside FeohLedger, in one transaction (201 + the `Payment`). 409 `exception_not_erp_paid_report` / `exception_not_actionable`; 403 on either segregation rule or a missing role; any `external_payment_*` refusal rolls both back. Rows also carry `erp_report` + `erp_name`, and such a row `record_erp_payment_refusal` and `erp_payment_split_stands` |
+| `POST` | `/api/exceptions/{id}/void-erp-bill` | `payment.void`. Body `{reason}`. On an open/escalated `duplicate` / `fraud_flag` whose invoice holds a bill at `sent_to_erp` / `posted_in_erp`: reads the bill, voids it in the ERP only on an `open` / `draft` read (a bill already cancelled or deleted there converges without a second void), clears the document id and walks the invoice to `approved`. 201, or 200 `replayed: true`. Coded refusals: `erp_void_not_flagged` / `no_bill` / `claimed` / `bill_paid` / `bill_settled` / `draft_only` / `unsupported` / `rejected` (409), `erp_void_failed` / `erp_void_unconfirmed` (502). `erp_void_in_progress` (409) while another attempt is calling the ERP for this bill; while that void is in flight `resolve` / `dismiss` on its flag are refused `erp_void_in_progress` (409) and `/bulk/resolve` skips the row with that reason (`escalate` stays open). Three transactions, no row lock held across the ERP calls (a committed marker, `invoices.erp_void_pending`); the ERP step is bounded as a whole at 150 s, and a void this attempt sent but can no longer record (its marker taken over, or the invoice moved on) writes `exception.erp_bill_void_orphaned` and, when the invoice is payable, opens a payment-blocking `payment_reconciliation` row. Emits `invoice.erp_bill_voided`, never `invoice.approved`. Rows carry `void_erp_bill_refusal`. Decisions §539, §542, §545, §550 |
 
 ## Notifications
 
@@ -450,7 +453,7 @@ Every refusal is a coded `detail = {code, message, params}`. Full rules:
 | `GET`  | `/api/credit-memos/counts`        | admin, ap_manager, ap_clerk, cfo | Per-status tallies for the filter chips: `{total, by_status: {open, applied, void}}`, over the list's own population filters (entity scope + `?search=`), never `status` |
 | `GET`  | `/api/credit-memos/eligible-invoices` | admin, ap_manager | The invoices a NEW memo can be linked to at creation: `?vendor_id=` (required, entity-scoped like create — 404 otherwise), optional `?amount=` (validated like a memo amount), `?search=`, paged — see § Eligible invoices |
 | `GET`  | `/api/credit-memos/{id}/eligible-invoices` | admin, ap_manager | The invoices `/apply` will accept for this memo — its terms read off the row; same opaque 404 as every by-id route, the apply's own 409 for a memo that is not `open` — see § Eligible invoices |
-| `POST` | `/api/credit-memos`                | admin, ap_manager | Create a credit memo. With no `invoice_id` it lands `open`; with one it is applied on the spot and runs the same guards as `/apply` |
+| `POST` | `/api/credit-memos`                | admin, ap_manager | Create a credit memo. With no `invoice_id` it lands `open`; with one it is applied on the spot and runs the same guards as `/apply`. Optional `discount_offer_id` (with `invoice_id`) records the memo as that accepted early-payment discount — see § A memo that takes a discount |
 | `PATCH` | `/api/credit-memos/{id}`          | admin, ap_manager | Correct an `open`, never-applied memo — see § Editing a memo. 409 on anything else |
 | `POST` | `/api/credit-memos/{id}/apply`     | admin, ap_manager | Apply an `open` credit memo against a payable. Every refusal (here and on a linked create) is a coded `409` `detail = {code, message, params}`: `credit_memo_invoice_settled` (`status`), `credit_memo_vendor_unresolved`, `credit_memo_vendor_mismatch`, `credit_memo_entity_mismatch`, `credit_memo_currency_mismatch`, `credit_memo_invoice_currency_unknown` (the invoice records no usable currency), `credit_memo_not_applicable` (`status`), `credit_memo_exceeds_balance` (`remaining` as an exact string, `currency`); an edit's refusal is `credit_memo_not_editable` (`status`) |
 | `POST` | `/api/credit-memos/{id}/void`      | admin, ap_manager | Void an `open` memo (409 once `applied` — applied memos are immutable for audit — and 409 on an already-`void` memo, so a retried void never writes a second `credit_memo.voided` row) |
@@ -658,6 +661,25 @@ provider's deep link to it. Both are null until a push is confirmed, and the URL
 stays null for a provider with no stable deep link. Neither is writable through
 the API: only `services/erp` sets them (`erp-integration.md` § The invoice
 names its bill in the ERP).
+
+
+### A memo that takes a discount — `discount_offer_id`
+
+`POST /api/credit-memos` with `discount_offer_id` (and `invoice_id`) records the
+memo as an accepted early-payment discount taken as a credit; every memo
+response carries `discount_offer_id` (null on an ordinary credit). It is the
+only thing that makes a memo count as the discount: the payment run then does
+not deduct that invoice's offer again, and the settlement captures the offer
+for the memo's amount. A memo that names no offer is an ordinary credit
+whatever its amount (decisions §520, migration 0145). The link is refused
+unless the memo is exactly the discount — 404 for an offer not on that invoice,
+else 409 `credit_memo_discount_offer_invalid` for: no `invoice_id`; a
+vendor-scoped offer; an offer not `accepted` with a tier; another currency; an
+offer priced on an amount the invoice no longer has; an amount other than the
+savings to the cent; another live linked memo on the invoice; or any live
+payment on the invoice. The link is never editable (a linked memo is
+applied at creation, and only an open memo is editable). Detail:
+`dynamic-discounting.md` § Taking a discount as a credit memo.
 
 ## Tax / 1099
 

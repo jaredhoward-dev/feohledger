@@ -14,9 +14,9 @@ import { PAYMENT_GUIDES } from './guides/payments.ts';
 import { SETUP_GUIDES } from './guides/setup.ts';
 import { START_GUIDES } from './guides/start.ts';
 import { VENDOR_GUIDES } from './guides/vendors.ts';
-import { plainText, type InlinePart } from './inline.ts';
 import { navPageFor } from './navPages.ts';
 import { PAGE_HELP } from './pages.ts';
+import { searchHelpIn, type Label, type SearchHit as AnySearchHit } from './search.ts';
 import { termHref, termKey, termShortKey } from './terms.ts';
 import type { GlossaryCategory, GlossaryEntry, Guide, GuideKind, HelpRole } from './types.ts';
 
@@ -112,79 +112,15 @@ export { pageHelpFor, pageHelpHref } from './routeHelp.ts';
 // Search
 // ---------------------------------------------------------------------------
 
-export type Label = (key: MessageKey) => string;
+export type { Label };
+export type SearchHit = AnySearchHit<GlossaryEntry>;
 
-export type SearchHit =
-	| { kind: 'guide'; guide: Guide; score: number }
-	| { kind: 'term'; term: GlossaryEntry; score: number }
-	| { kind: 'page'; href: string; score: number };
-
-const norm = (s: string) =>
-	s
-		.normalize('NFKD')
-		.replace(/[̀-ͯ]/g, '')
-		.toLowerCase();
-
-/** Resolve inline references to the words a reader sees. */
-function resolver(label: Label) {
-	return (p: Extract<InlinePart, { kind: 'ui' | 'term' | 'page' }>) => {
-		if (p.kind === 'ui') return label(p.key as MessageKey);
-		if (p.kind === 'term') return label(termKey(p.id));
-		const nav = navPageFor(p.href);
-		return nav ? label(nav.labelKey) : '';
-	};
-}
-
-function score(words: string[], title: string, body: string): number {
-	const t = norm(title);
-	const b = norm(body);
-	let s = 0;
-	for (const w of words) {
-		if (t.includes(w)) s += 3;
-		else if (b.includes(w)) s += 1;
-		else return 0;
-	}
-	if (t.startsWith(words.join(' '))) s += 5;
-	return s;
-}
+const pageLabel = (href: string) => navPageFor(href)?.labelKey;
 
 /**
- * Guides, glossary terms and pages matching every word of `query`, best first
- * (a title match outranks a body match; ties keep contents order). Titles are
- * matched in the reader's language (term names and page labels come from the
- * catalogue) and in English (guide titles, aliases), so either finds them.
+ * Guides, glossary terms and pages matching every word of `query`, best first.
+ * The scorer is `search.ts`'s, over the employee content; the supplier help
+ * calls it with its own lists (decisions §517).
  */
-export function searchHelp(query: string, label: Label): SearchHit[] {
-	const words = norm(query).split(/\s+/).filter(Boolean);
-	if (!words.length) return [];
-	const text = resolver(label);
-	const hits: (SearchHit & { i: number })[] = [];
-	let i = 0;
-	for (const guide of GUIDES) {
-		const body = [
-			guide.summary,
-			...guide.sections.flatMap((s) => [
-				s.heading,
-				...s.blocks.flatMap((b) =>
-					b.type === 'p' || b.type === 'note' ? [b.text] : b.type === 'steps' || b.type === 'list' ? b.items : []
-				)
-			])
-		]
-			.map((t) => plainText(t, text))
-			.join(' ');
-		const s = score(words, guide.title, body);
-		if (s) hits.push({ kind: 'guide', guide, score: s + 1, i: i++ });
-	}
-	for (const term of GLOSSARY) {
-		const title = [label(termKey(term.id)), term.id.replace(/-/g, ' '), ...(term.aliases ?? [])].join(' ');
-		const s = score(words, title, [label(termShortKey(term.id)), plainText(term.long, text)].join(' '));
-		if (s) hits.push({ kind: 'term', term, score: s, i: i++ });
-	}
-	for (const [href, help] of Object.entries(PAGE_HELP)) {
-		const nav = navPageFor(href);
-		const title = nav ? label(nav.labelKey) : href;
-		const s = score(words, title, plainText(help.summary, text));
-		if (s) hits.push({ kind: 'page', href, score: s, i: i++ });
-	}
-	return hits.sort((a, b) => b.score - a.score || a.i - b.i).map(({ i: _i, ...hit }) => hit as SearchHit);
-}
+export const searchHelp = (query: string, label: Label): SearchHit[] =>
+	searchHelpIn({ guides: GUIDES, terms: GLOSSARY, pages: PAGE_HELP, pageLabel }, query, label);

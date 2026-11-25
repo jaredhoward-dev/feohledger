@@ -30,9 +30,11 @@ class _FakeSortedSet:
         self.store: dict[str, list[tuple[str, float]]] = {}
 
     def zadd(self, key, mapping) -> None:
-        self.store.setdefault(key, [])
+        # Redis semantics: a member is held once; re-adding it moves its score.
+        entries = self.store.setdefault(key, [])
         for member, score in mapping.items():
-            self.store[key].append((member, score))
+            entries[:] = [(m, s) for m, s in entries if m != member]
+            entries.append((member, score))
 
     def zremrangebyscore(self, key, low, high) -> None:
         if key in self.store:
@@ -1444,7 +1446,7 @@ def provider_store_from_settings(monkeypatch, request):
     """
     if "realdb" in request.fixturenames:
         return
-    from app.services import provider_credentials
+    from app.services import credential_crypto, provider_credentials
 
     async def _from_settings(org_id, settings, block, *, db=None):  # noqa: ARG001
         return (settings or {}).get(block)
@@ -1455,8 +1457,20 @@ def provider_store_from_settings(monkeypatch, request):
         cfg = (getattr(org, "settings", None) or {}).get(block)
         return frozenset(provider_credentials.extract_secrets(block, cfg))
 
+    # The cache question the ERP webhooks ask once a source's unseal budget is
+    # spent (§527): a fake org carries its sealed row's envelope, if any, as
+    # `sealed_envelopes[block]`, and the REAL DEK-cache predicate answers.
+    async def _opens_from_cache(org, block, *, db=None):  # noqa: ARG001
+        envelope = (getattr(org, "sealed_envelopes", None) or {}).get(block)
+        if envelope is None:
+            return False
+        return credential_crypto.opens_from_cache(
+            envelope, provider_credentials._context(org.id, block)
+        )
+
     monkeypatch.setattr(provider_credentials, "resolve_block", _from_settings)
     monkeypatch.setattr(provider_credentials, "stored_secret_paths", _paths_from_settings)
+    monkeypatch.setattr(provider_credentials, "stored_block_opens_from_cache", _opens_from_cache)
 
 
 @pytest.fixture

@@ -88,6 +88,28 @@ reaches the deployed site.
 
 The seed script creates 2 organizations, 6 users, 4 roles, 10 vendors, and 10 invoices per tenant.
 
+### Paying by virtual card locally
+
+The demo tenants issue cards through the `mock` provider, which never charges
+them, and a payment run's card leg is paid only once its card's charge settles. To
+finish one, charge the card the way its issuer would (backend venv active):
+
+```bash
+pnpm simulate:card -- --tenant acme --card <card id or mock_card_… token> --settle
+```
+
+The card's `id` is in `GET /api/cards` (or `virtual_cards.id` in the tenant
+database). `--settle` sends the settlement after the authorization; without it the card
+is only authorized and the invoice stays `payment_scheduled` (an authorization is not money
+moved). Add `--amount 90.00` for a short charge. To undo an authorization instead, as the
+issuer would, send `--reverse` (or `--expire`): the card returns to unspent (decisions §544):
+
+```bash
+pnpm simulate:card -- --tenant acme --card <card id or mock_card_… token> --reverse
+```
+Details: [backend/docs/virtual-cards.md](../backend/docs/virtual-cards.md)
+§ Charging a mock card locally.
+
 ## What's Running Where
 
 | Service        | URL                       |

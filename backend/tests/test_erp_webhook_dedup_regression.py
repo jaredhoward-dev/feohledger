@@ -143,7 +143,7 @@ async def _post(*, org, invoice, status_value, correlation_id, erp_document_id, 
             "app.api.erp_webhook.async_sessionmaker",
             return_value=_tenant_session_factory(invoice),
         ),
-        patch("app.api.erp_webhook.transition_invoice", _capture),
+        patch("app.services.erp_status_report.transition_invoice", _capture),
     ):
         await erp_webhook(
             erp_type="generic",
@@ -182,6 +182,7 @@ async def test_distinct_status_events_without_event_id_both_apply(fake_redis):
         currency="USD",
         status=InvoiceStatus.sent_to_erp,
         amount=None,
+        method="ach",  # not a card leg, which would read its card (§537)
         settled_amount=None,
         settled_currency=None,
         settled_amount_unstorable=False,
@@ -251,7 +252,7 @@ async def test_event_id_omitted_from_body_defaults_to_none_not_a_fallback():
             "app.api.erp_webhook.async_sessionmaker",
             return_value=_tenant_session_factory(invoice),
         ),
-        patch("app.api.erp_webhook.transition_invoice", AsyncMock(return_value=invoice)),
+        patch("app.services.erp_status_report.transition_invoice", AsyncMock(return_value=invoice)),
         patch("app.api.erp_webhook.is_event_already_processed", _fake_dedup),
     ):
         await erp_webhook(

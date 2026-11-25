@@ -352,11 +352,15 @@ def verify_settlement(
 COVERAGE_COVERED = "covered"
 COVERAGE_SHORT = "short"
 COVERAGE_UNCERTAIN = "uncertain"
+#: Nothing has moved yet, so there is nothing to cover with: a run's
+#: virtual-card leg whose card the vendor has not charged (decisions §537).
+COVERAGE_IN_FLIGHT = "in_flight"
 
 REASON_NO_SETTLED_AMOUNT = "no_settled_amount_on_record"
 REASON_SETTLED_SHORT = "settled_below_every_authorized_leg"
 REASON_COVERAGE_CURRENCY_UNKNOWN = "settled_currency_matches_no_authorized_leg"
 REASON_SETTLED_AMOUNT_UNSTORABLE = "settled_amount_exceeded_the_column"
+REASON_CARD_NOT_SPENT = "card_not_yet_charged"
 
 #: The shape of ``payments.settled_amount``. Kept beside the code that decides
 #: what may be written into it so the two cannot drift.
@@ -430,6 +434,7 @@ def settlement_coverage(
     source_amount: Decimal | None = None,
     source_currency: str | None = None,
     settled_amount_unstorable: bool = False,
+    awaiting_card_spend: bool = False,
     tolerance: Decimal = SETTLEMENT_AMOUNT_TOLERANCE,
 ) -> SettlementCoverage:
     """Decide whether a recorded settlement discharges the invoice.
@@ -474,6 +479,17 @@ def settlement_coverage(
         garbage report is not an absent one, and must not be laundered into
         "nothing contradicts this invoice being settled".
 
+    ``in_flight``
+        ``awaiting_card_spend`` is set and no figure is on record: a run's
+        virtual-card leg books a ``completed`` payment when the card is MINTED,
+        but no money moves until the vendor charges it. Failing open here
+        counted a spendable, unspent card as payment in full, so an ERP ``paid``
+        for a bill settled outside us closed the invoice while the card could
+        still be charged (decisions §537). The NULL fail-open above is for a
+        rail that moved money and reported no figure; an uncharged card has
+        moved nothing. Callers learn the flag from
+        ``payment_settlement_record.payment_coverage``, which reads the card.
+
     Over-settlement is ``covered``: the vendor received at least what was
     authorized, so the invoice is discharged. It is still flagged by
     ``verify_settlement`` as an ``amount_mismatch`` — recording that too much
@@ -481,6 +497,9 @@ def settlement_coverage(
     """
     if settled_amount_unstorable:
         return SettlementCoverage(state=COVERAGE_UNCERTAIN, reason=REASON_SETTLED_AMOUNT_UNSTORABLE)
+
+    if settled_amount is None and awaiting_card_spend:
+        return SettlementCoverage(state=COVERAGE_IN_FLIGHT, reason=REASON_CARD_NOT_SPENT)
 
     if settled_amount is None:
         return SettlementCoverage(state=COVERAGE_COVERED, reason=REASON_NO_SETTLED_AMOUNT)

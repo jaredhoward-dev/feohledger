@@ -3,6 +3,7 @@
 	import AuthShell from '#lib/components/auth/AuthShell.svelte';
 	import AuthBrandMark from '#lib/components/auth/AuthBrandMark.svelte';
 	import LinkedMessage from '#lib/components/ui/LinkedMessage.svelte';
+	import WorkspaceLookupForm from '#lib/components/auth/WorkspaceLookupForm.svelte';
 	import { api } from '#lib/api.ts';
 	import { m } from '#lib/i18n/store.svelte.ts';
 	import type { MessageKey } from '#lib/i18n/messages.ts';
@@ -24,9 +25,12 @@
 	 * The landing page's "Sign in" links here, and the root layout routes an
 	 * apex `/login` here too.
 	 *
-	 * **The visitor types the address; nothing is looked up.** An email →
-	 * workspace search would tell anyone whether a person is a customer, and
-	 * where — an account-enumeration oracle on a public page. See
+	 * **The visitor types the address; nothing is looked up here.** An email →
+	 * workspace search that answered on the page would tell anyone whether a
+	 * person is a customer, and where — an account-enumeration oracle on a
+	 * public page. A visitor who has forgotten the address uses the form below
+	 * it instead, which only ever tells the mailbox itself, by email
+	 * (`WorkspaceLookupForm`, decisions §518). See
 	 * `#lib/utils/workspaceAddress.ts` and docs/multi-tenancy.md.
 	 */
 
@@ -52,6 +56,8 @@
 	// The deployment's `tenant_url_template`, from the public config. Until it
 	// arrives there is no host to send anyone to, and nothing is guessed.
 	let template = $state<string | null>(null);
+	// hCaptcha sitekey for the "email me my workspace address" form; empty = none.
+	let sitekey = $state('');
 	let configStatus = $state<'loading' | 'ready' | 'error'>('loading');
 	// The host being opened, once the address has been accepted.
 	let goingTo = $state<string | null>(null);
@@ -64,6 +70,7 @@
 		try {
 			const cfg = await api.get<PublicConfig>('/api/public-config');
 			template = cfg.tenant_url_template;
+			sitekey = cfg.hcaptcha_sitekey || '';
 			configStatus = tenantHostSuffix(template) === null ? 'error' : 'ready';
 		} catch {
 			configStatus = 'error';
@@ -202,14 +209,16 @@
 		</button>
 
 		<p class="sub small">{m('marketing.findWorkspace.lost')}</p>
-
-		<p class="footer">
-			<LinkedMessage
-				text={m('marketing.findWorkspace.noWorkspace', { product })}
-				links={{ create: { href: '/signup', label: m('marketing.cta.create') } }}
-			/>
-		</p>
 	</form>
+
+	<WorkspaceLookupForm {sitekey} />
+
+	<p class="footer">
+		<LinkedMessage
+			text={m('marketing.findWorkspace.noWorkspace', { product })}
+			links={{ create: { href: '/signup', label: m('marketing.cta.create') } }}
+		/>
+	</p>
 </AuthShell>
 
 <style>
@@ -320,8 +329,10 @@
 		cursor: pointer;
 	}
 
+	/* Outside the form now (the lookup section sits between them), so it
+	   spaces itself rather than taking the form's gap. */
 	.footer {
-		margin: 0;
+		margin: 18px 0 0;
 		padding-top: 16px;
 		border-top: 1px solid var(--border);
 		font-size: 0.85rem;

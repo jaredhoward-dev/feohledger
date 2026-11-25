@@ -905,6 +905,25 @@ def sync_listing_pages(page_size: int) -> int:
     return -(-SYNC_LISTING_MAX_ROWS // page_size)
 
 
+@dataclass(frozen=True)
+class FoundBill:
+    """A bill :meth:`ErpAdapter.find_posted_bill` found in the ERP for an
+    invoice whose push outcome is unknown (decisions §556). PII-free: the ERP's
+    ids, the total it booked, its currency and where it stands — never the
+    vendor, the lines or a memo."""
+
+    document_id: str
+    document_number: str | None
+    amount: Decimal | None
+    currency: str | None
+    status: ErpInvoiceStatus
+
+
+#: :attr:`ErpAdapter.bill_void_scope` values.
+BILL_VOID_ANY = "any"
+BILL_VOID_DRAFT_ONLY = "draft_only"
+
+
 class ErpAdapter:
     """Base class for ERP integrations. Subclass and implement all methods."""
 
@@ -935,9 +954,32 @@ class ErpAdapter:
     #: True when :meth:`revoke_stored_access` calls the provider, so tenant
     #: deletion defers it past a closure's commit like an OAuth revoke.
     revokes_stored_access: bool = False
+    #: Which bills :meth:`void_invoice` can void (decisions §542):
+    #: ``BILL_VOID_ANY`` — any bill nothing has been paid on;
+    #: ``BILL_VOID_DRAFT_ONLY`` — only a bill the ERP still holds as a draft or
+    #: pending approval (``get_invoice_status`` reads ``draft``), because its
+    #: API can only delete one and offers no void for a posted bill.
+    #: ``services/erp_bill_void`` reads it from the class, so the exception
+    #: queue can say so before anyone presses the button.
+    bill_void_scope: str = BILL_VOID_ANY
+    #: True for an adapter whose push's pre-create idempotency lookup is also
+    #: offered on its own, read-only, as :meth:`find_posted_bill`: how a person
+    #: names the bill a timed-out push may have left in the ERP (decisions
+    #: §556). ``services/erp_bill_void`` reads it from the class.
+    supports_bill_lookup: bool = False
 
     def __init__(self, config: dict):
         self.config = config
+
+    def status_sync_on(self) -> bool:
+        """Does THIS tenant's connection sync bills back and take write-backs?
+
+        ``supports_status_sync`` says the adapter can; this says the tenant's
+        configuration lets it. The default is the capability itself. An adapter
+        whose status-sync calls are not yet proven against the real ERP makes
+        it an explicit per-tenant opt-in instead (NetSuite, decisions §541).
+        Read through :func:`reports_status_back`, never the class constant."""
+        return self.supports_status_sync is True
 
     async def revoke_stored_access(self) -> str | None:
         """End, at the provider, the access this adapter's stored credentials
@@ -965,6 +1007,13 @@ class ErpAdapter:
 
     async def void_invoice(self, erp_document_id: str) -> bool:
         """Request cancellation of a posted invoice."""
+        raise NotImplementedError
+
+    async def find_posted_bill(self, payload: InvoicePayload) -> FoundBill | None:
+        """The bill an earlier push of ``payload`` left in the ERP, by the same
+        match the push's own idempotency lookup uses, or None when the ERP has
+        none (decisions §556). Read-only: GETs and queries, never a write. A
+        lookup that cannot finish raises; it is never read as "not posted"."""
         raise NotImplementedError
 
     def call_budget(self) -> CallBudget | None:
@@ -1052,7 +1101,7 @@ class ErpAdapter:
 
     # -- status sync-back + payment write-back (decisions §295) -------------
     #
-    # Every caller checks ``supports_status_sync`` first, and an adapter without
+    # Every caller checks :func:`reports_status_back` first, and an adapter without
     # it keeps the old behaviour (the push closes the invoice at ``done``;
     # ``payment_erp_sync`` writes nothing back). The defaults below are
     # therefore the honest answer of an ERP that does not report back, and each
@@ -1097,3 +1146,23 @@ class ErpAdapter:
         applied to it — the change-data-capture backstop for lost webhooks.
         Raises rather than return a partial list. Default: none reported."""
         return []
+
+
+def reports_status_back(adapter: object | None) -> bool:
+    """The one effective status-sync predicate (decisions §295, §541).
+
+    True only for an adapter whose class supports status sync AND whose
+    tenant's configuration turns it on (:meth:`ErpAdapter.status_sync_on`).
+    Every reader that decides whether a push stays payable at
+    ``posted_in_erp``, whether the sweep reads a tenant's bills, whether a
+    payment is written back, or whether the poll sweep leaves a tenant to the
+    status-sync path goes through this, so an adapter the tenant has not opted
+    in behaves exactly as one without the capability. A stand-in that is not an
+    :class:`ErpAdapter` (a test double) is read by its capability flag alone.
+    """
+    if adapter is None:
+        return False
+    method = getattr(adapter, "status_sync_on", None)
+    if callable(method):
+        return method() is True
+    return getattr(adapter, "supports_status_sync", False) is True

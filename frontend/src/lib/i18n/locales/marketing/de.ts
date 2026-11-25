@@ -136,5 +136,16 @@ export const messages = {
 	'marketing.findWorkspace.noWorkspace': 'Neu bei {product}? {create}',
 	'marketing.findWorkspace.panelHeading': 'Warum wir nach der Adresse fragen',
 	'marketing.findWorkspace.panelBody':
-		'Jedes Unternehmen hat einen eigenen Arbeitsbereich mit eigener Anmeldung. Wir suchen einen Arbeitsbereich nie anhand einer E-Mail-Adresse heraus – so kann niemand über diese Seite herausfinden, wo jemand arbeitet.'
+		"Jedes Unternehmen hat einen eigenen Arbeitsbereich mit eigener Anmeldung. Diese Seite zeigt nie, zu welchem Arbeitsbereich eine E-Mail-Adresse gehört: Haben Sie Ihren vergessen, senden wir ihn an diese Adresse – so kann niemand über diese Seite herausfinden, wo jemand arbeitet.",
+	'marketing.findWorkspace.lookup.heading': "Adresse Ihres Arbeitsbereichs vergessen?",
+	'marketing.findWorkspace.lookup.intro': "Geben Sie die E-Mail-Adresse ein, mit der Sie sich anmelden. Gehört sie zu einem Konto, senden wir ihr einen Link zur Anmeldeseite ihres Arbeitsbereichs.",
+	'marketing.findWorkspace.lookup.label': "E-Mail-Adresse",
+	'marketing.findWorkspace.lookup.submit': "Adresse meines Arbeitsbereichs senden",
+	'marketing.findWorkspace.lookup.sending': "Wird gesendet …",
+	'marketing.findWorkspace.lookup.invalid': "Geben Sie eine gültige E-Mail-Adresse ein.",
+	'marketing.findWorkspace.lookup.failed': "Das konnten wir nicht senden. Prüfen Sie Ihre Verbindung und versuchen Sie es erneut.",
+	'marketing.findWorkspace.lookup.sentHeading': "Prüfen Sie Ihr Postfach",
+	'marketing.findWorkspace.lookup.sent': "Wenn {email} zu einem Konto gehört, haben wir einen Link zur Anmeldeseite des Arbeitsbereichs dorthin gesendet. Das kann einige Minuten dauern – sehen Sie auch im Spam-Ordner nach.",
+	'marketing.findWorkspace.lookup.again': "Andere Adresse verwenden",
+	'marketing.footer.findWorkspace': "Arbeitsbereich vergessen?"
 } satisfies MarketingMessages;

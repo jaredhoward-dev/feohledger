@@ -3660,8 +3660,16 @@ class AppLocalizationsJa extends AppLocalizations {
       'ERP ではこの請求書が、少なくとも一部は ERP 側で適用された仕入先の貸方票で消し込まれています。未払い額を誰かが確認するまで、FeohLedger はこれを支払いません。';
 
   @override
+  String get exceptionDescriptionErpSettledNoPayment =>
+      'ERP ではこの請求書に未払い残高はありませんが、支払いの記録もありません（ERP 側で貸方票が適用されたか、残高が償却されています）。未払い額を誰かが確認するまで、FeohLedger はこれを支払いません。';
+
+  @override
   String get exceptionDescriptionErpPaidWhileScheduled =>
       'ERP ではこの請求書が FeohLedger 以外の支払いで支払済みになっていますが、FeohLedger でも支払いが予定されています。両方が仕入先に届く前に、どちらかを停止または無効にしてください。';
+
+  @override
+  String get exceptionDescriptionErpPaidWhilePaymentInFlight =>
+      'ERP ではこの請求書が支払済みになっていますが、FeohLedger の支払いはまだ完了していません。何かを無効にする前に、その記録が FeohLedger の支払いなのか、2 件目の支払いなのかを確認してください。';
 
   @override
   String get exceptionDescriptionErpPaidTwice =>
@@ -3879,6 +3887,21 @@ class AppLocalizationsJa extends AppLocalizations {
     String paymentId,
   ) {
     return '支払い $paymentId はキャンセルされましたが、以前の送信試行が決済代行会社に届いた可能性がある時点で中断されたため、資金が移動したかどうかは不明です。決済代行会社に確認し、取消または再支払いを行ってください。解決するまで、この請求書は新しい支払実行の対象外です。';
+  }
+
+  @override
+  String exceptionDescriptionCardSettledAfterCancel(String lastFour) {
+    return '末尾 $lastFour のカードが取消後に請求されたため、この請求書は二重に支払われた可能性があります。カード発行会社でその請求を確認し、この請求書の他の支払いと照合して重複分を回収してください。解決するまで、この請求書は新しい支払実行の対象外です。';
+  }
+
+  @override
+  String exceptionDescriptionCardSettlementRefused(String lastFour) {
+    return '末尾 $lastFour のカードの決済は有効な金額がなかったため拒否されました。記録されないままカードで資金が動いた可能性があります。カード発行会社でその請求を確認してください。解決するまで、このカードは取消できず、この請求書は新しい支払実行の対象外です。';
+  }
+
+  @override
+  String exceptionDescriptionCardClearingRefused(String lastFour) {
+    return '末尾 $lastFour のカードへの追加請求が記録されていないため、この請求書への支払額は表示より多い可能性があります。カード発行会社でその請求を確認し、差額を記録してください。解決するまで、この請求書は新しい支払実行の対象外です。';
   }
 
   @override
@@ -4704,6 +4727,9 @@ class AppLocalizationsJa extends AppLocalizations {
 
   @override
   String get notificationEventChatMessage => '新しいメッセージ';
+
+  @override
+  String get notificationEventErpBillFlagged => 'ERP登録済みの請求書へのフラグ';
 
   @override
   String get notificationEventOther => '通知';

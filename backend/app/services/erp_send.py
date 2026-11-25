@@ -192,7 +192,8 @@ async def start_erp_send(
     first). ``inline_dispatch``: await the local send instead of scheduling it,
     for a caller on a worker loop that closes when its job returns.
     ``trigger_details``: extra fixed literals for the transition's audit row
-    beside ``trigger`` (the recovery sweep marks its push ``recovered``).
+    beside ``trigger`` (the recovery sweep marks its push ``recovered``), on
+    the ``invoice.erp_retried`` row of a retry as on ``invoice.erp_submitted``.
 
     The dispatch runs after the commit, so the dispatcher never reads an
     uncommitted ``sending_to_erp``. When it raises (an SQS send), nothing will
@@ -232,15 +233,29 @@ async def start_erp_send(
     status_refusal = erp_send_status_refusal(invoice, retry=retry)
     if status_refusal is not None:
         raise HTTPException(status_code=409, detail=status_refusal)
+    # A void of the bill an earlier attempt left in the ERP is calling the ERP
+    # right now, with no lock held (decisions §556): a push now would find that
+    # bill by its idempotency lookup and record it as this invoice's just as it
+    # is voided. Under the lock, so the void's own status check sees the move.
+    from app.services.erp_bill_void import ERP_VOID_IN_PROGRESS, live_pending, refusal_message
+
+    if live_pending(invoice) is not None:
+        from app.api.refusals import coded_refusal
+
+        raise HTTPException(
+            status_code=409,
+            detail=coded_refusal(ERP_VOID_IN_PROGRESS, refusal_message(ERP_VOID_IN_PROGRESS)),
+        )
 
     # Commits before raising, so an exception `/complete`'s `refresh_warnings`
     # just opened survives the refusal that names it (see the gate).
     await refuse_blocked_erp_export(db, invoice)
 
+    marker = {"trigger": trigger, **(trigger_details or {})} if trigger else None
     if retry:
         from app.services.erp import retry_erp
 
-        await retry_erp(db, invoice, actor_id=actor_id)
+        await retry_erp(db, invoice, actor_id=actor_id, details=marker)
     else:
         from app.services.erp import reset_erp_push_budget
 
@@ -253,7 +268,7 @@ async def start_erp_send(
             InvoiceStatus.sending_to_erp,
             actor_id=actor_id,
             action_name="invoice.erp_submitted",
-            details={"trigger": trigger, **(trigger_details or {})} if trigger else None,
+            details=marker,
         )
     await db.commit()
 
@@ -532,8 +547,13 @@ async def _record_refusal(
     actor_id: uuid.UUID | None,
     exc: HTTPException,
     extra: dict | None = None,
+    action: str = AUTO_SEND_REFUSED_ACTION,
+    trigger: str = AUTO_SEND_TRIGGER,
 ) -> None:
     """The `invoice.erp_auto_send_refused` row: the code and params only.
+
+    ``action`` / ``trigger``: the call-budget re-send sweep records its own
+    refusal with the same shape (`services/erp_budget_retry_sweep`, §521).
 
     Every gate on this path raises a coded refusal (`api/refusals.coded_refusal`)
     whose params are fixed literals (a plan feature, an exception type, a flag),
@@ -545,17 +565,17 @@ async def _record_refusal(
     detail = exc.detail if isinstance(exc.detail, dict) else {}
     code = detail.get("code")
     params = detail.get("params") if isinstance(detail.get("params"), dict) else {}
-    _log.info("ERP auto-send refused for invoice %s: %s (%s)", invoice_id, code, exc.status_code)
+    _log.info("ERP %s refused for invoice %s: %s (%s)", trigger, invoice_id, code, exc.status_code)
     await dispatch_audit(
         db,
         correlation_id=correlation_id,
         organization_id=organization_id,
         actor_id=actor_id,
-        action=AUTO_SEND_REFUSED_ACTION,
+        action=action,
         entity_type="invoice",
         entity_id=invoice_id,
         details={
-            "trigger": AUTO_SEND_TRIGGER,
+            "trigger": trigger,
             "status_code": exc.status_code,
             "refusal": {"code": code, "params": params},
             **(extra or {}),

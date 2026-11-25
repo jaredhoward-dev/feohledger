@@ -5,21 +5,25 @@ names the root cause, the evidence, blast radius, and a recommended fix
 approach — this is a staging area for real problems, not a place to let them
 go stale. See root `CLAUDE.md` guard rail 6 (no dangling deferred findings).
 
-**Eight entries are open**: the run builder reading
-a missing invoice currency as USD (found 2026-10-21), the app rendering nothing when browser
-storage is blocked (found 2026-10-20),
-the expense-report Attach dead end found while
-writing the help centre, the `all`-mode approval-chain segregation deadlock,
+**Four entries are open**: the `all`-mode approval-chain segregation deadlock,
 an out-of-office delegation that cannot stand in on an `all`-mode level (found
 2026-11-24),
-the legal-contents smooth-scroll race and the e2e cleanup race directly below,
-and the `payments/` local-e2e flake near the bottom. The `/complete` amount
+the legal-contents smooth-scroll race directly below,
+and the `payments/` local-e2e flake near the bottom. The e2e cleanup race
+(`deleteInvoicesWhere`), found 2026-10-05, was struck on 2026-11-25 (decisions
+§523) and sits struck in place. The run builder reading
+a missing invoice currency as USD, found 2026-10-21, was fixed on 2026-11-18
+(decisions §457) but left open here until 2026-11-25; it sits struck in place.
+The expense-report Attach dead end, found writing the help centre, was struck
+on 2026-11-25 (§515). The `/complete` amount
 floor approving an invoice whose PO was never matched, found and struck on
 2026-11-15, sits struck above the run-builder entry. Merge.dev's vendor listing
 calling an endpoint Merge does not publish, found and struck on 2026-10-26, sits
 struck at the top. The payment mock tests that failed locally in one pytest
 process, found and struck on 2026-10-31, sit struck above the run-builder
-entry. The remove-tenant backup deletion the VM's IAM role refused, found
+entry. The app rendering nothing when browser storage is blocked, found
+2026-10-20, was struck on 2026-11-25 (decisions §514) and sits struck in
+place. The remove-tenant backup deletion the VM's IAM role refused, found
 2026-10-18, was struck on 2026-11-24 (#757, decisions §490) and sits struck in
 place. The paid-plan features no
 route enforced and the direct ERP adapters posting bills without the ERP's
@@ -36,10 +40,11 @@ this note has now warned about twice. Two defects were **fixed on 2026-09-17**:
 the `/organization` 320px reflow defect (issue #432), along with six more routes
 that failed the same criterion and had no entry at all because nothing measured
 them; and the local-e2e `alembic` drift, which now has a pre-run guard that
-refuses to start against a stale database. Twenty-two of the thirty `##`
+refuses to start against a stale database. Twenty-seven of the thirty-one `##`
 entries are now `~~struck-through~~` resolved stubs. (This line said "the other
 fifteen" while the file held fifteen struck in total, the two above included,
-and later "seventeen of the twenty-four" while nineteen were struck.)
+later "seventeen of the twenty-four" while nineteen were struck, and then
+"twenty-two of the thirty" while twenty-three of thirty-one were.)
 They are kept because the *diagnosis* is the
 expensive part and is worth not re-deriving. Add a new entry at the top when a
 defect is diagnosed but can't be fixed in the same session.
@@ -212,7 +217,23 @@ the floor's purpose for PO-less spend and is the recommended default. Test
 beside `tests/test_invoice_complete_auto_approve.py`: a below-floor invoice
 citing an unknown PO is not approved and carries `po_mismatch`.
 
-## The run builder reads a missing invoice currency as USD
+## ~~The run builder reads a missing invoice currency as USD~~ — FIXED 2026-11-18
+
+**Fixed** in round 16 (decisions §453, §457), by the first fix this entry
+recommends: a missing currency is refused, never counted as a value.
+`payment_runs.run_refusal_reasons` refuses an invoice whose
+`payable_currency_code` is `None` (NULL, blank, whitespace-only or malformed)
+as `currency_unknown`, so `create_payment_run_for_invoices` answers 409
+`currency_unknown: … <invoice numbers>` before any total or CFO comparison, and
+the mixed-currency 422 leaves the blank out rather than counting it as a second
+currency. `POST /api/payments/runs` and the copilot's `/draft-run` (which skips
+it under its own `currency_unknown` code) share that builder; dispatch,
+`POST /api/payments`, corridor quotes and the card mint refuse it too. Pinned
+by `backend/tests/test_payment_run_currency.py::test_payment_run_refuses_an_invoice_with_no_currency`
+(NULL, `""` and spaces; alone and batched with a USD invoice, nothing booked).
+The entry stayed open for a week after the fix because §457 did not strike it;
+re-verified against the code on 2026-11-25. The `or "USD"` defaults still in
+`app/` default the org's *reporting* currency setting, not an invoice's.
 
 **Found 2026-10-21**, in the money-path review of the ERP push gate (decisions
 §309); diagnosed from the code, not reproduced. `services/payment_runs.create_payment_run_for_invoices`
@@ -232,7 +253,20 @@ invoice's own currency.
 refuse the run, naming the invoice, until the currency is set), with a pytest
 beside `tests/test_payment_run_flow.py`'s mixed-currency case.
 
-## The app renders nothing when the browser blocks site storage
+## ~~The app renders nothing when the browser blocks site storage~~ — FIXED 2026-11-25
+
+**Resolution (`docs/decisions.md` §514).** Every storage access now goes
+through `frontend/src/lib/utils/safeStorage.ts`: blocked storage reads as empty
+(signed out, consolidated entity, default locale) and a write that cannot land
+is dropped. `/login` and the supplier portal's `/portal/login` show a localized
+notice that the browser is blocking site storage, so a sign-in cannot last.
+Guarded by `src/lib/utils/safeStorage.test.ts`, `src/lib/tokenStorage.test.ts`
+and `tests-e2e/auth/storage-blocked.spec.ts`. The diagnosis below was right
+about the three token / entity modules but missed one: `ConsentBanner.svelte`'s
+`getConsent()` was NOT wrapped — `typeof localStorage` runs the throwing
+getter — and it runs in the root layout. It also missed the login page's MFA
+challenge write and `api/expenses.ts`'s own token read. The original
+diagnosis stands below.
 
 **Found 2026-10-20**, building the light theme (decisions §289), whose own
 storage access is wrapped and was being tested for exactly this case.
@@ -452,7 +486,19 @@ against their REST counterparts in the same change. Trigger: next change to the
 assistant, or before the assistant is enabled for a production tenant, whichever
 is first.
 
-## An expense report's Attach asks for an expense ID the UI never shows
+## ~~An expense report's Attach asks for an expense ID the UI never shows~~ — FIXED 2026-11-25
+
+**Resolution (round 42, `docs/decisions.md` §515).** Done as recommended. The
+report's attach control is `ui/ExpensePicker`, a `SearchPicker` over
+`GET /api/expenses?attachable=true` (the caller's own loose draft lines plus
+unrecorded ones, the attach gate's rule), and the expenses list's bulk bar has
+**Add to report** over the caller's own draft reports
+(`GET /api/expense-reports?mine=true&status=draft`). The "submit expenses" help
+guide describes both. One correction to the diagnosis below: by the time it
+was fixed the text box had gained a datalist suggesting the loaded page's own
+loose lines, still by id and only for the loaded page, so the dead end stood.
+The original diagnosis stands below.
+
 
 **Root cause.** On `/expenses`, a draft report's attach control is a text box
 labelled "Expense ID to attach". No surface in the web app displays an
@@ -570,7 +616,22 @@ drop smooth scrolling on these pages altogether. Either is a design call on #467
 behaviour, so it was not made inside a CI fix. Trigger: the next change to
 `LegalPage.svelte`'s contents list, or any report of a section jump landing short.
 
-## `deleteInvoicesWhere` races the backend's own workers on a just-resubmitted invoice
+## ~~`deleteInvoicesWhere` races the backend's own workers on a just-resubmitted invoice~~ — FIXED 2026-11-25
+
+**Resolution (`docs/decisions.md` §523).** The helper now runs its whole
+teardown as ONE transaction (`tenantPsqlTransaction`: `psql
+--single-transaction -v ON_ERROR_STOP=1`) whose first statement locks the
+matching invoices with `SELECT … FOR UPDATE`, exactly as recommended below. A
+worker's child insert needs `FOR KEY SHARE` on its invoice for the FK check, so
+it either committed before the lock was granted (and the child deletes, each on
+a fresh READ COMMITTED snapshot, remove its row) or waits for the teardown to
+commit and then fails its own FK check against the deleted invoice — the
+worker's transaction rolls back, not the spec. Both orders were probed against
+a scratch Postgres database with two sessions. Nothing retries. The payment-run
+and virtual-card sub-graphs it delegates to now come from statement builders
+(`paymentRunDeleteStatements`, `virtualCardDeleteStatements`), so they run
+inside the same transaction; the standalone `deletePaymentRunsWhere` keeps its
+statement-at-a-time shape. The original diagnosis stands below.
 
 **Seen:** 2026-10-05, `tests-e2e/portal/rejected-invoice.spec.ts` ("the vendor
 can revise & resubmit a rejected invoice"), once in two runs, on a local stack.

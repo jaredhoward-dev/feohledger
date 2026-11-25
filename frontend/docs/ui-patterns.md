@@ -385,6 +385,9 @@ Pill-shaped search input with a magnifier-glass SVG. Single component:
 />
 ```
 
+- `oninput` (optional) is called with the new text on every keystroke —
+  for writing it to the URL from the input event rather than from an
+  `$effect`, which would also run at mount (`routes/portal/help/+page.svelte`).
 - Debounce search before fetching (250–300ms is the convention; see
   `routes/admin/+page.svelte` and `routes/invoices/+page.svelte`).
 - Server-side filter via `?search=` param. Backend uses ILIKE on the
@@ -882,19 +885,34 @@ centred dialog with backdrop-click + Esc to close:
   `<svelte:window>` listener a dialog needs stays in the caller.
 - Cancel sits left of the primary action. Required-field markers use
   `<em class="required">*</em>`.
-- **A `<label>` in a dialog is a stacked field by default.** `app.css`'s
-  `.modal label` is column flex and styles every direct-child `<span>` as a
-  small uppercase muted caption — right for "Vendor name" over an input, wrong
-  for a radio card. A choice list drawn as cards (one native radio per
-  `<label>`, inside a `<fieldset>` with a `<legend>`) sets `flex-direction:
-  row` on the card and resets `text-transform` / `letter-spacing` /
-  `font-size` / `color` on its own child spans, or it renders as a centred
-  stack of shouting captions (the `/billing` plan picker did, in production).
-  Put the focus ring on the card (`:has(input:focus-visible)`, as
-  `SegmentedControl` does) and mark the selection with border + ring, not an
+- **A `<label>` in a dialog is a stacked field, unless it wraps a choice.**
+  `app.css`'s `.modal label` is column flex and styles every direct-child
+  `<span>` as a small uppercase muted caption — right for "Vendor name" over
+  an input. It skips a label whose direct child is its own checkbox or radio
+  (a choice row: `display: flex`, row, centred, 8px gap by default) and any
+  `.radio-card`, so neither renders as a centred stack of shouting captions
+  (the `/billing` plan picker did, in production; decisions §516).
+- **Radio choices in a dialog are `.radio-card`s.** One native radio per
+  `<label class="radio-card">`, inside a `<fieldset>` with a `<legend>`
+  (visually hidden when the dialog's heading already names the group); add
+  `radio-card-group` to the fieldset to stack the cards 8px apart (it leaves
+  the fieldset's border and legend to you). The shared class (`app.css`) owns
+  the row layout, sentence-case text, the 24px minimum target, the selected
+  state (an `--accent` border + 1px ring via `:has(input:checked)`, never an
   `--accent-tint` fill: muted text on that fill drops under 4.5:1 in the dark
-  theme. Reference: `routes/billing/+page.svelte` (`.plan-option`); guard:
-  `tests-e2e/billing/billing.spec.ts` ("the picker is one radio group").
+  theme), the focus ring on the card (`:has(input:focus-visible)`, as
+  `SegmentedControl` does) and the disabled state (`--text-muted`, never
+  opacity). A component styles only its option's own content (the plan
+  picker's price column, the GL candidate's monospace id) and may override
+  alignment or padding from its own scoped class. Users: `/billing` plan
+  picker, `GlAccountErpLinkModal`, `RecordInspectionModal`,
+  `VendorStatementReconModal` (intake mode, side by side), `/admin/webhooks`
+  rotation overlap, `/discounts` accept tier, and the inline
+  `ErpCompanyPicker` on `/organization`. Guard:
+  `src/lib/a11y/radioCard.test.ts` (every radio `<label>` inside a `<Modal>`
+  or a `*Modal.svelte` carries the class; the class's layout, target and
+  contrast in both themes); behaviour guard: `tests-e2e/billing/billing.spec.ts`
+  ("the picker is one radio group").
 - **A long dialog keeps its decisions out of the scroll.** When a dialog's body
   runs past one screen (the invoice dialog's right pane: summary, fields, line
   items, activity, chat, e-invoice), split the `<form>` into a scrolling region

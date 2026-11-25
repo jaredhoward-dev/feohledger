@@ -7,6 +7,7 @@ Supports 2-way (invoice vs PO), 3-way (invoice vs PO vs GR), and 4-way
 import uuid
 from dataclasses import asdict, dataclass, field
 from decimal import Decimal, InvalidOperation
+from fractions import Fraction
 
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -231,9 +232,11 @@ class MatchResult:
     #: `to_json_dict()` like every other figure here.
     ordered_quantity: Decimal | None = None
     received_quantity: Decimal | None = None
-    #: 3-way, SHORT receipt only: the slice of ``po_total`` the received units
-    #: cover (``po_total × received / ordered``), in the invoice's currency.
-    #: ``None`` when nothing is short, or the two currencies differ.
+    #: 3-way, SHORT receipt only: the slice of ``po_total`` the received goods
+    #: are worth, in the invoice's currency — per PO line at each line's own
+    #: price where the lines are priced, else ``po_total × received / ordered``
+    #: (``_received_value``; the basis is ``details["receipt_valuation"]``).
+    #: ``None`` when nothing of value is outstanding, or the currencies differ.
     received_value: Decimal | None = None
     #: The invoice bills MORE than ``received_value`` by more than the match
     #: tolerance — paying it would pay for goods that have not arrived. This,
@@ -399,6 +402,7 @@ async def match_invoice_to_po(
     # Which receipts count is `_live_receipts`.
     grs, all_receipts_cancelled = await _live_receipts(db, po, entity_id)
     gr = grs[0] if grs else None
+    receipt_valuation: str | None = None
 
     if gr or all_receipts_cancelled:
         result.match_type = "3-way"
@@ -418,20 +422,6 @@ async def match_invoice_to_po(
                 result.issues.append(_partial_receipt_issue(po_qty_total, gr_qty_total))
                 if result.status == "matched":
                     result.status = "partial"
-                # Does the invoice bill beyond what arrived? Same exact-Decimal
-                # tolerance as the amount leg, measured against the received
-                # slice of the PO rather than its whole total. Skipped when the
-                # currencies differ or the PO's total is unverifiable — each is
-                # already a mismatch with no figure to measure against.
-                if (
-                    result.currency_check != CURRENCY_DIFFERENT
-                    and not result.po_total_unverifiable_reason
-                ):
-                    received_value = po_total * gr_qty_total / po_qty_total
-                    result.received_value = received_value
-                    result.billed_beyond_receipt = _bills_beyond(
-                        invoice_amount, received_value, tolerance
-                    )
             elif po_qty_total > 0 and gr_qty_total > po_qty_total:
                 # Over-receipt. The short side was flagged from the start; the
                 # long side never was, so more units booked in than were ever
@@ -443,6 +433,27 @@ async def match_invoice_to_po(
                 # gate that decides whether the invoice is payable.
                 result.over_receipt = True
                 result.issues.append(_over_receipt_issue(po_qty_total, gr_qty_total))
+
+            # Does the invoice bill beyond what arrived? Same exact-Decimal
+            # tolerance as the amount leg, measured against what the received
+            # goods are worth (`_received_value`: per PO line when the lines
+            # are priced) rather than the whole total. Per line this also
+            # catches a short line hidden by an over-received one, which the
+            # quantity sums above read as complete. Skipped when the
+            # currencies differ or the PO's total is unverifiable — each is
+            # already a mismatch with no figure to measure against.
+            if (
+                result.currency_check != CURRENCY_DIFFERENT
+                and not result.po_total_unverifiable_reason
+            ):
+                received_value, receipt_valuation = _received_value(
+                    po, grs, po_total, po_qty_total, gr_qty_total
+                )
+                if received_value is not None:
+                    result.received_value = received_value
+                    result.billed_beyond_receipt = _bills_beyond(
+                        invoice_amount, received_value, tolerance
+                    )
 
     # 4-way match: the inspection of these goods (`_latest_inspection_for`).
     inspection = await _latest_inspection_for(db, po, gr)
@@ -466,6 +477,7 @@ async def match_invoice_to_po(
         all_receipts_cancelled=all_receipts_cancelled,
         has_inspection=inspection is not None,
     )
+    result.details["receipt_valuation"] = receipt_valuation
 
     return result
 
@@ -654,6 +666,132 @@ def _receipt_quantities(
         Decimal("0"),
     )
     return ordered, received
+
+
+#: ``details["receipt_valuation"]`` — how ``received_value`` was worked out.
+#:
+#: ``per_line``  every ordered line is priced, so each received unit is worth
+#:               its own line's unit price (``_per_line_received_share``).
+#: ``pro_rata``  some ordered line carries no price, so the received units are
+#:               worth ``po_total × received / ordered``, the figure before
+#:               per-line valuation (decisions §249, §519).
+RECEIPT_VALUATION_PER_LINE = "per_line"
+RECEIPT_VALUATION_PRO_RATA = "pro_rata"
+
+
+def _per_line_received_share(po: PurchaseOrder, grs: list[GoodsReceipt]) -> Fraction | None:
+    """The share of the PO's goods value that live receipts cover, in [0, 1],
+    exact — or ``None`` when the lines cannot be priced.
+
+    * **Which lines carry value.** A line with an ordered quantity above zero
+      and a positive value: its ``total``, else ``quantity × unit_price``. A
+      line with no quantity (freight, a service charge) or a value of zero or
+      less (a free item, a discount line) is not goods anyone receives, and
+      what it adds to or takes off the PO total is spread over the goods lines
+      by the caller's scale to ``po_total``, as tax and header discounts are.
+      One goods line with neither price nor total makes the whole PO
+      unpriceable: valuing its units at nothing would hold every bill on the
+      PO, and at anything else would be a guess.
+    * **A receipt line naming one of this PO's lines** counts for that line, up
+      to the quantity ordered on it: units beyond the order cover nothing that
+      was ordered. One naming a line that carries no value covers nothing.
+    * **A receipt line naming no line of this PO** (a free-text line, or one
+      written before ``gr_line_items.po_line_item_id`` existed) fills the
+      cheapest outstanding units first. Nothing records which goods it was, so
+      it is given the lowest value it could have: what holds on that lower
+      bound is never a bill for goods the receipt proved arrived.
+
+    Arithmetic is ``Fraction`` throughout, so the share is exact whatever the
+    quantities; the caller turns it into ``Decimal`` once.
+    """
+    lines: dict[object, tuple[Fraction, Fraction]] = {}
+    order: list[tuple[Fraction, str, int, object]] = []
+    all_line_ids: set[object] = set()
+    for index, li in enumerate(po.line_items):
+        line_id = getattr(li, "id", None)
+        if line_id is not None:
+            all_line_ids.add(line_id)
+        quantity = _to_decimal(li.quantity)
+        if not quantity.is_finite() or quantity <= 0:
+            continue
+        total = getattr(li, "total", None)
+        unit_price = getattr(li, "unit_price", None)
+        if total is not None:
+            value = _to_decimal(total, Decimal("NaN"))
+        elif unit_price is not None:
+            value = quantity * _to_decimal(unit_price, Decimal("NaN"))
+        else:
+            return None
+        if not value.is_finite():
+            return None
+        if value <= 0:
+            continue
+        key = line_id if line_id is not None else ("index", index)
+        lines[key] = (Fraction(quantity), Fraction(value))
+        unit = Fraction(value) / Fraction(quantity)
+        order.append((unit, str(line_id), index, key))
+    goods_value = sum((v for _, v in lines.values()), Fraction(0))
+    if goods_value <= 0:
+        return None
+
+    received: dict[object, Fraction] = {}
+    unlinked = Fraction(0)
+    for g in grs:
+        for gl in g.line_items:
+            qty = _to_decimal(gl.quantity_received)
+            if not qty.is_finite() or qty <= 0:
+                continue
+            target = getattr(gl, "po_line_item_id", None)
+            if target is not None and target in lines:
+                received[target] = received.get(target, Fraction(0)) + Fraction(qty)
+            elif target is not None and target in all_line_ids:
+                continue  # a line of this PO that carries no goods value
+            else:
+                unlinked += Fraction(qty)
+
+    covered = Fraction(0)
+    outstanding: dict[object, Fraction] = {}
+    for key, (quantity, value) in lines.items():
+        taken = min(received.get(key, Fraction(0)), quantity)
+        covered += taken * value / quantity
+        outstanding[key] = quantity - taken
+    for unit, _, _, key in sorted(order):
+        if unlinked <= 0:
+            break
+        taken = min(unlinked, outstanding[key])
+        covered += taken * unit
+        unlinked -= taken
+    return covered / goods_value
+
+
+def _received_value(
+    po: PurchaseOrder,
+    grs: list[GoodsReceipt],
+    po_total: Decimal,
+    ordered: Decimal,
+    received: Decimal,
+) -> tuple[Decimal | None, str]:
+    """What the live receipts on ``po`` are worth of ``po_total``, and how
+    that was worked out (``RECEIPT_VALUATION_*``) — ``None`` when nothing of
+    value is outstanding, which is a full receipt as far as billing goes.
+
+    Per line where every goods line is priced (``_per_line_received_share``,
+    scaled to ``po_total`` so tax, freight and discounts the total carries are
+    spread over the goods in proportion to their value). Otherwise the
+    proportional figure, and only on an aggregate short receipt, exactly as
+    before per-line valuation. ``ordered`` / ``received`` are
+    ``_receipt_quantities``' sums. The one figure the per-invoice receipt
+    leg, a split's legs and the cumulative ``po_billed_beyond_receipt``
+    warning all read (``MatchResult.received_value``)."""
+    share = _per_line_received_share(po, grs)
+    if share is None:
+        if ordered > 0 and received < ordered:
+            return po_total * received / ordered, RECEIPT_VALUATION_PRO_RATA
+        return None, RECEIPT_VALUATION_PRO_RATA
+    if share >= 1:
+        return None, RECEIPT_VALUATION_PER_LINE
+    value = Fraction(po_total) * share
+    return Decimal(value.numerator) / Decimal(value.denominator), RECEIPT_VALUATION_PER_LINE
 
 
 async def _latest_inspection_for(
@@ -901,7 +1039,7 @@ async def _match_split(
     any_receipt_evidence = False
     any_all_cancelled = False
     quantified = False
-    short = over = False
+    short = over = value_short = False
     ordered_sum = received_sum = Decimal("0")
     covered = Decimal("0")
     inspected: list[QualityInspection] = []
@@ -913,6 +1051,7 @@ async def _match_split(
         gr = grs[0] if grs else None
         any_all_cancelled = any_all_cancelled or all_cancelled
         leg_value = total
+        leg_valuation = None
         quantities = None
         if gr or all_cancelled:
             any_receipt_evidence = True
@@ -927,10 +1066,15 @@ async def _match_split(
             if ordered > 0 and received < ordered:
                 short = True
                 result.issues.append(_partial_receipt_issue(ordered, received))
-                leg_value = total * received / ordered
             elif ordered > 0 and received > ordered:
                 over = True
                 result.issues.append(_over_receipt_issue(ordered, received))
+            # The leg's received goods at their own lines' prices, as for one
+            # PO (`_received_value`); `None` is nothing of value outstanding.
+            received_value, leg_valuation = _received_value(po, grs, total, ordered, received)
+            if received_value is not None:
+                value_short = True
+                leg_value = received_value
         covered += leg_value
 
         inspection = await _latest_inspection_for(db, po, gr)
@@ -950,6 +1094,7 @@ async def _match_split(
                 "all_receipts_cancelled": all_cancelled,
                 "ordered_quantity": quantities[0] if quantities else None,
                 "received_quantity": quantities[1] if quantities else None,
+                "receipt_valuation": leg_valuation,
                 "inspection_result": inspection.result if inspection is not None else None,
             }
         )
@@ -961,12 +1106,15 @@ async def _match_split(
         result.ordered_quantity = ordered_sum
         result.received_quantity = received_sum
     result.over_receipt = over
-    if short:
-        if result.status == "matched":
-            result.status = "partial"
-        if result.currency_check != CURRENCY_DIFFERENT and not result.po_total_unverifiable_reason:
-            result.received_value = covered
-            result.billed_beyond_receipt = _bills_beyond(invoice_amount, covered, tolerance)
+    if short and result.status == "matched":
+        result.status = "partial"
+    if (
+        value_short
+        and result.currency_check != CURRENCY_DIFFERENT
+        and not result.po_total_unverifiable_reason
+    ):
+        result.received_value = covered
+        result.billed_beyond_receipt = _bills_beyond(invoice_amount, covered, tolerance)
 
     if inspected:
         result.match_type = "4-way"

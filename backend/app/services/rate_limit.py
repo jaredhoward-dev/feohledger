@@ -24,7 +24,7 @@ import uuid
 from fastapi import HTTPException, Request, status
 
 from app.api.refusals import coded_refusal
-from app.config import settings
+from app.config import TRUSTED_PROXY_NONE, settings
 from app.redis import get_redis
 
 KEY_PREFIX = "ratelimit:"
@@ -54,7 +54,10 @@ class RateLimitExceeded(HTTPException):
 
 def _trusted_proxy_networks() -> tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...]:
     raw = (settings.trusted_proxy_cidrs or "").strip()
-    if not raw:
+    # Empty (local dev) and the explicit `none` (a deployed API clients reach
+    # directly, decisions §553) both trust no proxy: the socket peer is the
+    # client. Only a deployed env distinguishes them, at boot (config.py).
+    if not raw or raw.lower() == TRUSTED_PROXY_NONE:
         return ()
     nets: list[ipaddress.IPv4Network | ipaddress.IPv6Network] = []
     for entry in raw.split(","):
@@ -64,17 +67,13 @@ def _trusted_proxy_networks() -> tuple[ipaddress.IPv4Network | ipaddress.IPv6Net
         try:
             nets.append(ipaddress.ip_network(entry, strict=False))
         except ValueError:
-            # Skip junk silently — a typo in config shouldn't crash the
-            # rate limiter, and any unknown CIDR means "don't trust XFF
-            # from anything", which is the safe default anyway.
+            # config.py refuses a junk entry at boot; skipping one here keeps
+            # a value patched in at runtime (tests) from crashing the limiter.
             continue
     return tuple(nets)
 
 
-def _ip_in_trusted_proxy(ip: str) -> bool:
-    nets = _trusted_proxy_networks()
-    if not nets:
-        return False
+def _in_networks(ip: str, nets: tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...]) -> bool:
     try:
         addr = ipaddress.ip_address(ip)
     except ValueError:
@@ -82,28 +81,67 @@ def _ip_in_trusted_proxy(ip: str) -> bool:
     return any(addr in n for n in nets)
 
 
+def _ip_in_trusted_proxy(ip: str) -> bool:
+    nets = _trusted_proxy_networks()
+    if not nets:
+        return False
+    return _in_networks(ip, nets)
+
+
+def _parse_forwarded_entry(entry: str) -> str | None:
+    """One ``X-Forwarded-For`` element as a normalised address, or None.
+
+    Anything that is not an IP literal (``unknown``, an obfuscated ``_node``
+    identifier, a hostname, junk) yields None, so a malformed entry can never
+    become a rate-limit key."""
+    try:
+        return str(ipaddress.ip_address(entry.strip()))
+    except ValueError:
+        return None
+
+
 def resolve_client_ip(request: Request | None) -> str | None:
     """Resolve the originating client IP.
 
-    Only honours ``X-Forwarded-For`` when the connecting peer is in the
-    configured ``trusted_proxy_cidrs`` allowlist — otherwise a direct
-    attacker could rotate through arbitrary IPs by spoofing the header
-    and dodge per-IP rate limits.
+    ``X-Forwarded-For`` is read only when the socket peer is inside the
+    configured ``trusted_proxy_cidrs``; otherwise a direct caller could rotate
+    through arbitrary addresses by forging the header and dodge every per-IP
+    limit. With an empty value or ``none`` (decisions §553) no peer is trusted
+    and the socket peer is the client.
+
+    When the peer is trusted, the header is walked **from the right**: each
+    trusted proxy appends the address it received the request from, so the
+    rightmost entries are the hops we trust, and the first address that is
+    not inside ``trusted_proxy_cidrs`` is the client. Everything to its left
+    was written by that client and is ignored. This is what makes an
+    *appending* proxy safe (the AWS ALB appends to whatever the client sent,
+    so a forged leftmost entry survives into the header); a *replacing* proxy
+    (Caddy, for an untrusted client) leaves one entry and gives the same
+    answer. Entries that are not IP literals are skipped. If every entry is a
+    trusted address, the leftmost is the client (an internal caller behind the
+    proxy); a trusted peer with no usable entry keys on the peer itself
+    (decisions §558).
 
     This is the single shared resolver: every request-path caller that
-    records or keys on a client IP (limiter buckets, login/signup/SSO
-    audit rows, captcha verification) goes through here, so they all
-    agree on who the client is when the app sits behind a trusted proxy
-    (Caddy on the single-VM stack, the ALB on ECS).
+    records or keys on a client IP (limiter buckets, login/signup/SSO audit
+    rows, captcha verification) goes through here, so they all agree on who
+    the client is.
     """
     if request is None or request.client is None:
         return None
     peer = request.client.host
-    if _ip_in_trusted_proxy(peer):
-        forwarded = request.headers.get("x-forwarded-for", "")
-        if forwarded:
-            return forwarded.split(",")[0].strip()
-    return peer
+    nets = _trusted_proxy_networks()
+    if not nets or not _in_networks(peer, nets):
+        return peer
+    # Several X-Forwarded-For headers are one list, in order (RFC 9110 §5.3).
+    raw = ",".join(request.headers.getlist("x-forwarded-for"))
+    hops = [ip for ip in (_parse_forwarded_entry(e) for e in raw.split(",")) if ip]
+    if not hops:
+        return peer
+    for ip in reversed(hops):
+        if not _in_networks(ip, nets):
+            return ip
+    return hops[0]
 
 
 def _client_ip(request: Request) -> str:
@@ -273,8 +311,17 @@ async def check_auth_failures(
         raise RateLimitExceeded(window_seconds)
 
 
-async def record_auth_failure(scope: str, identity_key: str, *, window_seconds: int) -> None:
-    """Record one failed authentication attempt against this identity."""
+async def record_auth_failure(
+    scope: str, identity_key: str, *, window_seconds: int, member: str | None = None
+) -> None:
+    """Record one failed authentication attempt against this identity.
+
+    ``member`` turns the budget into a count of DISTINCT things that failed:
+    a sorted set holds each member once, so re-recording one refreshes its
+    timestamp instead of adding to the count. The ERP webhooks use it to count
+    the tenants a source has failed against, not its attempts (decisions §525).
+    Without it every call is a new entry, as for a login.
+    """
     if not settings.rate_limit_enabled:
         return
 
@@ -284,7 +331,7 @@ async def record_auth_failure(scope: str, identity_key: str, *, window_seconds: 
     r = await get_redis()
     async with r.pipeline(transaction=True) as pipe:
         pipe.zremrangebyscore(key, 0, now - window_seconds)
-        pipe.zadd(key, {str(uuid.uuid4()): now})
+        pipe.zadd(key, {member if member is not None else str(uuid.uuid4()): now})
         pipe.expire(key, window_seconds)
         await pipe.execute()
 

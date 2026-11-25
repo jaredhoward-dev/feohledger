@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { untrack } from 'svelte';
+	import { tick, untrack } from 'svelte';
 	import { page as pageStore } from '$app/state';
 	import { afterNavigate, replaceState } from '$app/navigation';
 	import { api } from '#lib/api.ts';
@@ -21,6 +21,7 @@
 	import Tabs from '#lib/components/ui/Tabs.svelte';
 	import Badge from '#lib/components/ui/Badge.svelte';
 	import Money from '#lib/components/ui/Money.svelte';
+	import ErpOrphanBill from '#lib/components/erp/ErpOrphanBill.svelte';
 	import {
 		EXCEPTION_SEVERITIES,
 		exceptionSeverityLabelKey,
@@ -119,6 +120,14 @@
 		/** Only on a row carrying an ERP-reported payment: the caller's verdict
 		 *  on `POST /{id}/record-erp-payment`. Absent = unknown = not offered. */
 		record_erp_payment_refusal?: ActionRefusal;
+		/** Only on a duplicate / fraud flag: the caller's verdict on
+		 *  `POST /{id}/void-erp-bill`, voiding the invoice's bill in the ERP
+		 *  (decisions §539). Absent = not offered. */
+		void_erp_bill_refusal?: ActionRefusal;
+		/** The lookup for the bill a failed push may have left in the ERP
+		 *  (`erp_bill_void.orphan_lookup_verdicts`, decisions §556 / §560):
+		 *  present only on a duplicate / fraud flag whose invoice is such a push. */
+		erp_orphan_lookup_refusal?: ActionRefusal;
 		/** On a `paid_not_recorded` row stating a figure and a breakdown: the
 		 *  SERVER's judgement that the breakdown is booked whatever one rail a
 		 *  person names (it adds up exactly and spans several rails, decisions
@@ -716,6 +725,19 @@
 			isErpPaidReport(resolveTarget.erp_report) &&
 			isOffered(resolveTarget.record_erp_payment_refusal)
 	);
+	/** The "void the bill in the ERP" panel (decisions §539) sits above the
+	 *  note too, so it holds the note's autofocus back for the same reason. */
+	const voidPanelShown = $derived(
+		!!resolveTarget && isOffered(resolveTarget.void_erp_bill_refusal)
+	);
+	// The flag's invoice is a failed push that may have left a bill in the ERP
+	// (decisions §556): the row carries the lookup's verdict only then, and
+	// `isOffered` hides it from a role that cannot act on it (§560).
+	const orphanPanelShown = $derived(
+		voidPanelShown &&
+			!!resolveTarget?.invoice_id &&
+			isOffered(resolveTarget?.erp_orphan_lookup_refusal)
+	);
 	// The note under the split reads the server's three-state verdict
 	// (`splitNoteKey`, in `ErpPaymentSplit`); the picker stays unless it stands.
 
@@ -751,6 +773,76 @@
 		} finally {
 			recordingErp = false;
 		}
+	}
+
+	// ---- Void the flagged bill in the ERP (decisions §539) ----
+	// A confirm dialog of its own: the void reaches into the customer's ERP and
+	// cannot be undone from here, so it is never one click from the queue. It
+	// STACKS on the flag's dialog rather than replacing it (the focus trap keeps
+	// a stack): Cancel / Escape closes only the confirm and the trap hands focus
+	// back to "Void the bill…", and `?id=` keeps naming the flag throughout.
+	let voidBillTarget = $state<ExceptionItem | null>(null);
+	let voidBillReason = $state('');
+	let voidingBill = $state(false);
+	let voidBillError = $state('');
+	let resolveNoteInput = $state<HTMLInputElement | null>(null);
+
+	function openVoidBill(target: ExceptionItem) {
+		voidBillTarget = target;
+		voidBillReason = '';
+		voidBillError = '';
+	}
+
+	async function commitVoidBill() {
+		const target = voidBillTarget;
+		const reason = voidBillReason.trim();
+		if (!target || !reason) return;
+		voidingBill = true;
+		voidBillError = '';
+		try {
+			await api.post(`/api/exceptions/${target.id}/void-erp-bill`, { reason });
+			toast(m('exceptions.erpVoid.done', { invoice: target.invoice_number ?? '—' }), 'success');
+			// Back to the flag, which stays open until a person decides it (the
+			// panel says so): close only the confirm, then re-read the flag so
+			// its dialog shows the verdicts after the void.
+			voidBillTarget = null;
+			await Promise.all([refreshResolveTarget(target.id), loadExceptions(), loadSummary()]);
+		} catch (err) {
+			voidBillError = formatApiDetail(
+				err instanceof Error ? err.message : undefined,
+				m('exceptions.erpVoid.failed')
+			);
+		} finally {
+			voidingBill = false;
+		}
+	}
+
+	/**
+	 * Re-read the open flag's row (the detail read carries the same verdicts as
+	 * a list row) and show it in the dialog, keeping the note being typed. A
+	 * failed read leaves the row as it was: the server still judges any click.
+	 *
+	 * The re-read usually disables "Void the bill…" (the bill is gone), which
+	 * the confirm's close had just returned focus to; a disabled control drops
+	 * focus without a `focusout`, so it moves to the note, the decision left.
+	 */
+	async function refreshResolveTarget(id: string) {
+		let fresh: ExceptionItem;
+		try {
+			fresh = await api.get<ExceptionItem>(`/api/exceptions/${encodeURIComponent(id)}`);
+		} catch {
+			return;
+		}
+		if (resolveTarget?.id !== id) return;
+		resolveTarget = fresh;
+		await tick();
+		const active = document.activeElement as HTMLElement | null;
+		const lost =
+			!active ||
+			active === document.body ||
+			!active.isConnected ||
+			(active as HTMLButtonElement).disabled === true;
+		if (lost && voidBillTarget === null) resolveNoteInput?.focus();
 	}
 
 	function openBulkResolve() {
@@ -1476,6 +1568,13 @@
 					{#if erpError}
 						<p class="modal-error" role="alert" data-testid="erp-payment-error">{erpError}</p>
 					{/if}
+					{#if resolveTarget.record_erp_payment_refusal}
+						<RefusalNote
+							id="erp-payment-refusal"
+							testid="erp-payment-refusal"
+							reason={refusalText(resolveTarget.record_erp_payment_refusal, m)}
+						/>
+					{/if}
 					<div class="modal-footer">
 						<button
 							type="submit"
@@ -1494,12 +1593,47 @@
 							{recordingErp ? m('exceptions.erpPayment.recording') : m('exceptions.erpPayment.record')}
 						</button>
 					</div>
-					{#if resolveTarget.record_erp_payment_refusal}
-						<p class="modal-hint" id="erp-payment-refusal" data-testid="erp-payment-refusal">
-							{refusalText(resolveTarget.record_erp_payment_refusal, m)}
-						</p>
-					{/if}
 				</form>
+			</section>
+		{/if}
+		{#if voidPanelShown}
+			<!-- A duplicate / fraud flag on an invoice whose bill may already be in
+			     the ERP, where it can be paid past our gate (decisions §539). -->
+			<section class="erp-payment" data-testid="erp-void-panel" aria-labelledby="erp-void-title">
+				<h3 id="erp-void-title">{m('exceptions.erpVoid.title', { erp: erpName(resolveTarget) })}</h3>
+				<p class="modal-hint">{m('exceptions.erpVoid.intro', { erp: erpName(resolveTarget) })}</p>
+				{#if resolveTarget.void_erp_bill_refusal}
+					<RefusalNote
+						id="erp-void-refusal"
+						testid="erp-void-refusal"
+						reason={refusalText(resolveTarget.void_erp_bill_refusal, m)}
+					/>
+				{/if}
+				<div class="modal-footer">
+					<button
+						type="button"
+						class="btn-danger"
+						data-testid="erp-void-open"
+						aria-describedby={resolveTarget.void_erp_bill_refusal ? 'erp-void-refusal' : undefined}
+						disabled={!isAllowed(resolveTarget.void_erp_bill_refusal)}
+						onclick={() => resolveTarget && openVoidBill(resolveTarget)}
+					>
+						{m('exceptions.erpVoid.open')}
+					</button>
+				</div>
+				{#if orphanPanelShown && resolveTarget.invoice_id}
+					{#key resolveTarget.invoice_id}
+						<ErpOrphanBill
+							invoiceId={resolveTarget.invoice_id}
+							verdict={resolveTarget.erp_orphan_lookup_refusal ?? null}
+							idPrefix="exception-erp-orphan"
+							invoiceHref="/invoices?id={resolveTarget.invoice_id}"
+							onvoided={async () => {
+								if (resolveTarget) await refreshResolveTarget(resolveTarget.id);
+							}}
+						/>
+					{/key}
+				{/if}
 			</section>
 		{/if}
 		<!-- `data-testid` is the e2e suite's handle on this dialog, so a spec
@@ -1515,7 +1649,8 @@
 					bind:value={resolutionText}
 					placeholder={m('exceptions.resolveModal.notePlaceholder')}
 					maxlength="500"
-					data-autofocus={erpPanelShown ? undefined : true}
+					bind:this={resolveNoteInput}
+					data-autofocus={erpPanelShown || voidPanelShown ? undefined : true}
 				/>
 			</label>
 			{#if decisionRefused}
@@ -1562,6 +1697,56 @@
 					aria-describedby={decisionRefused ? 'exception-decision-refusal' : null}
 				>
 					{saving ? m('common.saving') : m('exceptions.resolveModal.resolve')}
+				</button>
+			</div>
+		</form>
+	{/if}
+</Modal>
+
+<!-- Void-the-bill confirm (decisions §539) -->
+<Modal
+	open={voidBillTarget !== null}
+	ariaLabel={m('exceptions.erpVoid.confirmTitle')}
+	width="sm"
+	onclose={() => (voidBillTarget = null)}
+>
+	{#if voidBillTarget}
+		<h2>{m('exceptions.erpVoid.confirmTitle')}</h2>
+		<p class="modal-hint">
+			<strong>{voidBillTarget.invoice_number ?? '—'}</strong>
+			{#if voidBillTarget.vendor_name}· {voidBillTarget.vendor_name}{/if}
+			· <Money amount={voidBillTarget.amount} currency={voidBillTarget.currency} />
+		</p>
+		<p class="modal-hint">{m('exceptions.erpVoid.confirmBody', { erp: erpName(voidBillTarget) })}</p>
+		<form
+			data-testid="erp-void-form"
+			onsubmit={(e) => { e.preventDefault(); commitVoidBill(); }}
+		>
+			<label>
+				<span>{m('exceptions.erpVoid.reason')}</span>
+				<input
+					type="text"
+					bind:value={voidBillReason}
+					maxlength="500"
+					required
+					data-autofocus
+					data-testid="erp-void-reason"
+				/>
+			</label>
+			{#if voidBillError}
+				<p class="modal-error" role="alert" data-testid="erp-void-error">{voidBillError}</p>
+			{/if}
+			<div class="modal-footer">
+				<button type="button" class="btn-cancel" onclick={() => (voidBillTarget = null)}>
+					{m('exceptions.erpVoid.cancel')}
+				</button>
+				<button
+					type="submit"
+					class="btn-danger"
+					data-testid="erp-void-confirm"
+					disabled={voidingBill || !voidBillReason.trim()}
+				>
+					{voidingBill ? m('exceptions.erpVoid.voiding') : m('exceptions.erpVoid.confirm')}
 				</button>
 			</div>
 		</form>

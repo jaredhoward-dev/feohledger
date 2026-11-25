@@ -305,6 +305,12 @@ _ACTION_PHRASES: dict[str, tuple[str, bool]] = {
     # Approval was configured to start the push and a gate refused it; the
     # invoice stayed `approved` (decisions §304).
     "invoice.erp_auto_send_refused": ("held back from the automatic ERP send", _PASSIVE),
+    # The call-budget re-send sweep's retry was refused by a gate; the invoice
+    # stayed `failed` (decisions §521).
+    "invoice.erp_budget_resend_refused": (
+        "held back from the ERP re-send after the call allowance reset",
+        _PASSIVE,
+    ),
     "invoice.peppol_sent": ("sent over PEPPOL", _PASSIVE),
     "invoice.peppol_send_failed": ("failed to send over PEPPOL", _ACTIVE),
     "invoice.payment_scheduled": ("scheduled for payment", _PASSIVE),

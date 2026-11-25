@@ -7,7 +7,10 @@ Project invariant #9 says every inbound webhook must
 
 The payment adapter implements its own HMAC verification inline. This
 module exposes the same primitives in a form the card- and ERP-webhook
-handlers (which don't go through the adapter abstraction) can reuse.
+handlers (which don't go through the adapter abstraction) can reuse: a body
+HMAC (hex / base64 / base64url), the Standard-Webhooks scheme Lithic signs
+with (`verify_standard_webhook`), and the static shared header Nium sends in
+place of a signature (`verify_shared_header_token`, decisions §555).
 
 Dedup uses Redis with a TTL so retries within the provider's
 re-delivery window are caught, but the key set doesn't grow without
@@ -48,9 +51,11 @@ def verify_hmac_sha256(secret: str, raw_body: bytes, provided_hex: str | None) -
         return False
     try:
         expected = hmac.new(secret.encode("utf-8"), raw_body, hashlib.sha256).hexdigest()
+        # Compared as bytes: `compare_digest` on two `str` raises TypeError when
+        # either holds a non-ASCII character, and a header can (decisions §561).
+        return hmac.compare_digest(expected.encode("ascii"), provided_hex.encode("utf-8"))
     except Exception:  # noqa: BLE001 — defensive: malformed input must fail closed
         return False
-    return hmac.compare_digest(expected, provided_hex)
 
 
 def verify_hmac_sha256_base64(secret: str, raw_body: bytes, provided_b64: str | None) -> bool:
@@ -132,6 +137,136 @@ def verify_hmac_sha256_base64url(secret: str, raw_body: bytes, provided_b64url: 
     return hmac.compare_digest(expected, provided)
 
 
+#: Lithic's reference verifier rejects a ``webhook-timestamp`` more than five
+#: minutes from now, either way (https://docs.lithic.com/docs/events-api,
+#: checked 2026-11-25). The signed timestamp is the replay protection: a
+#: captured delivery stops verifying once it is older than this.
+STANDARD_WEBHOOK_TOLERANCE_SECONDS = 5 * 60
+_STANDARD_WEBHOOK_SECRET_PREFIX = "whsec_"
+
+
+#: A ``webhook-timestamp`` is ASCII digits only, at most 12 of them (seconds
+#: since the epoch fit in 10 until the year 2286). ``str.isdigit`` is not this:
+#: it accepts ``²`` and Arabic-Indic digits, which ``int`` / ``.encode("ascii")``
+#: then raise on (decisions §561).
+_STANDARD_WEBHOOK_TIMESTAMP = re.compile(r"[0-9]{1,12}")
+
+
+def verify_standard_webhook(
+    secret: str,
+    msg_id: str | None,
+    timestamp: str | None,
+    raw_body: bytes,
+    signature_header: str | None,
+    *,
+    tolerance_seconds: int = STANDARD_WEBHOOK_TOLERANCE_SECONDS,
+    now: float | None = None,
+) -> bool:
+    """Verify a Standard-Webhooks / Svix-style delivery (Lithic's scheme).
+
+    https://docs.lithic.com/docs/events-api (checked 2026-11-25): the headers
+    are ``webhook-id`` / ``webhook-timestamp`` / ``webhook-signature``; the
+    signed content is ``"{id}.{timestamp}.{raw body}"``; the key is the
+    base64 part of a ``whsec_``-prefixed secret; the header is a
+    space-separated list of ``v1,<base64 HMAC-SHA256>`` (several during a key
+    rotation, any one of which may match).
+
+    Fail closed: a missing header, a secret without the ``whsec_`` prefix or
+    whose key is not base64, a timestamp that is not 1-12 ASCII digits, one
+    outside ``tolerance_seconds`` of ``now`` (either direction), or no matching
+    ``v1`` signature is False. Digests are compared in constant time.
+
+    It NEVER raises, whatever the header values hold: the caller has already
+    looked the card up, so an exception escaping here would answer 500 where
+    an unknown card answers 204, telling a forger which tokens exist
+    (decisions §561). An unexpected error is logged by type only and is False.
+    """
+    try:
+        return _verify_standard_webhook(
+            secret,
+            msg_id,
+            timestamp,
+            raw_body,
+            signature_header,
+            tolerance_seconds=tolerance_seconds,
+            now=now,
+        )
+    except Exception as exc:  # noqa: BLE001 — the verifier's boundary fails closed
+        logger.warning("Standard-Webhooks verification failed closed: %s", type(exc).__name__)
+        return False
+
+
+def _verify_standard_webhook(
+    secret: str,
+    msg_id: str | None,
+    timestamp: str | None,
+    raw_body: bytes,
+    signature_header: str | None,
+    *,
+    tolerance_seconds: int,
+    now: float | None,
+) -> bool:
+    import time
+
+    if not secret or not msg_id or not timestamp or not signature_header:
+        return False
+    if not secret.startswith(_STANDARD_WEBHOOK_SECRET_PREFIX):
+        return False
+    try:
+        key = base64.b64decode(secret[len(_STANDARD_WEBHOOK_SECRET_PREFIX) :], validate=True)
+    except (binascii.Error, ValueError):
+        return False
+    if not key:
+        return False
+    ts_text = timestamp.strip()
+    if not _STANDARD_WEBHOOK_TIMESTAMP.fullmatch(ts_text):
+        return False
+    current = time.time() if now is None else now
+    if abs(current - int(ts_text)) > tolerance_seconds:
+        return False
+    signed = msg_id.encode("utf-8") + b"." + ts_text.encode("ascii") + b"." + raw_body
+    expected = hmac.new(key, signed, hashlib.sha256).digest()
+    matched = False
+    for candidate in signature_header.split():
+        version, _, encoded = candidate.partition(",")
+        if version != "v1" or not encoded:
+            continue
+        try:
+            provided = base64.b64decode(encoded, validate=True)
+        except (binascii.Error, ValueError):
+            continue
+        # No early exit: every listed signature is compared.
+        matched = hmac.compare_digest(expected, provided) or matched
+    return matched
+
+
+def sign_standard_webhook(secret: str, msg_id: str, timestamp: int, raw_body: bytes) -> str:
+    """The ``webhook-signature`` value :func:`verify_standard_webhook` accepts
+    (``v1,<base64>``). For tests and local tooling only — a provider signs its
+    own deliveries."""
+    key = base64.b64decode(secret[len(_STANDARD_WEBHOOK_SECRET_PREFIX) :])
+    signed = f"{msg_id}.{timestamp}.".encode() + raw_body
+    return "v1," + base64.b64encode(hmac.new(key, signed, hashlib.sha256).digest()).decode()
+
+
+def verify_shared_header_token(expected: str, provided: str | None) -> bool:
+    """Constant-time check of a static shared value a provider sends in a
+    header on every delivery (Nium's client-configured ``x-partner-key``,
+    https://docs.nium.com/docs/developers/notifications-and-webhooks, checked
+    2026-11-25 — Nium documents no body signature).
+
+    Weaker than an HMAC: it authenticates the sender but does not bind the
+    body and has no timestamp, so dedupe by the provider's event id is the
+    only replay control. Empty on either side is False.
+    """
+    if not expected or not provided:
+        return False
+    try:
+        return hmac.compare_digest(expected.encode("utf-8"), provided.encode("utf-8"))
+    except (UnicodeError, TypeError):  # a lone surrogate: never a match, never a 500 (§561)
+        return False
+
+
 async def is_event_already_processed(
     provider: str, event_id: str, *, ttl_seconds: int = DEFAULT_DEDUP_TTL_SECONDS
 ) -> bool:
@@ -186,7 +321,7 @@ def extract_signature_header(headers: dict, *candidates: str) -> str | None:
     """Pull the first present signature header out of a request.
 
     Different providers use different header names (Lithic:
-    `Webhook-Signature`, Stripe-style: `Stripe-Signature`,
+    `webhook-signature`, Stripe-style: `Stripe-Signature`,
     generic: `X-Signature`). Headers are case-insensitive in HTTP,
     so we walk the dict comparing lower-cased names.
     """

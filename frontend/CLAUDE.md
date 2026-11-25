@@ -237,6 +237,7 @@ Two things hold for every route, and a diff that breaks either is a bug:
 All data fetching goes through this module. Never call `fetch()` directly for API requests.
 
 - Auto-adds `Authorization: Bearer <token>` from localStorage
+- **Browser storage goes through `#lib/utils/safeStorage.ts`** (`storageGet` / `storageSet` / `storageRemove`, `storageArea`, `storageAvailable`), never a bare `localStorage` / `sessionStorage`: where a browser blocks site data the property READ itself throws, and one unguarded read at boot blanked the whole app. Blocked storage reads as empty — signed out — and both sign-in pages say why (decisions §514). Pass the key as a literal or a hoisted `*_KEY` const so `legal/storageInventory.test.ts` still sees it
 - Auto-adds `X-Tenant-Slug` header from subdomain
 - A 401, or a 403 coded `token_tenant_mismatch` (a token for another workspace), clears the token and redirects to `/login` (`endSessionIfRejected`; the second adds `?reason=other_workspace`, decisions §288), with `?next=` naming the page the user was on. **Any `next` is read and written only through `#lib/utils/postLoginRedirect.ts`** — it is the open-redirect gate (`docs/authentication.md` § Sign-in returns to the page asked for). Every raw-`fetch` path that bypasses `request()` calls the same helper
 - Methods: `api.get<T>()`, `api.post<T>()`, `api.patch<T>()`, `api.put<T>()`, `api.delete()`, `api.upload<T>()`
@@ -312,7 +313,7 @@ are lazy catalogue slices — `locales/help/`, `locales/settings/` (`org.*`,
 `orgSso.*`, `admin.*`, `billing.*`, `sweepHealth.*`), `locales/portal/` and
 `locales/marketing/` (the apex landing page, which awaits it itself) and
 `locales/audit/` (`/audit`'s action labels, `audit.action.*` /
-`audit.actionPattern.*`) —
+`audit.actionPattern.*`, also loaded by the invoice modal's timeline) —
 loaded by `ensureSlices()` from those routes' `+layout.ts` (decisions §261,
 §300). A new key under a slice prefix goes in the slice; a new route or shared
 component that renders slice keys must load the slice or keep the key in main.
@@ -394,7 +395,7 @@ component the second time you would duplicate one.**
 
 - `help/` — `HelpTip` (the ⓘ toggletip: `<HelpTip term="glossary-id" />`; `KpiCard helpTerm` / DataTable column `help` forward one) `RichText` `HelpNav` `HelpCrumbs` `InvoiceLifecycle` `EnglishNotice` `diagrams/` — placement rules in `docs/ui-patterns.md` § Contextual help
 - `ui/` — primitives: `PageHeader` (renders the page's "How this page works" link) `DataTable` `FilterChips` `Modal` `KpiCard` `Badge` `EmptyState` `Money` `SectionTabs` `Tabs` `SettingsRail` `SegmentedControl` `ThemePicker` `FieldWarning` `SecretReveal` `BrandMark` `PlanUpgradeNotice` (a setting the plan lacks — decisions §258) `LoadError` (a failed load stated in place, with Retry — never a toast alone) `LoadMoreFooter` (every paged list's Load more / Showing all N footer — never a copy of its markup) `SetupChecklist` (setup steps, each linked, `done` true / false / null — decisions §315)
-- domain: `InvoiceModal` `VendorModal` `VendorPicker` `InvoicePicker` (both over `ui/SearchPicker`) `RunDetailModal` `ApprovalMatrixEditor` `BulkRecodeGLModal` `AdvancedSearchModal` `ScreeningBadge` `SubscriptionBadge` `SpendBarChart` `UsageMeter` `PortalListFilters`
+- domain: `InvoiceModal` `VendorModal` `VendorPicker` `InvoicePicker` `ExpensePicker` (all over `ui/SearchPicker`) `RunDetailModal` `ApprovalMatrixEditor` `BulkRecodeGLModal` `AdvancedSearchModal` `ScreeningBadge` `SubscriptionBadge` `SpendBarChart` `UsageMeter` `PortalListFilters`
 - chrome: `Sidebar` `NotificationBell` `EntitySwitcher`
 - chat/assistant: `SupplierChatThread` `ChatMessage` `ExamplePrompts` `ToolResultView`
 - marketing: `Landing` `Pricing` `Atmosphere` `HeroPipeline` `AdapterRail`

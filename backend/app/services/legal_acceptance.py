@@ -40,7 +40,7 @@ from app.models.user import User
 #: document → version in force (its published effective date, YYYY-MM-DD).
 CURRENT_LEGAL_VERSIONS: dict[str, str] = {
     "terms": "2026-11-21",
-    "privacy": "2026-11-21",
+    "privacy": "2026-11-25",
 }
 
 LEGAL_DOCUMENTS: tuple[str, ...] = tuple(CURRENT_LEGAL_VERSIONS)

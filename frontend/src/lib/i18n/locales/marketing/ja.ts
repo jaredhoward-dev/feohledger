@@ -135,5 +135,16 @@ export const messages = {
 	'marketing.findWorkspace.noWorkspace': '{product} は初めてですか？ {create}',
 	'marketing.findWorkspace.panelHeading': 'アドレスをお尋ねする理由',
 	'marketing.findWorkspace.panelBody':
-		'各社にはそれぞれ専用のワークスペースとサインインがあります。メールアドレスからワークスペースを検索することは一切ないため、このページを使って誰がどこで働いているかを調べることはできません。'
+		"各社にはそれぞれ専用のワークスペースとサインインがあります。このページでは、メールアドレスがどのワークスペースのものかを表示しません。お忘れの場合はそのアドレス宛てにお送りするため、このページを使って誰がどこで働いているかを調べることはできません。",
+	'marketing.findWorkspace.lookup.heading': "ワークスペースのアドレスをお忘れですか？",
+	'marketing.findWorkspace.lookup.intro': "サインインに使うメールアドレスを入力してください。アカウントがある場合は、そのアドレス宛てにワークスペースのサインインページへのリンクをお送りします。",
+	'marketing.findWorkspace.lookup.label': "メールアドレス",
+	'marketing.findWorkspace.lookup.submit': "ワークスペースのアドレスをメールで受け取る",
+	'marketing.findWorkspace.lookup.sending': "送信中…",
+	'marketing.findWorkspace.lookup.invalid': "有効なメールアドレスを入力してください。",
+	'marketing.findWorkspace.lookup.failed': "送信できませんでした。接続を確認して、もう一度お試しください。",
+	'marketing.findWorkspace.lookup.sentHeading': "メールをご確認ください",
+	'marketing.findWorkspace.lookup.sent': "{email} にアカウントがある場合は、ワークスペースのサインインページへのリンクをお送りしました。届くまで数分かかることがあります。迷惑メールフォルダもご確認ください。",
+	'marketing.findWorkspace.lookup.again': "別のアドレスを使う",
+	'marketing.footer.findWorkspace': "ワークスペースをお忘れですか？"
 } satisfies MarketingMessages;

@@ -45,9 +45,11 @@ class _FakeSortedSet:
         self.store: dict[str, list[tuple[str, float]]] = {}
 
     def zadd(self, key, mapping):
-        self.store.setdefault(key, [])
+        # Redis semantics: a member is held once; re-adding it moves its score.
+        entries = self.store.setdefault(key, [])
         for member, score in mapping.items():
-            self.store[key].append((member, score))
+            entries[:] = [(m, s) for m, s in entries if m != member]
+            entries.append((member, score))
 
     def zremrangebyscore(self, key, low, high):
         if key in self.store:
@@ -237,6 +239,33 @@ async def test_scopes_are_independent(fake_redis):
         await record_auth_failure("auth_login", "ident", window_seconds=900)
 
     await check_auth_failures("auth_mfa", "ident", limit=3, window_seconds=900)
+
+
+@pytest.mark.asyncio
+async def test_a_member_is_counted_once_however_often_it_is_recorded():
+    """With ``member=`` the budget counts DISTINCT things that failed, not
+    attempts: re-recording one member refreshes its single entry, and only a
+    new member adds to the count (the ERP webhooks' per-source tenant budget,
+    decisions §525). Deliberately runs on the conftest's autouse fake rather
+    than this module's, so it also pins that shared fake's ZADD semantics,
+    which every webhook test's budget assertions rest on."""
+    from app.services.rate_limit import check_auth_failures, record_auth_failure
+
+    scope = "erp_webhook_unseal_source"
+    for _ in range(5):
+        await record_auth_failure(scope, "src", window_seconds=900, member="tenant-a")
+    # Five recordings of one member are one entry: under a limit of 2.
+    await check_auth_failures(scope, "src", limit=2, window_seconds=900)
+
+    await record_auth_failure(scope, "src", window_seconds=900, member="tenant-b")
+    with pytest.raises(HTTPException):
+        await check_auth_failures(scope, "src", limit=2, window_seconds=900)
+
+    # Without ``member`` each call is its own entry, as for a login.
+    for _ in range(2):
+        await record_auth_failure(scope, "plain", window_seconds=900)
+    with pytest.raises(HTTPException):
+        await check_auth_failures(scope, "plain", limit=2, window_seconds=900)
 
 
 @pytest.mark.asyncio

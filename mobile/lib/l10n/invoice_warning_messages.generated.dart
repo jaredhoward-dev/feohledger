@@ -297,7 +297,9 @@ const Map<String, Map<String, String>> invoiceWarningParamKinds = {
   'exception.erp_payment_void_writeback_failed': {'erp': 'text'},
   'exception.erp_payment_void_writeback_failed_unnamed': {},
   'exception.erp_credit_settlement': {},
+  'exception.erp_settled_no_payment': {},
   'exception.erp_paid_while_scheduled': {},
+  'exception.erp_paid_while_payment_in_flight': {},
   'exception.erp_paid_twice': {},
   'exception.erp_partly_paid_outside': {},
   'exception.erp_recorded_payment_withdrawn': {},
@@ -354,6 +356,9 @@ const Map<String, Map<String, String>> invoiceWarningParamKinds = {
   },
   'exception.payment_dispatch_interrupted_failed': {'paymentId': 'text'},
   'exception.payment_dispatch_interrupted_cancelled': {'paymentId': 'text'},
+  'exception.card_settled_after_cancel': {'lastFour': 'text'},
+  'exception.card_settlement_refused': {'lastFour': 'text'},
+  'exception.card_clearing_refused': {'lastFour': 'text'},
   'exception.settlement_currency_mismatch': {
     'settledAmount': 'number',
     'settledCurrency': 'text',
@@ -1174,9 +1179,15 @@ String? _localizeWarningCode(
     // The ERP shows this bill settled, at least in part by a vendor credit applied there. FeohLedger will not pay it until someone confirms what is still owed.
     case 'exception.erp_credit_settlement':
       return l.exceptionDescriptionErpCreditSettlement;
+    // The ERP shows nothing owing on this bill, but no payment against it: a credit was applied or the balance written off there. FeohLedger will not pay it until someone confirms what is still owed.
+    case 'exception.erp_settled_no_payment':
+      return l.exceptionDescriptionErpSettledNoPayment;
     // The ERP shows this bill paid by a payment FeohLedger did not make, while a FeohLedger payment is scheduled for it. Stop or void one of them before both reach the supplier.
     case 'exception.erp_paid_while_scheduled':
       return l.exceptionDescriptionErpPaidWhileScheduled;
+    // The ERP shows this bill paid while FeohLedger's payment for it has not completed. Confirm whether that entry is FeohLedger's payment or a second one before voiding anything.
+    case 'exception.erp_paid_while_payment_in_flight':
+      return l.exceptionDescriptionErpPaidWhilePaymentInFlight;
     // FeohLedger paid this invoice, and the ERP shows the bill also paid by a payment FeohLedger did not make — the supplier may have been paid twice. Recover one of the payments.
     case 'exception.erp_paid_twice':
       return l.exceptionDescriptionErpPaidTwice;
@@ -1344,6 +1355,21 @@ String? _localizeWarningCode(
       return l.exceptionDescriptionPaymentDispatchInterruptedCancelled(
         paymentId,
       );
+    // The card ending {lastFour} was charged after it was cancelled, so this invoice may have been paid twice. Check the charge with the card provider and the other payments on this invoice, and recover the duplicate — this invoice is blocked from a new payment run until this is resolved.
+    case 'exception.card_settled_after_cancel':
+      final lastFour = _text(p['lastFour'], currency);
+      if (lastFour == null) return null;
+      return l.exceptionDescriptionCardSettledAfterCancel(lastFour);
+    // A settlement on the card ending {lastFour} was refused because it stated no usable amount, so money may have moved on the card without being recorded. Check the charge with the card provider — the card cannot be cancelled and this invoice is blocked from a new payment run until this is resolved.
+    case 'exception.card_settlement_refused':
+      final lastFour = _text(p['lastFour'], currency);
+      if (lastFour == null) return null;
+      return l.exceptionDescriptionCardSettlementRefused(lastFour);
+    // A further charge on the card ending {lastFour} was not recorded, so the amount paid on this invoice may be more than shown. Check the charge with the card provider and record any difference — this invoice is blocked from a new payment run until this is resolved.
+    case 'exception.card_clearing_refused':
+      final lastFour = _text(p['lastFour'], currency);
+      if (lastFour == null) return null;
+      return l.exceptionDescriptionCardClearingRefused(lastFour);
     // Settlement currency mismatch: the processor reported {settledAmount} {settledCurrency} but this payment authorizes {authorizedAmount} {authorizedCurrency}. Money moved on a currency AP did not authorize — reconcile with the processor before releasing this invoice.
     case 'exception.settlement_currency_mismatch':
       final settledAmount = _number(p['settledAmount'], currency);

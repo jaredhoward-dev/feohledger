@@ -353,8 +353,8 @@ jobs:
 
       - name: Smoke-check the deployed stack (deploy/smoke.sh)
         # The apex, api/health, a tenant host's TLS, and /api/public-config
-        # agreeing with SIGNUP_ENABLED (plus a captcha site key whenever signup
-        # is on). Repository variables, none secret; an unset one fails the
+        # agreeing with SIGNUP_ENABLED (plus a captcha site key, signup open or
+        # not: the workspace lookup needs one, §553). Repository variables, none secret; an unset one fails the
         # step rather than skipping its check.
         #
         # The tenant host is the same synthetic `smoke-check.` subdomain the

@@ -342,6 +342,173 @@ async def test_the_sweep_reads_changed_bills_and_applies_them(realdb, monkeypatc
     assert (await _invoice(realdb, inv_id)).status == InvoiceStatus.paid
 
 
+async def _configure_netsuite(realdb, key: str, account: str, **extra) -> str:
+    """A tenant on NetSuite: stored credentials, no OAuth connection block,
+    opted in to status sync (decisions §541) unless ``extra`` says otherwise.
+    Returns the connection realm its pushes record."""
+    async with realdb.control_sessionmaker()() as s:
+        org = await s.get(Organization, realdb.info(key).org_id)
+        org.settings = {
+            **{k: v for k, v in (org.settings or {}).items() if k != "erp_status_sync"},
+            "erp": {
+                "type": "netsuite",
+                "integration_method": "direct",
+                "account_id": account,
+                "netsuite_status_sync": "on",
+            }
+            | extra,
+        }
+        await s.commit()
+    return f"netsuite:{account.lower()}"
+
+
+class _FakeNetSuite:
+    erp_type = "netsuite"
+    supports_status_sync = True
+    bills_match_by_reference = False
+
+    def __init__(self, report: ErpBillReport):
+        self.changed_bills = AsyncMock(return_value=[report.bill_id])
+        self.bill_report = AsyncMock(return_value=report)
+
+
+async def test_the_sweep_selects_a_netsuite_tenant_by_its_type_and_keeps_its_mark(
+    realdb, monkeypatch
+):
+    """NetSuite has no OAuth block (decisions §536): the sweep finds the tenant
+    by ``settings.erp.type``, applies the bill, and keeps the pass's mark
+    beside the configuration, tied to the account it names."""
+    from datetime import UTC, datetime, timedelta
+
+    from app.config import settings
+
+    account = f"TSTDRV{uuid.uuid4().hex[:6].upper()}"
+    realm = await _configure_netsuite(realdb, "a", account)
+    inv_id, corr = await _seed(realdb, status=InvoiceStatus.posted_in_erp, realm=realm)
+    monkeypatch.setattr(settings, "erp_status_sync_enabled", True)
+    fake = _FakeNetSuite(
+        _report(
+            corr,
+            ErpBillState.paid,
+            external_payment_ids=("7001",),
+            paid_amount=Decimal("250.00"),
+            paid_currency="USD",
+        )
+    )
+    first = datetime(2026, 11, 25, 9, 0, tzinfo=UTC)
+
+    with patch.object(erp_status_sync, "_adapter_or_none", return_value=fake):
+        result = await erp_status_sync.run_status_sync_once(now=first)
+
+    assert result.failures == 0 and result.invoices_changed == 1
+    assert result.full_reconciliations == 1  # no mark yet: every payable bill read back
+    assert (await _invoice(realdb, inv_id)).status == InvoiceStatus.paid
+    org = await _org(realdb)
+    assert org.settings[erp_status_sync.DIRECT_MARK_KEY] == {
+        "realm": realm,
+        "through": first.isoformat(),
+    }
+    assert "oauth" not in org.settings["erp"]
+
+    # The next pass reads changes from that mark, with no full reconciliation.
+    fake.changed_bills.reset_mock()
+    with patch.object(erp_status_sync, "_adapter_or_none", return_value=fake):
+        again = await erp_status_sync.run_status_sync_once(now=first + timedelta(minutes=5))
+    assert again.full_reconciliations == 0
+    assert fake.changed_bills.await_args.args[0] <= first
+
+
+async def test_a_netsuite_mark_for_another_account_is_not_used(realdb, monkeypatch):
+    """Pointing the configuration at another NetSuite account starts with no
+    mark: the old account's changes say nothing about the new one's bills."""
+    from datetime import UTC, datetime
+
+    from app.config import settings
+
+    realm = await _configure_netsuite(realdb, "a", f"OLD{uuid.uuid4().hex[:6].upper()}")
+    assert await erp_status_sync.record_direct_mark(
+        realdb.info("a").org_id, realm, datetime(2026, 11, 24, tzinfo=UTC)
+    )
+    new_account = f"NEW{uuid.uuid4().hex[:6].upper()}"
+    async with realdb.control_sessionmaker()() as s:
+        org = await s.get(Organization, realdb.info("a").org_id)
+        org.settings = {**org.settings, "erp": {**org.settings["erp"], "account_id": new_account}}
+        await s.commit()
+    org = await _org(realdb)
+    assert erp_status_sync.direct_mark(org, f"netsuite:{new_account.lower()}") is None
+    # A mark is never written for a realm the stored configuration no longer names.
+    assert not await erp_status_sync.record_direct_mark(
+        org.id, realm, datetime(2026, 11, 25, tzinfo=UTC)
+    )
+
+    monkeypatch.setattr(settings, "erp_status_sync_enabled", True)
+    _, corr = await _seed(
+        realdb, status=InvoiceStatus.posted_in_erp, realm=f"netsuite:{new_account.lower()}"
+    )
+    fake = _FakeNetSuite(_report(corr, ErpBillState.open))
+    with patch.object(erp_status_sync, "_adapter_or_none", return_value=fake):
+        result = await erp_status_sync.run_status_sync_once()
+    assert result.full_reconciliations == 1
+
+
+async def test_a_netsuite_type_left_under_merge_is_not_swept(realdb, monkeypatch):
+    """The dispatcher's rule decides the adapter: ``type: netsuite`` under a
+    Merge.dev integration is a Merge tenant, which this sweep never reads."""
+    from app.config import settings
+
+    await _configure_netsuite(
+        realdb, "a", f"MRG{uuid.uuid4().hex[:6].upper()}", integration_method="merge_dev"
+    )
+    monkeypatch.setattr(settings, "erp_status_sync_enabled", True)
+    probe = AsyncMock()
+    with patch.object(erp_status_sync, "sync_org", probe):
+        await erp_status_sync.run_status_sync_once()
+    assert all(c.args[0].id != realdb.info("a").org_id for c in probe.await_args_list)
+
+
+@pytest.mark.parametrize("opt_in", [None, "off"])
+async def test_a_netsuite_tenant_without_the_opt_in_is_not_swept(realdb, monkeypatch, opt_in):
+    """NetSuite's status sync is a per-tenant opt-in (decisions §541): with the
+    deployment's switch on, a tenant that has not opted in is never read, its
+    pushes keep closing at ``done``, and nothing is written back to it."""
+    from app.config import settings
+    from app.services.erp_adapters.netsuite import NetSuiteAdapter
+    from app.services.erp_payment_writeback import SKIPPED, write_back_payment
+
+    await _configure_netsuite(realdb, "a", f"OFF{uuid.uuid4().hex[:6].upper()}")
+    async with realdb.control_sessionmaker()() as s:
+        org = await s.get(Organization, realdb.info("a").org_id)
+        erp = dict(org.settings["erp"])
+        if opt_in is None:
+            erp.pop("netsuite_status_sync")
+        else:
+            erp["netsuite_status_sync"] = opt_in
+        org.settings = {**org.settings, "erp": erp}
+        await s.commit()
+    monkeypatch.setattr(settings, "erp_status_sync_enabled", True)
+    probe = AsyncMock()
+    with patch.object(erp_status_sync, "sync_org", probe):
+        result = await erp_status_sync.run_status_sync_once()
+    assert all(c.args[0].id != realdb.info("a").org_id for c in probe.await_args_list)
+    org = await _org(realdb)
+    assert erp_status_sync.status_sync_active(org.settings["erp"]) is False
+    assert await erp_status_sync.sync_bills(org, ["NS-1"], event_id=None) == 0
+    # The write-back refuses before reading anything: no payment, no ERP call.
+    adapter = NetSuiteAdapter(org.settings["erp"])
+    adapter.post_payment = AsyncMock()
+    outcome = await write_back_payment(
+        None,
+        adapter=adapter,
+        erp_config=org.settings["erp"],
+        payment=None,
+        invoice=None,
+        state_data={},
+    )
+    assert outcome == SKIPPED
+    adapter.post_payment.assert_not_awaited()
+    assert result.failures == 0
+
+
 async def test_the_sweep_is_off_by_default(monkeypatch):
     from app.config import settings
 
@@ -1221,7 +1388,7 @@ async def test_a_row_from_an_erp_that_never_reads_bills_back_needs_no_read():
     their kept rows are recorded at what is owed here, as their first report
     already is: nothing is read, and nothing is held for a figure."""
     figure = await erp_status_sync.read_back_unstated_figure(
-        None, invoice=None, org=None, facts={"erp_type": "netsuite"}
+        None, invoice=None, org=None, facts={"erp_type": "sage_intacct"}
     )
     assert figure == erp_status_sync.ReadBackFigure(needed=False)
 
@@ -1810,12 +1977,12 @@ async def test_a_xero_bill_only_a_realmless_push_names_is_never_read(realdb, mon
 
     factory = realdb.sessionmaker("a")
     realm = "quickbooks_online:any"
-    assert await erp_status_sync._bills_we_posted(factory, [XERO_BILL], realm) == [XERO_BILL]
+    assert await erp_status_sync.bills_we_posted(factory, [XERO_BILL], realm) == [XERO_BILL]
     assert (
-        await erp_status_sync._bills_we_posted(factory, [XERO_BILL], realm, by_reference=True) == []
+        await erp_status_sync.bills_we_posted(factory, [XERO_BILL], realm, by_reference=True) == []
     )
     assert (
-        await erp_status_sync._bills_we_posted(factory, [XERO_BILL], None, by_reference=True) == []
+        await erp_status_sync.bills_we_posted(factory, [XERO_BILL], None, by_reference=True) == []
     )
 
 
@@ -2090,6 +2257,134 @@ async def test_an_on_request_pass_refused_at_start_is_still_audited(realdb, monk
         )
     assert row.details["outcome"] == "refused"
     assert row.details["refusal"] == "status_sync_off"
+
+
+async def test_an_on_request_pass_runs_for_an_opted_in_netsuite_tenant(realdb, monkeypatch):
+    """NetSuite has no OAuth connection block (decisions §536); its on-request
+    pass is selected the way the sweep selects it, by the adapter its
+    configuration resolves to, and runs the sweep's own pass: the invoice
+    moves, the mark is kept beside the configuration, and the outcome is
+    audited under the configured ERP's name (decisions §547)."""
+    from app.config import settings
+    from app.models.workflow import AuditLog
+
+    realm = await _configure_netsuite(realdb, "a", f"NOW{uuid.uuid4().hex[:6].upper()}")
+    inv_id, corr = await _seed(realdb, status=InvoiceStatus.posted_in_erp, realm=realm)
+    monkeypatch.setattr(settings, "erp_status_sync_enabled", True)
+    org = await _org(realdb)
+    assert await erp_status_sync.status_sync_now_refusal(org) is None
+    assert erp_status_sync.status_sync_provider(org) == "netsuite"
+
+    fake = _FakeNetSuite(
+        _report(
+            corr,
+            ErpBillState.paid,
+            external_payment_ids=("7002",),
+            paid_amount=Decimal("250.00"),
+            paid_currency="USD",
+        )
+    )
+    org_id = realdb.info("a").org_id
+    erp_status_sync._now_running.add(org_id)
+    with patch.object(erp_status_sync, "_adapter_or_none", return_value=fake):
+        await erp_status_sync._sync_org_now_task(org_id, None)
+
+    assert (await _invoice(realdb, inv_id)).status == InvoiceStatus.paid
+    assert (await _org(realdb)).settings[erp_status_sync.DIRECT_MARK_KEY]["realm"] == realm
+    async with realdb.sessionmaker("a")() as s:
+        [row] = (
+            (
+                await s.execute(
+                    select(AuditLog).where(AuditLog.action == "organization.erp_status_synced")
+                )
+            )
+            .scalars()
+            .all()
+        )
+    assert row.details["outcome"] == "completed", row.details
+    assert row.details["provider"] == "netsuite"
+    assert row.details["invoices_changed"] == 1
+
+
+async def test_the_on_request_audit_names_the_resolved_erp_not_a_leftover_oauth_block(
+    realdb, monkeypatch
+):
+    """An OAuth block survives a switch of ERP (§270): a NetSuite tenant that
+    once connected QuickBooks keeps that block. The audit names the adapter the
+    configuration resolves to, as the refusal selects it (decisions §550)."""
+    from app.config import settings
+    from app.models.workflow import AuditLog
+
+    await _configure_netsuite(
+        realdb,
+        "a",
+        f"SW{uuid.uuid4().hex[:6].upper()}",
+        oauth={"provider": "quickbooks_online", "external_tenant_id": "123"},
+    )
+    monkeypatch.setattr(settings, "erp_status_sync_enabled", True)
+    org = await _org(realdb)
+    assert erp_status_sync.status_sync_provider(org) == "netsuite"
+
+    org_id = realdb.info("a").org_id
+    erp_status_sync._now_running.add(org_id)
+    with patch.object(erp_status_sync, "sync_org_now", AsyncMock(side_effect=RuntimeError)):
+        await erp_status_sync._sync_org_now_task(org_id, None)
+    async with realdb.sessionmaker("a")() as s:
+        [row] = (
+            (
+                await s.execute(
+                    select(AuditLog).where(AuditLog.action == "organization.erp_status_synced")
+                )
+            )
+            .scalars()
+            .all()
+        )
+    assert row.details["provider"] == "netsuite"
+
+
+def test_the_on_request_audit_names_no_erp_when_none_is_configured():
+    from types import SimpleNamespace
+
+    assert erp_status_sync.status_sync_provider(SimpleNamespace(settings={})) is None
+    assert erp_status_sync.status_sync_provider(SimpleNamespace(settings={"erp": "x"})) is None
+
+
+@pytest.mark.parametrize("opt_in", [None, "off", "yes"])
+async def test_an_on_request_pass_is_refused_for_netsuite_without_the_opt_in(
+    realdb, monkeypatch, opt_in
+):
+    """The per-tenant opt-in (decisions §541) holds on request as in the sweep:
+    without it the ERP does not report back, with the existing code."""
+    from app.config import settings
+
+    await _configure_netsuite(realdb, "a", f"OFF{uuid.uuid4().hex[:6].upper()}")
+    async with realdb.control_sessionmaker()() as s:
+        row = await s.get(Organization, realdb.info("a").org_id)
+        erp = dict(row.settings["erp"])
+        if opt_in is None:
+            erp.pop("netsuite_status_sync")
+        else:
+            erp["netsuite_status_sync"] = opt_in
+        row.settings = {**row.settings, "erp": erp}
+        await s.commit()
+    monkeypatch.setattr(settings, "erp_status_sync_enabled", True)
+    org = await _org(realdb)
+    assert await erp_status_sync.status_sync_now_refusal(org) == "status_sync_unsupported"
+    monkeypatch.setattr(settings, "erp_status_sync_enabled", False)
+    assert await erp_status_sync.status_sync_now_refusal(org) == "status_sync_off"
+
+
+async def test_an_on_request_pass_is_refused_for_a_netsuite_type_under_merge(realdb, monkeypatch):
+    """The dispatcher's rule decides the adapter, as in the sweep: ``type:
+    netsuite`` left under a Merge.dev integration is a Merge tenant."""
+    from app.config import settings
+
+    await _configure_netsuite(
+        realdb, "a", f"MRG{uuid.uuid4().hex[:6].upper()}", integration_method="merge_dev"
+    )
+    monkeypatch.setattr(settings, "erp_status_sync_enabled", True)
+    org = await _org(realdb)
+    assert await erp_status_sync.status_sync_now_refusal(org) == "status_sync_unsupported"
 
 
 # ---------------------------------------------------------------------------
@@ -2527,3 +2822,54 @@ async def test_an_erp_sourced_record_is_not_held_by_a_kept_split(realdb):
     assert recorded.created
     [booked] = await _payments(realdb, inv_id)
     assert booked.amount == Decimal("250.00") and booked.status == "completed"
+
+
+# ---------------------------------------------------------------------------
+# a flag is deduplicated by its kind, never by its type alone (decisions §535)
+# ---------------------------------------------------------------------------
+
+
+async def _unrelated_live_row(realdb, inv_id, exception_type: str, kind: str) -> uuid.UUID:
+    exc_id = uuid.uuid4()
+    async with realdb.sessionmaker("a")() as s:
+        s.add(
+            APException(
+                id=exc_id,
+                organization_id=realdb.info("a").org_id,
+                invoice_id=inv_id,
+                exception_type=exception_type,
+                severity="error",
+                status="open",
+                description="Another report.",
+                erp_report={"kind": kind},
+            )
+        )
+        await s.commit()
+    return exc_id
+
+
+async def test_paid_twice_is_not_swallowed_by_an_unrelated_live_row(realdb):
+    """A leftover write-back flag of the same type does not stand in for
+    "the supplier was paid twice": the report would never come again."""
+    inv_id, corr = await _seed(realdb, status=InvoiceStatus.paid)
+    async with realdb.sessionmaker("a")() as s:
+        s.add(
+            Payment(
+                invoice_id=inv_id,
+                amount=Decimal("250.00"),
+                method="ach",
+                status="completed",
+                provider="mock",
+            )
+        )
+        await s.commit()
+    await _unrelated_live_row(realdb, inv_id, "erp_reconciliation", "payment_writeback_failed")
+
+    report = _report(corr, ErpBillState.paid, external_payment_ids=("9",))
+    assert (await _apply(realdb, report)).action == "double_payment_flagged"
+    codes = sorted(r.description_code or "" for r in await _exceptions(realdb, inv_id))
+    assert codes == ["", "exception.erp_paid_twice"]
+
+    # The same report again (the sweep re-reads the bill) is one row of its kind.
+    await _apply(realdb, report)
+    assert len(await _exceptions(realdb, inv_id)) == 2

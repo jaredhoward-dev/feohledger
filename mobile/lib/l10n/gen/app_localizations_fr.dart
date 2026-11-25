@@ -3861,8 +3861,16 @@ class AppLocalizationsFr extends AppLocalizations {
       'Selon l\'ERP, cette facture est réglée, au moins en partie, par un avoir fournisseur appliqué dans l\'ERP. FeohLedger ne la paiera pas tant que quelqu\'un n\'aura pas confirmé ce qui reste dû.';
 
   @override
+  String get exceptionDescriptionErpSettledNoPayment =>
+      'Selon l\'ERP, plus rien n\'est dû sur cette facture, mais aucun paiement n\'y est rattaché : un avoir y a été appliqué ou le solde passé en perte. FeohLedger ne la paiera pas tant que quelqu\'un n\'aura pas confirmé ce qui reste dû.';
+
+  @override
   String get exceptionDescriptionErpPaidWhileScheduled =>
       'Selon l\'ERP, cette facture a été payée par un paiement que FeohLedger n\'a pas effectué, alors qu\'un paiement FeohLedger est planifié pour elle. Arrêtez ou annulez l\'un des deux avant qu\'ils n\'atteignent tous deux le fournisseur.';
+
+  @override
+  String get exceptionDescriptionErpPaidWhilePaymentInFlight =>
+      'Selon l\'ERP, cette facture est payée alors que le paiement FeohLedger correspondant n\'est pas encore terminé. Vérifiez si cette écriture est le paiement FeohLedger ou un second paiement avant d\'annuler quoi que ce soit.';
 
   @override
   String get exceptionDescriptionErpPaidTwice =>
@@ -4082,6 +4090,21 @@ class AppLocalizationsFr extends AppLocalizations {
     String paymentId,
   ) {
     return 'Le paiement $paymentId a été annulé, mais une tentative d’envoi antérieure a été interrompue alors qu’il avait peut-être déjà atteint le prestataire ; l’argent a donc pu partir ou non. Vérifiez auprès du prestataire puis annulez ou payez à nouveau : cette facture est exclue des nouveaux lots de paiement jusqu’à résolution.';
+  }
+
+  @override
+  String exceptionDescriptionCardSettledAfterCancel(String lastFour) {
+    return 'La carte se terminant par $lastFour a été débitée après son annulation ; cette facture a donc pu être payée deux fois. Vérifiez le débit auprès du fournisseur de la carte et les autres paiements de cette facture, puis récupérez le doublon : cette facture est exclue des nouveaux lots de paiement jusqu’à résolution.';
+  }
+
+  @override
+  String exceptionDescriptionCardSettlementRefused(String lastFour) {
+    return 'Un règlement sur la carte se terminant par $lastFour a été refusé car il n’indiquait aucun montant exploitable ; de l’argent a donc pu être débité sur la carte sans être enregistré. Vérifiez le débit auprès du fournisseur de la carte : la carte ne peut pas être annulée et cette facture est exclue des nouveaux lots de paiement jusqu’à résolution.';
+  }
+
+  @override
+  String exceptionDescriptionCardClearingRefused(String lastFour) {
+    return 'Un débit supplémentaire sur la carte se terminant par $lastFour n’a pas été enregistré ; le montant payé pour cette facture peut donc dépasser celui affiché. Vérifiez le débit auprès du fournisseur de la carte et enregistrez l’écart : cette facture est exclue des nouveaux lots de paiement jusqu’à résolution.';
   }
 
   @override
@@ -4954,6 +4977,9 @@ class AppLocalizationsFr extends AppLocalizations {
 
   @override
   String get notificationEventChatMessage => 'Nouveau message';
+
+  @override
+  String get notificationEventErpBillFlagged => 'Signalement d\'une facture déjà dans l\'ERP';
 
   @override
   String get notificationEventOther => 'Notification';

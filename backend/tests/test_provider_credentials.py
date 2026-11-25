@@ -164,6 +164,67 @@ def test_kms_error_names_no_value(fake_kms):
     assert SECRET not in str(exc.value)
 
 
+def test_opens_from_cache_answers_without_calling_kms_or_touching_the_cache(fake_kms, monkeypatch):
+    """The predicate the ERP webhooks' spent unseal budget consults (decisions
+    §527): True exactly when an opening would be served by the cache — the
+    same key, the same context, inside the TTL — and asking neither calls KMS
+    nor warms, refreshes or evicts an entry."""
+    env = credential_crypto.seal_sync(b"payload", CTX)
+    assert credential_crypto.opens_from_cache(env, CTX) is False  # never opened
+    assert credential_crypto._dek_cache == {}  # asking did not warm it
+
+    credential_crypto.open_sync(env, CTX)
+    snapshot = dict(credential_crypto._dek_cache)
+    calls = list(fake_kms.calls)
+    for _ in range(3):
+        assert credential_crypto.opens_from_cache(env, CTX) is True
+    assert credential_crypto._dek_cache == snapshot  # expiry not refreshed
+    assert fake_kms.calls == calls  # no KMS call to answer
+
+    # Another context (another org or block) is another cache entry.
+    assert credential_crypto.opens_from_cache(env, {**CTX, "organization_id": "other"}) is False
+
+    # Past the TTL: False, and the stale entry is left for the opener to replace.
+    (expires,) = (e for e, _dek in snapshot.values())
+    monkeypatch.setattr(credential_crypto.time, "monotonic", lambda: expires + 0.001)
+    assert credential_crypto.opens_from_cache(env, CTX) is False
+    assert credential_crypto._dek_cache == snapshot
+
+
+def test_opens_from_cache_is_false_for_a_local_envelope(monkeypatch):
+    """Local unwraps are never cached (one AES operation), so a local row is
+    never "served by the cache"."""
+    monkeypatch.setattr(settings, "credential_kms_key_id", "")
+    env = credential_crypto.seal_sync(b"payload", CTX)
+    assert env.key_provider == credential_crypto.KEY_PROVIDER_LOCAL
+    credential_crypto.open_sync(env, CTX)
+    assert credential_crypto.opens_from_cache(env, CTX) is False
+
+
+@pytest.mark.asyncio
+async def test_stored_block_opens_from_cache_reads_the_row_without_unsealing(
+    realdb, fake_kms, monkeypatch
+):
+    """The row-level spelling: no row is False; a KMS-sealed row is True only
+    once an opening has cached its data key, and asking never decrypts."""
+    from app.services import provider_credentials
+
+    org = await _org(realdb)
+    async with realdb.control_sessionmaker()() as s:
+        assert await provider_credentials.stored_block_opens_from_cache(org, "erp", db=s) is False
+
+    await realdb.store_provider_secrets("a", "erp", {"webhook_signing_secret": SECRET})
+    calls = len(fake_kms.calls)
+    async with realdb.control_sessionmaker()() as s:
+        assert await provider_credentials.stored_block_opens_from_cache(org, "erp", db=s) is False
+    assert len(fake_kms.calls) == calls
+
+    async with realdb.control_sessionmaker()() as s:
+        await provider_credentials.load_secrets(org.id, "erp", db=s)
+        assert await provider_credentials.stored_block_opens_from_cache(org, "erp", db=s) is True
+        assert await provider_credentials.stored_block_opens_from_cache(org, "cards", db=s) is False
+
+
 async def test_kms_unwrap_runs_off_the_event_loop(fake_kms):
     """boto3 is synchronous — the KMS round trip must not stall the loop."""
     env = await credential_crypto.seal(b"payload", CTX)
@@ -454,6 +515,56 @@ async def test_bad_bodies_are_refused_without_echoing_the_value(realdb, body):
     assert resp.status_code == 422, resp.text
     assert SECRET not in resp.text
     assert await _rows(realdb) == []
+
+
+async def _set_cards_provider(realdb, provider: str, key="a") -> None:
+    async with realdb.control_sessionmaker()() as s:
+        org = (
+            await s.execute(select(Organization).where(Organization.id == realdb.info(key).org_id))
+        ).scalar_one()
+        org.settings = {**(org.settings or {}), "cards": {"enabled": True, "provider": provider}}
+        await s.commit()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("value", [SECRET, "whsec", " WHSEC_abc", "abc_whsec_def"])
+async def test_a_lithic_card_webhook_secret_without_its_prefix_is_refused(realdb, value):
+    """Decisions §562: Lithic signs with a Standard-Webhooks `whsec_` secret and
+    the verifier fails closed on any other value, so saving one would answer
+    every real delivery with a silent 204. Refused with a coded 422 that never
+    echoes the value; nothing is sealed and nothing is audited."""
+    await _set_cards_provider(realdb, "lithic")
+    async with realdb.client(key="a", role="admin") as c:
+        resp = await c.put(f"{URL}/cards", json={"set": {"webhook_signing_secret": value}})
+    assert resp.status_code == 422, resp.text
+    detail = resp.json()["detail"]
+    assert detail["code"] == "card_webhook_secret_format"
+    assert detail["params"] == {"provider": "lithic"}
+    assert SECRET not in resp.text
+    assert await _rows(realdb) == []
+    assert await _audit(realdb, "organization.credentials_updated") == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("provider", "value"),
+    [
+        ("lithic", "whsec_MfKQ9r8GKYqrTwjUPD8ILPZIo2LaLaSw"),
+        # Nium's secret is its free-form `x-partner-key`; the mock's a hex key.
+        ("nium", "partner-key-123"),
+        ("mock", "deadbeef"),
+    ],
+)
+async def test_a_card_webhook_secret_in_its_providers_format_is_saved(realdb, provider, value):
+    await _set_cards_provider(realdb, provider)
+    async with realdb.client(key="a", role="admin") as c:
+        resp = await c.put(f"{URL}/cards", json={"set": {"webhook_signing_secret": value}})
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["cards"] == ["webhook_signing_secret"]
+    org = await _org(realdb)
+    assert (await provider_credentials.provider_config(org, "cards"))[
+        "webhook_signing_secret"
+    ] == value
 
 
 @pytest.mark.asyncio
@@ -1204,3 +1315,20 @@ async def test_a_reset_that_cannot_be_audited_removes_nothing(realdb, monkeypatc
         resp = await c.delete(f"{URL}/erp")
     assert resp.status_code == 503
     assert len(await _rows(realdb)) == 1
+
+
+def test_the_kms_client_is_built_with_bounded_timeouts_and_retries(monkeypatch):
+    """boto's defaults (60 s connect, 60 s read, five legacy attempts) could hold
+    one unseal for minutes, past the ERP void's staleness rule (decisions §550).
+    Building the client makes no network call."""
+    monkeypatch.setenv("AWS_DEFAULT_REGION", "us-east-1")
+    monkeypatch.setattr(credential_crypto, "_kms_client_instance", None)
+    client = credential_crypto._kms_client()
+    try:
+        cfg = client.meta.config
+        assert cfg.connect_timeout == credential_crypto.KMS_CONNECT_TIMEOUT_S
+        assert cfg.read_timeout == credential_crypto.KMS_READ_TIMEOUT_S
+        assert cfg.retries["mode"] == "standard"
+        assert cfg.retries["total_max_attempts"] == credential_crypto.KMS_MAX_ATTEMPTS
+    finally:
+        monkeypatch.setattr(credential_crypto, "_kms_client_instance", None)

@@ -145,6 +145,17 @@ _EN: dict[str, str] = {
     "signup.verify.cta": "Confirm and create workspace",
     "email.layout.open_cta": "Open {product}",
     "email.layout.fallback_link": "Button not working? Paste this link into your browser:",
+    # Self-service workspace lookup (`api/workspace_lookup.py`, decisions §518).
+    "workspace_lookup.subject": "Your FeohLedger workspace address",
+    "workspace_lookup.greeting": "Hi {name},",
+    "workspace_lookup.body": (
+        "Your account is in the {workspace} workspace. Sign in on its own page:"
+    ),
+    "workspace_lookup.cta": "Go to your sign-in page",
+    "workspace_lookup.ignore": (
+        "Someone asked us to email the workspace address for this email address. If it "
+        "wasn't you, you can ignore this email: nothing about your account has changed."
+    ),
 }
 
 # --- German ------------------------------------------------------------------
@@ -203,6 +214,19 @@ _DE: dict[str, str] = {
     "email.layout.open_cta": "{product} öffnen",
     "email.layout.fallback_link": (
         "Schaltfläche funktioniert nicht? Fügen Sie diesen Link in Ihren Browser ein:"
+    ),
+    # Self-service workspace lookup (`api/workspace_lookup.py`, decisions §518).
+    "workspace_lookup.subject": "Die Adresse Ihres FeohLedger-Arbeitsbereichs",
+    "workspace_lookup.greeting": "Hallo {name},",
+    "workspace_lookup.body": (
+        "Ihr Konto gehört zum Arbeitsbereich {workspace}. Melden Sie sich auf dessen "
+        "eigener Seite an:"
+    ),
+    "workspace_lookup.cta": "Zur Anmeldeseite",
+    "workspace_lookup.ignore": (
+        "Jemand hat uns gebeten, die Adresse des Arbeitsbereichs an diese E-Mail-Adresse "
+        "zu senden. Wenn Sie das nicht waren, können Sie diese E-Mail ignorieren: An "
+        "Ihrem Konto hat sich nichts geändert."
     ),
 }
 
@@ -264,6 +288,19 @@ _FR: dict[str, str] = {
     "email.layout.fallback_link": (
         "Le bouton ne fonctionne pas ? Collez ce lien dans votre navigateur :"
     ),
+    # Self-service workspace lookup (`api/workspace_lookup.py`, decisions §518).
+    "workspace_lookup.subject": "L'adresse de votre espace de travail FeohLedger",
+    "workspace_lookup.greeting": "Bonjour {name},",
+    "workspace_lookup.body": (
+        "Votre compte se trouve dans l'espace de travail {workspace}. Connectez-vous sur "
+        "sa propre page :"
+    ),
+    "workspace_lookup.cta": "Aller à votre page de connexion",
+    "workspace_lookup.ignore": (
+        "Quelqu'un nous a demandé d'envoyer l'adresse de l'espace de travail à cette "
+        "adresse e-mail. Si ce n'était pas vous, vous pouvez ignorer cet e-mail : rien "
+        "n'a changé sur votre compte."
+    ),
 }
 
 # --- Spanish -----------------------------------------------------------------
@@ -322,6 +359,18 @@ _ES: dict[str, str] = {
     "signup.verify.cta": "Confirmar y crear el espacio de trabajo",
     "email.layout.open_cta": "Abrir {product}",
     "email.layout.fallback_link": "¿El botón no funciona? Pegue este enlace en su navegador:",
+    # Self-service workspace lookup (`api/workspace_lookup.py`, decisions §518).
+    "workspace_lookup.subject": "La dirección de su espacio de trabajo de FeohLedger",
+    "workspace_lookup.greeting": "Hola {name}:",
+    "workspace_lookup.body": (
+        "Su cuenta está en el espacio de trabajo {workspace}. Inicie sesión en su propia página:"
+    ),
+    "workspace_lookup.cta": "Ir a su página de inicio de sesión",
+    "workspace_lookup.ignore": (
+        "Alguien nos pidió que enviáramos la dirección del espacio de trabajo a esta "
+        "dirección de correo. Si no fue usted, puede ignorar este correo: no ha cambiado "
+        "nada en su cuenta."
+    ),
 }
 
 # --- Portuguese (Brazil) -----------------------------------------------------
@@ -378,6 +427,18 @@ _PT_BR: dict[str, str] = {
     "signup.verify.cta": "Confirmar e criar o espaço de trabalho",
     "email.layout.open_cta": "Abrir {product}",
     "email.layout.fallback_link": "O botão não funciona? Cole este link no seu navegador:",
+    # Self-service workspace lookup (`api/workspace_lookup.py`, decisions §518).
+    "workspace_lookup.subject": "O endereço do seu espaço de trabalho do FeohLedger",
+    "workspace_lookup.greeting": "Olá {name},",
+    "workspace_lookup.body": (
+        "Sua conta está no espaço de trabalho {workspace}. Entre pela página dele:"
+    ),
+    "workspace_lookup.cta": "Ir para sua página de login",
+    "workspace_lookup.ignore": (
+        "Alguém nos pediu para enviar o endereço do espaço de trabalho para este "
+        "endereço de e-mail. Se não foi você, pode ignorar este e-mail: nada mudou na "
+        "sua conta."
+    ),
 }
 
 # --- Japanese ----------------------------------------------------------------
@@ -433,6 +494,19 @@ _JA: dict[str, str] = {
     "email.layout.open_cta": "{product} を開く",
     "email.layout.fallback_link": (
         "ボタンが機能しない場合は、このリンクをブラウザに貼り付けてください："
+    ),
+    # Self-service workspace lookup (`api/workspace_lookup.py`, decisions §518).
+    "workspace_lookup.subject": "FeohLedger ワークスペースのアドレス",
+    "workspace_lookup.greeting": "{name} さん、",
+    "workspace_lookup.body": (
+        "お使いのアカウントは {workspace} ワークスペースにあります。"
+        "そのワークスペース専用のページからサインインしてください："
+    ),
+    "workspace_lookup.cta": "サインインページへ移動",
+    "workspace_lookup.ignore": (
+        "このメールアドレス宛てにワークスペースのアドレスを送信するよう依頼が"
+        "ありました。お心当たりがない場合は、このメールを無視してください。ア"
+        "カウントには何も変更されていません。"
     ),
 }
 

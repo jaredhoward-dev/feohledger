@@ -440,3 +440,120 @@ async def test_a_line_creator_on_the_report_is_refused_as_its_approver(realdb):
     async with realdb.client(key="a", role="admin") as c:
         approved = await c.post(f"/api/expense-reports/{rid}/approve")
     assert approved.status_code == 200, approved.text
+
+
+# ---------------------------------------------------------------------------
+# What the attach picker offers (`GET /api/expenses?attachable=true`, §515)
+# ---------------------------------------------------------------------------
+
+
+async def _attachable_ids(realdb, role: str, **params) -> set[str]:
+    async with realdb.client(key="a", role=role) as c:
+        resp = await c.get(
+            "/api/expenses", params={"attachable": "true", "page_size": 100, **params}
+        )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["total"] == len(body["items"]), "test set outgrew one page"
+    return {e["id"] for e in body["items"]}
+
+
+async def test_attachable_lists_exactly_what_an_attach_by_the_caller_accepts(realdb):
+    """The picker's set is the attach gate's: the caller's own loose draft
+    lines plus unrecorded (pre-0134) ones — never a colleague's line, a line
+    already on a report, or a loose line that is not a draft."""
+    mine = await _loose_line(realdb, "ap_clerk")
+    legacy = await _loose_line(realdb, "ap_manager")
+    await _clear_creator(realdb, legacy)
+    foreign = await _loose_line(realdb, "ap_manager")
+    _rid, on_report = await _clerk_draft_report(realdb)
+    not_draft = await _loose_line(realdb, "ap_clerk")
+    async with realdb.sessionmaker("a")() as s:
+        row = (
+            await s.execute(select(Expense).where(Expense.id == uuid.UUID(not_draft)))
+        ).scalar_one()
+        row.status = "rejected"
+        await s.commit()
+
+    ids = await _attachable_ids(realdb, "ap_clerk")
+    assert {mine, legacy} <= ids
+    assert not ids & {foreign, on_report, not_draft}
+
+    # Every line it offers is one the attach then takes.
+    rid = await _own_report(realdb, "ap_clerk")
+    async with realdb.client(key="a", role="ap_clerk") as c:
+        attached = await c.post(
+            f"/api/expense-reports/{rid}/expenses", json={"expense_ids": [mine, legacy]}
+        )
+    assert attached.status_code == 200, attached.text
+    assert not (await _attachable_ids(realdb, "ap_clerk")) & {mine, legacy}
+
+
+async def test_attachable_is_per_caller_and_composes_with_search(realdb):
+    mine = await _loose_line(realdb, "ap_clerk")
+    async with realdb.client(key="a", role="ap_clerk") as c:
+        tagged = (
+            await c.post(
+                "/api/expenses",
+                json={"expense_date": "2026-06-04", "amount": "12.00", "merchant": "Zeppelin Taxi"},
+            )
+        ).json()["id"]
+    assert not (await _attachable_ids(realdb, "ap_manager")) & {mine, tagged}
+    assert await _attachable_ids(realdb, "ap_clerk", search="zeppelin") == {tagged}
+
+
+async def test_select_all_ids_narrow_to_the_same_attachable_set(realdb):
+    """`GET /api/expenses/ids?attachable=true` — what the bulk "Add to report"
+    sends out of an all-matching selection — is the list's attachable set, so
+    a line already on another report is skipped, never moved (§515)."""
+    mine = await _loose_line(realdb, "ap_clerk")
+    foreign = await _loose_line(realdb, "ap_manager")
+    _rid, on_report = await _clerk_draft_report(realdb)
+    async with realdb.client(key="a", role="ap_clerk") as c:
+        narrowed = await c.get("/api/expenses/ids", params={"attachable": "true"})
+        everything = await c.get("/api/expenses/ids")
+    assert narrowed.status_code == 200, narrowed.text
+    ids = set(narrowed.json()["ids"])
+    assert mine in ids
+    assert not ids & {foreign, on_report}
+    assert narrowed.json()["total"] == len(ids)
+    assert ids == await _attachable_ids(realdb, "ap_clerk")
+    # Without the flag the resolver still covers the whole filtered set.
+    assert {mine, foreign, on_report} <= set(everything.json()["ids"])
+
+
+async def test_the_summary_counts_the_same_attachable_set(realdb):
+    """`/api/expenses/summary?attachable=true` counts exactly the lines the list
+    returns under the same flag, so a KPI over the picker's set never spans a
+    wider one (`test_whole_set_kpi_rollups`)."""
+    await _loose_line(realdb, "ap_clerk")
+    await _loose_line(realdb, "ap_manager")
+    await _clerk_draft_report(realdb)
+    async with realdb.client(key="a", role="ap_clerk") as c:
+        narrowed = await c.get("/api/expenses/summary", params={"attachable": "true"})
+        everything = await c.get("/api/expenses/summary")
+    assert narrowed.status_code == 200, narrowed.text
+    expected = len(await _attachable_ids(realdb, "ap_clerk"))
+    assert narrowed.json()["total"] == expected
+    assert narrowed.json()["by_status"] == {"draft": expected}
+    assert sum(cur["count"] for cur in narrowed.json()["by_currency"]) == expected
+    assert everything.json()["total"] > expected
+
+
+async def test_mine_lists_only_the_callers_reports(realdb):
+    """`/expense-reports?mine=true&status=draft` is the bulk "Add to report"
+    target list: reports only their owner may compose."""
+    clerk_rid = await _own_report(realdb, "ap_clerk")
+    manager_rid = await _own_report(realdb, "ap_manager")
+    async with realdb.client(key="a", role="ap_clerk") as c:
+        resp = await c.get(
+            "/api/expense-reports", params={"mine": "true", "status": "draft", "page_size": 100}
+        )
+    assert resp.status_code == 200, resp.text
+    items = resp.json()["items"]
+    ids = {r["id"] for r in items}
+    assert clerk_rid in ids
+    assert manager_rid not in ids
+    clerk = str(realdb.info("a").users["ap_clerk"])
+    assert all(r["employee_user_id"] == clerk for r in items)
+    assert all(r["actions"]["compose"] is None for r in items)

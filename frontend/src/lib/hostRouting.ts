@@ -272,6 +272,19 @@ function siteUrlHost(siteUrl: string | null | undefined): string | null {
 }
 
 /**
+ * A page on the platform apex (`PUBLIC_SITE_URL`) — where the pages that come
+ * before any workspace live (`/signup`, `/find-workspace`) — for a link from a
+ * workspace host, which has no apex of its own to be relative to. `null` when
+ * the build declares no http(s) site URL: a link that guessed the apex from
+ * the current host could send a sign-in to a host that is not ours.
+ */
+export function apexPageUrl(siteUrl: string | null | undefined, path: string): string | null {
+	const base = (siteUrl ?? '').trim().replace(/\/+$/, '');
+	if (!/^https?:\/\/[^/]+$/i.test(base)) return null;
+	return `${base}${path.startsWith('/') ? path : `/${path}`}`;
+}
+
+/**
  * The current browser hostname, or `null` when there is no `window` (SSR /
  * prerender — the build prerenders every route, so this path is live).
  *

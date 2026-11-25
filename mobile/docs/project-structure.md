@@ -82,7 +82,7 @@ mobile/
 │   │   ├── approvals_screen.dart # Pending approvals with swipe-to-approve; AsyncListBody with Load more; the count is the server's total of invoices awaiting review
 │   │   ├── exceptions_screen.dart # Exception queue — filter + swipe resolve/dismiss; tap a row → detail; long-press / checklist app-bar action → multi-select + BulkActionBar bulk-resolve (admin/ap_manager)
 │   │   ├── exception_detail_screen.dart # Single-exception detail (GET /api/exceptions/{id}) — full fields + linked invoice + SLA/due/overdue + assignee, resolve/escalate/dismiss + an admin-gated assignee picker; loading/error/empty states
-│   │   ├── notifications_screen.dart # In-app notification center — All/Unread filter, tap → mark read (+ deep-link to invoice detail when the row is an invoice), mark-all-read; body is `AsyncListBody` (Unread-to-zero → filtered empty + Show all)
+│   │   ├── notifications_screen.dart # In-app notification center — All/Unread filter, tap → mark read (+ deep-link to invoice or exception detail when the row is one), mark-all-read; body is `AsyncListBody` (Unread-to-zero → filtered empty + Show all)
 │   │   ├── capture_screen.dart   # Camera/gallery capture + file picker (PDF/PNG/JPG/TIFF) → upload → extract
 │   │   ├── payments_screen.dart  # Payment history — PaymentStore + AsyncListBody
 │   │   ├── vendors_screen.dart   # Vendor management — list + search/status filters, swipe/sheet verify+reject (unverified only), ERP-sync app-bar action (all admin/ap_manager-gated); body is `AsyncListBody` (chip or search to zero → filtered empty + Show all, which also clears the search box)

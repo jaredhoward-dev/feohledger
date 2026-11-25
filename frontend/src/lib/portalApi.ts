@@ -8,6 +8,7 @@ import type { ActionRefusal } from '#lib/api/actionVerdicts.ts';
 import { portalAcceptanceRefusal } from '#lib/api/acceptanceRefusal.ts';
 import { apiErrorCode } from '#lib/utils/apiError.ts';
 import { getApiBase, getTenantSlug } from '#lib/tenant.ts';
+import { storageGet, storageRemove, storageSet } from '#lib/utils/safeStorage.ts';
 
 // Resolved per request, not frozen at module load — see the note in
 // `#lib/api.ts`. The supplier portal is served from the SAME hosts as the AP
@@ -15,17 +16,18 @@ import { getApiBase, getTenantSlug } from '#lib/tenant.ts';
 // origin through the same owner rather than keeping a second spelling.
 const TOKEN_KEY = 'portal_auth_token';
 
+// Guarded like `#lib/api.ts`'s: blocked site storage reads as signed out
+// rather than throwing out of the portal layout's boot (decisions §514).
 function getToken(): string | null {
-	if (typeof window === 'undefined') return null;
-	return localStorage.getItem(TOKEN_KEY);
+	return storageGet(TOKEN_KEY);
 }
 
 export function setPortalToken(token: string) {
-	localStorage.setItem(TOKEN_KEY, token);
+	storageSet(TOKEN_KEY, token);
 }
 
 export function clearPortalToken() {
-	localStorage.removeItem(TOKEN_KEY);
+	storageRemove(TOKEN_KEY);
 }
 
 export function hasPortalToken(): boolean {

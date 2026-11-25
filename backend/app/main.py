@@ -80,6 +80,7 @@ from app.api import (
     workflow,
     workflow_definitions,
     workflow_experiments,
+    workspace_lookup,
 )
 from app.api.v1 import router as public_v1_router
 from app.api.v1_openapi import router as public_v1_openapi_router
@@ -225,9 +226,12 @@ async def lifespan(app: FastAPI):
     from app.services.contract_renewal import run_renewal_loop
     from app.services.discount_auto_trigger import run_discount_optimization_loop
     from app.services.erp_auto_send_sweep import run_auto_send_sweep_loop
+    from app.services.erp_budget_retry_sweep import run_budget_retry_sweep_loop
     from app.services.erp_connection_health import run_connection_health_loop
+    from app.services.erp_status_poll_sweep import run_status_poll_sweep_loop
     from app.services.erp_status_sync import run_status_sync_loop
     from app.services.extraction_reaper import run_reaper_loop
+    from app.services.merge_readback_sweep import run_merge_readback_loop
     from app.services.payment_reconciler import run_reconciler_loop
     from app.services.qms_sync import run_qms_sync_loop
     from app.services.recurring_invoices import run_recurring_invoices_loop
@@ -381,6 +385,28 @@ async def lifespan(app: FastAPI):
     if settings.erp_auto_send_sweep_enabled:
         auto_send_task = start_sweep(run_auto_send_sweep_loop(), name="erp-auto-send")
 
+    # Call-budget re-send (decisions §521): a push refused before any call
+    # because the org's share of a shared ERP quota was used is re-sent once
+    # the allowance has reset. Disabled by default. Books a bill in the ERP.
+    budget_retry_task: asyncio.Task | None = None
+    if settings.erp_budget_retry_sweep_enabled:
+        budget_retry_task = start_sweep(run_budget_retry_sweep_loop(), name="erp-budget-retry")
+
+    # ERP status polling (decisions §528): the backstop for the generic ERP
+    # webhook, which drops a delivery it cannot verify. Reads each sent bill's
+    # status and applies a change through the webhook's own transition.
+    status_poll_task: asyncio.Task | None = None
+    if settings.erp_status_poll_sweep_enabled:
+        status_poll_task = start_sweep(run_status_poll_sweep_loop(), name="erp-status-poll")
+
+    # Merge.dev bill read-back (decisions §540): the backstop for the Merge
+    # webhook, which drops a delivery it cannot verify. Reads back the pushed
+    # bills Merge's change feed lists and applies them with the webhook's own
+    # reconciler.
+    merge_readback_task: asyncio.Task | None = None
+    if settings.merge_readback_sweep_enabled:
+        merge_readback_task = start_sweep(run_merge_readback_loop(), name="merge-readback")
+
     try:
         yield
     finally:
@@ -405,6 +431,9 @@ async def lifespan(app: FastAPI):
             connection_health_task,
             subprocessor_notices_task,
             auto_send_task,
+            budget_retry_task,
+            status_poll_task,
+            merge_readback_task,
         ):
             if task is not None:
                 task.cancel()
@@ -654,6 +683,8 @@ app.include_router(organization_close.router, prefix="/api")
 app.include_router(partner.router, prefix="/api")
 app.include_router(payments.router, prefix="/api")
 app.include_router(signup.router, prefix="/api")
+# Public "email me my workspace address" (decisions §518).
+app.include_router(workspace_lookup.router, prefix="/api")
 app.include_router(auth_sso.router, prefix="/api")
 app.include_router(auth_saml.router, prefix="/api")
 app.include_router(billing.router, prefix="/api")

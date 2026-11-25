@@ -3,13 +3,16 @@
 		value = $bindable(''),
 		placeholder = 'Search...',
 		ariaLabel = 'Search',
-		testid
+		testid,
+		oninput
 	}: {
 		value?: string;
 		placeholder?: string;
 		ariaLabel?: string;
 		/** `data-testid` for the input, for a page with more than one search. */
 		testid?: string;
+		/** Called with the new text on every keystroke, e.g. to write it to the URL. */
+		oninput?: (value: string) => void;
 	} = $props();
 </script>
 
@@ -18,7 +21,8 @@
 		<circle cx="11" cy="11" r="8" />
 		<path d="m21 21-4.35-4.35" />
 	</svg>
-	<input type="text" {placeholder} aria-label={ariaLabel} bind:value data-testid={testid} />
+	<input type="text" {placeholder} aria-label={ariaLabel} bind:value data-testid={testid}
+		oninput={oninput && ((e) => oninput(e.currentTarget.value))} />
 </div>
 
 <style>

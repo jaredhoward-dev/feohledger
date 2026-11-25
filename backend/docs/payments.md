@@ -433,11 +433,13 @@ An offer is **not** applied, and the invoice is paid in full, when it is
 vendor-scoped (no single payment can be shown to settle a bulk offer), its
 deadline has passed, its currency is not the invoice's, its `base_amount` is no
 longer the invoice's `amount` (the bargain was struck on a different figure),
-the deduction would leave nothing to pay, or the savings were already taken
-through an applied credit memo for exactly that figure — the documented way to
-pay a discount before this, which is already inside the net and must not come
-off twice (an amount coincidence, resolved toward paying the supplier in full). Several accepted offers on one invoice: the earliest accepted is
-taken.
+or the deduction would leave nothing to pay. Nor is it applied when the invoice
+already took a discount through an applied credit memo that **names** an offer
+(`credit_memos.discount_offer_id`, decisions §520): that memo is inside the net
+and must not come off twice. A memo that names no offer is an ordinary credit
+whatever its amount — the old amount match (§250) read a return credit equal to
+the savings as the discount. Several accepted offers on one invoice: the
+earliest accepted is taken.
 
 **The deadline is re-checked on the day the money moves.** Dispatch re-asks
 `payable_amount(pay_date=today)` immediately before the adapter call. If the
@@ -538,6 +540,21 @@ pair in opposite orders is a Postgres deadlock (40P01) and a 500 on one side,
 so a new multi-invoice locker sorts too. Bulk delete never meets a run's
 payments at all: it skips any invoice with a live payment (`docs/decisions.md`
 §263).
+
+### An ERP bill void in flight holds the invoice through its flag
+
+`POST /api/exceptions/{id}/void-erp-bill` calls the ERP with no row lock held
+(decisions §545, `backend/docs/erp-integration.md` § Voiding a flagged bill).
+While it does, the invoice carries a committed `erp_void_pending` marker and
+the `duplicate` / `fraud_flag` it was started from cannot be resolved or
+dismissed. That open flag is what every payment path already refuses
+(`payment_runs.blocking_exception_types`: run creation, card mint, mark-paid,
+retry-failed, the queue), so no path here reads the marker itself. A crashed
+attempt's marker stops counting after 300 s and the next void click resumes
+it; while it counts, the flag stays open and the invoice stays unpayable. The
+ERP step gives up at 150 s, so it never outlives its marker; a void it sent but
+could not record (the invoice moved on) opens a blocking
+`payment_reconciliation` row (decisions §550).
 
 ### Bounded wait for the invoice lock
 
@@ -934,6 +951,8 @@ assertion has to be true. Two honest failure states rather than a misleading
 | `failure_reason` | When |
 |---|---|
 | `card_already_charged` | the occupying card is `charged`/`completed` — its funds already moved, under a *different* payment |
+| `card_authorized_before` | the occupying card is unspent again because its authorization lapsed (decisions §544), but it was authorized once (`first_authorized_at`), and a single-use card is closed at the provider by that. Retry-safe: cancel it (the void accepts it) and the re-send mints a fresh card (decisions §549) |
+| `card_settlement_refused` | a settlement on the occupying card was refused for stating no usable figure (decisions §562), so money may have moved on it although it reads unspent. Not retry-safe: the card can be neither cancelled by hand nor reused until a person reconciles it with the provider (the invoice also carries a blocking `card_settlement_refused` flag) |
 | `card_already_issued_insufficient_limit` | the card is live and unspent but its `amount_limit` is below this payment's amount |
 | `card_issuance_conflict` | the contended live-card slot was empty on re-read (the winner cancelled its card in between) — surfaced for AP rather than silently re-calling the provider |
 
@@ -1477,8 +1496,8 @@ MORE than we authorized**, matching `bank_reconciliation.match_variance`.
   own return processing uses.
 - The **discount capture is skipped**.
   `discount_capture.capture_offer_for_settled_payment` captures the booked
-  offer for `payment.discount_amount` (or matches an accepted offer's
-  discounted payoff against `payment.amount`) — our authorized figure,
+  offer for `payment.discount_amount` (or the offer a linked credit memo on
+  the invoice names) on the strength of `payment.amount` — our authorized figure,
   which the rail has just contradicted — so capturing would permanently mark
   savings realized on a number that is in dispute and misreport them to the CFO.
 - The **ERP sync still runs**, and the invoice still transitions to `paid`.
@@ -1502,6 +1521,7 @@ verifier's *did the rail report what we authorized?*.
 | `covered` | some authorized leg is satisfied, **or** nothing was ever reported | invoice proceeds to `paid` |
 | `short` | a figure was reported and falls below every currency-compatible leg by more than a cent | invoice held at `payment_scheduled` |
 | `uncertain` | reported in a currency matching no authorized leg, **or** reported a figure the column cannot hold | invoice held at `payment_scheduled` |
+| `in_flight` | a run's `virtual_card` leg whose card's charge has not settled (card not `completed`: uncharged, only authorized, or missing) | nothing moved: the payment sync skips the leg; an ERP `paid` takes the in-flight hold (decisions §537, §543) |
 
 Over-settlement is `covered`: the vendor is not short, so the payable is
 discharged even though the verifier still raises `amount_mismatch` on the same
@@ -1509,6 +1529,71 @@ numbers. And a NULL `settled_amount` is `covered` — it means an amount-free
 rail or a row predating `0083`, and treating "we don't know" as a shortfall
 would hold every invoice those rails settle. Absence is not evidence, exactly
 as the verifier treats a missing amount as `unverified`.
+
+##### A run's card leg counts what its card was charged
+
+Only a **settled** charge counts (decisions §543).
+
+The card leg books a `completed` `Payment` when the card is **minted**
+(`_execute_single_payment`), but no money moves until the vendor charges it.
+The NULL fail-open above is for a rail that moved money and reported no
+figure; an uncharged card has moved nothing, and reading it as covered let an
+ERP `paid` for a bill settled outside us close the invoice while the card was
+still spendable (decisions §537). So every coverage decision goes through
+`payment_settlement_record.payment_coverage`, which for a `virtual_card`
+payment always reads its card (`card_leg_card`: the card naming the payment,
+else the invoice's unlinked one):
+
+- **not settled** (`created` / `sent` / `active`, only authorized `charged`,
+  `cancelled`, or no card) → `in_flight`, whatever figure the payment carries.
+  An authorization is a hold the network can still reverse, let expire or
+  decline at clearing; no money has moved until the charge settles. `payment_erp_sync` skips the leg
+  (counted `skipped`, like a `submitted` ACH); `erp_status_report` (generic
+  webhook and `erp-status-poll`) opens the in-flight hold — one blocking
+  `payment_reconciliation`, `erp_paid_while_payment_in_flight`, no transition.
+  The card is left alone: nothing cancels it automatically, because the ERP
+  entry may be a bookkeeper recording our own card payment.
+- **settled** (`completed`) → the figure the webhook stamped on the payment,
+  or the card's `amount_charged` when none was, so a full charge is `covered`
+  and a short one `short`.
+
+The card webhook writes the settled charge onto the payment
+(`record_card_spend`, on the settlement event only; an authorization writes
+nothing and dispatches nothing), then re-dispatches the payment sync for the
+run (`dispatch_payment_sync` only schedules the pass on the running loop, after
+the commit, so no ERP latency reaches the issuer's response), which is what moves the skipped invoice to `paid` — or holds it short,
+with `/settlement/accept` and `/void` as the exits. A card no run payment owns
+(`/cards/generate`) has no payment to write. A reversed, expired or declined
+authorization needs no undo on the payment: it never counted, and nothing is
+re-dispatched. Since decisions §544 a reversal or expiry returns the card
+itself to `active` with no charged figure (a `card.authorization_lapsed` audit
+row), so a void can close it; a re-run refuses to converge onto it
+(`card_authorized_before`, decisions §549); a decline leaves a `charged` card
+as it is. The leg stays `in_flight` throughout, and a clearing that arrives
+after the hold lapsed still settles the card and records the leg. A clearing
+that arrives after the card was **cancelled** (the payment voided, the invoice
+perhaps paid on another rail) records nothing on any payment: it writes
+`card.settled_after_cancel` and opens a payment-blocking
+`payment_reconciliation` exception on the invoice (decisions §549). Only a
+name in the provider's explicit event map is a stage at all (§549); anything
+else changes nothing. A lapse
+delivered **before** its authorization is remembered per provider transaction
+and the late authorization is applied as lapsed, so the card stays unspent
+(decisions §554). A **further clearing** on a settled card (an incremental
+capture) adds to the card's figure and `record_card_spend` writes the new
+total onto the leg's `settled_amount`, once per clearing, with the payment
+sync re-dispatched; a total past the leg's amount opens one payment-blocking
+`payment_reconciliation` flag (kind `card_over_settled`), and a decrease (a
+refund) is refused and only audited (§554). A further Nium settlement, or one
+with no figure, is refused and also opens a blocking `card_clearing_refused`
+flag, and a change to a completed leg's `settled_amount` writes a
+`payment.settled_amount_changed` row on the payment (decisions §562). A
+**first** settlement with no usable figure (§557) leaves the card in its state
+but records a durable `settlement_refused` fact on it and opens a blocking
+`card_settlement_refused` flag: the card may read `active` after a lapse, and
+the fact is what stops a hand cancel (409 `card_cancel_settlement_refused`),
+the void's card leg (`card_already_charged`) and a run's reuse
+(`card_settlement_refused`) from treating it as unspent (§562).
 
 ##### A figure the column cannot hold
 
@@ -2076,6 +2161,18 @@ Execute Payment Run (response sent immediately)
   non-covering verdict opens an `erp_reconciliation` exception and leaves the
   invoice at `payment_scheduled` (silent 204) rather than flipping a
   short-paid invoice to `paid` and stranding `/settlement/accept` behind a 409.
+  With **no** `completed` payment at all (ours still pending or processing)
+  it never transitions: it opens a payment-blocking `payment_reconciliation`
+  (`exception.erp_paid_while_payment_in_flight`, which asks a person to
+  confirm whether the ERP entry is our payment or a second one before voiding
+  anything) — the webhook and the `erp-status-poll` sweep alike, through
+  `services/erp_status_report` (decisions §533, §535). A virtual card is
+  neither case. A `/cards/generate` card leaves the invoice `approved` /
+  `posted_in_erp`, where an ERP `paid` is refused `external_payment_card_live`
+  and kept as a blocking `paid_not_recorded` row. A run's card leg books a
+  `completed` `Payment` with a NULL `settled_amount`, which coverage reads as
+  covering (fail-open), so an ERP `paid` moves it to `paid` (decisions §535;
+  the unspent-card gap is in `docs/followups.md`).
 - **A completed payment whose settlement doesn't cover the invoice is held
   here**, not marked `paid`, and counted separately in the sync's log line.
 - Sync runs async — **doesn't block** the payment run response
@@ -2871,7 +2968,7 @@ Decimal `amount` as a string, and the reference — never bank/account values.
 | `payment.pending_compliance` | A child payment held by the sanctions/KYC gate | `payment` |
 | `payment.compliance_released` | `POST /{id}/compliance/release` re-ran compliance-then-adapter for a held payment | `payment` |
 | `payment.compliance_dismissed` | `POST /{id}/compliance/dismiss` gave up on a held payment, flipping it to `failed` | `payment` |
-| `payment.voided` | A completed / in-flight payment voided (`POST /{id}/void`); also writes the `invoice.voided_return_to_approved` invoice row | `payment` |
+| `payment.voided` | A completed / in-flight payment voided (`POST /{id}/void`); also writes the `invoice.voided_return_to_approved` invoice row, which emits the outbound `payment.voided` webhook and no `invoice.approved` / "approved" notice (decisions §542) | `payment` |
 | `payment_run.cfo_approved` | CFO sign-off on an over-threshold draft run | `payment_run` |
 | `payment_run.cancelled` | A draft run cancelled before execution | `payment_run` |
 

@@ -551,6 +551,40 @@ async def test_failed_leg_exception_is_deduped_across_retries(realdb):
     assert len(rows) == 1
 
 
+async def test_failed_leg_is_not_swallowed_by_an_unrelated_live_row(realdb):
+    """The dedupe is by kind (decisions §535): an unrelated live
+    `erp_reconciliation` (a void write-back that failed earlier) does not
+    stand in for the strand — nothing re-invokes this sync, so a swallowed
+    strand is invisible once that row is resolved."""
+    await _set_org_erp(realdb, "a", {"type": "mock", "integration_method": "direct"})
+    run_id, invoice_id = await _seed_run(realdb, "a")
+    async with realdb.sessionmaker("a")() as s:
+        s.add(
+            APException(
+                organization_id=realdb.info("a").org_id,
+                invoice_id=invoice_id,
+                exception_type="erp_reconciliation",
+                severity="error",
+                status="open",
+                description="Another report.",
+                erp_report={"kind": "payment_void_writeback_failed"},
+            )
+        )
+        await s.commit()
+
+    with patch(
+        "app.services.workflow_engine.transition_invoice",
+        AsyncMock(side_effect=RuntimeError("erp exploded")),
+    ):
+        await _sync_payments(run_id, realdb.info("a").org_id)
+
+    rows = await _open_erp_reconciliation_rows(realdb, "a", invoice_id)
+    assert sorted(r.erp_report["kind"] for r in rows) == [
+        "payment_sync_back_failed",
+        "payment_void_writeback_failed",
+    ]
+
+
 async def test_failed_leg_does_not_discard_a_sibling_leg_that_already_synced(realdb):
     """Regression: one failing leg used to roll back the WHOLE run.
 
@@ -1087,3 +1121,130 @@ async def test_sync_back_still_pays_on_a_plan_without_merge(realdb, plan):
     async with realdb.sessionmaker("a")() as s:
         inv = (await s.execute(select(Invoice).where(Invoice.id == invoice_id))).scalar_one()
     assert inv.status == InvoiceStatus.paid
+
+
+# ---------------------------------------------------------------------------
+# A run's virtual-card leg (decisions §537)
+# ---------------------------------------------------------------------------
+
+
+async def _seed_card_leg_run(realdb, *, card_status: str) -> tuple[uuid.UUID, uuid.UUID, uuid.UUID]:
+    """A run whose one leg is a card leg as `_execute_single_payment` books it:
+    a `completed` `virtual_card` payment with no settled figure, and its card.
+    Returns (run_id, invoice_id, card_id)."""
+    from app.models.virtual_card import VirtualCard
+
+    run_id, invoice_id = await _seed_run(realdb, "a", amount=Decimal("500.00"))
+    card_id = uuid.uuid4()
+    async with realdb.sessionmaker("a")() as s:
+        payment = (
+            await s.execute(select(Payment).where(Payment.payment_run_id == run_id))
+        ).scalar_one()
+        payment.method = "virtual_card"
+        payment.provider = "mock"
+        s.add(
+            VirtualCard(
+                id=card_id,
+                invoice_id=invoice_id,
+                payment_id=payment.id,
+                organization_id=realdb.info("a").org_id,
+                card_provider="mock",
+                provider_card_id=f"card-{card_id.hex[:8]}",
+                amount_limit=Decimal("500.00"),
+                currency="USD",
+                status=card_status,
+            )
+        )
+        await s.commit()
+    return run_id, invoice_id, card_id
+
+
+async def _charge(realdb, card_id: uuid.UUID, *, status: str, amount: str) -> None:
+    """What the card webhook does on a charge: the card row, then the payment."""
+    from app.models.virtual_card import VirtualCard
+    from app.services.payment_settlement_record import record_card_spend
+
+    async with realdb.sessionmaker("a")() as s:
+        card = await s.get(VirtualCard, card_id)
+        card.status = status
+        card.amount_charged = Decimal(amount)
+        assert await record_card_spend(s, card) is not None
+        await s.commit()
+
+
+async def _invoice_status(realdb, invoice_id: uuid.UUID) -> InvoiceStatus:
+    async with realdb.sessionmaker("a")() as s:
+        return (await s.get(Invoice, invoice_id)).status
+
+
+@pytest.mark.parametrize("card_status", ["created", "sent", "active"])
+async def test_an_uncharged_card_leg_is_skipped_not_paid(realdb, card_status):
+    """Minting the card moved no money: the invoice stays `payment_scheduled`
+    and the leg counts as in flight (skipped), not held or synced."""
+    await _set_org_erp(realdb, "a", {"type": "mock", "integration_method": "direct"})
+    run_id, invoice_id, _ = await _seed_card_leg_run(realdb, card_status=card_status)
+
+    result = await _sync_payments(run_id, realdb.info("a").org_id)
+
+    assert (result.skipped, result.synced, result.held, result.transitioned) == (1, 0, 0, 0)
+    assert await _invoice_status(realdb, invoice_id) == InvoiceStatus.payment_scheduled
+
+
+async def test_an_authorized_card_leg_is_still_skipped_not_paid(realdb):
+    """Decisions §543: a card authorized for the full amount (`charged`) has
+    moved no money — the authorization can still be reversed or expire — so
+    the leg stays in flight until the charge settles."""
+    from app.models.virtual_card import VirtualCard
+
+    await _set_org_erp(realdb, "a", {"type": "mock", "integration_method": "direct"})
+    run_id, invoice_id, card_id = await _seed_card_leg_run(realdb, card_status="active")
+    async with realdb.sessionmaker("a")() as s:
+        card = await s.get(VirtualCard, card_id)
+        card.status, card.amount_charged = "charged", Decimal("500.00")
+        await s.commit()
+
+    result = await _sync_payments(run_id, realdb.info("a").org_id)
+
+    assert (result.skipped, result.synced, result.held, result.transitioned) == (1, 0, 0, 0)
+    assert await _invoice_status(realdb, invoice_id) == InvoiceStatus.payment_scheduled
+
+
+async def test_a_card_leg_settled_in_full_reaches_paid(realdb):
+    await _set_org_erp(realdb, "a", {"type": "mock", "integration_method": "direct"})
+    run_id, invoice_id, card_id = await _seed_card_leg_run(realdb, card_status="active")
+    await _sync_payments(run_id, realdb.info("a").org_id)
+    assert await _invoice_status(realdb, invoice_id) == InvoiceStatus.payment_scheduled
+
+    await _charge(realdb, card_id, status="completed", amount="500.00")
+    result = await _sync_payments(run_id, realdb.info("a").org_id)
+
+    assert result.transitioned == 1
+    assert await _invoice_status(realdb, invoice_id) == InvoiceStatus.paid
+    async with realdb.sessionmaker("a")() as s:
+        payment = (
+            await s.execute(select(Payment).where(Payment.payment_run_id == run_id))
+        ).scalar_one()
+    assert payment.settled_amount == Decimal("500.00")
+    assert payment.settled_currency == "USD"
+
+
+async def test_a_card_leg_charged_short_is_held(realdb):
+    """A card charged for less than the leg is a short settlement, held like a
+    short ACH (with `/settlement/accept` now offered on it)."""
+    from app.models.invoice import Invoice as _Invoice
+    from app.services.payment_controls import settlement_accept_refusal
+
+    await _set_org_erp(realdb, "a", {"type": "mock", "integration_method": "direct"})
+    run_id, invoice_id, card_id = await _seed_card_leg_run(realdb, card_status="active")
+    await _charge(realdb, card_id, status="completed", amount="350.00")
+
+    result = await _sync_payments(run_id, realdb.info("a").org_id)
+
+    assert (result.held, result.transitioned) == (1, 0)
+    assert await _invoice_status(realdb, invoice_id) == InvoiceStatus.payment_scheduled
+    async with realdb.sessionmaker("a")() as s:
+        payment = (
+            await s.execute(select(Payment).where(Payment.payment_run_id == run_id))
+        ).scalar_one()
+        invoice = await s.get(_Invoice, invoice_id)
+        assert settlement_accept_refusal(payment, invoice) is None

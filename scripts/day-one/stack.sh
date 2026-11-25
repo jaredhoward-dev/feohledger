@@ -89,6 +89,11 @@ wait_for() {
 # here is a committed secret. FEOH_CORS_ORIGINS names the browser's origins
 # explicitly: a deployed environment admits no loopback origin by default
 # (backend/app/main.py::_cors_allow_origins), and only an explicit list keeps one.
+# A deployed environment also requires the hCaptcha pair whether signup is open
+# or not (the workspace lookup is always served, docs/decisions.md §553): these
+# are hCaptcha's published test keys, not secrets, and the journey never
+# submits a captcha. And it must decide FEOH_TRUSTED_PROXY_CIDRS (§553): the
+# browser reaches this API directly, with no proxy in front, hence `none`.
 write_env() {
 	mkdir -p "$STATE_DIR"
 	chmod 700 "$STATE_DIR"
@@ -126,6 +131,9 @@ FEOH_SMTP_HOST=127.0.0.1
 FEOH_SMTP_PORT=${SMTP_PORT}
 FEOH_EMAIL_FROM=no-reply@localhost
 FEOH_SUBPROCESSOR_NOTICES_ENABLED=true
+FEOH_HCAPTCHA_SECRET=0x0000000000000000000000000000000000000000
+FEOH_HCAPTCHA_SITEKEY=10000000-ffff-ffff-ffff-000000000001
+FEOH_TRUSTED_PROXY_CIDRS=none
 EOF
 	)
 }

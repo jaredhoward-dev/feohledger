@@ -5659,11 +5659,23 @@ abstract class AppLocalizations {
   /// **'The ERP shows this bill settled, at least in part by a vendor credit applied there. FeohLedger will not pay it until someone confirms what is still owed.'**
   String get exceptionDescriptionErpCreditSettlement;
 
+  /// No description provided for @exceptionDescriptionErpSettledNoPayment.
+  ///
+  /// In en, this message translates to:
+  /// **'The ERP shows nothing owing on this bill, but no payment against it: a credit was applied or the balance written off there. FeohLedger will not pay it until someone confirms what is still owed.'**
+  String get exceptionDescriptionErpSettledNoPayment;
+
   /// No description provided for @exceptionDescriptionErpPaidWhileScheduled.
   ///
   /// In en, this message translates to:
   /// **'The ERP shows this bill paid by a payment FeohLedger did not make, while a FeohLedger payment is scheduled for it. Stop or void one of them before both reach the supplier.'**
   String get exceptionDescriptionErpPaidWhileScheduled;
+
+  /// No description provided for @exceptionDescriptionErpPaidWhilePaymentInFlight.
+  ///
+  /// In en, this message translates to:
+  /// **'The ERP shows this bill paid while FeohLedger\'s payment for it has not completed. Confirm whether that entry is FeohLedger\'s payment or a second one before voiding anything.'**
+  String get exceptionDescriptionErpPaidWhilePaymentInFlight;
 
   /// No description provided for @exceptionDescriptionErpPaidTwice.
   ///
@@ -5931,6 +5943,24 @@ abstract class AppLocalizations {
   String exceptionDescriptionPaymentDispatchInterruptedCancelled(
     String paymentId,
   );
+
+  /// No description provided for @exceptionDescriptionCardSettledAfterCancel.
+  ///
+  /// In en, this message translates to:
+  /// **'The card ending {lastFour} was charged after it was cancelled, so this invoice may have been paid twice. Check the charge with the card provider and the other payments on this invoice, and recover the duplicate — this invoice is blocked from a new payment run until this is resolved.'**
+  String exceptionDescriptionCardSettledAfterCancel(String lastFour);
+
+  /// No description provided for @exceptionDescriptionCardSettlementRefused.
+  ///
+  /// In en, this message translates to:
+  /// **'A settlement on the card ending {lastFour} was refused because it stated no usable amount, so money may have moved on the card without being recorded. Check the charge with the card provider — the card cannot be cancelled and this invoice is blocked from a new payment run until this is resolved.'**
+  String exceptionDescriptionCardSettlementRefused(String lastFour);
+
+  /// No description provided for @exceptionDescriptionCardClearingRefused.
+  ///
+  /// In en, this message translates to:
+  /// **'A further charge on the card ending {lastFour} was not recorded, so the amount paid on this invoice may be more than shown. Check the charge with the card provider and record any difference — this invoice is blocked from a new payment run until this is resolved.'**
+  String exceptionDescriptionCardClearingRefused(String lastFour);
 
   /// No description provided for @exceptionDescriptionSettlementCurrencyMismatch.
   ///
@@ -7105,6 +7135,12 @@ abstract class AppLocalizations {
   /// In en, this message translates to:
   /// **'New message'**
   String get notificationEventChatMessage;
+
+  /// A duplicate or fraud flag raised on an invoice whose bill is already in the ERP (event erp_bill_flagged).
+  ///
+  /// In en, this message translates to:
+  /// **'Flag on a bill already in the ERP'**
+  String get notificationEventErpBillFlagged;
 
   /// An event type this app version does not know.
   ///

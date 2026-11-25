@@ -57,7 +57,7 @@ import asyncio
 import logging
 import re
 import uuid
-from collections.abc import Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
@@ -73,7 +73,12 @@ from app.models.invoice_status import PAYABLE_STATUSES
 from app.models.organization import Organization
 from app.models.payment import Payment
 from app.models.workflow import WorkflowInstance
-from app.services.erp_adapters.base import ErpAdapter, ErpBillReport, ErpBillState
+from app.services.erp_adapters.base import (
+    ErpAdapter,
+    ErpBillReport,
+    ErpBillState,
+    reports_status_back,
+)
 from app.services.exception_service import create_exception
 from app.services.invoice_warning_catalog import (
     ERP_UNNAMED_SUFFIX,
@@ -188,9 +193,18 @@ def reported_payment_parts(parts: Sequence[RailPart]) -> tuple[RailPart, ...]:
 #:   settled short of what AP authorized.
 #: * ``voided_after_post`` — the ERP voided a bill FeohLedger had already
 #:   moved past the point a void can be applied.
+#: * ``settled_no_payment`` — a status read shows nothing owing and no payment
+#:   behind it (a credit applied or a write-off in the ERP, §303, §532).
+#: * ``paid_while_scheduled`` — the generic webhook or the polling sweep read
+#:   the bill paid while FeohLedger's own payment has not completed (§533).
+#: * ``partly_paid`` — the polling sweep read the bill partly paid in the ERP,
+#:   which FeohLedger never writes back to on that route (§533).
 ERP_REPORT_PAID_NOT_RECORDED = "paid_not_recorded"
 ERP_REPORT_SETTLED_SHORT = "settled_short"
 ERP_REPORT_VOIDED_AFTER_POST = "voided_after_post"
+ERP_REPORT_SETTLED_NO_PAYMENT = "settled_no_payment"
+ERP_REPORT_PAID_WHILE_SCHEDULED = "paid_while_scheduled"
+ERP_REPORT_PARTLY_PAID = "partly_paid"
 
 #: How each ERP adapter is named to an AP user. An adapter missing here reads
 #: as "your ERP" — never its raw registry key.
@@ -256,14 +270,21 @@ async def open_erp_reconciliation_exception(
     org_id,
     finding: dict,
     exception_type: str = ERP_RECONCILIATION_EXCEPTION_TYPE,
-    erp_report: dict | None = None,
+    erp_report: dict,
 ) -> bool:
     """Open ONE reconciliation exception for human review, PII-free.
 
-    **Idempotent**: skipped when an open or escalated exception of the same type
-    already exists for the invoice, so distinct ERP events (or a webhook and the
-    sweep reporting the same change) never pile up duplicates. Returns whether
-    one was opened.
+    **Idempotent by kind**: skipped only while an open or escalated exception
+    of the same type AND the same ``erp_report["kind"]`` exists for the
+    invoice, so a repeated report of one fact (a webhook redelivery, the sweep
+    and a webhook reporting the same change, a retried leg) never piles up
+    duplicates. Returns whether one was opened.
+
+    Never by type alone (decisions §533, §535): most reports come once (an
+    event id, a recorded read, a write-back that fails once per payment), so
+    one swallowed by an UNRELATED live row of the same type is never repeated —
+    once a person resolves that row, nothing would block the run, or tell
+    anyone, for the fact this report carried. Every caller states a kind.
 
     A ``paid_not_recorded`` report goes through :func:`_keep_erp_paid_report`
     instead, which keeps at most ONE live such row per invoice and refreshes it.
@@ -276,7 +297,8 @@ async def open_erp_reconciliation_exception(
     machine detail, as data (decisions §319). Every caller passes a catalogue
     finding, the QuickBooks write-back's included (``erp_payment_writeback``).
     """
-    if (erp_report or {}).get("kind") == ERP_REPORT_PAID_NOT_RECORDED:
+    kind = erp_report["kind"]
+    if kind == ERP_REPORT_PAID_NOT_RECORDED:
         return await _keep_erp_paid_report(
             db,
             invoice,
@@ -285,7 +307,7 @@ async def open_erp_reconciliation_exception(
             exception_type=exception_type,
             erp_report=erp_report,
         )
-    if await _live_of_type(db, invoice.id, exception_type):
+    if await live_erp_report_of_kind(db, invoice.id, exception_type, kind):
         return False
     await _create_reconciliation(
         db,
@@ -298,12 +320,18 @@ async def open_erp_reconciliation_exception(
     return True
 
 
-async def _live_of_type(db: AsyncSession, invoice_id: uuid.UUID, exception_type: str) -> bool:
+async def live_erp_report_of_kind(
+    db: AsyncSession, invoice_id: uuid.UUID, exception_type: str, kind: str
+) -> bool:
+    """Is an open or escalated exception of ``exception_type`` AND
+    ``erp_report["kind"]`` live on the invoice? The one dedupe rule for ERP
+    reconciliation rows (decisions §533, §535)."""
     existing = await db.execute(
         select(func.count()).where(
             APException.invoice_id == invoice_id,
             APException.exception_type == exception_type,
             APException.status.in_(("open", "escalated")),
+            APException.erp_report["kind"].astext == kind,
         )
     )
     return (existing.scalar() or 0) > 0
@@ -354,10 +382,10 @@ async def _keep_erp_paid_report(
       is refused BY it (its own type blocks the record), which says nothing new
       about why, so its refusal and sentence stand unless the new refusal is
       itself a double-pay one; its payment facts are refreshed.
-    * A new double-pay refusal over a live non-blocking row opens the blocking
-      row — the run must stop — and closes the non-blocking one as superseded.
-      If an older blocker of that type with no ERP facts is already open, the
-      run is stopped anyway: the non-blocking row is refreshed instead.
+    * A new double-pay refusal opens the blocking row — the run must stop —
+      and closes any live non-blocking one as superseded. An unrelated live
+      blocker of that type never stands in for it: once a person resolves
+      that row for its own fact, the run would be free to pay (§535).
     * Otherwise the live non-blocking row is refreshed, or a row is opened.
 
     Two live rows would each offer to record the same payment, and a stale one
@@ -377,7 +405,7 @@ async def _keep_erp_paid_report(
             _set_finding(row, finding)
         await _supersede(db, invoice, others)
         return False
-    if new_blocking and not await _live_of_type(db, invoice.id, exception_type):
+    if new_blocking:
         await _supersede(db, invoice, others)
         await _create_reconciliation(
             db,
@@ -394,16 +422,14 @@ async def _keep_erp_paid_report(
         _set_finding(row, finding)
         await _supersede(db, invoice, others[1:])
         return False
-    # The facts ride a row of their own, never swallowed by the per-type dedupe
-    # other ERP rows use. Non-blocking even for a double-pay refusal here: we
-    # only reach this with one when a blocker of that type is already open,
-    # which stops the run on its own.
+    # The facts ride a row of their own, never swallowed by an unrelated row
+    # of the same type. Only a non-blocking refusal reaches here.
     await _create_reconciliation(
         db,
         invoice,
         org_id=org_id,
         finding=finding,
-        exception_type=ERP_RECONCILIATION_EXCEPTION_TYPE,
+        exception_type=exception_type,
         erp_report=erp_report,
     )
     return True
@@ -937,6 +963,10 @@ async def read_back_unstated_figure(
     erp_config = (org.settings or {}).get("erp")
     if not isinstance(erp_config, dict) or resolve_adapter_key(erp_config) != erp_type:
         return unconfirmed  # another ERP is connected now: this bill cannot be read
+    if not reports_status_back(_adapter_or_none(erp_config)):
+        # The connected ERP has the capability but not this tenant's opt-in
+        # (NetSuite, §541): its bills are not read back, as before §536.
+        return ReadBackFigure(needed=False)
     state = (
         await db.execute(
             select(WorkflowInstance.state_data).where(WorkflowInstance.invoice_id == invoice.id)
@@ -953,7 +983,9 @@ async def read_back_unstated_figure(
         or realm != connection_realm(erp_config)
     ):
         return unconfirmed
-    adapter = _adapter_or_none(erp_config)
+    # The adapter reads with the stored credentials (`settings.erp` holds none
+    # of them), as `_bill_to_read`'s does.
+    adapter = _adapter_or_none(await _credentialed_erp(org) or {})
     if adapter is None:
         return unconfirmed
     report = await _read_bill(
@@ -987,7 +1019,8 @@ async def hold_unconfirmed_erp_payment(
     and nothing may book it at FeohLedger's own figure. Through
     :func:`open_erp_reconciliation_exception`, so a live non-blocking row is
     closed as superseded and its facts ride the blocking one (or, when an
-    older blocker of that type is already open, it is refreshed in place).
+    older blocking ``paid_not_recorded`` row is already open, it is refreshed
+    in place).
     The sentence says the record did not happen automatically and points at
     the one-click record, which reads the bill again.
     """
@@ -1015,11 +1048,12 @@ async def hold_unconfirmed_erp_payment(
 def status_sync_active(erp_config: dict | None) -> bool:
     """Does a confirmed push to ``erp_config``'s ERP leave the invoice payable
     at ``posted_in_erp``? Only when the operator has status sync on AND the
-    adapter reports its bills' payments back (``supports_status_sync``)."""
+    adapter reports its bills' payments back for this tenant
+    (:func:`reports_status_back`: the capability, plus NetSuite's per-tenant
+    opt-in, §541)."""
     if not settings.erp_status_sync_enabled or not isinstance(erp_config, dict):
         return False
-    adapter = _adapter_or_none(erp_config)
-    return bool(adapter is not None and adapter.supports_status_sync)
+    return reports_status_back(_adapter_or_none(erp_config))
 
 
 def _adapter_or_none(erp_config: dict) -> ErpAdapter | None:
@@ -1468,7 +1502,9 @@ async def erp_bill_dispatch_refusal(
     :func:`erp_bill_dispatch_refusals` is the same check over many invoices
     with the reads made concurrently.
     """
-    pending = await _bill_to_read(db, invoice=invoice, org=org, payment=payment)
+    pending = await _bill_to_read(
+        db, invoice=invoice, org=org, payment=payment, credentialed=_credentialed_once(org)
+    )
     if not isinstance(pending, _BillRead):
         return pending
     report = await _read_bill(pending, org.id)
@@ -1497,8 +1533,11 @@ async def erp_bill_dispatch_refusals(
     the reads not yet started; the ones already in flight finish or time out.
     """
     bound = max(1, int(concurrency or settings.erp_dispatch_check_concurrency))
+    credentialed = _credentialed_once(org)  # one credential read for the whole file
     staged = [
-        await _bill_to_read(db, invoice=invoice, org=org, payment=payment)
+        await _bill_to_read(
+            db, invoice=invoice, org=org, payment=payment, credentialed=credentialed
+        )
         for invoice, payment in items
     ]
     gate = asyncio.Semaphore(bound)
@@ -1530,16 +1569,37 @@ class _BillRead:
     state: dict
 
 
+def _credentialed_once(org: Organization) -> Callable[[], Awaitable[dict | None]]:
+    """:func:`_credentialed_erp` for ``org``, read at most once however many
+    bills ask (a NACHA file checks every item's)."""
+    read: list[dict | None] = []
+
+    async def credentialed() -> dict | None:
+        if not read:
+            read.append(await _credentialed_erp(org))
+        return read[0]
+
+    return credentialed
+
+
 async def _bill_to_read(
     db: AsyncSession,
     *,
     invoice: Invoice,
     org: Organization,
     payment: Payment | None,
+    credentialed: Callable[[], Awaitable[dict | None]],
 ) -> _BillRead | str | None:
     """The database half before the read: no bill to check (``None``), a
     verdict reached without reading (a refusal string — opening the unlinked
-    exception here), or the :class:`_BillRead` to read."""
+    exception here), or the :class:`_BillRead` to read.
+
+    ``settings.erp`` decides whether there is a bill and which company it is
+    in; the adapter that reads it is built from ``credentialed()``, the same
+    block with its sealed secrets merged in. A NetSuite connection's are
+    stored only there (``consumer_secret``, ``token_secret``, ``private_key``),
+    so an adapter built from ``settings.erp`` alone could never sign a read and
+    held every payment ``erp_bill_unverified``."""
     from app.services.erp_link_realm import connection_realm
 
     erp_config = (org.settings or {}).get("erp")
@@ -1577,7 +1637,7 @@ async def _bill_to_read(
             },
         )
         return f"{ERP_BILL_UNLINKED}:{unlinked}"
-    adapter = _adapter_or_none(erp_config)
+    adapter = _adapter_or_none(await credentialed() or {})
     if adapter is None:
         return ERP_BILL_UNVERIFIED
     return _BillRead(
@@ -1745,7 +1805,22 @@ async def _resolved_erp(org: Organization) -> dict | None:
         return await provider_config(org, "erp", db=ctrl) or None
 
 
-async def _bills_we_posted(
+async def _credentialed_erp(org: Organization) -> dict | None:
+    """:func:`_resolved_erp` for a read made before money moves: None when the
+    stored credentials cannot be opened (a KMS outage, a bad envelope), which
+    the caller holds as unverifiable, never pays past."""
+    try:
+        return await _resolved_erp(org)
+    except Exception as exc:  # noqa: BLE001 — unopenable credentials are "cannot read"
+        logger.warning(
+            "[erp-dispatch-check] ERP credentials for org %s unavailable: %s",
+            org.id,
+            exc.__class__.__name__,
+        )
+        return None
+
+
+async def bills_we_posted(
     factory, bill_ids: list[str], realm: str | None, *, by_reference: bool = False
 ) -> list[str]:
     """The bills of ``bill_ids`` some invoice here was pushed as, under
@@ -1785,12 +1860,12 @@ async def sync_bills(org: Organization, bill_ids: list[str], *, event_id: str | 
 
     erp_config = await _resolved_erp(org)
     adapter = _adapter_or_none(erp_config or {})
-    if adapter is None or not adapter.supports_status_sync:
+    if not reports_status_back(adapter):
         return 0
     realm = connection_realm(erp_config)
     factory = async_sessionmaker(get_tenant_engine(org.db_name), expire_on_commit=False)
     changed = 0
-    for bill_id in await _bills_we_posted(
+    for bill_id in await bills_we_posted(
         factory,
         list(dict.fromkeys(bill_ids)),
         realm,
@@ -2009,11 +2084,18 @@ async def sync_org(org: Organization, *, now: datetime, result: StatusSyncResult
     oauth_meta = ((org.settings or {}).get("erp") or {}).get("oauth") or {}
     erp_config = await _resolved_erp(org)
     adapter = _adapter_or_none(erp_config or {})
-    if adapter is None or not adapter.supports_status_sync:
+    if not reports_status_back(adapter):
         return
+    # An OAuth ERP keeps its mark on its connection block; one reached with
+    # stored credentials (NetSuite, §536) has no such block, so its mark is
+    # kept beside it, tied to the company the configuration names.
+    oauth_backed = oauth_meta.get("provider") == adapter.erp_type
+    realm = connection_realm(erp_config)
     hours = max(1, min(int(settings.erp_status_sync_lookback_hours), 24 * 30))
     since = now - timedelta(hours=hours)
-    mark = parse_timestamp(oauth_meta.get(SYNCED_THROUGH_KEY))
+    mark = parse_timestamp(
+        oauth_meta.get(SYNCED_THROUGH_KEY) if oauth_backed else direct_mark(org, realm)
+    )
     # No mark (a first pass, or a new connection after a reconnect), or one
     # older than CDC can reach: CDC alone cannot prove nothing was missed.
     full = mark is None or mark < now - _CDC_REACH
@@ -2043,37 +2125,92 @@ async def sync_org(org: Organization, *, now: datetime, result: StatusSyncResult
         bill_ids, full = exc.bill_ids, True
     if full:
         result.full_reconciliations += 1
-        bill_ids = [*bill_ids, *await _open_bill_ids(org, connection_realm(erp_config))]
+        bill_ids = [*bill_ids, *await _open_bill_ids(org, realm)]
     result.bills_read += len(set(bill_ids))
     if bill_ids:
         result.invoices_changed += await sync_bills(org, bill_ids, event_id=None)
     result.voids_pending += await resume_pending_voids(org)
-    await update_connection_metadata(
-        provider, org.id, connection_id, {SYNCED_THROUGH_KEY: now.isoformat()}
-    )
+    if oauth_backed:
+        await update_connection_metadata(
+            provider, org.id, connection_id, {SYNCED_THROUGH_KEY: now.isoformat()}
+        )
+    else:
+        await record_direct_mark(org.id, realm, now)
+
+
+#: ``Organization.settings`` key holding the sweep's mark for an ERP reached
+#: with stored credentials (no ``settings.erp.oauth`` block): ``{"realm":
+#: <connection realm>, "through": <ISO timestamp>}``. Kept outside
+#: ``settings.erp`` so saving the ERP configuration never has to carry it,
+#: and read only while ``realm`` is still the configured company's: pointing
+#: the configuration at another account starts with no mark, so the first
+#: pass reads back every payable bill (decisions §536).
+DIRECT_MARK_KEY = "erp_status_sync"
+
+
+def direct_mark(org: Organization, realm: str | None) -> str | None:
+    """The stored mark for ``realm``, or None (none, or another company's)."""
+    block = (org.settings or {}).get(DIRECT_MARK_KEY)
+    if not realm or not isinstance(block, dict) or block.get("realm") != realm:
+        return None
+    through = block.get("through")
+    return through if isinstance(through, str) else None
+
+
+async def record_direct_mark(org_id: uuid.UUID, realm: str | None, now: datetime) -> bool:
+    """Store ``now`` as the mark for ``realm`` under the org row lock, only
+    while the stored ERP configuration still names that company (a
+    reconfiguration mid-pass must not inherit this pass's mark). Returns
+    whether it wrote."""
+    from sqlalchemy.orm.attributes import flag_modified
+
+    from app.services.erp_link_realm import connection_realm
+
+    if not realm:
+        return False
+    async with control_session_factory() as session:
+        org = (
+            await session.execute(
+                select(Organization).where(Organization.id == org_id).with_for_update()
+            )
+        ).scalar_one_or_none()
+        current = dict((org.settings if org else None) or {})
+        if org is None or connection_realm(current.get("erp")) != realm:
+            await session.rollback()
+            return False
+        current[DIRECT_MARK_KEY] = {"realm": realm, "through": now.isoformat()}
+        org.settings = current
+        flag_modified(org, "settings")
+        await session.commit()
+        return True
 
 
 async def run_status_sync_once(*, now: datetime | None = None) -> StatusSyncResult:
     """One pass over every tenant connected to an ERP whose bills sync back
-    (QuickBooks Online, Xero — ``status_sync_adapter_keys``): ask its company
+    (QuickBooks Online, Xero, NetSuite — ``status_sync_adapter_keys``; an
+    OAuth ERP found by its connection block, one reached with stored
+    credentials by its ``settings.erp.type``, §536): ask its company
     for the bills and bill payments changed since its last complete pass (at
     least the lookback window) and apply each bill; read back every
     still-payable bill when the change feed cannot vouch for the gap.
     Re-applying a report changes nothing. One tenant's failure never stops the
     others."""
-    from app.services.erp_adapters.dispatcher import status_sync_adapter_keys
+    from app.services.erp_adapters.dispatcher import resolve_adapter_key, status_sync_adapter_keys
 
     result = StatusSyncResult()
     if not settings.erp_status_sync_enabled:
         return result
     moment = now or datetime.now(UTC)
-    oauth = Organization.settings["erp"]["oauth"]
+    keys = status_sync_adapter_keys()
+    erp = Organization.settings["erp"]
     async with control_session_factory() as ctrl:
         orgs = (
             (
                 await ctrl.execute(
+                    # An OAuth ERP is named by its connection block; one reached
+                    # with stored credentials (NetSuite, §536) only by its type.
                     select(Organization).where(
-                        oauth["provider"].astext.in_(status_sync_adapter_keys())
+                        or_(erp["oauth"]["provider"].astext.in_(keys), erp["type"].astext.in_(keys))
                     )
                 )
             )
@@ -2081,8 +2218,19 @@ async def run_status_sync_once(*, now: datetime | None = None) -> StatusSyncResu
             .all()
         )
     for org in orgs:
-        oauth_meta = ((org.settings or {}).get("erp") or {}).get("oauth") or {}
-        if oauth_meta.get("needs_reconnect"):
+        erp_settings = (org.settings or {}).get("erp") or {}
+        # The adapter the configuration selects, by the dispatcher's own rule:
+        # a `type` left behind under a Merge.dev integration is not swept.
+        if not isinstance(erp_settings, dict) or resolve_adapter_key(erp_settings) not in keys:
+            continue
+        if not reports_status_back(_adapter_or_none(erp_settings)):
+            # The capability without this tenant's opt-in (NetSuite, §541):
+            # not swept, as before §536 (the §528 poll sweep reads it instead).
+            continue
+        oauth_meta = erp_settings.get("oauth") or {}
+        if oauth_meta.get("provider") == erp_settings.get("type") and oauth_meta.get(
+            "needs_reconnect"
+        ):
             # Nothing to read with; the connection-health notice tells the
             # admins, and the reconnect starts a new connection with no mark,
             # so its first pass reads back every payable bill.
@@ -2114,22 +2262,51 @@ STATUS_SYNC_NEEDS_RECONNECT = "status_sync_needs_reconnect"
 async def status_sync_now_refusal(org: Organization) -> str | None:
     """Why this tenant cannot run a status-sync pass on request, or None.
 
-    The same conditions the sweep skips a tenant on: status sync off, an ERP
-    whose bills do not report back (or a tenant that has switched away from
-    the one it connected), a connection that needs reconnecting."""
-    from app.services.erp_adapters.dispatcher import status_sync_adapter_keys
+    The same conditions the sweep skips a tenant on (:func:`run_status_sync_once`):
+    status sync off, an ERP whose bills do not report back for this tenant (or
+    a tenant that has switched away from the one it connected), a connection
+    that needs reconnecting. An OAuth ERP is judged by its connection block;
+    an ERP reached with stored credentials (NetSuite) has none, and is
+    selected, as the sweep selects it, by the adapter its configuration
+    resolves to, its per-tenant opt-in (§541) read through
+    :func:`reports_status_back` like every other reader (decisions §547)."""
+    from app.services.erp_adapters.dispatcher import resolve_adapter_key, status_sync_adapter_keys
+    from app.services.erp_oauth import load_providers
 
     if not settings.erp_status_sync_enabled:
         return STATUS_SYNC_OFF
-    oauth_meta = ((org.settings or {}).get("erp") or {}).get("oauth") or {}
-    if oauth_meta.get("provider") not in status_sync_adapter_keys():
+    keys = status_sync_adapter_keys()
+    erp_settings = (org.settings or {}).get("erp") or {}
+    if not isinstance(erp_settings, dict):
         return STATUS_SYNC_UNSUPPORTED
-    if oauth_meta.get("needs_reconnect"):
-        return STATUS_SYNC_NEEDS_RECONNECT
+    key = resolve_adapter_key(erp_settings)
+    if key not in keys:
+        return STATUS_SYNC_UNSUPPORTED
+    if key in load_providers():
+        oauth_meta = erp_settings.get("oauth") or {}
+        if oauth_meta.get("provider") not in keys:
+            return STATUS_SYNC_UNSUPPORTED
+        if oauth_meta.get("needs_reconnect"):
+            return STATUS_SYNC_NEEDS_RECONNECT
     adapter = _adapter_or_none(await _resolved_erp(org) or {})
-    if adapter is None or not adapter.supports_status_sync:
+    if not reports_status_back(adapter):
         return STATUS_SYNC_UNSUPPORTED
     return None
+
+
+def status_sync_provider(org: Organization) -> str | None:
+    """The ERP an on-request pass reads, for its audit rows: the adapter the
+    configuration resolves to (``dispatcher.resolve_adapter_key``), as
+    :func:`status_sync_now_refusal` selects it. Never the OAuth block's
+    ``provider``: that block survives a switch of ERP (§270), so a NetSuite
+    tenant that once connected QuickBooks would be audited as QuickBooks
+    (decisions §550). ``None`` when no ERP is configured."""
+    from app.services.erp_adapters.dispatcher import resolve_adapter_key
+
+    erp_settings = (org.settings or {}).get("erp") or {}
+    if not isinstance(erp_settings, dict) or not erp_settings:
+        return None
+    return resolve_adapter_key(erp_settings)
 
 
 async def sync_org_now(org: Organization, *, now: datetime | None = None) -> StatusSyncResult:
@@ -2180,9 +2357,7 @@ async def _sync_org_now_task(org_id: uuid.UUID, actor_id: uuid.UUID | None) -> N
         if org is None:
             details["outcome"] = "refused"
         else:
-            details["provider"] = (((org.settings or {}).get("erp") or {}).get("oauth") or {}).get(
-                "provider"
-            )
+            details["provider"] = status_sync_provider(org)
             refused = await status_sync_now_refusal(org)
             if refused is not None:
                 # Changed between the request and the task: nothing to read with.

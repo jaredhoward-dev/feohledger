@@ -148,7 +148,7 @@ async def _post(*, org, invoice, transition_side_effect=None, event_id="ev_1"):
         patch("app.api.erp_webhook.control_session_factory", _ctrl_session_for_org(org)),
         patch("app.api.erp_webhook.get_tenant_engine", return_value=MagicMock()),
         patch("app.api.erp_webhook.async_sessionmaker", return_value=factory),
-        patch("app.api.erp_webhook.transition_invoice", _transition),
+        patch("app.services.erp_status_report.transition_invoice", _transition),
     ):
         result = await erp_webhook(
             erp_type="generic",

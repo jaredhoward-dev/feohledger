@@ -9,7 +9,9 @@
 export type WebhookEventType =
 	| 'invoice.approved'
 	| 'invoice.approval_recalled'
+	| 'invoice.erp_bill_voided'
 	| 'payment.settled'
+	| 'payment.voided'
 	| 'exception.raised';
 
 /** All event types the create/edit forms offer, in display order (the
@@ -18,7 +20,9 @@ export type WebhookEventType =
 export const WEBHOOK_EVENT_TYPES: WebhookEventType[] = [
 	'invoice.approved',
 	'invoice.approval_recalled',
+	'invoice.erp_bill_voided',
 	'payment.settled',
+	'payment.voided',
 	'exception.raised'
 ];
 

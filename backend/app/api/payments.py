@@ -176,6 +176,7 @@ from app.services.payment_settlement_record import (
 )
 from app.services.provider_credentials import provider_config, settings_with_secrets
 from app.services.workflow_engine import (
+    PAYMENT_VOID_ACTION,
     get_invoice_for_update,
     transition_invoice,
 )
@@ -1771,6 +1772,13 @@ async def _cancel_card_for_void(
         return "card_already_cancelled"
     if card.status in CARD_SPENT_STATUSES:
         return "card_already_charged"
+    from app.services import card_transaction_memory as card_memory
+
+    if await card_memory.settlement_refused(db, card):
+        # A refused settlement may have spent it although it reads unspent
+        # (decisions §562): treated as charged, so the card keeps the invoice's
+        # live-card slot and no other rail pays it until a person reconciles.
+        return "card_already_charged"
 
     outcome = await cancel_card_at_provider(
         card=card,
@@ -1915,7 +1923,9 @@ async def void_payment(
             invoice,
             InvoiceStatus.approved,
             actor_id=user.id,
-            action_name="invoice.voided_return_to_approved",
+            # Not an approval: no `invoice.approved` event or "approved" notice,
+            # `payment.voided` instead (decisions §542).
+            action_name=PAYMENT_VOID_ACTION,
             details={"void_reason": body.reason, "payment_id": str(payment.id)},
         )
         # Back in the queue, and a re-payment pays whoever the invoice names
@@ -4306,7 +4316,13 @@ async def _execute_single_payment(
             # Converging marks this payment `completed` — money moved. Only do
             # that against a card that can actually be what moved it (unspent,
             # and big enough). See `card_settlement_block`.
-            block = card_settlement_block(card, payment.amount)
+            from app.services import card_transaction_memory as card_memory
+
+            block = card_settlement_block(
+                card,
+                payment.amount,
+                settlement_refused=await card_memory.settlement_refused(db, card),
+            )
             if block is not None:
                 payment.status = "failed"
                 payment.failure_reason = block
@@ -6266,13 +6282,13 @@ async def payment_webhook(tenant_slug: str, provider: str, request: Request):
             # the synchronous leg of `_execute_single_payment` — ACH/wire sit
             # `submitted`/`processing` until the processor calls back. This is
             # the settlement moment for those payments, so it's also where an
-            # accepted discount offer paid at its discounted payoff gets
-            # recognized (mirrors the synchronous completion leg's call) —
+            # accepted discount offer the payment took (booked on it, or via a
+            # linked credit memo) gets recognized (mirrors the synchronous completion leg's call) —
             # unless the settlement itself didn't reconcile.
             if payment.status == "completed":
                 if completion is not None and completion.is_discrepancy:
-                    # Flag, and do NOT capture the discount: the payoff match
-                    # runs against `payment.amount` — OUR authorized figure,
+                    # Flag, and do NOT capture the discount: the capture rests
+                    # on `payment.amount` — OUR authorized figure,
                     # which the rail has just contradicted — so capturing here
                     # would permanently mark savings realized on a number in
                     # dispute and misreport them to the CFO.

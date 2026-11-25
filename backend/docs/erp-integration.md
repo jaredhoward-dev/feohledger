@@ -141,9 +141,9 @@ class ErpAdapter:
         ...
 
     # Status sync-back + payment write-back (decisions §295). Only an adapter
-    # with `supports_status_sync = True` implements them (QuickBooks Online
-    # today); the base raises NotImplementedError and every caller checks the
-    # flag first.
+    # with `supports_status_sync = True` implements them (QuickBooks Online,
+    # Xero, NetSuite); the base answers fail-closed (refused / `unknown`) and
+    # every caller checks the flag first.
     supports_status_sync: bool = False
     async def bill_report(self, bill_id: str) -> ErpBillReport: ...
     async def bills_for_payment(self, payment_id: str) -> list[str]: ...
@@ -260,7 +260,7 @@ After sending an invoice to the ERP, the system needs to know when the ERP has p
 | Method | How it works | When to use |
 |---|---|---|
 | **Webhook** | ERP calls our endpoint when status changes | Preferred — real-time, no polling cost |
-| **Polling** | Background job checks ERP for status every N minutes | Fallback for ERPs without webhook support — **designed, not built** for the generic case (below); QuickBooks Online has its change-data-capture sweep (§295), and Xero its `If-Modified-Since` sweep (§386) |
+| **Polling** | Background job checks ERP for status every N minutes | Fallback for ERPs without webhook support, and the backstop for a dropped generic delivery — the `erp-status-poll` sweep (§528, below); QuickBooks Online has its change-data-capture sweep (§295), and Xero its `If-Modified-Since` sweep (§386) |
 
 **Webhook endpoint:** `POST /api/erp/webhook/{erp_type}` (the generic shape
 below). QuickBooks, Xero and Merge.dev have their own routes, since none of them
@@ -307,6 +307,36 @@ redelivered (`docs/followups.md`). The QuickBooks and Xero routes verify against
 one platform key from the environment, never a tenant's sealed one, so none of
 this applies to them.
 
+**An unseal budget for deliveries that do not verify (decisions §525).** Just
+before the opening, both per-tenant routes check a Redis budget
+(`api/erp_webhook._unseal_budget_open`, reusing `services/rate_limit`'s
+failure-budget primitives), and count an opening that verified nothing — a
+wrong signature, or a key that could not be opened
+(`_record_unverified_unseal`). The budget is DISTINCT tenants one source
+address has failed against in a rolling window
+(`FEOH_ERP_WEBHOOK_UNVERIFIED_*`, `docs/environment.md`; default 10 per 10
+minutes). Repeat openings of one tenant hit the DEK cache, so cycling
+signatures across tenants is the only way to force a KMS `Decrypt` per
+request, and that is what it cuts off; a provider address serving one
+misconfigured tenant never spends the others' budget. There is no per-tenant
+budget: anyone who knows a slug could spend it and drop that tenant's genuine
+deliveries, for no KMS saving. A spent budget opens nothing and is the same
+silent 204 as every other rejection, logged with the slug and adapter (never
+the address) — except an opening the in-process DEK cache would serve, which
+costs no KMS call and goes ahead (decisions §527): the route then asks
+`provider_credentials.stored_block_opens_from_cache` (the row's wrapped key
+only, through `credential_crypto.opens_from_cache`, which respects the cache's
+TTL and neither warms nor evicts an entry). So a provider whose shared address
+spent its budget at stale-secret tenants still verifies every tenant opened in
+that process in the last five minutes; a cold tenant (or a local-provider row,
+never cached) is still refused. A failure on a cache-served opening is still
+counted, which keeps a source failing across warm tenants cut off from cold
+ones. Genuine deliveries are never counted. Redis unreachable fails
+open: a genuine delivery then verifies and meets the dedup claim's 503, so the
+provider redelivers. The budget follows `FEOH_RATE_LIMIT_ENABLED` (off in
+local dev). A distributed caller with many addresses is still bounded only by
+KMS's own quota (`docs/followups.md`).
+
 The webhook handler:
 1. Validates the request (signature, API key, or IP whitelist)
 2. Dedupes by `event_id` (`services/webhook_security.is_event_already_processed`)
@@ -327,7 +357,11 @@ matches nothing. An invoice pushed before realms were recorded counts only
 while the push's own legacy rule trusts it (`erp_link_realm.legacy_links_trusted`:
 the tenant is still on the realm migration 0115 recorded; decisions §423),
 because document ids are small per-ERP numbers that collide across ERPs; a
-connection that names no realm (`mock`) matches nothing. Two or more candidates are refused rather than guessed between, a
+connection that names no realm (no ERP configured, an OAuth ERP with no
+consent) matches nothing. The `mock` connection's bills are its own company's:
+a push through it records `erp_link_realm.MOCK_BILL_REALM`
+(`"mock:mock-company"`, `bill_realm`), so its route matches them like a real
+ERP's, and it never trusts a NULL-realm bill (decisions §538). Two or more candidates are refused rather than guessed between, a
 silent 204 like no match at all. The match is re-checked under the
 `get_invoice_for_update` row lock, so a confirmed re-push that replaced the bill
 in between is not acted on. A correlation id that is present still decides
@@ -377,22 +411,107 @@ integration that omits a per-delivery `event_id` instead hits
 path, which is the correct trade-off: no dedup at all beats false dedup on a
 different event.
 
-**Polling job — not built.** Every adapter implements
-`get_invoice_status(erp_document_id)` (and fake-erp's `__set-status` /
-`__set-balance` hooks can drive it), but **nothing under `app/` calls it**: there is
-no background sweep, so an ERP without a webhook never reports a status change
-back, and nothing times a stuck `sent_to_erp` invoice out. The webhook above is the
-only inbound path today. The intended design was a sweep every few minutes over
-`sent_to_erp` invoices that transitions on a changed status and fails one stuck
-past a timeout. The adapters' reads are ready for it: since decisions §303 `paid`
-means the ERP's own paid status or a payment it records, never a zero balance
-alone, and a bill with nothing owing but no visible payment reads
-`settled_no_payment` (for a person, never recorded). Tracked in
-`docs/followups.md` ("A bill paid in an ERP other than QuickBooks or Xero
-never reaches FeohLedger"). QuickBooks Online and Xero are the exceptions:
-QuickBooks' status comes back through its own webhook and a change-data-capture
-sweep, Xero's through its invoice webhook and the same sweep reading its
-`If-Modified-Since` listings (next two sections).
+**Polling job (decisions §528).** The generic route drops a delivery it
+cannot verify — the tenant's ERP credentials could not be opened, or the
+source's unseal budget was spent (§408, §525) — with the same silent 204 as a
+forgery, so the ERP never redelivers it. The `erp-status-poll` sweep
+(`services/erp_status_poll_sweep`, `FEOH_ERP_STATUS_POLL_SWEEP_ENABLED`, off by
+default) is the backstop. For every tenant whose adapter is not Merge.dev and
+has no status sync of its own for that tenant (QuickBooks Online and Xero
+have theirs, and NetSuite only with the tenant's opt-in, §541; § QuickBooks /
+Xero / NetSuite status sync-back), it calls
+`get_invoice_status(erp_document_id)` for invoices at `approved`,
+`sent_to_erp`, `posted_in_erp` or `payment_scheduled` that carry an ERP
+document id, least recently polled first and at most
+`FEOH_ERP_STATUS_POLL_SWEEP_BATCH_SIZE` per tenant a tick. A bill is asked
+about only under the connection that issued it, by the webhook's own
+by-document rule — one function, `erp_link_realm.bill_realm_clause`, called by
+both (§417 / §423 / §533): the push's recorded realm must be the current one, a
+pre-realm (NULL) push counts only while `legacy_links_trusted` holds, and a
+connection that names no company (an OAuth ERP with no consent) polls
+nothing, as the webhook matches nothing for it. **The mock is polled locally:**
+its pushes record `MOCK_BILL_REALM` (`erp_link_realm.bill_realm`), so with
+`FEOH_ERP_STATUS_POLL_SWEEP_ENABLED=true` a laptop tenant on the mock polls the
+bills it pushed (the mock always reads `open`, so a `sent_to_erp` bill moves to
+`posted_in_erp`). A NULL-realm bill is never polled on the mock, whatever the
+0115 snapshot says, since it may be a real ERP's from before realms were
+recorded (decisions §538). The push must also have been
+confirmed after the ERP went live (§428) when that moment is known.
+`approved` is polled because a payment void returns an invoice there with its
+bill and realm intact (§535): a dropped ERP `paid` must still be read, or the
+next run pays the bill again. Its `paid` goes through
+`record_erp_reported_payment` and every double-pay refusal (a live card, a run
+holding it: a blocking `paid_not_recorded` row); `open` has no edge from
+`approved`, and `cancelled` opens the "voided after posting" review row.
+
+- **One transition.** What it reads is applied through
+  `services/erp_status_report.apply_erp_status_report`, the very function the
+  webhook calls, as the webhook's own words: `open` → `posted`, `paid` →
+  `paid`, `cancelled` → `cancelled`. The audit rows are the webhook's, with
+  `source: poll` on a transition. `draft` and `unknown` have no webhook
+  equivalent and are not applied (since §303 `paid` is the ERP's own paid
+  status or a payment it records, never a zero balance alone).
+- **Paid while our payment is in flight (§533, webhook and sweep alike).** A
+  `paid` report for a `payment_scheduled` invoice moves it to `paid` only over
+  a `completed` payment whose settlement covers it; one that settled short is
+  held behind the settled-short `erp_reconciliation` row, as before. With no
+  completed payment — our rail payment still pending or processing, or none
+  on file — moving to `paid` could hide a double payment, so the invoice is
+  not moved; one payment-blocking `payment_reconciliation` opens (code
+  `exception.erp_paid_while_payment_in_flight`, `erp_report.kind`
+  `paid_while_scheduled`). The sentence is not the QuickBooks sync's
+  `erp_paid_while_scheduled` (§535): QuickBooks raises that only when the
+  bill's balance shows a payment from outside us, while this route cannot
+  tell, and the usual cause is a bookkeeper recording our own in-flight
+  payment in the ERP — so it asks a person to confirm which payment the entry
+  is before voiding anything, never to void one.
+- **Settled with no payment (§532).** `settled_no_payment` — nothing owing in
+  the ERP and no payment behind it (a credit applied, a write-off) — is never
+  a payment (§303), and the invoice is not moved. The sweep opens one
+  payment-blocking `payment_reconciliation` exception (code
+  `exception.erp_settled_no_payment`, `erp_report.kind` `settled_no_payment`,
+  with the ERP, document id, `source: poll` and the invoice's status), so no
+  payment run pays a bill the ERP already shows settled until a person says
+  what is still owed. This branch lives in the sweep, not
+  `apply_erp_status_report`: the generic webhook has no word for the status.
+- **Part paid (§533).** `partially_paid` is the same kind of fact: the ERP
+  shows part of the bill paid or credited there, and this route never writes a
+  payment back, so a run for the full amount would overpay. The invoice is not
+  moved; one blocking `payment_reconciliation` opens with the QuickBooks sync's
+  sentence `exception.erp_partly_paid_outside` (`erp_report.kind`
+  `partly_paid`, `source: poll`). Both reads first withdraw a payment the ERP
+  reported earlier that FeohLedger could not record (§319): neither is a bill
+  paid in full.
+- **Deduplicated by kind (§533, §535).** Every ERP reconciliation row — this
+  route's, the sweep's, and since §535 every other caller's (the QuickBooks and
+  Xero syncs, the payment write-back and its void, the sync-back's failed leg)
+  — goes through `erp_status_sync.open_erp_reconciliation_exception` (or, for
+  the sync-back, `live_erp_report_of_kind`): it is skipped only while a live
+  row of the same type AND `erp_report.kind` exists. There is no per-type mode. An unrelated live row of the same type (a
+  settled-short row beside a void, another report's `payment_reconciliation`)
+  never swallows it, because each change is reported once — the webhook by
+  event id, the sweep by its recorded read — and a swallowed report would be
+  gone once a person resolved the unrelated row. A report the dedupe skips
+  changed nothing: the outcome is `NOOP`, not counted as applied and, at the
+  webhook, not committed.
+- **Only a change.** The last status read is kept in the latest workflow
+  instance's `state_data["erp_status_poll"]`; a read equal to it applies
+  nothing, so an unchanged `open` bill costs one call and no trail row, and a
+  "voided after posting" or "settled with no payment" exception a person
+  resolved or dismissed is not re-opened — only a read that changes away and
+  back raises it again.
+- **Idempotent across replicas.** The ERP is read outside any transaction;
+  the result is applied under the invoice row lock after asking again whether
+  the invoice is still a candidate with the same document id, and the record
+  is written in the same transaction.
+- **Budget and credentials.** Before each read the connection's call budget
+  (`call_budget().usage()`) is asked; a pause, or a read refused with
+  `ErpCallBudgetExhausted`, ends the tenant's pass. A tenant whose credentials
+  cannot be opened is logged (`[erp-status-poll] the ERP credentials of org …
+  could not be opened`) and skipped.
+- **Not polled.** `done`, `paid` and `failed` invoices: nothing more is paid
+  here, and polling every closed bill forever is unbounded. A void reported
+  for a `done` invoice therefore still arrives only by webhook.
 
 **A paid report may carry the ERP's own payment date and rail.** The generic
 body accepts optional `paid_on` (`YYYY-MM-DD`) and `payment_method` (a
@@ -455,7 +574,12 @@ Decisions §295; the phase-by-phase account is
   (`erp_status_sync.erp_bill_dispatch_refusal`, decisions §296): not open →
   refused `erp_bill_not_open:<state>` with the blocking
   `payment_reconciliation`; unreadable → held `erp_bill_unverified`, never paid
-  blind. The NACHA export runs the same read.
+  blind. The NACHA export runs the same read. The reading adapter is built
+  from `settings.erp` with its sealed secrets merged in (`provider_config`),
+  never from `settings.erp` alone: a stored-credential ERP (NetSuite, §536)
+  keeps its signing secrets only in the sealed store, and an adapter without
+  them held every payment `erp_bill_unverified`. Credentials that cannot be
+  opened hold the item the same way.
 
 ### Xero status sync-back and payment write-back
 
@@ -507,14 +631,15 @@ differs:
   `status_sync_off` / `status_sync_unsupported` / `status_sync_needs_reconnect`).
   The ERP settings panel's "Check payments now" button calls it, shown only
   while `GET …/oauth/status` says `status_sync_available` (the same rule, its
-  `status_sync_refusal` naming the 409 code otherwise).
+  `status_sync_refusal` naming the 409 code otherwise; stated for a
+  stored-credential ERP too, decisions §551).
 - **Matched by the bill id, in every state.** `Reference` is ACCREC-only in
   Xero, so a bill carries no marker of ours. Its `InvoiceID` is a GUID Xero
   never reuses, so the report sets `match_by_reference` and the sync matches it
   by `erp_reference` within the realm the push recorded, exactly one invoice or
   none (the way a deleted QuickBooks bill is matched). A push that recorded no
   realm can therefore never match, so the sweep does not read its bill back
-  either (`ErpAdapter.bills_match_by_reference` → `_bills_we_posted`);
+  either (`ErpAdapter.bills_match_by_reference` → `bills_we_posted`);
   QuickBooks still reads such bills, since its marker can match them.
 - **Paid, part-paid, credited.** `report_from_bill`: `deleted` for `DELETED` /
   `VOIDED`; `paid` for `Status == PAID` with nothing due; `partially_paid` /
@@ -586,6 +711,134 @@ Tests: `backend/tests/test_xero_status_sync_adapter.py` (the adapter against a
 stateful Xero double), the Xero section of `test_erp_status_sync.py` (real
 rows), and `test_erp_oauth.py` § status sync on request. Fake surface:
 `tools/fake-erp/README.md` § Xero.
+
+### NetSuite status sync-back and payment write-back
+
+Decisions §536 extends §295 to NetSuite (`NetSuiteAdapter.supports_status_sync`),
+the first ERP reached with stored credentials rather than an OAuth consent.
+With `FEOH_ERP_STATUS_SYNC_ENABLED` on **and the tenant opted in**, a confirmed
+NetSuite push lands at `posted_in_erp`, and §296's dispatch-time read, §309's
+live-claim refusals and §386's recorded-cash rule apply unchanged.
+
+- **Per-tenant opt-in, off by default (decisions §541).** The calls below are
+  not yet proven against a real NetSuite account (#654), so the deployment
+  switch alone does not turn them on: the tenant's
+  `settings.erp.netsuite_status_sync` must be `"on"` (or `true`). An admin sets
+  it on Organization → ERP connection → NetSuite → **Payment status sync**,
+  whose help text says to pass a sandbox account first. Without it a NetSuite
+  tenant behaves exactly as before §536: a push closes at `done`, the
+  status-sync sweep skips it, nothing is written back, the dispatch-time read
+  does not apply, and the §528 poll sweep keeps polling it. Every reader goes
+  through one predicate, `erp_adapters.base.reports_status_back(adapter)`
+  (`ErpAdapter.status_sync_on`, which NetSuite overrides), never the class
+  constant; `dispatcher.status_sync_adapter_keys()` is only the candidate set.
+
+- **Matching.** The bill's `externalId` is the invoice's correlation id (the
+  push's idempotency key), so a report carries it as `correlation_id` and is
+  matched like QuickBooks' (`bills_match_by_reference` stays False). A bill
+  NetSuite answers `NONEXISTENT_ID` for, or shows Voided / Cancelled, is
+  `deleted`.
+- **`bill_report`.** Reads the vendorBill, every transaction applied to it
+  (SuiteQL `NextTransactionLineLink` joined to `transaction` for the applied
+  record's `externalid` and `trandate`) and the bill currency's ISO `symbol`.
+  Open = `total` − everything applied, which must agree with the status
+  (Open with something open, Paid In Full with nothing); Pending Approval,
+  Rejected, mixed-sign or unreadable links are `unknown`. A `VendPymt` whose
+  `externalid` starts `feohledger-payment-` is our write-back; any other
+  `VendPymt` is a person's cash; anything else (`VendCred`, a journal) is a
+  credit (§303). `paid_amount` / `paid_currency` are stated only for a bill
+  paid wholly in a person's cash. The rail is not read (not stated, so the
+  payment counts as 1099-reportable).
+- **`changed_bills`.** NetSuite offers REST no change feed, so a keyset poll:
+  vendor bills with `lastmodifieddate` in the window, plus the bills of
+  transactions applied in it. The window is widened by a day because SuiteQL
+  compares in the account's time zone. A truncated read is a full
+  reconciliation; a failed one fails the pass with its mark unmoved.
+- **`post_payment`.** A `vendorPayment` (`entity` = the bill's vendor,
+  `account` = the mapped pay-from account, the bill's `currency`,
+  `apply.items[] = {doc, apply: true, amount}`) at the exact Decimal that
+  reached the supplier, with `externalId feohledger-payment-<payment id>`:
+  looked up by `eid:` first, and NetSuite's per-type externalId uniqueness
+  makes a racing second create fail; a refused create is looked up once more.
+  Refused before any write: no account, bill gone or voided
+  (`bill_not_in_erp`), not approved (`bill_not_posted`), another currency or
+  none stated (`currency_mismatch`), more than is open
+  (`payment_exceeds_balance`). No `disc` is sent: an early-payment discount
+  leaves the bill open by the discount and is flagged
+  (`bill_balance_after`), as for QuickBooks and Xero.
+- **`void_payment`.** Deletes our vendorPayment (REST has no void); none, or
+  one NetSuite shows voided, is success. A refused delete is flagged.
+- **Sweep selection.** `run_status_sync_once` selects a tenant by its OAuth
+  connection's provider or by `settings.erp.type`, then keeps it only when
+  `dispatcher.resolve_adapter_key` names a status-sync adapter (a `type`
+  left under Merge.dev is not swept). A credentials-based ERP has no
+  `settings.erp.oauth` block, so its mark lives in
+  `settings.erp_status_sync = {realm, through}` (written under the org row
+  lock, read only while `realm` is the configured account's). NetSuite has
+  no webhook, so the sweep and the admin's on-request pass are its channels.
+- **On-request pass (decisions §547).** `POST
+  /api/organization/erp/oauth/status-sync` is not OAuth-only despite its
+  prefix: `status_sync_now_refusal` selects the tenant as the sweep does, by
+  the adapter `resolve_adapter_key` names. An OAuth ERP is still judged by
+  its connection block (`status_sync_unsupported` for a block of an ERP that
+  does not report back, `status_sync_needs_reconnect`); an ERP reached with
+  stored credentials has none, so only `reports_status_back` (NetSuite's
+  opt-in) and the deployment switch decide. Every other rule is the
+  endpoint's own (admin, audited first, four an hour, one at a time, 202),
+  and the audit rows' `provider` is the configured `settings.erp.type` when
+  there is no connection block. Generic over the capability: another
+  stored-credential adapter that turns `supports_status_sync` on needs no
+  change here. `GET …/oauth/status` states the tenant's verdict
+  (`status_sync_available` / `status_sync_refusal`) with or without a
+  connection block, and the ERP panel draws "Check payments now" on the saved
+  stored-credential ERP while it says available; a refusal hides it, as it
+  does for an OAuth connection (decisions §551).
+- **Not verified live (#654).** The `vendorPayment` body and `eid:` /
+  `DELETE` on it, the `NextTransactionLineLink` join and its `foreignamount`
+  sign, `transaction.lastmodifieddate` / `TO_DATE`, and whether applying or
+  deleting a payment moves the bill's `lastmodifieddate`. Everything is
+  against fake-erp, which encodes this reading.
+
+Tests: `backend/tests/test_netsuite_status_sync_adapter.py` (the adapter
+against fake-erp in process), `test_erp_status_sync.py` § NetSuite sweep
+(tenant selection, the mark, another account's mark, Merge leftovers) and the
+on-request pass (opted in runs, opted out / under Merge refused),
+`test_erp_oauth.py` § status sync on request (NetSuite 202 / 409 / admin-only,
+and the status read's verdict with no connection block).
+End to end: `frontend/tests-e2e/erp/netsuite-status-sync.spec.ts` (a person's
+payment, a partial payment, a deleted write-back, a re-run, each pass started
+with the panel's button; the opt-in off, where the panel offers none).
+
+### Business Central: no status sync-back
+
+Decisions §546. Business Central is **not** a status-sync adapter
+(`supports_status_sync` stays False, and there is no per-tenant opt-in):
+its standard API v2.0 cannot do the two things §295 rests on. Checked
+2026-11-25 against Microsoft Learn and the API's own AL source
+(`microsoft/BCApps`, `src/Apps/W1/APIV2/app/src/pages/`):
+
+- **No open amount.** `purchaseInvoice` states `totalAmountIncludingTax` and a
+  `status`, but no remaining amount, and API v2.0 publishes no vendor ledger
+  entry. `Open` covers a part-paid invoice, so §296's dispatch read could not
+  tell "nothing taken off" from "half paid by a person", and `post_payment`
+  could not prove it is never above what is open.
+- **`Paid` is `Closed`.** The aggregator sets `Paid` whenever the posted
+  invoice's vendor ledger entry is closed, a credit memo applied in full
+  included. Nothing in v2.0 says what closed it, so the cash cannot be stated
+  (§303).
+- **No way to post our payment against the bill.** A `vendorPayment` line
+  carries `appliesToInvoiceId` and `externalDocumentNumber`, but
+  `vendorPaymentJournals` has no bound actions; the `post` action is on
+  `journals`, whose lines have no applies-to field and whose page is filtered
+  to the general journal template. A line we create stays unposted in BC.
+  `void_payment` is moot, since nothing would be posted; it keeps the base
+  refusal.
+
+What a BC tenant gets instead: the push closes at `done` as before; the §528
+poll sweep reads `get_invoice_status`, where BC's `Paid` is
+`settled_no_payment`, so it opens a payment-blocking reconciliation and never
+books a cash payment. Durable fix: `docs/followups.md`, "A bill paid in an
+ERP other than QuickBooks or Xero".
 
 ### Live QuickBooks contract check
 
@@ -855,7 +1108,9 @@ POST /purchaseInvoices
 
 **Post (finalize):** `POST /purchaseInvoices({id})/Microsoft.NAV.post`
 
-**Status field:** `status` — `Draft`, `Open` (posted), `Paid`, `Canceled`
+**Status field:** `status` — `Draft`, `In Review`, `Open` (posted), `Paid` (the posted
+invoice's `Closed` flag: settled by anything, so read as `settled_no_payment`), `Canceled`,
+`Corrective`. No status sync-back: see § Business Central: no status sync-back.
 
 **Webhook support:** Business Central supports webhooks via subscriptions API:
 ```
@@ -1682,7 +1937,9 @@ NetSuite, Business Central, Sage Accounting (ZA), Sage Intacct, Merge.dev, Xero
 and QuickBooks Online.
 
 **A sync with no realm never touches another company's rows.** `mock`, and an
-OAuth ERP with no consent, have no realm. A sync under one leaves alone every
+OAuth ERP with no consent, have no realm for links (the mock's BILLS do —
+`MOCK_BILL_REALM`, decisions §538 — but its vendor and account ids are fixtures
+and filtering them would refuse every NULL fixture link at a local push). A sync under one leaves alone every
 row linked, or offered candidates, under a named realm: no re-judging,
 unlinking, id matching, re-linking by code or candidate refresh, and a pulled
 account whose code such a row holds is refused `code_taken`. It works only on
@@ -1715,13 +1972,28 @@ badges it "Needs a decision" and counts such rows above the table; an admin or
 AP manager picks one with **Choose ERP account**
 (`POST /api/gl-accounts/{id}/erp-link`, audited `gl_account.erp_link_confirmed`).
 Only an id the last sync offered, under the same connection, is accepted, and
-only on an unlinked row. A confirmed link is exempt from rules 3 and 4 (it still
+only on an unlinked row or one rule 4 questioned (below). A confirmed link is
+exempt from rules 3 and 4 (it still
 leaves the row with its realm, kept for that company as below, and dies when
 the account leaves the ERP). The live case: an old
 row "Depreciation" when QuickBooks has a top-level "Depreciation" (40) and
 "Truck:Depreciation" (39). Picking 39 for the old row means the top-level
 account cannot also own the code "Depreciation" in that chart (it stays
 `code_taken`): pick the account the invoices coded to the row meant.
+
+**A link that looks right can still be questioned** (decisions §524). If that
+old row's link landed on the top-level account (40), its code is the account's
+current code and nothing proves it wrong, so rule 4 keeps the link and bills
+keep posting to 40. But "Truck:Depreciation" was also keyed "Depreciation"
+before §284, so the row may have merged the two: the sync records both
+accounts as its `erp_link_candidates` (reason `ambiguous_legacy`, its own
+account included) and the row shows "Needs a decision" beside its link, on
+every pull, until a person answers. Confirming 40 marks the link confirmed;
+choosing 39 re-points it; the audit row's `from_erp_account_id` says where its
+bills posted until then. The question drops by itself once no other pulled
+account answers to the old key. It is raised for every linked row whose code
+is a key another pulled account also had, so a row a post-§284 sync created
+under a top-level name asks once too: nothing on the row tells the two apart.
 
 **A GL account keeps its state for every company it was synced under**
 (decisions §376, `services/gl_account_erp_links`, migration 0127). A row's
@@ -2252,6 +2524,119 @@ naming a document the adapter merely found replaces the orphan and drops both,
 and a row from before the flag existed is read as not ours. Business Central is the one
 adapter that reads it today.
 
+## Finding and voiding the bill a failed push left (decisions §556)
+
+A push that timed out or got a 5xx may have created the bill anyway: the retry
+gate's refusal says `possibly_posted: true` (§286). From the failed invoice, a
+holder of `payment.void` can name that bill and void it:
+
+- `GET /api/invoices/{id}/erp-orphan-bill` runs `ErpAdapter.find_posted_bill`,
+  the push's own pre-create idempotency match offered on its own and read-only
+  (GETs / queries only). Offered by `supports_bill_lookup` on the class: the
+  **mock** (bills it posted this process, by correlation id) and **QuickBooks
+  Online** (`_find_existing`: DocNumber + vendor + our `PrivateNote` marker).
+  Every other adapter answers 409 `erp_lookup_unsupported`; their lookups live
+  inside `post_invoice` with client state and are wired one at a time. Only an
+  invoice at `failed`, naming no bill, whose state is `possibly_posted` is
+  looked up (409 `erp_lookup_not_failed`). A lookup that cannot finish is 502
+  `erp_lookup_failed`, never "none". Answers `{found, bill: {erp_document_id,
+  erp_document_number, amount, currency, erp_status}}` and writes an
+  `invoice.erp_orphan_bill_looked_up` audit row.
+- `POST /api/invoices/{id}/void-erp-orphan-bill` (`{erp_document_id, reason}`)
+  voids it through the flag void's three steps (`begin_orphan_void` →
+  `call_erp` → `finish_orphan_void`): the same marker, the same positive status
+  read, and the lookup run again — the bill is voided only if the lookup still
+  names that id (else 409 `erp_void_not_found`). The invoice stays `failed`
+  (no transition: `failed` is not payable and the approval is unchanged); the
+  void is recorded under `state_data["erp_orphan_bills_voided"][document_id]`
+  (a replay answers 200 `replayed: true`) and audited
+  `invoice.erp_orphan_bill_voided`. The push's possibly-posted record is left:
+  one bill voided does not prove there is no other. A void sent but not
+  recordable writes `invoice.erp_orphan_bill_void_orphaned` (§550).
+- While the marker is live, `send-to-erp` / `retry-erp` answer 409
+  `erp_void_in_progress`: a push would otherwise adopt the bill being voided.
+- **Keeping the bill** needs no new door and no new edge: `failed → sent_to_erp`
+  does not exist, and `retry-erp` already adopts it — the push's own lookup
+  finds the bill and records it instead of creating another. While a
+  duplicate / fraud flag is open the retry is refused, which is right: adopting
+  a flagged bill would put it on record as payable.
+
+## Voiding a flagged bill from the exception queue (decisions §539)
+
+`void_invoice` has one user-facing caller: `POST /api/exceptions/{id}/void-erp-bill`
+(`services/erp_bill_void.py`). When a `duplicate` / `fraud_flag` opens on an
+invoice whose bill is already posted (`sent_to_erp` / `posted_in_erp` with an
+`erp_document_id`), `create_exception` sends the `erp_bill_flagged` notice to
+every holder of `payment.void`; the flag's dialog then offers the void to
+them. Never automatic: the flag may be false.
+
+The endpoint reads the bill first (`get_invoice_status`, bounded at 30 s) and
+voids only on a positive read (decisions §542):
+
+| Read | Answer |
+|---|---|
+| `open` / `draft` | `void_invoice` (bounded at 45 s). `False` → `erp_void_rejected`; raised or timed out → 502 `erp_void_unconfirmed` (the ERP may have voided it: check before retrying) |
+| `cancelled`, or `unknown` with `bill_report` → `deleted` | already gone (ours, whose commit was lost, or someone's in the ERP): no void is sent, the rest runs as on a void, `erp_status_read: "cancelled"`, `already_gone: true` |
+| `paid` / `partially_paid` | `erp_void_bill_paid` |
+| `settled_no_payment` | `erp_void_bill_settled` |
+| `unknown`, not implemented, or the read raised | 502 `erp_void_failed` (nothing was written) |
+
+QuickBooks reads a deleted bill as `unknown` (its status read does not tell a
+404 from a deleted bill), which is why the service asks `bill_report`, whose
+`deleted` is every adapter's positive answer; Xero reads one as `cancelled`.
+`ErpAdapter.bill_void_scope` says which bills an adapter can void:
+**NetSuite: pending-approval bills only; Business Central: drafts only** (their
+REST APIs delete such a bill and have no void for a posted one). For those
+the queue refuses a bill at `posted_in_erp` up front, and the endpoint refuses
+any read but `draft`, both `erp_void_draft_only`. An adapter that raises
+`NotImplementedError` from `void_invoice` is `erp_void_unsupported` (each
+adapter's own rules for what it will void are in its table below). On success the document id, deep link and the push's
+`erp_reference` are cleared, the void is recorded on the workflow state, and
+the invoice walks `→ approved` by the void's own edge; any other
+possibly-posted record stays, so the recall (§374) still refuses where another
+bill may exist. A live FeohLedger payment or card refuses the void
+(`erp_void_claimed`).
+
+**No row lock is held while the ERP answers (decisions §545).** The endpoint
+runs in three transactions. (1) Under the invoice, flag and workflow-instance
+locks: every refusal that needs no ERP call, then a void-in-progress marker on
+`invoices.erp_void_pending` (`attempt_id`, `exception_id`, `document_id`,
+`actor_id`, `reason`, `started_at`; migration 0146), committed. (2) With no lock
+held: the adapter is opened (the credential unseal included) and the read and
+void above run. (3) The same locks again: if the marker is still this
+attempt's and the invoice still holds the same bill at a voidable status, the
+void is finished as above and the marker cleared; after a refusal from (2) the
+marker is just cleared.
+
+While the marker is live (younger than `PENDING_STALE_AFTER_S`, 300 s; step 2
+is bounded as a whole at `CALL_ERP_TIMEOUT_S`, 150 s, the credential unseal
+included, and the KMS client itself at a 5 s connect, 10 s read and three
+attempts; decisions §550):
+
+- a second click answers 409 `erp_void_in_progress`, and the queue's verdict
+  says the same;
+- the flag it names cannot be resolved or dismissed (409 `erp_void_in_progress`
+  from `POST /exceptions/{id}/resolve`; a per-row skip with that reason from
+  `/bulk/resolve`; `escalate` stays open). The open flag is what keeps the
+  payment run, the card mint, mark-paid, retry-failed and the push refusing the
+  invoice, so they hold it with no change of their own. The recall refuses it
+  because it is not `approved` and still names its bill.
+
+A crash between (1) and (3) leaves the marker standing. Once stale it holds
+nothing, and the next click takes it over: the read finds the bill gone and
+converges (§542), or finds it open and voids it. No sweep is needed: a stale
+marker blocks nothing, and while it is live the open flag keeps every money
+path closed.
+
+**A void that cannot be recorded is recorded as orphaned (decisions §550).**
+If (3) finds the marker taken over or the invoice moved on (the flag dismissed
+once the marker was stale, a run scheduling it) after (2) sent the void, or
+(2) ended `erp_void_unconfirmed` that way, nothing on the invoice is changed,
+but an append-only `exception.erp_bill_void_orphaned` row names the bill, the
+actor, the attempt and the invoice's status now; and if the invoice no longer
+holds the bill and is payable, a payment-blocking `payment_reconciliation` row
+(`erp_report.kind` `void_orphaned`, deduped by kind) holds it for a person.
+
 ## The invoice names its bill in the ERP
 
 A confirmed push stores the adapter's `erp_document_id` on
@@ -2532,7 +2917,8 @@ Scale (§256, §281).
 | Webhook endpoint | Done |
 | ERP config UI in org settings | Done (catalogue-driven, write-only secrets) |
 | Post-ERP statuses (posted_in_erp, payment_scheduled, paid) | Done |
-| Polling job for status sync | Planned |
+| Polling job for status sync | Done — `erp-status-poll` sweep, § Polling job (decisions §528) |
+| Merge.dev read-back of bills the webhook missed | Done — `merge-readback` sweep, § Merge.dev: idempotency, refusals, region and webhook (decisions §540) |
 | OAuth authorization-code connect flow (`services/erp_oauth`) | Done — § Connecting an OAuth ERP |
 | QuickBooks Online direct adapter | Done (Phases 1–2) — `quickbooks-online-adapter.md`; webhooks and BillPayment write-back still scoped |
 | Remaining direct adapters (SAP, Epicor, etc.) | Use Merge.dev |
@@ -2705,6 +3091,30 @@ write-error guides (read 2026-11-13). Reasoning: `docs/decisions.md` §399.
   tenant slug. Nor does it accept the generic shape for a Merge tenant under
   any `erp_type`: Merge holds that key, and the generic route trusts the body
   (§ Webhook endpoint above).
+- **Read-back sweep (decisions §540).** A delivery the route drops before
+  verifying (the tenant's credentials cannot be opened, or the source's unseal
+  budget is spent for a tenant whose data key is cold, §408 / §525 / §527) is
+  lost to Merge, which never redelivers a 204. The `merge-readback` sweep
+  (`services/merge_readback_sweep`, `FEOH_MERGE_READBACK_SWEEP_ENABLED`, off by
+  default) is the backstop: per Merge tenant it asks `changed_bills(since)` for
+  the bills Merge changed after the tenant's cursor
+  (`Organization.settings.erp_merge_readback`: `through`, the moment the last
+  listing started, and `pending`, that listing's bills not yet applied; a first
+  pass looks back `FEOH_MERGE_READBACK_SWEEP_LOOKBACK_HOURS`; later passes ask
+  from `through` less `FEOH_MERGE_READBACK_SWEEP_OVERLAP_MINUTES`, default 10,
+  since `through` is our clock and a bill Merge stamped just before it by skew
+  or its own sync lag would otherwise never be listed; re-reading the overlap
+  is harmless, decisions §543), keeps the ones an
+  invoice was pushed as (`bills_we_posted`, the route's own filter), and reads
+  each back and applies it exactly as the route does (`bill_report` →
+  `apply_bill_report`, marked `source: reconciliation_sweep`). At most
+  `FEOH_MERGE_READBACK_SWEEP_BATCH_SIZE` reads a tick; the rest stays pending.
+  A failed read, or the call budget, ends the pass with that bill still
+  pending; a failed listing moves nothing. The cursor is written under the org
+  row lock only if it is still what the pass read, so two replicas move it
+  once, and applying a bill twice changes nothing. A 404 is not read as gone
+  (the route reads it so only for `Invoice.removed`). Credentials that cannot
+  be opened skip the tenant with an error log that carries no exception text.
 - **No status sync, and why (decisions §504).** Read against the same spec on
   2026-11-24: Merge's `Payment` is `POST` / `GET` / `PATCH` only (no `DELETE`
   or void), and neither `Payment` nor `PaymentRequest` has a memo or reference
@@ -2725,7 +3135,9 @@ write-error guides (read 2026-11-13). Reasoning: `docs/decisions.md` §399.
   Two more things stand between that and a sweep: the sweep selects tenants by
   their OAuth block (`settings.erp.oauth.provider`), which a Merge tenant has
   none of, and `bill_report` states no `paid_amount`, so an ERP payment would be
-  recorded at the figure owed here (`docs/followups.md`).
+  recorded at the figure owed here (`docs/followups.md`). The `merge-readback`
+  sweep above reads the same feed, but only to apply bill reports through the
+  webhook's reconciler; it is not a status sync and writes nothing back.
 
 ## Sage Intacct direct adapter (`sage_intacct`)
 
@@ -3506,8 +3918,24 @@ Request rules worth knowing:
   `erp_call_budget_exhausted` with `params.reason` (`tenant_budget`,
   `subscription_quota`, `rate_limited`) and `params.retry_after`. Only
   `rate_limited` is retryable by the backoff; the others fail the invoice with
-  the reason, and the operator retries after the reset (an automatic re-send
-  at the reset is an open follow-up). A sync listing is refused call by call
+  the reason. **After the reset the call-budget re-send sweep sends them
+  again** (`services/erp_budget_retry_sweep`, sweep `erp-budget-retry`,
+  `FEOH_ERP_BUDGET_RETRY_SWEEP_ENABLED`, off by default, decisions §521): an
+  invoice still `failed` whose latest `invoice.erp_failed` row carries this
+  refusal, whose `retry_after` has passed, refused within
+  `FEOH_ERP_BUDGET_RETRY_SWEEP_LOOKBACK_HOURS` (48 h) and after the ERP went
+  live (`configured_at` / `connected_at`), with nothing on its trail since but
+  reads of the trail, is retried through `erp_send.start_erp_send(retry=True)`
+  (status, plan and export gates), earliest `retry_after` first. The
+  `invoice.erp_retried` row carries `trigger: erp_call_budget_reset` and the
+  refusal's `retry_after`, actor NULL; a gate that refuses is recorded once as
+  `invoice.erp_budget_resend_refused` and the invoice is left to a person.
+  Before each re-send the connection's own budget is read (`usage()`, no
+  notice): a paused share, quota or cool-down ends the tenant's pass, as does
+  (local dispatch) a re-send the budget refused again. Decided under the
+  invoice row lock, so two replicas send once. Without the sweep, or for a
+  refusal it does not take, `POST /{id}/retry-erp` after the reset still works.
+  A sync listing is refused call by call
   (`ErpCallBudgetExhausted` → a coded 429 with `Retry-After`, nothing synced);
   a status read is `unknown`; a PO sync is refused the same way. Org admins get an
   `erp_call_quota` notice once a day each at 80% of the share, when the share
@@ -3566,7 +3994,7 @@ period or an inactive vendor on the create or in the job, and whether
 | `list_gl_accounts` | `GET accounts` — `number` → code, `displayName` → name, `id` → `erp_account_id`, `category` Assets/Liabilities/Equity/Income/Cost of Goods Sold/Expense → asset/liability/equity/revenue/expense/expense (blank → unclassified). Heading / total accounts are skipped (BC refuses a line on one); blocked accounts, and Posting accounts with `directPosting: false` (control accounts — payables, bank, inventory — which refuse a purchase line), are emitted `active=False`. |
 | `list_pos` | `GET purchaseOrders?$expand=purchaseOrderLines` — total `totalAmountIncludingTax`; status `Draft` (unreleased) / `In Review` (pending approval) → unissued (decisions §394), `Open` and anything else → open; vendor linked by `vendorId` (the vendor GUID `list_vendors` stamps; BC's empty GUID is no vendor) before `vendorName`; `currencyCode` only when non-blank; `requestedReceiptDate` unless BC's blank `0001-01-01`; comment lines dropped |
 | `list_vendors` | `GET vendors?$expand=paymentTerm` — `payment_terms` is the term's `code` (`30 DAYS`), never the vendor's `paymentTermsId` GUID (no term, or no expansion, → None); `blocked` `Payment` or `All` → `active=False`, so the sync never makes a blocked vendor a payee and marks a linked one `inactive` |
-| `get_invoice_status` | `GET purchaseInvoices({id})` — `Draft` / `Open` / `Paid` / `Canceled`; `Corrective` (an invoice BC made by cancelling a posted credit memo — a live document, never one we pushed) and blank are `unknown` |
+| `get_invoice_status` | `GET purchaseInvoices({id})` — `Draft` / `Open` / `Canceled`; BC's `Paid` reads **`settled_no_payment`**, never `paid`: BC derives it from the posted invoice's `Closed` flag, which a credit memo closes as surely as a payment, and API v2.0 shows neither (decisions §303, §546); `Corrective` (an invoice BC made by cancelling a posted credit memo — a live document, never one we pushed) and blank are `unknown` |
 | `void_invoice` | `GET purchaseInvoices({id})`; a `Draft` is deleted (`DELETE` with `If-Match` = the etag just read — never `*`; a read with no etag returns `False` unsent); anything else returns `False` |
 
 **Lines post on `accountId`, not the No.** The chart sync is now the writer of

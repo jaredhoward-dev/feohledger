@@ -5,37 +5,36 @@ import logging
 import uuid
 
 from fastapi import APIRouter, HTTPException, Request, Response, status
-from sqlalchemy import or_, select
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.config import settings
 from app.database import control_session_factory, get_tenant_engine
-from app.models.invoice import Invoice, InvoiceStatus
+from app.models.invoice import Invoice
 from app.models.organization import Organization
-from app.models.payment import Payment
 from app.models.workflow import WorkflowInstance
 from app.services import provider_credentials
 from app.services.credential_crypto import CredentialCryptoError
 from app.services.erp_adapters.dispatcher import MERGE_DEV_ADAPTER_KEY, resolve_adapter_key
+from app.services.erp_status_report import ERP_STATUS_MAP, NOOP, apply_erp_status_report
 from app.services.erp_status_sync import (
     DOUBLE_PAY_REFUSALS,
     ERP_PAID_RECORDABLE,
     ERP_RECONCILIATION_EXCEPTION_TYPE,
-    ERP_REPORT_SETTLED_SHORT,
-    ERP_REPORT_VOIDED_AFTER_POST,
-    erp_finding,
     reported_paid_on,
     reported_payment_method,
-    withdraw_erp_paid_reports,
-)
-from app.services.erp_status_sync import (
-    open_erp_reconciliation_exception as _open_erp_reconciliation_exception,
 )
 from app.services.erp_status_sync import (
     record_erp_reported_payment as _record_erp_reported_payment,
 )
-from app.services.payment_settlement import settlement_coverage
 from app.services.provider_credentials import provider_config
+from app.services.rate_limit import (
+    RateLimitExceeded,
+    auth_identity_key,
+    check_auth_failures,
+    record_auth_failure,
+    resolve_client_ip,
+)
 from app.services.webhook_security import (
     extract_signature_header,
     is_event_already_processed,
@@ -44,24 +43,24 @@ from app.services.webhook_security import (
     well_formed_base64url_sha256,
     well_formed_hex_sha256,
 )
-from app.services.workflow_engine import (
-    VALID_TRANSITIONS,
-    get_invoice_for_update,
-    transition_invoice,
-)
+from app.services.workflow_engine import get_invoice_for_update
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/erp", tags=["erp"])
 
 # `ERP_RECONCILIATION_EXCEPTION_TYPE`, `ERP_PAID_RECORDABLE`,
-# `DOUBLE_PAY_REFUSALS` and the two helpers aliased above live in
-# `services/erp_status_sync`, which QuickBooks' status sync-back shares; they
-# are re-exported here, under their old names, for this module and its tests.
+# `DOUBLE_PAY_REFUSALS` and the helper aliased above live in
+# `services/erp_status_sync`, which QuickBooks' status sync-back shares, and
+# `ERP_STATUS_MAP` in `services/erp_status_report`, which the status polling
+# sweep shares (decisions §528); they are re-exported here, under their old
+# names, for this module and its tests.
 __all__ = [
     "DOUBLE_PAY_REFUSALS",
     "ERP_PAID_RECORDABLE",
     "ERP_RECONCILIATION_EXCEPTION_TYPE",
+    "ERP_STATUS_MAP",
+    "_record_erp_reported_payment",
     "erp_webhook",
     "merge_webhook",
     "quickbooks_webhook",
@@ -94,8 +93,69 @@ def _retry_please() -> Response:
 # generic route and the Merge route alike.
 _WEBHOOK_KEY_PATH = "webhook_signing_secret"
 
+# The unseal budget (decisions §525): distinct tenants a source address has
+# failed against. There is deliberately no per-tenant budget: anyone who knows
+# a slug could spend it and drop the tenant's genuine deliveries, and it buys
+# no KMS protection, since repeat openings of one tenant hit the DEK cache.
+_UNSEAL_SOURCE_SCOPE = "erp_webhook_unseal_source"
 
-async def _tenant_webhook_config(tenant_slug: object, adapter_key: str):
+
+def _unseal_source_key(request: Request) -> str:
+    """The caller's address, digested so it is never a Redis key in the clear."""
+    return auth_identity_key(str(resolve_client_ip(request) or "unknown"))
+
+
+async def _unseal_budget_open(request: Request) -> bool:
+    """Has this delivery's source unseal budget left? (decisions §525)
+
+    Read-only: nothing is counted here, only by
+    :func:`_record_unverified_unseal` once an opened key has failed to verify a
+    delivery, so a genuine sender never spends the budget. Spent when the
+    source address has failed against
+    ``erp_webhook_unverified_tenants_per_source_limit`` DISTINCT tenants in
+    the window: cycling across tenants is the only way past the DEK cache to a
+    KMS ``Decrypt`` per request. A spent budget still lets through an opening
+    the DEK cache would serve (:func:`_tenant_webhook_config`, decisions §527).
+
+    Redis unreachable FAILS OPEN, as the public API's per-key limiter does:
+    the budget guards KMS cost, not correctness, and a genuine delivery that
+    verifies then reaches the dedup claim, which answers a 503 without Redis
+    so the provider redelivers. Failing closed would drop that delivery with a
+    204 instead.
+    """
+    try:
+        await check_auth_failures(
+            _UNSEAL_SOURCE_SCOPE,
+            _unseal_source_key(request),
+            limit=settings.erp_webhook_unverified_tenants_per_source_limit,
+            window_seconds=settings.erp_webhook_unverified_window_seconds,
+        )
+    except RateLimitExceeded:
+        return False
+    except Exception as exc:  # noqa: BLE001 — Redis unreachable: fail open
+        logger.warning("ERP webhook: unseal budget unavailable (%s)", exc.__class__.__name__)
+    return True
+
+
+async def _record_unverified_unseal(request: Request, org) -> None:
+    """Count one opening of ``org``'s key that verified nothing: a signature
+    that failed against it, or a key that could not be opened. The source
+    records the TENANT as its member, so it counts distinct tenants — a
+    provider address serving one misconfigured tenant never spends the budget
+    of every other tenant behind it. Best effort: Redis down records nothing
+    (fails open, see :func:`_unseal_budget_open`)."""
+    try:
+        await record_auth_failure(
+            _UNSEAL_SOURCE_SCOPE,
+            _unseal_source_key(request),
+            window_seconds=settings.erp_webhook_unverified_window_seconds,
+            member=auth_identity_key(str(org.id)),  # digested like the source
+        )
+    except Exception as exc:  # noqa: BLE001 — Redis unreachable: fail open
+        logger.warning("ERP webhook: unseal budget unavailable (%s)", exc.__class__.__name__)
+
+
+async def _tenant_webhook_config(tenant_slug: object, adapter_key: str, request: Request):
     """``(org, erp_config)`` for a tenant whose webhook key may verify a
     delivery on ``adapter_key``'s route, else ``None`` (decisions §408).
 
@@ -110,7 +170,17 @@ async def _tenant_webhook_config(tenant_slug: object, adapter_key: str):
        method and type are configuration, never sealed);
     3. a webhook key is stored at all — the row's path NAMES, no decrypt
        (``provider_credentials.stored_secret_paths``);
-    4. only then the block is opened (``provider_config``).
+    4. the source still has unseal budget
+       (:func:`_unseal_budget_open`, decisions §525) — or, once it is spent,
+       the opening would be served by the in-process DEK cache, which costs
+       no KMS call and so is not what the budget bounds
+       (``provider_credentials.stored_block_opens_from_cache``, decisions
+       §527);
+    5. only then the block is opened (``provider_config``). The caller counts
+       an opening whose key then fails the signature
+       (:func:`_record_unverified_unseal`) — a cache-served one too, so a
+       source failing across warm tenants still spends its budget for the
+       cold ones.
 
     The caller has already refused a request whose signature header could
     never verify (absent, or not the route's digest shape), so a request
@@ -149,9 +219,20 @@ async def _tenant_webhook_config(tenant_slug: object, adapter_key: str):
                 adapter_key,
             )
             return None
+        if not await _unseal_budget_open(request) and not (
+            await provider_credentials.stored_block_opens_from_cache(org, "erp", db=ctrl_db)
+        ):
+            logger.warning(
+                "ERP webhook dropped: unverified-delivery budget spent by the source "
+                "for tenant '%s' (%s)",
+                tenant_slug,
+                adapter_key,
+            )
+            return None
         try:
             erp_config = await provider_config(org, "erp", db=ctrl_db) or {}
         except CredentialCryptoError:
+            await _record_unverified_unseal(request, org)
             logger.error(
                 "ERP webhook dropped: the ERP credentials of tenant '%s' could not be opened (%s)",
                 tenant_slug,
@@ -159,25 +240,6 @@ async def _tenant_webhook_config(tenant_slug: object, adapter_key: str):
             )
             return None
     return org, erp_config
-
-
-# Map ERP status strings to our internal status transitions
-ERP_STATUS_MAP = {
-    # Merge.dev statuses
-    "OPEN": InvoiceStatus.posted_in_erp,
-    "SUBMITTED": InvoiceStatus.posted_in_erp,
-    # Business Central
-    "Open": InvoiceStatus.posted_in_erp,
-    "Paid": InvoiceStatus.paid,
-    # NetSuite
-    "open": InvoiceStatus.posted_in_erp,
-    "paidInFull": InvoiceStatus.paid,
-    # Generic
-    "posted": InvoiceStatus.posted_in_erp,
-    "paid": InvoiceStatus.paid,
-    "cancelled": InvoiceStatus.failed,
-    "voided": InvoiceStatus.failed,
-}
 
 
 # ---------------------------------------------------------------------------
@@ -393,12 +455,13 @@ async def merge_webhook(tenant_slug: str, request: Request):
     if not well_formed_base64url_sha256(signature):
         return
 
-    resolved = await _tenant_webhook_config(tenant_slug, merge_events.MERGE_PROVIDER)
+    resolved = await _tenant_webhook_config(tenant_slug, merge_events.MERGE_PROVIDER, request)
     if resolved is None:
-        return  # unknown, not on Merge, no key, or a key that cannot be opened
+        return  # unknown, not on Merge, no key, budget spent, or a key that cannot be opened
     org, erp_config = resolved
     signing_secret = erp_config.get(_WEBHOOK_KEY_PATH) or ""
     if not verify_hmac_sha256_base64url(signing_secret, raw_body, signature):
+        await _record_unverified_unseal(request, org)
         return
 
     try:
@@ -547,14 +610,15 @@ async def erp_webhook(
     # switch to another ERP drops every sealed secret, the webhook key
     # included (`erp_adapters/catalog.secrets_to_drop`), so a key stored for
     # one ERP never verifies another's route.
-    resolved = await _tenant_webhook_config(tenant_slug, erp_type)
+    resolved = await _tenant_webhook_config(tenant_slug, erp_type, request)
     if resolved is None:
-        return
+        return  # ... or the source's unseal budget spent (decisions §525)
     org, erp_config = resolved
 
     # Verify HMAC against the tenant's configured signing secret.
     signing_secret = erp_config.get(_WEBHOOK_KEY_PATH) or ""
     if not verify_hmac_sha256(signing_secret, raw_body, provided_sig):
+        await _record_unverified_unseal(request, org)
         return  # silent 204 on bad / missing signature
 
     # Dedup by event id. Cross-tenant key because event ids should be
@@ -626,152 +690,26 @@ async def erp_webhook(
                 # the lock: the id no longer names this invoice.
                 return
 
-            # Only transition if the AUTHORITATIVE state machine permits it.
-            # We deliberately do NOT keep a second local transition map here: a
-            # divergent copy that permitted an edge VALID_TRANSITIONS forbids
-            # (e.g. posted_in_erp → paid, or an ERP void/cancel → failed from
-            # posted_in_erp / payment_scheduled) would make transition_invoice
-            # raise a 409 that then escaped this handler — breaking the
-            # documented "every webhook rejection path returns 204 silently"
-            # contract. Screening against the canonical set guarantees the
-            # webhook can never claim a transition the engine will reject, and a
-            # transition the machine legitimately forbids becomes a silent ack
-            # (same as an unknown status / unknown invoice), not a 409.
-            current = invoice.status
-            # Any status but `Paid` for an invoice still payable here means the
-            # ERP no longer shows the bill paid (a voided cheque reads `Open`):
-            # a payment it reported earlier, which FeohLedger could not record,
-            # must never be recorded now (decisions §319). Before the
-            # transition screen, because `posted_in_erp → posted_in_erp` is a
-            # silent no-op below.
-            withdrawn = 0
-            if target_status is not InvoiceStatus.paid and current in ERP_PAID_RECORDABLE:
-                withdrawn = await withdraw_erp_paid_reports(
-                    db, invoice, erp_type=erp_type, erp_state=erp_status
-                )
-            if target_status not in VALID_TRANSITIONS.get(current, set()):
-                # The state machine forbids this transition for the invoice's
-                # current state. Almost always a silent no-op — a stale or
-                # duplicate ERP status for an invoice that already moved on.
-                # ONE forbidden case is a real reconciliation signal we must
-                # NOT drop: the ERP reports the invoice VOIDED/CANCELLED
-                # (→ failed) after we already advanced it (sent_to_erp /
-                # posted_in_erp / payment_scheduled / paid). Money may already
-                # be in flight, so we never auto-transition (auto → failed from
-                # payment_scheduled/paid would collide with the money path);
-                # instead we open an Exception for a human to reconcile. Every
-                # OTHER forbidden transition stays a pure silent no-op — turning
-                # them all into exceptions would be noise.
-                if target_status is InvoiceStatus.failed:
-                    await _raise_erp_reconciliation_exception(
-                        db,
-                        invoice,
-                        org_id=org.id,
-                        erp_type=erp_type,
-                        erp_status=erp_status,
-                        erp_document_id=erp_document_id,
-                        event_id=event_id,
-                    )
-                    await db.commit()
-                elif target_status is InvoiceStatus.paid and current in ERP_PAID_RECORDABLE:
-                    # The ERP paid an invoice FeohLedger never paid — the
-                    # ERP-led half of the no-rail model (issue #517). The state
-                    # machine has no `posted_in_erp → paid` edge because `paid`
-                    # needs a payment behind it; recording the ERP's payment
-                    # supplies one, through the same service a user's "paid
-                    # outside FeohLedger" goes through. Before this the report
-                    # was dropped here, and a tenant with no rail had no
-                    # automatic path to `paid` at all.
-                    await _record_erp_reported_payment(
-                        db,
-                        invoice,
-                        org=org,
-                        erp_type=erp_type,
-                        erp_document_id=erp_document_id,
-                        event_id=event_id,
-                        paid_on=paid_on,
-                        method=payment_method,
-                    )
-                    await db.commit()
-                elif withdrawn:
-                    await db.commit()  # the withdrawal is the whole effect
-                return  # silent 204 on every forbidden-transition path
-
-            # `payment_scheduled → paid` is a legal edge, but it is the exact
-            # transition the settlement-coverage hold governs. `payment_erp_sync`
-            # (the normal, one-shot path to `paid`) refuses to close out an
-            # invoice whose rail settled SHORT of what AP authorized — it holds
-            # at `payment_scheduled` for a human, with `/settlement/accept` and
-            # `/void` as the two exits. A validly-signed `{"status":"Paid"}`
-            # from the tenant's own ERP (which legitimately fires once a bill
-            # payment is applied there) must not walk around that: it would
-            # flip a short-paid invoice to `paid`, fire the outbound
-            # `payment.settled` webhook, email the supplier, and count the full
-            # amount in aging / dashboard / 1099 YTD — and `/settlement/accept`
-            # would then 409, so the documented exit is gone. Run the SAME check
-            # off the SAME persisted figure (`Payment.settled_amount`) and take
-            # the reconciliation-exception path on a non-covering verdict.
-            if target_status is InvoiceStatus.paid and current == InvoiceStatus.payment_scheduled:
-                settling = (
-                    await db.execute(
-                        select(Payment)
-                        .where(
-                            Payment.invoice_id == invoice.id,
-                            Payment.status == "completed",
-                        )
-                        .order_by(Payment.created_at.desc())
-                        .limit(1)
-                    )
-                ).scalar_one_or_none()
-                if settling is not None:
-                    coverage = settlement_coverage(
-                        settled_amount=settling.settled_amount,
-                        settled_currency=settling.settled_currency,
-                        target_amount=settling.amount,
-                        target_currency=invoice.currency,
-                        source_amount=settling.source_amount,
-                        source_currency=settling.source_currency,
-                        settled_amount_unstorable=settling.settled_amount_unstorable,
-                    )
-                    if not coverage.completes_invoice:
-                        await _open_erp_reconciliation_exception(
-                            db,
-                            invoice,
-                            org_id=org.id,
-                            finding=erp_finding("erp_settled_short", erp_type),
-                            erp_report={
-                                "kind": ERP_REPORT_SETTLED_SHORT,
-                                "erp_type": erp_type,
-                                "erp_document_id": erp_document_id,
-                                "event_id": str(event_id) if event_id else None,
-                                "payment_id": str(settling.id),
-                                "coverage_state": coverage.state,
-                                "shortfall": (
-                                    str(coverage.shortfall)
-                                    if coverage.shortfall is not None
-                                    else None
-                                ),
-                            },
-                        )
-                        await db.commit()
-                        return  # silent 204 — held for human reconciliation
-
-            await transition_invoice(
+            # The transition itself is shared with the status polling sweep
+            # (decisions §528): one service decides every edge, screened
+            # against the authoritative state machine, so a forbidden
+            # transition is a silent ack here (never a 409), and a void after
+            # posting opens a reconciliation exception instead.
+            outcome = await apply_erp_status_report(
                 db,
                 invoice,
-                target_status,
-                action_name=f"invoice.erp_status_{target_status.value}",
-                # PII guard: never splat the raw ERP `details` payload into the
-                # append-only audit row — the ERP may include vendor bank/tax/address
-                # fields. Whitelist only the safe, non-PII routing identifiers.
-                details={
-                    "erp_type": erp_type,
-                    "erp_status": erp_status,
-                    "erp_document_id": erp_document_id,
-                    "raw_event_id": str(event_id) if event_id else None,
-                },
+                org_id=org.id,
+                org=org,
+                erp_type=erp_type,
+                erp_status=erp_status,
+                target_status=target_status,
+                erp_document_id=erp_document_id,
+                event_id=event_id,
+                paid_on=paid_on,
+                payment_method=payment_method,
             )
-            await db.commit()
+            if outcome != NOOP:
+                await db.commit()
             return
 
         except HTTPException:
@@ -832,20 +770,17 @@ async def _invoice_id_by_document(
     realm (``erp_link_realm.legacy_links_trusted``, decisions §423): ERP
     document ids are small per-ERP numbers, so once the tenant has connected
     elsewhere a NULL-realm invoice's "1042" says nothing about the new ERP's
-    bill 1042. With no realm at all (``mock``, an OAuth ERP with no consent)
-    no company can be named and nothing matches. Two or more candidates are
+    bill 1042. With no realm at all (an OAuth ERP with no consent) no company
+    can be named and nothing matches; the mock's bills are its own company's
+    (``erp_link_realm.bill_realm``, §538). Two or more candidates are
     refused, never guessed between: the caller answers the same silent 204 as
     for no match.
     """
-    from app.services.erp_link_realm import connection_realm, legacy_links_trusted
+    from app.services.erp_link_realm import bill_realm_clause
 
-    realm = connection_realm(erp_config)
-    if realm is None:
+    realm_clause = bill_realm_clause(WorkflowInstance.state_data["erp_realm"].astext, erp_config)
+    if realm_clause is None:
         return None
-    recorded = WorkflowInstance.state_data["erp_realm"].astext
-    realm_clause = recorded == realm
-    if legacy_links_trusted(erp_config, realm):
-        realm_clause = or_(realm_clause, recorded.is_(None))
     rows = (
         await db.execute(
             select(Invoice.id)
@@ -860,38 +795,3 @@ async def _invoice_id_by_document(
             logger.warning("ERP webhook: a document id names more than one invoice; not applied")
         return None
     return rows[0][0]
-
-
-async def _raise_erp_reconciliation_exception(
-    db: AsyncSession,
-    invoice: Invoice,
-    *,
-    org_id,
-    erp_type: str,
-    erp_status: str,
-    erp_document_id: str | None,
-    event_id,
-) -> None:
-    """Open an ``erp_reconciliation`` Exception when the ERP reports an invoice
-    VOIDED/CANCELLED (``→ failed``) that we've already advanced past the point
-    where ``→ failed`` is a legal transition (``sent_to_erp`` /
-    ``posted_in_erp`` / ``payment_scheduled`` / ``paid``). Money may already be
-    in flight, so this is a review signal — we deliberately do NOT
-    auto-transition the invoice. (A payment the ERP reported earlier and
-    FeohLedger could not record has already been withdrawn by the handler,
-    which does so for every non-`Paid` status — decisions §319.)
-    """
-    await _open_erp_reconciliation_exception(
-        db,
-        invoice,
-        org_id=org_id,
-        finding=erp_finding("erp_voided_after_post", erp_type),
-        erp_report={
-            "kind": ERP_REPORT_VOIDED_AFTER_POST,
-            "erp_type": erp_type,
-            "erp_status": erp_status,
-            "erp_document_id": erp_document_id,
-            "event_id": str(event_id) if event_id else None,
-            "invoice_status": invoice.status.value,
-        },
-    )

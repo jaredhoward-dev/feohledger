@@ -767,3 +767,261 @@ async def test_an_unverifiable_po_measures_no_received_value_either():
     assert result.match_type == "3-way"
     assert result.received_value is None
     assert result.billed_beyond_receipt is False
+
+
+# ---------------------------------------------------------------------------
+# The receipt leg values receipts per PO line (decisions §519). Before, a
+# receipt was worth `po_total × received / ordered`, so nine cheap cables of a
+# server order read as nine tenths of the order received.
+# ---------------------------------------------------------------------------
+
+
+def _po_line(quantity, *, total=None, unit_price=None):
+    return SimpleNamespace(
+        id=uuid.uuid4(),
+        quantity=None if quantity is None else Decimal(quantity),
+        unit_price=None if unit_price is None else Decimal(unit_price),
+        total=None if total is None else Decimal(total),
+    )
+
+
+def _gr_line(received, line=None):
+    return SimpleNamespace(
+        quantity_received=Decimal(received),
+        po_line_item_id=line.id if line is not None else None,
+    )
+
+
+def _mk_db_grs(*, po, grs):
+    """`_mk_db` for several live receipts on the one PO."""
+    po_res = MagicMock()
+    po_res.scalar_one_or_none = MagicMock(return_value=po)
+    gr_res = MagicMock()
+    gr_scalars = MagicMock()
+    gr_scalars.all = MagicMock(return_value=grs)
+    gr_res.scalars = MagicMock(return_value=gr_scalars)
+    insp_res = MagicMock()
+    insp_res.scalar_one_or_none = MagicMock(return_value=None)
+    fixed = [po_res, gr_res]
+    calls = {"n": 0}
+
+    async def _execute(*_args, **_kwargs):
+        i = calls["n"]
+        calls["n"] += 1
+        return fixed[i] if i < len(fixed) else insp_res
+
+    db = AsyncMock()
+    db.execute = _execute
+    return db
+
+
+def _server_order():
+    """One 910.00 server and nine 10.00 cables: a 1000.00 order of ten units."""
+    server = _po_line("1", unit_price="910.00", total="910.00")
+    cables = _po_line("9", unit_price="10.00", total="90.00")
+    return _po(total=Decimal("1000.00"), line_items=[server, cables]), server, cables
+
+
+async def _match(po, grs, amount):
+    return await match_invoice_to_po(_mk_db_grs(po=po, grs=grs), _invoice(amount=Decimal(amount)))
+
+
+@pytest.mark.asyncio
+async def test_nine_cables_of_a_server_order_are_worth_the_cables():
+    """Nine of ten units in is 900.00 pro rata; the cables are worth 90.00, so
+    billing the server on them is billing for goods that have not arrived."""
+    po, _server, cables = _server_order()
+    grs = [_gr(line_items=[_gr_line("9", cables)])]
+
+    result = await _match(po, grs, "900.00")
+
+    assert "po_match.issue.partial_receipt" in [i["code"] for i in result.issues]
+    assert result.received_value == Decimal("90.00")
+    assert result.billed_beyond_receipt is True
+    assert result.details["receipt_valuation"] == "per_line"
+    # The cables alone, billed, are partial billing and hold nothing.
+    cables_only = await _match(po, grs, "90.00")
+    assert cables_only.billed_beyond_receipt is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("amount", "beyond"), [("94.50", False), ("94.51", True)])
+async def test_per_line_value_keeps_the_exact_tolerance_boundary(amount, beyond):
+    po, _server, cables = _server_order()
+    grs = [_gr(line_items=[_gr_line("9", cables)])]
+    result = await _match(po, grs, amount)
+    assert result.billed_beyond_receipt is beyond
+
+
+@pytest.mark.asyncio
+async def test_multi_line_partial_receipts_across_shipments_cap_each_line_at_its_order():
+    """Two shipments over three lines; the extra two units of the cheap line
+    cover nothing that was ordered on the others."""
+    cheap = _po_line("10", unit_price="5.00", total="50.00")
+    mid = _po_line("4", unit_price="100.00", total="400.00")
+    dear = _po_line("2", unit_price="275.00", total="550.00")
+    po = _po(total=Decimal("1000.00"), line_items=[cheap, mid, dear])
+    grs = [
+        _gr(line_items=[_gr_line("2", mid), _gr_line("1", dear)]),
+        _gr(line_items=[_gr_line("12", cheap), _gr_line("1", mid)]),
+    ]
+
+    result = await _match(po, grs, "625.00")
+
+    # 50.00 (capped at 10) + 3 × 100.00 + 1 × 275.00
+    assert result.received_value == Decimal("625.00")
+    assert result.billed_beyond_receipt is False
+    assert (await _match(po, grs, "656.26")).billed_beyond_receipt is True
+
+
+@pytest.mark.asyncio
+async def test_a_short_line_hidden_by_an_over_received_line_still_measures_the_bill():
+    """Ten cables in and no server: the quantity sums read ten of ten, but
+    only the cables arrived, so a bill for the order is held."""
+    po, _server, cables = _server_order()
+    grs = [_gr(line_items=[_gr_line("10", cables)])]
+
+    result = await _match(po, grs, "1000.00")
+
+    # Ten of ten by the quantity sums: neither short nor over, so the status
+    # stays the amount leg's — but the receipt leg holds the bill.
+    assert (result.ordered_quantity, result.received_quantity) == (Decimal(10), Decimal(10))
+    assert result.over_receipt is False
+    assert result.status == "matched"
+    assert result.received_value == Decimal("90.00")
+    assert result.billed_beyond_receipt is True
+
+
+@pytest.mark.asyncio
+async def test_receipt_lines_naming_no_po_line_fill_the_cheapest_units_first():
+    """Nothing says which goods an unlinked line was, so it is given the
+    lowest value it could have: the cheapest outstanding units."""
+    po, server, cables = _server_order()
+
+    three = await _match(po, [_gr(line_items=[_gr_line("3")])], "30.00")
+    assert three.received_value == Decimal("30.00")
+    assert three.billed_beyond_receipt is False
+
+    # Four cables named, five more unnamed: the five fill the cables left.
+    mixed = await _match(po, [_gr(line_items=[_gr_line("4", cables), _gr_line("5")])], "900.00")
+    assert mixed.received_value == Decimal("90.00")
+    assert mixed.billed_beyond_receipt is True
+
+    # Enough unnamed units to fill every line: nothing of value is outstanding.
+    full = await _match(po, [_gr(line_items=[_gr_line("10")])], "1000.00")
+    assert full.received_value is None
+    assert full.billed_beyond_receipt is False
+
+    # A line naming a line of ANOTHER order is no evidence for this one's
+    # lines either, so it is unnamed here too.
+    stray = SimpleNamespace(quantity_received=Decimal("1"), po_line_item_id=uuid.uuid4())
+    other = await _match(po, [_gr(line_items=[stray, _gr_line("0", server)])], "10.00")
+    assert other.received_value == Decimal("10.00")
+
+
+@pytest.mark.asyncio
+async def test_tax_and_freight_in_the_total_are_spread_over_the_goods():
+    """`po_total` carries what the lines do not (tax here, a freight line with
+    no quantity) and the received goods carry their share of it."""
+    goods_a = _po_line("3", unit_price="100.00", total="300.00")
+    goods_b = _po_line("1", unit_price="500.00", total="500.00")
+    freight = _po_line(None, total="200.00")
+    # 1000.00 of lines + 15 % tax
+    po = _po(total=Decimal("1150.00"), line_items=[goods_a, goods_b, freight])
+
+    one = await _match(po, [_gr(line_items=[_gr_line("1", goods_a)])], "115.00")
+    # 100 of the 800.00 of goods: an eighth of 1150.00
+    assert one.received_value == Decimal("143.75")
+    assert one.details["receipt_valuation"] == "per_line"
+
+    # Every goods unit in: the freight line is nothing to receive, so the bill
+    # for the whole order is not measured against a receipt.
+    every = await _match(
+        po, [_gr(line_items=[_gr_line("3", goods_a), _gr_line("1", goods_b)])], "1150.00"
+    )
+    assert every.received_value is None
+    assert every.billed_beyond_receipt is False
+
+
+@pytest.mark.asyncio
+async def test_a_non_terminating_share_is_compared_exactly():
+    """One unit of three at 100.00, beside a 200.00 line, of a 1000.00 PO is a
+    ninth: 111.11…, a 5 % limit of 116.666…"""
+    thirds = _po_line("3", total="100.00")
+    other = _po_line("1", unit_price="200.00")  # priced by unit only
+    po = _po(total=Decimal("1000.00"), line_items=[thirds, other])
+    grs = [_gr(line_items=[_gr_line("1", thirds)])]
+
+    under = await _match(po, grs, "116.66")
+    over = await _match(po, grs, "116.67")
+
+    assert under.received_value == Decimal(1000) / Decimal(9)
+    assert under.billed_beyond_receipt is False
+    assert over.billed_beyond_receipt is True
+
+
+@pytest.mark.asyncio
+async def test_a_currency_mismatch_values_no_receipt_and_an_unknown_one_does():
+    po, _server, cables = _server_order()
+    grs = [_gr(line_items=[_gr_line("9", cables)])]
+
+    eur = await match_invoice_to_po(
+        _mk_db_grs(po=po, grs=grs), _invoice(amount=Decimal("900.00"), currency="EUR")
+    )
+    assert eur.received_value is None
+    assert eur.billed_beyond_receipt is False
+
+    po.currency = None  # unknown: compared at face value, as the amount leg is
+    unknown = await _match(po, grs, "900.00")
+    assert unknown.currency_check == "unknown"
+    assert unknown.received_value == Decimal("90.00")
+    assert unknown.billed_beyond_receipt is True
+
+
+@pytest.mark.asyncio
+async def test_an_unpriced_goods_line_falls_back_to_the_proportional_value():
+    """One goods line with neither a price nor a total: nothing says what its
+    units are worth, so the PO keeps the proportional figure."""
+    server = _po_line("1", unit_price="910.00", total="910.00")
+    cables = _po_line("9")
+    po = _po(total=Decimal("1000.00"), line_items=[server, cables])
+    grs = [_gr(line_items=[_gr_line("9", cables)])]
+
+    result = await _match(po, grs, "900.00")
+
+    assert result.received_value == Decimal("900")
+    assert result.billed_beyond_receipt is False
+    assert result.details["receipt_valuation"] == "pro_rata"
+
+
+@pytest.mark.asyncio
+async def test_every_receipt_cancelled_is_worth_nothing_per_line():
+    po, _server, _cables = _server_order()
+    result = await match_invoice_to_po(_mk_db_cancelled(po), _invoice(amount=Decimal("10.00")))
+    assert result.received_value == Decimal("0")
+    assert result.billed_beyond_receipt is True
+
+
+def _mk_db_cancelled(po):
+    """No live receipt, but one (cancelled) exists for the PO."""
+    po_res = MagicMock()
+    po_res.scalar_one_or_none = MagicMock(return_value=po)
+    gr_res = MagicMock()
+    gr_scalars = MagicMock()
+    gr_scalars.all = MagicMock(return_value=[])
+    gr_res.scalars = MagicMock(return_value=gr_scalars)
+    any_res = MagicMock()
+    any_res.scalar_one_or_none = MagicMock(return_value=uuid.uuid4())
+    none_res = MagicMock()
+    none_res.scalar_one_or_none = MagicMock(return_value=None)
+    fixed = [po_res, gr_res, any_res]
+    calls = {"n": 0}
+
+    async def _execute(*_args, **_kwargs):
+        i = calls["n"]
+        calls["n"] += 1
+        return fixed[i] if i < len(fixed) else none_res
+
+    db = AsyncMock()
+    db.execute = _execute
+    return db

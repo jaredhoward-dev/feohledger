@@ -678,6 +678,26 @@ def _expense_list_filters(
     return query
 
 
+def _attachable_by(query, user_id: uuid.UUID):
+    """Narrow ``query`` to the loose draft lines ``user_id`` may attach.
+
+    The attach gate's own rule (``report_line_creator_refusal``): a line goes
+    onto a report only when its creator owns the report, and a NULL creator
+    (a pre-0134 line) is attachable by any owner. The caller is the owner of
+    any report they can compose, so "theirs or unrecorded" is exactly what an
+    attach by them would accept. Only lines on NO report: moving a line off
+    another report is a different act (it rewrites that report), and a
+    picker labelled "add" should not do it silently. Only ``draft`` lines:
+    a line outside a report is draft (reject hands lines back as draft), so
+    this excludes nothing real, and it keeps a stray non-draft line out of a
+    report the owner is still building (decisions §515)."""
+    return query.where(
+        Expense.report_id.is_(None),
+        Expense.status == ExpenseStatus.draft,
+        or_(Expense.created_by_user_id == user_id, Expense.created_by_user_id.is_(None)),
+    )
+
+
 # `sort=` allowlist for `GET /expenses` — see `api/sorting.py`. `.id` is
 # always appended as the final tie-break regardless of which column is
 # picked (mirrors the pre-existing `created_at, id` default order below).
@@ -698,6 +718,7 @@ async def list_expenses(
     status_filter: str | None = Query(None, alias="status"),
     report_id: uuid.UUID | None = Query(None),
     search: str | None = Query(None),
+    attachable: bool = Query(False),
     sort: SortParams = Depends(sort_params),
     pagination: PaginationParams = Depends(pagination_params),
     entity_id: uuid.UUID | None = Depends(get_entity_id),
@@ -709,6 +730,10 @@ async def list_expenses(
     and with the entity scope: without it the page could only filter the rows
     it had already loaded, so a term matching an expense past the first page
     read as "nothing matched".
+
+    `attachable=true` narrows to the lines the CALLER could put onto a draft
+    report they own (`_attachable_by`) — the set the report's attach picker
+    offers, so it never lists a line the attach would refuse as foreign.
     """
     base = _expense_list_filters(
         apply_entity_scope(select(Expense), Expense, entity_id),
@@ -716,6 +741,8 @@ async def list_expenses(
         report_id=report_id,
         search=search,
     )
+    if attachable:
+        base = _attachable_by(base, user.id)
 
     total = int((await db.execute(select(func.count()).select_from(base.subquery()))).scalar() or 0)
     # `.id` tie-breaker: bulk-imported expenses can share `created_at`, so
@@ -748,18 +775,26 @@ async def list_expense_ids(
     status_filter: str | None = Query(None, alias="status"),
     report_id: uuid.UUID | None = Query(None),
     search: str | None = Query(None),
+    attachable: bool = Query(False),
     entity_id: uuid.UUID | None = Depends(get_entity_id),
 ):
     """Every expense id matching the caller's list filters — the resolver
     behind "select all N matching" on the expenses list page. Same filters
     (and the same shared `_expense_list_filters`) as `GET /expenses`, so the
-    two describe the same set."""
+    two describe the same set.
+
+    `attachable=true` narrows to the lines the caller could add to their own
+    draft report (`_attachable_by`, the list's own filter): the bulk "Add to
+    report" sends only those out of an all-matching selection and reports the
+    rest as skipped, rather than moving a line off another report (§515)."""
     base = _expense_list_filters(
         apply_entity_scope(select(Expense.id), Expense, entity_id),
         status_filter=status_filter,
         report_id=report_id,
         search=search,
     )
+    if attachable:
+        base = _attachable_by(base, user.id)
     total = int((await db.execute(select(func.count()).select_from(base.subquery()))).scalar() or 0)
     query = base.order_by(Expense.created_at.desc(), Expense.id.desc()).limit(MAX_SELECT_ALL_IDS)
     ids = [str(row) for row in (await db.execute(query)).scalars().all()]
@@ -943,6 +978,7 @@ async def export_expenses(
     date_to: date | None = Query(None),
     report_id: uuid.UUID | None = Query(None),
     search: str | None = Query(None),
+    attachable: bool = Query(False),
     entity_id: uuid.UUID | None = Depends(get_entity_id),
 ):
     """Stream the filtered expense register as ``text/csv``.
@@ -959,7 +995,9 @@ async def export_expenses(
     FastAPI drops an undeclared query param silently, so a CSV taken mid-search
     covered the whole status-filtered set with nothing to say it had. The
     export-only filters (`category`, the date range) stay here: they are not on
-    the list surface, and the CSV is the place a period is sliced."""
+    the list surface, and the CSV is the place a period is sliced.
+    `attachable=true` narrows by the list's own `_attachable_by`, so an export
+    of the caller's attachable lines covers that set and no wider."""
     from app.services.report_export import EXPORTERS
 
     base = _expense_list_filters(
@@ -980,6 +1018,8 @@ async def export_expenses(
         base = base.where(Expense.expense_date >= date_from)
     if date_to:
         base = base.where(Expense.expense_date <= date_to)
+    if attachable:
+        base = _attachable_by(base, user.id)
     base = base.order_by(Expense.expense_date.desc())
 
     rows = (await db.execute(base)).all()
@@ -1079,6 +1119,7 @@ async def expense_summary(
     status_filter: str | None = Query(None, alias="status"),
     report_id: uuid.UUID | None = Query(None),
     search: str | None = Query(None),
+    attachable: bool = Query(False),
     entity_id: uuid.UUID | None = Depends(get_entity_id),
 ):
     """Whole-set status counts + per-currency totals for the expenses KPI row.
@@ -1088,19 +1129,23 @@ async def expense_summary(
     The read gate matches the list's (all four roles) — a rollup exposes strictly
     less than the rows it summarises.
 
+    `attachable=true` narrows by the list's own `_attachable_by`, so a rollup
+    asked about the caller's attachable lines counts that set and no wider.
+
     Totals are grouped BY CURRENCY and serialised as exact decimal strings. They
     are never added across currencies and never FX-converted: an FX rate fetched
     on a read would make the figure non-deterministic, and a cross-currency SUM
     is a number denominated in nothing.
     """
+
+    def _scoped(query):
+        query = apply_entity_scope(query, Expense, entity_id)
+        return _attachable_by(query, user.id) if attachable else query
+
     status_rows = (
         await db.execute(
             _expense_list_filters(
-                apply_entity_scope(
-                    select(Expense.status, func.count()).select_from(Expense),
-                    Expense,
-                    entity_id,
-                ),
+                _scoped(select(Expense.status, func.count()).select_from(Expense)),
                 status_filter=status_filter,
                 report_id=report_id,
                 search=search,
@@ -1118,14 +1163,12 @@ async def expense_summary(
     currency_rows = (
         await db.execute(
             _expense_list_filters(
-                apply_entity_scope(
+                _scoped(
                     select(
                         currency_key,
                         func.coalesce(func.sum(Expense.amount), 0),
                         func.count(),
-                    ).select_from(Expense),
-                    Expense,
-                    entity_id,
+                    ).select_from(Expense)
                 ),
                 status_filter=status_filter,
                 report_id=report_id,
@@ -1383,12 +1426,20 @@ async def list_reports(
     user: User = Depends(require_roles(ROLE_ADMIN, ROLE_AP_MANAGER, ROLE_AP_CLERK, ROLE_CFO)),
     org: Organization = Depends(get_tenant),
     status_filter: str | None = Query(None, alias="status"),
+    mine: bool = Query(False),
     pagination: PaginationParams = Depends(pagination_params),
     entity_id: uuid.UUID | None = Depends(get_entity_id),
 ):
+    """Paginated, entity-scoped report list, each with the caller's verdicts.
+
+    `mine=true` narrows to reports the caller owns (`employee_user_id`) — with
+    `status=draft`, the reports the expenses list's "Add to report" bulk action
+    can target, since only the owner composes a report."""
     base = apply_entity_scope(select(ExpenseReport), ExpenseReport, entity_id)
     if status_filter:
         base = base.where(ExpenseReport.status == status_filter)
+    if mine:
+        base = base.where(ExpenseReport.employee_user_id == user.id)
 
     total = int((await db.execute(select(func.count()).select_from(base.subquery()))).scalar() or 0)
     # `.id` tie-breaker: see the same fix on the sibling expense list above.

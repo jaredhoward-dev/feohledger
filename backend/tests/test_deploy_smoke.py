@@ -11,7 +11,8 @@ it is configured:
   first vanity host) each serve a 200 with a body — curl verifies the
   certificate, so the tenant check is the TLS check;
 - `GET /api/public-config` reports `signup_enabled` exactly as the env has it,
-  and a captcha site key whenever signup is on (the configured one, if known).
+  and a captcha site key whether signup is on or not (the configured one, if
+  known; docs/decisions.md §553).
 
 The real script, copied with `lib.sh` into a scratch `deploy/`, runs against a
 `curl` stub first on PATH that answers per URL from a rules file
@@ -186,17 +187,22 @@ def test_public_config_must_report_signup_as_configured(
     assert f"reports signup_enabled={json.dumps(served)}" in result.stderr
 
 
+@pytest.mark.parametrize("signup", [True, False])
 @pytest.mark.parametrize("sitekey", [None, "", "  "])
-def test_open_signup_needs_a_captcha_sitekey(smoke: Smoke, sitekey: str | None) -> None:
-    smoke.healthy(signup=True, sitekey=sitekey)
-    result = smoke.run(*_remote("true"))
+def test_a_captcha_sitekey_is_needed_signup_open_or_closed(
+    smoke: Smoke, signup: bool, sitekey: str | None
+) -> None:
+    """/find-workspace's lookup verifies a captcha on every deployment, signup
+    open or not (docs/decisions.md §553), so public-config must serve a key."""
+    smoke.healthy(signup=signup, sitekey=sitekey)
+    result = smoke.run(*_remote("true" if signup else "false"))
     assert result.returncode == 1
-    assert "no hcaptcha_sitekey while signup is on" in result.stderr
+    assert "has no hcaptcha_sitekey" in result.stderr
 
 
-def test_closed_signup_needs_no_sitekey(smoke: Smoke) -> None:
-    smoke.healthy(signup=False, sitekey="")
-    result = smoke.run(*_remote("false"))
+def test_closed_signup_with_a_sitekey_passes(smoke: Smoke) -> None:
+    smoke.healthy(signup=False)
+    result = smoke.run(*_remote("false", "--sitekey", "site-key-1"))
     assert result.returncode == 0, result.stderr
 
 

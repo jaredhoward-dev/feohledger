@@ -24,7 +24,7 @@ from app.api.pagination import (
     paginated,
     pagination_params,
 )
-from app.api.permissions import PERM_PAYMENT_RECORD_EXTERNAL
+from app.api.permissions import PERM_PAYMENT_RECORD_EXTERNAL, PERM_PAYMENT_VOID
 from app.api.refusals import ActionRefusal
 from app.api.sorting import SortParams, resolve_order_by, sort_params
 from app.database import get_control_db
@@ -42,6 +42,7 @@ from app.services.erp_status_sync import (
 )
 from app.services.exception_lifecycle import (
     ACTIONABLE_STATUSES,
+    CLEARING_ACTIONS,
     EXCEPTION_SEVERITY_RANK,
     EXCEPTION_TYPE_LABELS,
     RESOLUTION_ACTIONS,
@@ -185,17 +186,49 @@ def _caller_verdicts(
     user: User,
     org_settings: dict | None,
     instance: WorkflowInstance | None = None,
+    orphan_instance: WorkflowInstance | None = None,
 ) -> dict:
     """The caller's verdicts on this row's actions, for the list and the detail:
     Resolve / Dismiss / Escalate (`decision_refusals`) and — only on a row that
     carries an ERP-reported payment — recording it in one click
-    (`record_erp_payment_refusal`)."""
+    (`record_erp_payment_refusal`).
+
+    ``orphan_instance`` is the invoice's workflow instance, loaded only for a
+    duplicate / fraud flag whose invoice :func:`erp_bill_void.may_be_orphan`:
+    the lookup verdict reads its possibly-posted record (decisions §560)."""
+    from app.services.erp_bill_void import (
+        bill_void_scope,
+        is_void_candidate,
+        orphan_lookup_verdicts,
+        void_refusal,
+    )
+
     out = {"decision_refusals": decision_refusals(exc, inv, user, org_settings, instance)}
+    # Only on a duplicate / fraud flag (decisions §539): the verdict on voiding
+    # the invoice's bill in the ERP. Absent elsewhere, so nothing is offered.
+    if is_void_candidate(exc):
+        out["void_erp_bill_refusal"] = void_refusal(
+            exc, inv, user, void_scope=bill_void_scope(org_settings)
+        )
+        # The bill a failed push may have left (decisions §556, §560): absent
+        # unless the flag's invoice is such a push, so nothing is offered then.
+        out.update(orphan_lookup_verdicts(inv, orphan_instance, user, org_settings))
     if is_erp_paid_report(exc):
         out["record_erp_payment_refusal"] = record_erp_payment_refusal(
             exc, inv, user, org_settings, instance
         )
     return out
+
+
+async def _orphan_instances(db: AsyncSession, rows) -> dict:
+    """``{invoice_id: WorkflowInstance}`` for the rows whose orphan-lookup
+    verdict needs one (a duplicate / fraud flag on a failed push naming no
+    bill), in one query, and none when no row does."""
+    from app.services.erp_bill_void import is_void_candidate, may_be_orphan
+
+    return await workflow_instances_for(
+        db, [inv for exc, inv in rows if is_void_candidate(exc) and may_be_orphan(inv)]
+    )
 
 
 def _exception_dict(exc: APException, inv: Invoice | None) -> dict:
@@ -416,6 +449,7 @@ async def list_exceptions(
     instances = await workflow_instances_for(
         db, [inv for exc, inv in rows if needs_approval_chain(exc, inv)]
     )
+    orphan_instances = await _orphan_instances(db, rows)
 
     items = [
         {
@@ -423,7 +457,12 @@ async def list_exceptions(
             # The caller's verdict on Resolve / Dismiss / Escalate for this row,
             # from the gates the resolve endpoint runs (`decision_refusals`).
             **_caller_verdicts(
-                exc, inv, user, org.settings, instances.get(inv.id) if inv else None
+                exc,
+                inv,
+                user,
+                org.settings,
+                instances.get(inv.id) if inv else None,
+                orphan_instances.get(inv.id) if inv else None,
             ),
         }
         for exc, inv in rows
@@ -562,9 +601,10 @@ async def get_exception(
     # With the caller's verdicts, like a list row: the queue opens this row's
     # dialog from a deep link (`/exceptions?id=`) and offers its buttons from them.
     instance = await workflow_instance_for(db, exc, inv)
+    orphan_instance = (await _orphan_instances(db, [(exc, inv)])).get(inv.id) if inv else None
     return {
         **_exception_dict(exc, inv),
-        **_caller_verdicts(exc, inv, user, org.settings, instance),
+        **_caller_verdicts(exc, inv, user, org.settings, instance, orphan_instance),
     }
 
 
@@ -666,6 +706,14 @@ async def bulk_resolve(
         if refusal is not None:
             skipped.append({"id": str(exc.id), "reason": refusal})
             continue
+        # Likewise the flag of a bill being voided in the ERP right now (§545).
+        if body.action in CLEARING_ACTIONS:
+            from app.services.erp_bill_void import clear_refusal
+
+            pending = await clear_refusal(db, exc)
+            if pending is not None:
+                skipped.append({"id": str(exc.id), "reason": pending})
+                continue
         await record_decision(
             db,
             exception=exc,
@@ -949,6 +997,156 @@ async def record_erp_payment(
         response.status_code = http_status.HTTP_201_CREATED
     await db.refresh(recorded.payment)
     return PaymentResponse.from_db(recorded.payment, invoice)
+
+
+# ---------- Void the flagged bill in the ERP (decisions §539) --------------
+
+
+class VoidErpBillRequest(BaseModel):
+    """Why the bill is being voided — recorded on both audit rows."""
+
+    reason: str = Field(..., min_length=1, max_length=500)
+
+
+@router.post("/{exception_id}/void-erp-bill")
+async def void_erp_bill(
+    exception_id: uuid.UUID,
+    body: VoidErpBillRequest,
+    response: Response,
+    db: AsyncSession = Depends(get_tenant_db),
+    org: Organization = Depends(get_tenant),
+    # The payment void's permission (admin + cfo by default): voiding the bill
+    # is how a payment out of the ERP is stopped, the same duty (§539).
+    user: User = Depends(require_permission(PERM_PAYMENT_VOID)),
+    entity_id: uuid.UUID | None = Depends(get_entity_id),
+):
+    """Void, in the ERP, the bill of an invoice a duplicate or fraud flag now
+    holds, and walk the invoice back to ``approved``.
+
+    Never automatic: a person who may void a payment decides, from the flag.
+    Three transactions, so no row lock is held while the ERP answers
+    (decisions §545, ``services/erp_bill_void``): under the locks (invoice,
+    then the flag, then the workflow instance — the order every ERP writer
+    takes them) every refusal that needs no ERP call, then a void-in-progress
+    marker, committed; the ERP read and void with no lock held; then the same
+    locks again to finish, or to clear the marker after a refusal. A replay of
+    a void this flag already made answers 200 with ``replayed: true`` and calls
+    nothing; a fresh void answers 201; a click while another attempt is calling
+    the ERP answers 409 ``erp_void_in_progress``. The flag stays open: the
+    payment run and the ERP push still refuse the invoice until someone decides
+    it.
+    """
+    from app.services import erp_bill_void as ebv
+
+    scoped = apply_entity_scope(
+        select(APException).where(APException.id == exception_id), APException, entity_id
+    )
+
+    async def _lock():
+        """The invoice, the flag and the invoice's own workflow instance, FOR
+        UPDATE and read fresh. The instance is the invoice's own (not
+        `workflow_instance_for`, which reads it only for the approver axis):
+        the void clears the push's `erp_reference` there and records itself,
+        which is what makes a replay recognisable."""
+        found = (await db.execute(scoped)).scalar_one_or_none()
+        if found is None:
+            raise HTTPException(status_code=404, detail="Exception not found")
+        inv = None
+        if found.invoice_id is not None:
+            inv = (
+                await db.execute(
+                    select(Invoice)
+                    .where(Invoice.id == found.invoice_id)
+                    .with_for_update()
+                    .execution_options(populate_existing=True)
+                )
+            ).scalar_one_or_none()
+        locked = (
+            await db.execute(
+                scoped.with_for_update(of=APException).execution_options(populate_existing=True)
+            )
+        ).scalar_one_or_none()
+        if locked is None or locked.invoice_id != found.invoice_id:
+            raise HTTPException(status_code=404, detail="Exception not found")
+        inst = None
+        if inv is not None:
+            inst = (
+                await db.execute(
+                    select(WorkflowInstance)
+                    .where(WorkflowInstance.invoice_id == inv.id)
+                    .with_for_update()
+                    .execution_options(populate_existing=True)
+                )
+            ).scalar_one_or_none()
+        return locked, inv, inst
+
+    reason = body.reason.strip()
+
+    # 1. Under the locks: refuse, or commit the marker.
+    row, invoice, instance = await _lock()
+    try:
+        started = await ebv.begin_void(
+            db, exception=row, invoice=invoice, instance=instance, user=user, reason=reason
+        )
+    except ebv.VoidRefused as refused:
+        raise HTTPException(status_code=refused.status_code, detail=refused.detail()) from None
+    if isinstance(started, ebv.VoidOutcome):
+        outcome = started
+    else:
+        await db.commit()
+
+        # 2. No lock held: the ERP.
+        refusal: ebv.VoidRefused | None = None
+        answer = None
+        try:
+            answer = await ebv.call_erp(org, started)
+        except ebv.VoidRefused as refused:
+            refusal = refused
+
+        # 3. The same locks again: finish, or clear the marker.
+        # An attempt that sent its void but can no longer record it leaves an
+        # orphan record (decisions §550).
+        erp_type = ebv.configured_erp_type(org.settings)
+        row, invoice, instance = await _lock()
+        try:
+            if refusal is not None:
+                if refusal.code == ebv.ERP_VOID_UNCONFIRMED and ebv.lost_its_invoice(
+                    invoice, started
+                ):
+                    await ebv.record_orphaned_void(
+                        db,
+                        attempt=started,
+                        exception=row,
+                        invoice=invoice,
+                        user=user,
+                        void_result="unconfirmed",
+                        erp_type=erp_type,
+                    )
+                ebv.abandon_void(invoice, started)
+                raise refusal
+            outcome = await ebv.finish_void(
+                db,
+                attempt=started,
+                answer=answer,
+                exception=row,
+                invoice=invoice,
+                instance=instance,
+                user=user,
+                reason=reason,
+                erp_type=erp_type,
+            )
+        except ebv.VoidRefused as refused:
+            await db.commit()
+            raise HTTPException(status_code=refused.status_code, detail=refused.detail()) from None
+        await db.commit()
+        response.status_code = http_status.HTTP_201_CREATED
+    return {
+        "exception_id": str(row.id),
+        "invoice_id": str(row.invoice_id),
+        "erp_document_id": outcome.document_id,
+        "invoice_status": outcome.status,
+        "replayed": outcome.replayed,
+    }
 
 
 # ---------- Assignment ----------------------------------------------------

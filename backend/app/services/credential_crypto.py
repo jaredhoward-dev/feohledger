@@ -148,6 +148,27 @@ _dek_cache_lock = threading.Lock()
 _kms_client_instance = None
 _kms_client_lock = threading.Lock()
 
+#: Bounds on every KMS call (decisions §550). boto's defaults are a 60 s
+#: connect, a 60 s read and up to five legacy-mode attempts, so one stalled
+#: unseal could hold a request for minutes. Every caller is a request or a
+#: sweep unsealing one tenant's provider credential, where KMS answers in
+#: milliseconds; a call that has not answered in these bounds is failing, and
+#: each caller already maps `CredentialCryptoError` to its own refusal.
+KMS_CONNECT_TIMEOUT_S = 5
+KMS_READ_TIMEOUT_S = 10
+#: Attempts in all, the first included (botocore's `total_max_attempts`).
+KMS_MAX_ATTEMPTS = 3
+
+
+def _kms_client_config():
+    from botocore.config import Config
+
+    return Config(
+        connect_timeout=KMS_CONNECT_TIMEOUT_S,
+        read_timeout=KMS_READ_TIMEOUT_S,
+        retries={"mode": "standard", "total_max_attempts": KMS_MAX_ATTEMPTS},
+    )
+
 
 def _kms_client():
     """One KMS client per process, built once under a lock.
@@ -164,7 +185,9 @@ def _kms_client():
             import boto3
 
             _kms_client_instance = boto3.session.Session().client(
-                "kms", endpoint_url=settings.aws_endpoint_url or None
+                "kms",
+                endpoint_url=settings.aws_endpoint_url or None,
+                config=_kms_client_config(),
             )
         return _kms_client_instance
 
@@ -182,8 +205,12 @@ def _kms_generate(context: dict[str, str]) -> tuple[bytes, bytes, str]:
     return resp["Plaintext"], resp["CiphertextBlob"], resp.get("KeyId") or key_id
 
 
+def _dek_cache_key(wrapped: bytes, context: dict[str, str]) -> bytes:
+    return hashlib.sha256(wrapped + _aad(context)).digest()
+
+
 def _kms_unwrap(wrapped: bytes, context: dict[str, str]) -> bytes:
-    cache_key = hashlib.sha256(wrapped + _aad(context)).digest()
+    cache_key = _dek_cache_key(wrapped, context)
     now = time.monotonic()
     with _dek_cache_lock:
         hit = _dek_cache.get(cache_key)
@@ -199,6 +226,27 @@ def _kms_unwrap(wrapped: bytes, context: dict[str, str]) -> bytes:
             _dek_cache.clear()
         _dek_cache[cache_key] = (now + _DEK_CACHE_TTL_SECONDS, dek)
     return dek
+
+
+def opens_from_cache(envelope: Envelope, context: dict[str, str]) -> bool:
+    """Would opening ``envelope`` now be served by the DEK cache, with no KMS call?
+
+    Side-effect free: it reads the cache under its lock and neither refreshes
+    an entry's age nor evicts one, so asking cannot keep a key warm. True only
+    for a KMS envelope whose data key is cached and unexpired; a local
+    envelope is False (local unwraps are never cached — and costing nothing,
+    they are dev-only). The answer is a moment's: the entry may expire, or
+    the cache be cleared at its bound, before the caller opens the envelope,
+    so it may decide what an opening is WORTH (the ERP webhooks' unseal
+    budget, decisions §527), never whether it is allowed.
+    """
+    if envelope.key_provider != KEY_PROVIDER_KMS:
+        return False
+    cache_key = _dek_cache_key(envelope.wrapped_key, context)
+    now = time.monotonic()
+    with _dek_cache_lock:
+        hit = _dek_cache.get(cache_key)
+        return hit is not None and hit[0] > now
 
 
 def clear_dek_cache() -> None:

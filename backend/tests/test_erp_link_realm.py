@@ -39,7 +39,10 @@ from app.services.erp_adapters.base import (
 from app.services.erp_adapters.catalog import merge_erp_update
 from app.services.erp_link_realm import (
     LEGACY_REALM_KEY,
+    MOCK_BILL_REALM,
     UNNAMED_REALM,
+    bill_realm,
+    bill_realm_clause,
     connection_realm,
     legacy_links_trusted,
     link_is_live,
@@ -247,6 +250,47 @@ def test_a_no_realm_pull_stamps_a_sentinel_no_company_realm_can_equal():
     # a fixture link is never posted to a real company.
     assert not link_is_live(UNNAMED_REALM, PROD, trust_legacy=True)
     assert link_is_live(UNNAMED_REALM, None, trust_legacy=False)
+
+
+def test_the_mock_records_its_bills_under_its_own_company_and_no_other():
+    """§538: the mock names no company for LINKS (fixture ids, posts nowhere),
+    but its bills have one issuer, so a push records ``MOCK_BILL_REALM`` and the
+    webhook and the poll sweep attribute them under the one rule. No real
+    adapter's realm can equal it, nor can a link stamp."""
+    mock = {"type": "mock", "integration_method": "direct"}
+    assert connection_realm(mock) is None  # links: unchanged (§496)
+    assert bill_realm(mock) == MOCK_BILL_REALM
+    assert bill_realm({"integration_method": "direct"}) == MOCK_BILL_REALM  # blank type
+    assert MOCK_BILL_REALM.startswith("mock:") and MOCK_BILL_REALM != UNNAMED_REALM
+    for cfg in (SANDBOX_CFG, PROD_CFG, INTACCT_CFG, {"integration_method": "merge_dev"}):
+        assert bill_realm(cfg) == connection_realm(cfg) != MOCK_BILL_REALM
+    # Still nothing nameable: no ERP configured, an OAuth ERP with no consent.
+    assert bill_realm({}) is None and bill_realm(None) is None
+    assert bill_realm({"type": "quickbooks_online", "integration_method": "direct"}) is None
+
+
+def _clause_sql(erp_config) -> str | None:
+    from sqlalchemy import column
+
+    clause = bill_realm_clause(column("erp_realm"), erp_config)
+    if clause is None:
+        return None
+    return str(clause.compile(compile_kwargs={"literal_binds": True}))
+
+
+def test_the_bill_rule_never_widens_for_a_realm_less_real_adapter():
+    """A real adapter whose connection names no company still matches nothing,
+    and the mock never trusts a pre-realm (NULL) bill, whatever its snapshot."""
+    assert _clause_sql({}) is None
+    assert _clause_sql({"type": "xero", "integration_method": "direct"}) is None
+    assert _clause_sql({"type": "sage_accounting", "integration_method": "direct"}) is None
+    mock = {"type": "mock", "integration_method": "direct"}
+    for cfg in (mock, {**mock, LEGACY_REALM_KEY: MOCK_BILL_REALM}):
+        sql = _clause_sql(cfg)
+        assert sql == f"erp_realm = '{MOCK_BILL_REALM}'"
+    # A real realm keeps §423's legacy trust, and only under its own snapshot.
+    assert "IS NULL" in _clause_sql({**SANDBOX_CFG, LEGACY_REALM_KEY: SANDBOX})
+    assert "IS NULL" not in _clause_sql({**PROD_CFG, LEGACY_REALM_KEY: SANDBOX})
 
 
 def test_a_settings_save_never_sets_or_drops_the_snapshot_for_the_same_erp():
@@ -1552,6 +1596,70 @@ async def test_the_confirm_endpoint_refuses_anything_but_an_offered_candidate(
         moved = await c.post(f"/api/gl-accounts/{row_id}/erp-link", json={"erp_account_id": "40"})
     assert moved.status_code == 409
     assert (await _chart(realdb))["Depreciation"].erp_account_id is None
+
+
+async def test_a_questioned_link_is_confirmed_in_place(realdb, restore_settings):
+    """decisions §524: a merged row whose link landed on the top-level account
+    keeps posting there but needs a decision. Confirming its own account marks
+    it confirmed, clears the question, and audits where it posted before."""
+    await _set_erp(realdb, PROD_CFG)
+    row_id = await _add(
+        realdb, code="Depreciation", name="Depreciation", erp_account_id="40", erp_link_realm=PROD
+    )
+    await _sync(realdb, _depreciation_chart(), realm=PROD)
+
+    async with realdb.client(key=TENANT, role="ap_manager") as c:
+        listed = (await c.get("/api/gl-accounts")).json()
+        questioned = next(a for a in listed if a["code"] == "Depreciation")
+        assert questioned["erp_account_id"] == "40"
+        assert [a["erp_account_id"] for a in questioned["erp_link_candidates"]["accounts"]] == [
+            "39",
+            "40",
+        ]
+        resp = await c.post(f"/api/gl-accounts/{row_id}/erp-link", json={"erp_account_id": "40"})
+        again = await c.post(f"/api/gl-accounts/{row_id}/erp-link", json={"erp_account_id": "39"})
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert (body["erp_account_id"], body["erp_link_candidates"]) == ("40", None)
+    assert body["erp_link_confirmed_at"]
+    # Answered: a second person cannot re-point it on the stale question.
+    assert again.status_code == 409
+
+    async with realdb.sessionmaker(TENANT)() as s:
+        audit = (
+            await s.execute(
+                select(AuditLog).where(AuditLog.action == "gl_account.erp_link_confirmed")
+            )
+        ).scalar_one()
+    assert (audit.details["from_erp_account_id"], audit.details["erp_account_id"]) == ("40", "40")
+
+    later = await _sync(realdb, _depreciation_chart(), realm=PROD)
+    assert later.unlinked == []
+    row = (await _chart(realdb))["Depreciation"]
+    assert (row.erp_account_id, row.erp_link_candidates) == ("40", None)
+
+
+async def test_a_questioned_link_is_repointed_to_the_chosen_sub_account(realdb, restore_settings):
+    """The row's invoices meant Truck:Depreciation: the person's choice moves
+    the link, and the audit row says where its bills posted until now."""
+    await _set_erp(realdb, PROD_CFG)
+    row_id = await _add(
+        realdb, code="Depreciation", name="Depreciation", erp_account_id="40", erp_link_realm=PROD
+    )
+    await _sync(realdb, _depreciation_chart(), realm=PROD)
+    async with realdb.client(key=TENANT, role="admin") as c:
+        resp = await c.post(f"/api/gl-accounts/{row_id}/erp-link", json={"erp_account_id": "39"})
+    assert resp.status_code == 200, resp.text
+    async with realdb.sessionmaker(TENANT)() as s:
+        audit = (
+            await s.execute(
+                select(AuditLog).where(AuditLog.action == "gl_account.erp_link_confirmed")
+            )
+        ).scalar_one()
+    assert (audit.details["from_erp_account_id"], audit.details["erp_account_id"]) == ("40", "39")
+    row = (await _chart(realdb))["Depreciation"]
+    assert (row.erp_account_id, row.erp_link_realm) == ("39", PROD)
+    assert row.erp_link_confirmed_at is not None
 
 
 async def test_a_confirmation_under_no_realm_is_stamped_not_null(realdb, restore_settings):

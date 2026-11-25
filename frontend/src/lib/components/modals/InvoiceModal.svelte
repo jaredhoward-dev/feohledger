@@ -14,6 +14,7 @@
 	import { INVOICE_FILE_ACCEPT } from '#lib/utils/invoiceFiles.ts';
 	import { invoiceStore } from '#lib/stores/invoices.svelte.ts';
 	import { auth } from '#lib/stores/auth.svelte.ts';
+	import ErpOrphanBill from '#lib/components/erp/ErpOrphanBill.svelte';
 	import { adminStore } from '#lib/stores/admin.svelte.ts';
 	import { api, ApiError } from '#lib/api.ts';
 	import {
@@ -27,7 +28,11 @@
 	import Money from '#lib/components/ui/Money.svelte';
 	import Badge from '#lib/components/ui/Badge.svelte';
 	import type { BadgeTone } from '#lib/components/ui/badgeTone.ts';
-	import { m } from '#lib/i18n/store.svelte.ts';
+	import { ensureSlices, m } from '#lib/i18n/store.svelte.ts';
+	import {
+		activityTimelineView,
+		invoiceTimelineActionLabel,
+	} from '#lib/types/invoiceTimelineActions.ts';
 	import LoadingState from '#lib/components/ui/LoadingState.svelte';
 	import { erpRefusalText } from '#lib/api/erpRefusals.ts';
 	import { invoiceWarningText, poMatchIssueText } from '#lib/api/invoiceWarnings.ts';
@@ -166,44 +171,16 @@
 		return key ? m(key) : field;
 	}
 
-	const ACTION_LABEL_KEYS: Record<string, MessageKey> = {
-		'invoice.uploaded': 'invoices.modal.action.uploaded',
-		'invoice.submitted_for_review': 'invoices.modal.action.submittedForReview',
-		'invoice.approved': 'invoices.modal.action.approved',
-		'invoice.rejected': 'invoices.modal.action.rejected',
-		'invoice.resubmitted': 'invoices.modal.action.resubmitted',
-		'invoice.approval_recalled': 'invoices.modal.action.approvalRecalled',
-		'invoice.assigned_for_review': 'invoices.modal.action.assignedForReview',
-		'invoice.erp_submitted': 'invoices.modal.action.erpSubmitted',
-		'invoice.erp_auto_send_refused': 'invoices.modal.action.erpAutoSendRefused',
-		'invoice.extraction_dispatched': 'invoices.modal.action.extractionStarted',
-		'invoice.extraction_reset': 'invoices.modal.action.extractionReset',
-		'invoice.extraction_triggered': 'invoices.modal.action.extractionTriggered',
-		'invoice.extraction_completed': 'invoices.modal.action.extractionCompleted',
-		'invoice.extraction_failed': 'invoices.modal.action.extractionFailed',
-		'invoice.completed': 'invoices.modal.action.markedComplete',
-		'invoice.edited': 'invoices.modal.action.editedFields',
-		'invoice.file_attached': 'invoices.modal.action.fileAttached',
-		'invoice.file_replaced': 'invoices.modal.action.fileReplaced',
-		'invoice.file_deleted': 'invoices.modal.action.fileDeleted',
-		'audit.viewed': 'invoices.modal.action.auditViewed',
-		'audit.exported': 'invoices.modal.action.auditExported',
-		// Exception-queue events. They are correlation-keyed to the invoice
-		// (backend services/exception_lifecycle), so they arrive in this same
-		// timeline — a raised duplicate / fraud flag is why the invoice stalled,
-		// and clearing it is what let it move.
-		'exception.raised': 'invoices.modal.action.exceptionRaised',
-		'exception.resolved': 'invoices.modal.action.exceptionResolved',
-		'exception.escalated': 'invoices.modal.action.exceptionEscalated',
-		'exception.dismissed': 'invoices.modal.action.exceptionDismissed',
-		'exception.assigned': 'invoices.modal.action.exceptionAssigned',
-		'chat_message_posted': 'invoices.modal.action.chatPosted',
-		'chat_thread_resolved': 'invoices.modal.action.chatResolved',
-		'chat_thread_reopened': 'invoices.modal.action.chatReopened',
-	};
+	// Timeline labels: invoice-voice overrides, then the /audit console's
+	// catalogue, which covers every token the backend writes
+	// (`types/invoiceTimelineActions.ts`, decisions §522). That catalogue is
+	// a lazy slice the modal loads itself, since it opens on several routes.
+	// The rows are stored as soon as they arrive (the ERP panel reads them), but
+	// the Activity list draws none until that slice has landed
+	// (`activityTimelineView`), so no row shows its raw token first
+	// (decisions §529, §534).
 	function actionLabel(action: string): string {
-		const key = ACTION_LABEL_KEYS[action];
-		return key ? m(key) : action;
+		return invoiceTimelineActionLabel(action, m);
 	}
 
 	let {
@@ -1643,6 +1620,20 @@
 		};
 	});
 	let auditLoading = $state(false);
+	// The Activity list's own gates (decisions §534): a first fetch has settled,
+	// the last one failed, and the `audit` label slice has landed.
+	let auditFetched = $state(false);
+	let auditErrored = $state(false);
+	let auditLabelsReady = $state(false);
+	ensureSlices('audit').then(() => (auditLabelsReady = true));
+	let activityView = $derived(
+		activityTimelineView({
+			labelsReady: auditLabelsReady,
+			fetched: auditFetched,
+			errored: auditErrored,
+			rowCount: auditLog.length,
+		})
+	);
 
 	interface RagNeighbor {
 		invoice_id: string;
@@ -1775,10 +1766,13 @@
 		auditLoading = true;
 		try {
 			auditLog = await getInvoiceAuditLog(invoice.id);
+			auditErrored = false;
 		} catch {
-			// non-critical
+			// Stated in the Activity list (with Retry); rows already held stay.
+			auditErrored = true;
 		} finally {
 			auditLoading = false;
+			auditFetched = true;
 		}
 	}
 
@@ -2537,6 +2531,20 @@
 								</p>
 							{/if}
 						{/if}
+						{#if isOffered(verdicts?.erp_orphan_lookup_refusal)}
+							<!-- The bill this failed push may have left in the ERP
+							     (decisions §556): find it, then void or keep it. Shown
+							     from the server's verdict alone (§560); keyed on the
+							     invoice so one invoice's bill never shows on another. -->
+							{#key invoice.id}
+								<ErpOrphanBill
+									invoiceId={invoice.id}
+									verdict={verdicts?.erp_orphan_lookup_refusal ?? null}
+									idPrefix="invoice-erp-orphan"
+									onvoided={() => loadVerdicts()}
+								/>
+							{/key}
+						{/if}
 					</div>
 				{/if}
 
@@ -2674,9 +2682,28 @@
 					</div>
 				{/if}
 
-				{#if auditLog.length > 0}
-					<div class="activity-section">
-						<div class="activity-title">{m('invoices.modal.activity.title')}</div>
+				<!-- Always mounted, so `data-ready` is a signal even for an invoice
+				     with no activity: true once a fetch has settled AND the label
+				     slice has landed, with no fetch in flight (decisions §534). -->
+				<div
+					class="activity-section"
+					data-testid="invoice-activity"
+					data-ready={auditFetched && auditLabelsReady && !auditLoading ? 'true' : 'false'}
+				>
+					<div class="activity-title">{m('invoices.modal.activity.title')}</div>
+					{#if activityView === 'loading'}
+						<LoadingState testId="invoice-activity-loading" />
+					{:else if activityView === 'errored'}
+						<LoadError
+							message={m('invoices.modal.activity.loadError')}
+							onretry={() => void loadAuditLog()}
+							testId="invoice-activity-error"
+						/>
+					{:else if activityView === 'empty'}
+						<p class="activity-empty" data-testid="invoice-activity-empty">
+							{m('invoices.modal.activity.empty')}
+						</p>
+					{:else}
 						<div class="activity-list">
 							{#each auditLog as entry}
 								<div class="activity-item">
@@ -2718,8 +2745,8 @@
 								</div>
 							{/each}
 						</div>
-					</div>
-				{/if}
+					{/if}
+				</div>
 
 				<div class="chat-section">
 					<SupplierChatThread
@@ -3576,7 +3603,7 @@
 		font-weight: 600;
 	}
 	.contract-empty {
-		font-size: 0.82rem;
+		font-size: 0.78rem;
 		color: var(--text-muted);
 	}
 	.contract-select {
@@ -3616,7 +3643,7 @@
 	}
 
 	.ltm-title {
-		font-size: 0.82rem;
+		font-size: 0.78rem;
 		font-weight: 600;
 	}
 
@@ -3705,7 +3732,7 @@
 	.approver-select {
 		/* base look (border/radius/colour/font/chevron) from the global recipe */
 		padding: 8px 30px 8px 10px;
-		font-size: 0.82rem;
+		font-size: 0.78rem;
 		max-width: 140px;
 	}
 
@@ -3759,7 +3786,7 @@
 
 	.einvoice-error-title {
 		margin: 0;
-		font-size: 0.82rem;
+		font-size: 0.78rem;
 		font-weight: 600;
 		color: var(--text);
 	}
@@ -4128,7 +4155,7 @@
 
 	.po-match-value.mono {
 		font-family: 'SF Mono', 'Cascadia Code', 'Fira Code', monospace;
-		font-size: 0.82rem;
+		font-size: 0.78rem;
 	}
 
 	.po-match-value.variance-pos {
@@ -4241,6 +4268,12 @@
 		letter-spacing: 0.04em;
 		color: var(--text-muted);
 		margin-bottom: 8px;
+	}
+
+	.activity-empty {
+		margin: 0;
+		font-size: 0.78rem;
+		color: var(--text-muted);
 	}
 
 	.activity-list {
@@ -4485,13 +4518,13 @@
 	}
 
 	.review-assigned-hint {
-		font-size: 0.82rem;
+		font-size: 0.78rem;
 		color: var(--text-muted);
 		margin: 0;
 	}
 
 	.review-refusal {
-		font-size: 0.82rem;
+		font-size: 0.78rem;
 		color: var(--text-muted);
 		margin: 0.5rem 0 0;
 	}
@@ -4502,7 +4535,7 @@
 		color: var(--danger);
 		padding: 8px 12px;
 		border-radius: 4px;
-		font-size: 0.82rem;
+		font-size: 0.78rem;
 		margin-top: 8px;
 	}
 
@@ -4682,7 +4715,7 @@
 	.priors-table {
 		width: 100%;
 		border-collapse: collapse;
-		font-size: 0.82rem;
+		font-size: 0.78rem;
 	}
 	.priors-table th,
 	.priors-table td {

@@ -38,6 +38,15 @@ void main() {
         isNot(contains('brand_new_event')));
   });
 
+  test('the ERP bill flag notice has its own name, translated', () {
+    expect(notificationEventLabel(en, 'erp_bill_flagged'),
+        'Flag on a bill already in the ERP');
+    expect(notificationEventLabel(en, 'erp_bill_flagged'),
+        isNot(notificationEventLabel(en, 'brand_new_event')));
+    expect(notificationEventLabel(ja, 'erp_bill_flagged'),
+        isNot(notificationEventLabel(en, 'erp_bill_flagged')));
+  });
+
   test('every status, type and severity is translated, not echoed', () {
     final pairs = <(String, String)>[
       for (final s in InvoiceStatus.values)

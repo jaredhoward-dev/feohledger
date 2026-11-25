@@ -1591,7 +1591,7 @@ async def _refresh_po_overbilling(
         totalBilled=total_billed,
         poNumber=po.po_number,
         # Display only: the comparison above used the exact share,
-        # which `po_total × received / ordered` can make non-terminating.
+        # which a received share of the PO can make non-terminating.
         receivedValue=received_value.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP),
         currency=code,
     )

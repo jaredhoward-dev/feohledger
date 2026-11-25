@@ -49,6 +49,14 @@ class VirtualCard(Base, EntityMixin, TimestampMixin):
     expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     charged_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # When the card was FIRST authorized. Set by the card webhook's first
+    # authorization and never cleared — unlike `charged_at`, which a lapsed
+    # authorization clears (decisions §544). A single-use card is closed at the
+    # provider by its first authorization whatever happens to the hold, so a
+    # card with this set is never reused by a re-run
+    # (`card_issuance.card_settlement_block` → `card_authorized_before`,
+    # decisions §549; migration 0147).
+    first_authorized_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     merchant_name: Mapped[str | None] = mapped_column(String(255))
     decline_reason: Mapped[str | None] = mapped_column(String(500))
 
@@ -96,6 +104,62 @@ class CardRebate(Base, TimestampMixin):
     rate: Mapped[Decimal] = mapped_column(Numeric(5, 4), nullable=False)
     status: Mapped[str] = mapped_column(String(30), default="pending")
     period: Mapped[str | None] = mapped_column(String(7))  # e.g. "2026-04"
+
+    organization_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), nullable=False, index=True
+    )
+
+
+class CardTransactionEvent(Base, TimestampMixin):
+    """One provider transaction event the card webhook must remember beyond
+    the delivery that carried it (decisions §554; migration 0148).
+
+    Three kinds, keyed per card by ``(kind, event_key)``:
+
+    * ``lapse`` — a reversal / expiry that arrived BEFORE its authorization, on
+      a card with no hold to release. ``event_key`` is the provider's
+      transaction id, so the late authorization of that same transaction finds
+      it and is applied as already lapsed instead of charging the card.
+    * ``clearing`` — each clearing applied to the card. ``event_key`` is that
+      clearing's own identity (Lithic's clearing event token, else the
+      delivery id with the transaction token and its cumulative settled figure
+      when the body has no `events`, decisions §561; the delivery id for
+      the mock), so an incremental capture is added exactly once even when the
+      Redis event-id claim is gone.
+    * ``settlement_refused`` — a settlement refused for stating no usable figure
+      (decisions §562). ``event_key`` is the delivery's identity. Money may have
+      moved, so while one exists the card is never cancelled by hand nor reused
+      by a run, whatever status it reads.
+
+    Not the audit log: in ``lambda`` audit mode those rows ship to SQS and may
+    not be in the tenant database, and this is read back by the webhook.
+    """
+
+    __tablename__ = "card_transaction_events"
+    __table_args__ = (
+        Index(
+            "uq_card_transaction_events_card_kind_key",
+            "virtual_card_id",
+            "kind",
+            "event_key",
+            unique=True,
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    virtual_card_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("virtual_cards.id", ondelete="CASCADE"), nullable=False
+    )
+    kind: Mapped[str] = mapped_column(String(20), nullable=False)
+    event_key: Mapped[str] = mapped_column(String(255), nullable=False)
+    provider_transaction_id: Mapped[str | None] = mapped_column(String(255))
+    # `reversal` / `expiry` on a lapse row; NULL on a clearing.
+    lapse: Mapped[str | None] = mapped_column(String(20))
+    # Major units. A lapse: the figure it named, if any (a partial reversal is
+    # told apart by it). A clearing: what this clearing added (negative for a
+    # refused decrease, recorded so a replay of it stays quiet).
+    amount: Mapped[Decimal | None] = mapped_column(Numeric(15, 2))
+    currency: Mapped[str | None] = mapped_column(String(3))
 
     organization_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), nullable=False, index=True

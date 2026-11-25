@@ -1,18 +1,20 @@
 <script lang="ts">
 	import { confirmGlAccountErpLink } from '#lib/api/glAccounts.ts';
 	import { erpCandidateLabel, type GlAccount } from '#lib/types/glAccount.ts';
+	import Badge from '#lib/components/ui/Badge.svelte';
 	import Modal from '#lib/components/ui/Modal.svelte';
 	import { toast } from '#lib/components/ui/Toast.svelte';
 	import { m } from '#lib/i18n/store.svelte.ts';
 	import { untrack } from 'svelte';
 
 	/**
-	 * Say which ERP account an unlinked chart row means, among the candidates
-	 * the last sync named (`account.erp_link_candidates`, docs/decisions.md
-	 * §284). The sync never guesses: a pre-§284 QuickBooks row "Depreciation"
-	 * may be the top-level account or "Truck:Depreciation", and only a person
-	 * who knows what the invoices coded to it meant can say. Nothing is
-	 * preselected, so confirming is always a choice.
+	 * Say which ERP account a chart row means, among the candidates the last
+	 * sync named (`account.erp_link_candidates`, docs/decisions.md §284). The
+	 * sync never guesses: a pre-§284 QuickBooks row "Depreciation" may be the
+	 * top-level account or "Truck:Depreciation", and only a person who knows
+	 * what the invoices coded to it meant can say. A row may already be linked
+	 * to one of them — a link the sync kept but questions (§524) — and the
+	 * intro says so. Nothing is preselected, so confirming is always a choice.
 	 */
 	let {
 		account,
@@ -23,6 +25,17 @@
 	// Fixed for the life of the dialog: the page mounts one per row.
 	const row = untrack(() => account);
 	const candidates = row.erp_link_candidates?.accounts ?? [];
+	/** The candidate the row already posts to, when the sync kept its link but
+	 *  questions it (§524); otherwise none. The backend always lists the current
+	 *  account among the candidates, so the fallback below only keeps the intro
+	 *  honest if that ever stops being true — it never renders as a card. */
+	const current = row.erp_account_id
+		? (candidates.find((c) => c.erp_account_id === row.erp_account_id) ?? {
+				erp_account_id: row.erp_account_id,
+				code: row.erp_account_id,
+				name: row.erp_account_id
+			})
+		: null;
 	let chosen = $state<string | null>(null);
 	let saving = $state(false);
 	/** The backend's refusal, verbatim (a 409 when the candidates came from
@@ -66,18 +79,33 @@
 			handleSubmit();
 		}}
 	>
-		<p class="intro">{m('glAccounts.erpLink.intro', { code: row.code })}</p>
-		<fieldset>
+		<p class="intro">
+			{#if current}
+				{m('glAccounts.erpLink.introLinked', { code: row.code, current: erpCandidateLabel(current) })}
+			{:else}
+				{m('glAccounts.erpLink.intro', { code: row.code })}
+			{/if}
+		</p>
+		<fieldset class="radio-card-group">
 			<legend class="visually-hidden">{m('glAccounts.erpLink.title', { code: row.code })}</legend>
 			{#each candidates as candidate (candidate.erp_account_id)}
-				<label class="option" data-testid="gl-erp-candidate">
+				{@const isCurrent = candidate.erp_account_id === current?.erp_account_id}
+				<!-- The current link is tagged, never preselected (§284): confirming
+				     it is as deliberate a choice as picking another. -->
+				<label class="radio-card" data-testid="gl-erp-candidate">
 					<input
 						type="radio"
 						name="erp-candidate"
 						value={candidate.erp_account_id}
+						aria-describedby={isCurrent ? 'gl-erp-current-link' : undefined}
 						bind:group={chosen}
 					/>
 					<span class="label">{erpCandidateLabel(candidate)}</span>
+					{#if isCurrent}
+						<span id="gl-erp-current-link" data-testid="gl-erp-current-link">
+							<Badge tone="accent" variant="current-link">{m('glAccounts.erpLink.currentLink')}</Badge>
+						</span>
+					{/if}
 					<span class="id">{m('glAccounts.erpLink.optionId', { id: candidate.erp_account_id })}</span>
 				</label>
 			{/each}
@@ -100,26 +128,11 @@
 		font-size: 13px;
 		color: var(--text-muted);
 	}
+	/* Each candidate is a shared `.radio-card` (app.css). */
 	fieldset {
 		border: 0;
 		margin: 0;
 		padding: 0;
-		display: flex;
-		flex-direction: column;
-		gap: 8px;
-	}
-	.option {
-		display: flex;
-		align-items: center;
-		gap: 8px;
-		padding: 8px 10px;
-		border: 1px solid var(--border);
-		border-radius: 6px;
-		font-size: 13px;
-		cursor: pointer;
-	}
-	.option:has(input:checked) {
-		border-color: var(--accent);
 	}
 	.label {
 		flex: 1;

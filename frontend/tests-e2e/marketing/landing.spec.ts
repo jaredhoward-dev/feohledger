@@ -352,7 +352,7 @@ test.describe('landing — signing in from the main domain (#635 finding 4)', ()
 
 		await expect(page.getByRole('heading', { level: 1, name: 'Sign in to your workspace' })).toBeVisible();
 		await expect(page).toHaveURL(/\/find-workspace$/);
-		const field = page.getByLabel('Workspace address');
+		const field = page.getByLabel('Workspace address', { exact: true });
 		// The platform host is shown beside the field, from the template.
 		await expect(page.locator('#workspace-suffix')).toHaveText('.feoh.example');
 
@@ -365,7 +365,7 @@ test.describe('landing — signing in from the main domain (#635 finding 4)', ()
 	test('an address that cannot be a workspace is refused in place, with the reason', async ({ page }) => {
 		await stubPublicConfig(page);
 		await page.goto('/find-workspace');
-		const field = page.getByLabel('Workspace address');
+		const field = page.getByLabel('Workspace address', { exact: true });
 		await field.fill('acme_corp');
 		await page.getByRole('button', { name: 'Continue' }).click();
 
@@ -381,7 +381,7 @@ test.describe('landing — signing in from the main domain (#635 finding 4)', ()
 		// from that host, so that is what its users type.
 		await stubPublicConfig(page);
 		await page.goto('/find-workspace');
-		const field = page.getByLabel('Workspace address');
+		const field = page.getByLabel('Workspace address', { exact: true });
 		await field.fill('ap.acmecorp.com');
 		await page.getByRole('button', { name: 'Continue' }).click();
 
@@ -423,6 +423,82 @@ test.describe('landing — signing in from the main domain (#635 finding 4)', ()
 		await expect(page.getByRole('heading', { level: 1, name: 'Sign in to your workspace' })).toBeVisible();
 		await expect(page).toHaveURL(/\/find-workspace$/);
 		await expect(page.locator('.landing')).toHaveCount(0);
+	});
+
+	test('the footer links to "email me my workspace address"', async ({ page }) => {
+		await gotoLanding(page);
+		await expect(
+			page.getByRole('navigation', { name: 'Footer' }).getByRole('link', { name: 'Forgot your workspace?' })
+		).toHaveAttribute('href', '/find-workspace#email');
+	});
+
+	test('a forgotten workspace: the address goes to the lookup, and every address gets the same answer', async ({
+		page
+	}) => {
+		// decisions §518: the server answers alike for every address and only
+		// ever tells the mailbox, so the page has one confirmation to show.
+		await stubPublicConfig(page);
+		const bodies: unknown[] = [];
+		await page.route(
+			(url) => url.pathname === '/api/workspace-lookup',
+			async (route) => {
+				bodies.push(route.request().postDataJSON());
+				await route.fulfill({ json: { status: 'accepted', message: 'ignored by the page' } });
+			}
+		);
+		await page.goto('/find-workspace#email');
+		const lookup = page.locator('#email');
+		await expect(lookup.getByRole('heading', { name: 'Forgot your workspace address?' })).toBeVisible();
+
+		await lookup.getByLabel('Email address').fill('  ada@example.com ');
+		await lookup.getByRole('button', { name: 'Email me my workspace address' }).click();
+
+		await expect(lookup.getByRole('heading', { name: 'Check your email' })).toBeFocused();
+		await expect(lookup).toContainText('If ada@example.com has an account');
+		expect(bodies).toEqual([{ email: 'ada@example.com', captcha_token: null, locale: 'en' }]);
+
+		await lookup.getByRole('button', { name: 'Use a different address' }).click();
+		await expect(lookup.getByLabel('Email address')).toBeFocused();
+		await expectNoA11yViolations(page);
+	});
+
+	test('a malformed address is refused in place and never sent', async ({ page }) => {
+		await stubPublicConfig(page);
+		let calls = 0;
+		await page.route(
+			(url) => url.pathname === '/api/workspace-lookup',
+			(route) => {
+				calls += 1;
+				return route.fulfill({ json: { status: 'accepted', message: '' } });
+			}
+		);
+		await page.goto('/find-workspace');
+		const lookup = page.locator('#email');
+		await lookup.getByLabel('Email address').fill('not-an-address');
+		await lookup.getByRole('button', { name: 'Email me my workspace address' }).click();
+		await expect(lookup.getByRole('alert')).toHaveText('Enter a valid email address.');
+		await expect(lookup.getByLabel('Email address')).toBeFocused();
+		expect(calls).toBe(0);
+	});
+
+	test("the server's refusal is stated in the form", async ({ page }) => {
+		await stubPublicConfig(page);
+		await page.route(
+			(url) => url.pathname === '/api/workspace-lookup',
+			(route) =>
+				route.fulfill({
+					status: 400,
+					json: {
+						detail: { code: 'captcha_required', message: 'Captcha is required.', params: {} }
+					}
+				})
+		);
+		await page.goto('/find-workspace');
+		const lookup = page.locator('#email');
+		await lookup.getByLabel('Email address').fill('ada@example.com');
+		await lookup.getByRole('button', { name: 'Email me my workspace address' }).click();
+		await expect(lookup.getByRole('alert')).toBeVisible();
+		await expect(lookup.getByRole('heading', { name: 'Check your email' })).toHaveCount(0);
 	});
 
 	test('find-your-workspace fits a 320px screen', async ({ page }) => {

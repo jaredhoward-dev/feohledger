@@ -1,3 +1,4 @@
+import ipaddress
 from decimal import Decimal
 
 from pydantic import Field, model_validator
@@ -6,6 +7,11 @@ from pydantic_settings import BaseSettings
 # Environment names that are NOT a deployed/production environment. In these,
 # safety guards (e.g. the captcha requirement) are relaxed for local dev + CI.
 _NON_DEPLOYED_ENVS = frozenset({"development", "dev", "local", "test", "ci"})
+
+#: FEOH_TRUSTED_PROXY_CIDRS' explicit "no proxy in front of the API" value —
+#: trust no X-Forwarded-For and key on the socket peer. Distinct from empty,
+#: which a deployed environment refuses (decisions §553).
+TRUSTED_PROXY_NONE = "none"
 
 # Every provider `app/services/extraction_adapters/` registers. Held as a
 # literal because config.py must not import the service layer (that would make
@@ -449,6 +455,49 @@ class Settings(BaseSettings):
     erp_auto_send_sweep_delay_seconds: int = Field(default=300, ge=60)
     erp_auto_send_sweep_lookback_hours: int = Field(default=24, ge=1)
     erp_auto_send_sweep_batch_size: int = Field(default=100, ge=1)
+    # Call-budget re-send (decisions §521, `services/erp_budget_retry_sweep`): a
+    # push refused before any call because the org's share of a shared ERP
+    # quota was used (`erp_call_budget_exhausted`, §322) is re-sent once its
+    # `retry_after` has passed, through `erp_send.start_erp_send` (plan and
+    # export gates), earliest `retry_after` first, stopping for the tenant as
+    # soon as its share is used again. Only an invoice still `failed` with that
+    # refusal as the last row on its trail, refused within the lookback and
+    # after the ERP went live. Off by default like every sweep that calls out.
+    erp_budget_retry_sweep_enabled: bool = False
+    erp_budget_retry_sweep_interval_seconds: int = Field(default=900, ge=60)
+    erp_budget_retry_sweep_lookback_hours: int = Field(default=48, ge=1)
+    erp_budget_retry_sweep_batch_size: int = Field(default=50, ge=1)
+    # Status polling (decisions §528, `services/erp_status_poll_sweep`): the
+    # backstop for the generic per-tenant ERP webhook, which drops a delivery
+    # it cannot verify (credentials unopenable, unseal budget spent, §408 /
+    # §525). Asks the adapter `get_invoice_status` for each bill still at
+    # `sent_to_erp` / `posted_in_erp` / `payment_scheduled`, least recently
+    # polled first, at most `batch_size` per tenant a tick, and applies a
+    # changed status through the webhook's own transition. Not for Merge.dev,
+    # QuickBooks or Xero (their own paths). Stops a tenant's pass at the ERP
+    # call budget. Off by default like every sweep that calls out.
+    erp_status_poll_sweep_enabled: bool = False
+    erp_status_poll_sweep_interval_seconds: int = Field(default=900, ge=60)
+    erp_status_poll_sweep_batch_size: int = Field(default=50, ge=1)
+    # Merge.dev bill read-back (decisions §540, `services/merge_readback_sweep`):
+    # the backstop for the Merge webhook, which drops a delivery it cannot
+    # verify (credentials unopenable, unseal budget spent for a cold tenant,
+    # §408 / §525 / §527). Lists each Merge tenant's bills changed since its
+    # cursor (`settings.erp_merge_readback`; the first pass looks back
+    # `lookback_hours`), keeps those we pushed, reads at most `batch_size` back
+    # a tick and applies each with the webhook's own reconciler. Stops a
+    # tenant's pass at the ERP call budget. Off by default like every sweep
+    # that calls out. Each listing asks from `through − overlap_minutes`, not
+    # `through` itself: `through` is our own clock at the last listing's start,
+    # and a bill Merge stamps a little earlier (clock skew, or Merge's own lag
+    # syncing the ERP) would otherwise fall between two listings for good.
+    # Re-reading a bill in the overlap is harmless: the reconciler is
+    # idempotent (decisions §543).
+    merge_readback_sweep_enabled: bool = False
+    merge_readback_sweep_interval_seconds: int = Field(default=900, ge=60)
+    merge_readback_sweep_lookback_hours: int = Field(default=48, ge=1)
+    merge_readback_sweep_batch_size: int = Field(default=50, ge=1)
+    merge_readback_sweep_overlap_minutes: int = Field(default=10, ge=0)
 
     # Commerce / inventory sync (decisions §273, `services/commerce_sync.py`).
     # OPERATOR-only override that points EVERY commerce adapter at one fake
@@ -648,7 +697,9 @@ class Settings(BaseSettings):
     # and uses ``request.client.host`` for rate-limit / audit purposes, so
     # a hostile direct caller can't rotate IPs by spoofing the header.
     # Default empty → never trust XFF (matches local-dev with no proxy).
-    # Comma-separated list of CIDRs.
+    # Comma-separated list of CIDRs, or `none` (explicit: no proxy, key on the
+    # socket peer). A deployed env refuses to boot with it empty — behind a
+    # proxy that would make every per-IP limit global (decisions §553).
     trusted_proxy_cidrs: str = ""
 
     # Self-service signup
@@ -709,6 +760,13 @@ class Settings(BaseSettings):
     # needs a generous per-IP cap — high enough for real typing, low enough to
     # stop wire-speed namespace enumeration / DB amplification.
     slug_check_rate_limit_per_hour: int = 120
+    # Self-service "email me my workspace address" (`api/workspace_lookup.py`,
+    # decisions §518): the same per-IP and per-address shape as signup's
+    # verification email, on budgets of its own so neither flow spends the
+    # other's. The per-address cap is what stops an attacker rotating IPs from
+    # filling one person's inbox.
+    workspace_lookup_rate_limit_per_hour: int = Field(default=5, ge=1)
+    workspace_lookup_email_rate_limit_per_hour: int = Field(default=3, ge=1)
 
     # Master switch for the Redis-backed rate limiter at
     # ``app/services/rate_limit.py``. Defaults to True so deployed envs
@@ -995,6 +1053,22 @@ class Settings(BaseSettings):
     # truncates a real one.
     erp_webhook_max_bytes: int = 4 * 1024 * 1024
 
+    # Unseal budget on the two per-tenant ERP webhooks (`/api/erp/webhook/
+    # {erp_type}` and `/webhook/merge_dev/{slug}`, decisions §525). Each of
+    # them opens a tenant's sealed key BEFORE the signature can be checked;
+    # repeat openings of one tenant hit the DEK cache, so only a caller cycling
+    # well-formed signatures across tenants forces a KMS Decrypt per request.
+    # The budget is DISTINCT tenants a source address has failed against in
+    # the window; only deliveries that fail to verify after an unseal count (a
+    # genuine sender never does, and a provider's shared IPs serving one
+    # misconfigured tenant never trip it). No per-tenant budget: it would let
+    # anyone who knows a slug drop that tenant's genuine deliveries. A spent
+    # budget skips the unseal and is the same silent 204 as every other
+    # rejection, logged. Composes with `rate_limit_enabled`; fails open when
+    # Redis is unreachable. No secret.
+    erp_webhook_unverified_window_seconds: int = 600
+    erp_webhook_unverified_tenants_per_source_limit: int = 10
+
     # Email-intake inbound webhook (`POST /api/email-intake/inbound/{provider}`,
     # public, HMAC-gated). Same memory-exhaustion guard as the ERP webhook above
     # — email provider payloads (incl. base64 attachments) can legitimately run
@@ -1232,30 +1306,30 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def _require_captcha_in_deployed_envs(self) -> "Settings":
-        # Fail fast at boot rather than silently shipping signup with captcha
-        # disabled — a 'fail open' captcha is an abuse hole on a public,
-        # tenant-creating endpoint. Only while that endpoint exists: with
-        # `signup_enabled` off every signup route 404s before reaching the
-        # captcha check, so demanding a secret would only make an operator hold
-        # a credential for a feature they turned off.
-        if self.is_deployed and self.signup_enabled and not self.hcaptcha_secret:
+        # Fail fast at boot rather than silently shipping a public endpoint
+        # with captcha disabled — a 'fail open' captcha is an abuse hole. Two
+        # public endpoints verify it: `/signup/start` (tenant-creating, behind
+        # `signup_enabled`) and `/workspace-lookup` (§518), which is served on
+        # every deployment because closing signup does not stop existing users
+        # forgetting their workspace. So the pair is required whenever the
+        # environment is deployed, signup open or closed (decisions §553).
+        if self.is_deployed and not self.hcaptcha_secret.strip():
             raise ValueError(
                 "FEOH_HCAPTCHA_SECRET must be set when FEOH_ENVIRONMENT is a deployed "
-                f"environment ({self.environment!r}) and self-service signup is on; "
-                "refusing to boot with captcha verification disabled on the public "
-                "signup endpoint. Set FEOH_SIGNUP_ENABLED=false to close signup instead."
+                f"environment ({self.environment!r}); refusing to boot with captcha "
+                "verification disabled on the public workspace-lookup (and, while "
+                "FEOH_SIGNUP_ENABLED is on, signup) endpoints."
             )
         # The other half of the pair. With the secret set the server verifies
-        # every signup, but the browser only renders the widget when
+        # every request, but the browser only renders the widget when
         # /api/public-config hands it a site key — so a missing key is a
-        # signup page whose every submit fails the captcha (#575: the
-        # post-deploy smoke check asserts the same thing from outside).
-        if self.is_deployed and self.signup_enabled and not self.hcaptcha_sitekey.strip():
+        # lookup (and signup) form whose every submit fails the captcha (#575:
+        # the post-deploy smoke check asserts the same thing from outside).
+        if self.is_deployed and not self.hcaptcha_sitekey.strip():
             raise ValueError(
                 "FEOH_HCAPTCHA_SITEKEY must be set when FEOH_ENVIRONMENT is a deployed "
-                f"environment ({self.environment!r}) and self-service signup is on; "
-                "without it /signup renders no captcha and every signup is refused. "
-                "Set FEOH_SIGNUP_ENABLED=false to close signup instead."
+                f"environment ({self.environment!r}); without it /find-workspace (and "
+                "/signup) render no captcha and every request is refused."
             )
         return self
 
@@ -1367,6 +1441,61 @@ class Settings(BaseSettings):
                 "change notices are emailed to every customer's administrators, and this "
                 "sweep is what sends them."
             )
+        return self
+
+    @model_validator(mode="after")
+    def _require_trusted_proxy_decision_in_deployed_envs(self) -> "Settings":
+        # Empty FEOH_TRUSTED_PROXY_CIDRS behind a proxy collapses every caller
+        # into the proxy's address, so every per-IP limit (login, signup,
+        # workspace lookup, the ERP webhook unseal budget) becomes one global
+        # bucket. A deployed env must therefore name its proxy's network, or
+        # say explicitly that it has none (`none`: no proxy, key on the socket
+        # peer). Empty is never read as either (decisions §553).
+        if not self.is_deployed:
+            return self
+        raw = self.trusted_proxy_cidrs.strip()
+        if not raw:
+            raise ValueError(
+                "FEOH_TRUSTED_PROXY_CIDRS must be set when FEOH_ENVIRONMENT is a deployed "
+                f"environment ({self.environment!r}): name the reverse proxy / load "
+                "balancer network whose X-Forwarded-For is trusted (e.g. the compose "
+                "subnet 172.28.0.0/16), or set it to 'none' if clients connect to the "
+                "API directly. Empty would collapse every client behind a proxy into one "
+                "rate-limit bucket."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_trusted_proxy_cidrs(self) -> "Settings":
+        # Every environment: a typo'd CIDR is never intended, and silently
+        # skipping it (as the resolver once did) leaves the deployment trusting
+        # less than its operator believes — the same global-bucket failure as
+        # empty. `none` is the explicit "no proxy" value and stands alone.
+        raw = self.trusted_proxy_cidrs.strip()
+        if not raw:
+            return self
+        if raw.lower() == TRUSTED_PROXY_NONE:
+            return self
+        entries = [e.strip() for e in raw.split(",") if e.strip()]
+        if not entries:
+            # "," alone would trust nothing, exactly as empty does — refused
+            # rather than read as a decision.
+            raise ValueError(
+                "FEOH_TRUSTED_PROXY_CIDRS names no CIDR; set the proxy network(s) or 'none'."
+            )
+        for entry in entries:
+            if entry.lower() == TRUSTED_PROXY_NONE:
+                raise ValueError(
+                    "FEOH_TRUSTED_PROXY_CIDRS: 'none' means no proxy and cannot be "
+                    "combined with CIDRs."
+                )
+            try:
+                ipaddress.ip_network(entry, strict=False)
+            except ValueError:
+                raise ValueError(
+                    f"FEOH_TRUSTED_PROXY_CIDRS entry {entry!r} is not a CIDR or address "
+                    "(comma-separated, e.g. '172.28.0.0/16,10.0.0.0/8', or 'none')."
+                ) from None
         return self
 
 

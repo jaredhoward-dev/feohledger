@@ -75,9 +75,9 @@ def _fake_tenant_session_factory(invoice, *, existing_recon_count: int = 0, sett
     On the ``payment_scheduled → paid`` edge the handler then issues one more
     ``execute`` — the settling-payment lookup that feeds ``settlement_coverage``
     — which returns ``settling_payment`` (``None`` = no completed payment, so
-    the coverage check is skipped and the transition applies). If the coverage
-    verdict is non-covering it issues a FURTHER ``execute`` — the
-    open-``erp_reconciliation``-exception dedup count — returning
+    the invoice is held behind a blocking exception, decisions §533). If there
+    is none, or the coverage verdict is non-covering, it issues a FURTHER
+    ``execute`` — the live-exception-of-that-kind dedup count — returning
     ``existing_recon_count``.
 
     The ``side_effect`` list is exact, so a stand-in invoice that omits a field
@@ -172,7 +172,7 @@ async def _post(
     `existing_recon_count` seeds the open-`erp_reconciliation`-exception dedup
     count the reconciliation path reads; `settling_payment` is the completed
     `Payment` the `payment_scheduled → paid` settlement-coverage check finds
-    (default `None` = no completed payment, check skipped).
+    (default `None` = no completed payment: held, decisions §533).
 
     Returns (result, tenant_db, transition_calls) where transition_calls records
     the args every `transition_invoice` invocation received (empty if the guard
@@ -208,7 +208,7 @@ async def _post(
         patch("app.api.erp_webhook.control_session_factory", _ctrl_session_for_org(org)),
         patch("app.api.erp_webhook.get_tenant_engine", return_value=MagicMock()),
         patch("app.api.erp_webhook.async_sessionmaker", return_value=tenant_factory),
-        patch("app.api.erp_webhook.transition_invoice", _capture),
+        patch("app.services.erp_status_report.transition_invoice", _capture),
     ):
         result = await erp_webhook(
             erp_type=erp_type,
@@ -284,7 +284,7 @@ async def test_a_bill_unpaid_again_withdraws_the_erp_payment_kept_earlier(fake_r
         id=uuid.uuid4(), correlation_id=uuid.uuid4(), status=InvoiceStatus.posted_in_erp
     )
     withdraw = AsyncMock(return_value=1)
-    with patch("app.api.erp_webhook.withdraw_erp_paid_reports", withdraw):
+    with patch("app.services.erp_status_report.withdraw_erp_paid_reports", withdraw):
         result, db, transition_calls = await _post(
             org=org, invoice=invoice, status_value=erp_status, event_id=f"ev_{erp_status}"
         )
@@ -304,8 +304,8 @@ async def test_a_paid_report_never_withdraws(fake_redis):
     )
     withdraw = AsyncMock(return_value=0)
     with (
-        patch("app.api.erp_webhook.withdraw_erp_paid_reports", withdraw),
-        patch("app.api.erp_webhook._record_erp_reported_payment", AsyncMock()),
+        patch("app.services.erp_status_report.withdraw_erp_paid_reports", withdraw),
+        patch("app.services.erp_status_report._record_erp_reported_payment", AsyncMock()),
     ):
         await _post(org=org, invoice=invoice, status_value="Paid", event_id="ev_paid_again")
     withdraw.assert_not_awaited()
@@ -406,7 +406,7 @@ async def test_erp_paid_for_an_invoice_feohledger_never_paid_is_recorded(fake_re
     invoice = SimpleNamespace(id=uuid.uuid4(), correlation_id=uuid.uuid4(), status=current)
 
     recorded = AsyncMock()
-    with patch("app.api.erp_webhook._record_erp_reported_payment", recorded):
+    with patch("app.services.erp_status_report._record_erp_reported_payment", recorded):
         result, db, transition_calls = await _post(
             org=org, invoice=invoice, status_value="Paid", event_id=f"ev_paid_{current.value}"
         )
@@ -444,7 +444,7 @@ async def test_a_merge_held_key_never_unlocks_the_generic_route(fake_redis, erp_
         id=uuid.uuid4(), correlation_id=uuid.uuid4(), status=InvoiceStatus.posted_in_erp
     )
     recorded = AsyncMock()
-    with patch("app.api.erp_webhook._record_erp_reported_payment", recorded):
+    with patch("app.services.erp_status_report._record_erp_reported_payment", recorded):
         result, db, transition_calls = await _post(
             org=org,
             invoice=invoice,
@@ -481,7 +481,7 @@ async def test_an_erp_type_that_is_not_the_tenants_own_adapter_is_a_silent_204(f
         id=uuid.uuid4(), correlation_id=uuid.uuid4(), status=InvoiceStatus.posted_in_erp
     )
     recorded = AsyncMock()
-    with patch("app.api.erp_webhook._record_erp_reported_payment", recorded):
+    with patch("app.services.erp_status_report._record_erp_reported_payment", recorded):
         result, db, transition_calls = await _post(
             org=org,
             invoice=invoice,
@@ -535,6 +535,7 @@ def _payment(*, settled_amount, amount="1000.00", settled_currency="USD"):
     return SimpleNamespace(
         id=uuid.uuid4(),
         status="completed",
+        method="ach",
         amount=Decimal(amount),
         settled_amount=None if settled_amount is None else Decimal(settled_amount),
         settled_currency=settled_currency,
@@ -545,10 +546,17 @@ def _payment(*, settled_amount, amount="1000.00", settled_currency="USD"):
 
 
 @pytest.mark.asyncio
-async def test_permitted_transition_scheduled_to_paid_applies(fake_redis):
-    """`payment_scheduled → paid` is a canonical edge (ERP reports paid). With no
-    completed payment on file the settlement-coverage check is skipped and the
-    transition applies + commits as before."""
+async def test_scheduled_to_paid_is_held_while_our_payment_is_in_flight(fake_redis):
+    """`payment_scheduled → paid` is a canonical edge, but with NO completed
+    payment on file the ERP's `paid` is not ours: `payment_erp_sync` writes
+    nothing back to a generic ERP, so the bill was paid there while our rail
+    payment is still in flight. Moving to `paid` could hide a double payment,
+    so the invoice is held behind ONE blocking `payment_reconciliation`
+    exception and not transitioned (decisions §533), in words that never tell
+    anyone to void a payment the route cannot attribute (§535)."""
+    from app.models.exception import Exception as APException
+    from app.services.payment_gates import PAYMENT_BLOCKING_EXCEPTION_TYPES
+
     org = _org_with_erp_secret("erp-secret")
     invoice = SimpleNamespace(
         id=uuid.uuid4(),
@@ -562,9 +570,52 @@ async def test_permitted_transition_scheduled_to_paid_applies(fake_redis):
     )
 
     assert result is None
-    assert len(transition_calls) == 1
-    assert transition_calls[0]["target"] is InvoiceStatus.paid
-    assert invoice.status is InvoiceStatus.paid
+    assert transition_calls == []
+    assert invoice.status is InvoiceStatus.payment_scheduled
+    added = [a.args[0] for a in db.add.call_args_list if isinstance(a.args[0], APException)]
+    assert len(added) == 1
+    exc = added[0]
+    assert exc.exception_type == "payment_reconciliation"
+    assert exc.exception_type in PAYMENT_BLOCKING_EXCEPTION_TYPES
+    assert exc.description_code == "exception.erp_paid_while_payment_in_flight"
+    assert exc.erp_report == {
+        "kind": "paid_while_scheduled",
+        "erp_type": "generic",
+        "erp_document_id": "doc_1",
+        "event_id": "ev_paid2",
+        "invoice_status": "payment_scheduled",
+    }
+    db.commit.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_scheduled_paid_in_flight_does_not_pile_up_a_second_exception(fake_redis):
+    """A distinct later `paid` delivery while the same kind of row is live
+    changes nothing, so nothing is committed."""
+    from app.models.exception import Exception as APException
+
+    org = _org_with_erp_secret("erp-secret")
+    invoice = SimpleNamespace(
+        id=uuid.uuid4(),
+        correlation_id=uuid.uuid4(),
+        currency="USD",
+        status=InvoiceStatus.payment_scheduled,
+    )
+
+    result, db, transition_calls = await _post(
+        org=org,
+        invoice=invoice,
+        status_value="paid",
+        event_id="ev_paid_again_in_flight",
+        existing_recon_count=1,
+    )
+
+    assert result is None
+    assert transition_calls == []
+    assert invoice.status is InvoiceStatus.payment_scheduled
+    added = [a.args[0] for a in db.add.call_args_list if isinstance(a.args[0], APException)]
+    assert added == []
+    db.commit.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -643,8 +694,9 @@ async def test_scheduled_to_paid_is_held_when_the_rail_settled_short(fake_redis)
 
 @pytest.mark.asyncio
 async def test_scheduled_to_paid_short_does_not_pile_up_a_second_exception(fake_redis):
-    """If an open `erp_reconciliation` exception already exists for the invoice,
-    a redelivered short-settlement `paid` must not open a second one."""
+    """If an open `erp_reconciliation` exception of the same kind already
+    exists for the invoice, a redelivered short-settlement `paid` must not open
+    a second one — and, having changed nothing, commits nothing (§533)."""
     from app.models.exception import Exception as APException
 
     org = _org_with_erp_secret("erp-secret")
@@ -670,7 +722,7 @@ async def test_scheduled_to_paid_short_does_not_pile_up_a_second_exception(fake_
     # dedup — no second Exception row
     added = [a.args[0] for a in db.add.call_args_list if isinstance(a.args[0], APException)]
     assert added == []
-    db.commit.assert_awaited()
+    db.commit.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------
@@ -823,7 +875,7 @@ async def test_dedup_claim_released_when_transition_raises(fake_redis):
         patch("app.api.erp_webhook.control_session_factory", _ctrl_session_for_org(org)),
         patch("app.api.erp_webhook.get_tenant_engine", return_value=MagicMock()),
         patch("app.api.erp_webhook.async_sessionmaker", return_value=tenant_factory),
-        patch("app.api.erp_webhook.transition_invoice", _boom),
+        patch("app.services.erp_status_report.transition_invoice", _boom),
     ):
         result = await erp_webhook(
             erp_type="generic",
@@ -874,7 +926,7 @@ async def test_invoice_fetch_uses_row_lock(fake_redis):
         patch("app.api.erp_webhook.control_session_factory", _ctrl_session_for_org(org)),
         patch("app.api.erp_webhook.get_tenant_engine", return_value=MagicMock()),
         patch("app.api.erp_webhook.async_sessionmaker", return_value=tenant_factory),
-        patch("app.api.erp_webhook.transition_invoice", _capture),
+        patch("app.services.erp_status_report.transition_invoice", _capture),
         patch(
             "app.api.erp_webhook.get_invoice_for_update", AsyncMock(return_value=invoice)
         ) as locked_fetch,
@@ -1151,20 +1203,76 @@ async def test_a_pre_realm_push_and_a_current_one_sharing_an_id_resolve_to_the_c
     "erp_config",
     [
         {},
-        {"integration_method": "direct", "type": "mock"},
         {"integration_method": "direct", "type": "quickbooks_online"},
+        {"integration_method": "direct", "type": "sage_accounting"},
     ],
 )
 async def test_a_document_id_matches_nothing_when_no_company_can_be_named(erp_config):
-    """No connection realm (``mock``, an OAuth ERP with no consent) names no
-    company a document id could belong to: the lookup refuses before querying
-    (decisions §423)."""
+    """No connection realm (no ERP configured, an OAuth ERP with no consent)
+    names no company a document id could belong to: the lookup refuses before
+    querying (decisions §423). The mock is no longer one: its bills are its own
+    company's (§538, below)."""
     from app.api.erp_webhook import _invoice_id_by_document
 
     db = MagicMock()
     db.execute = AsyncMock()
     assert await _invoice_id_by_document(db, "1042", erp_config) is None
     db.execute.assert_not_awaited()
+
+
+async def _mock_tenant(realdb, *, legacy_realm=None):
+    """Tenant ``a`` on the mock ERP with its webhook key sealed (§538)."""
+    from sqlalchemy.orm.attributes import flag_modified
+
+    from app.models.organization import Organization
+    from app.services.erp_link_realm import LEGACY_REALM_KEY
+
+    erp = {"type": "mock", "integration_method": "direct"}
+    if legacy_realm is not None:
+        erp[LEGACY_REALM_KEY] = legacy_realm
+    async with realdb.control_sessionmaker()() as s:
+        org = await s.get(Organization, realdb.info("a").org_id)
+        org.settings = {**(org.settings or {}), "erp": erp}
+        flag_modified(org, "settings")
+        await s.commit()
+    await realdb.store_provider_secrets("a", "erp", {"webhook_signing_secret": "erp-secret"})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("legacy_realm", [None, "mock:mock-company"])
+async def test_a_document_id_matches_a_bill_the_mock_pushed_and_never_a_pre_realm_one(
+    realdb, monkeypatch, fake_redis, legacy_realm
+):
+    """§538: a mock push records ``MOCK_BILL_REALM``, so the mock's own webhook
+    route matches its bill by document id under the normal rule. A NULL-realm
+    bill on the same id is never trusted on the mock, whatever the snapshot
+    says: it may be a real ERP's from before realms were recorded. A link
+    stamp (``"mock"``) is never a bill's realm."""
+    from app.api import erp_webhook
+    from app.services.erp_link_realm import MOCK_BILL_REALM, UNNAMED_REALM, bill_realm
+
+    await _mock_tenant(realdb, legacy_realm=legacy_realm)
+    assert bill_realm({"type": "mock", "integration_method": "direct"}) == MOCK_BILL_REALM
+    legacy = await _pushed_invoice(realdb, "MOCK-7", realm=None)
+    stamp = await _pushed_invoice(realdb, "MOCK-8", realm=UNNAMED_REALM)
+    mocked = await _pushed_invoice(realdb, "MOCK-7", realm=MOCK_BILL_REALM)
+
+    monkeypatch.setattr(erp_webhook, "control_session_factory", realdb.control_sessionmaker())
+    for doc in ("MOCK-7", "MOCK-8"):
+        body = json.loads(_doc_only_body(doc))
+        body["tenant_slug"] = realdb.info("a").slug
+        raw = json.dumps(body).encode("utf-8")
+        assert (
+            await erp_webhook.erp_webhook(
+                erp_type="mock",
+                request=_fake_request(raw, {"X-Webhook-Signature": _sign("erp-secret", raw)}),
+            )
+            is None
+        )
+
+    assert await _invoice_status(realdb, mocked) == InvoiceStatus.posted_in_erp
+    assert await _invoice_status(realdb, legacy) == InvoiceStatus.sent_to_erp
+    assert await _invoice_status(realdb, stamp) == InvoiceStatus.sent_to_erp
 
 
 @pytest.mark.asyncio

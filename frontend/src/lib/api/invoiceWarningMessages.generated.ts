@@ -257,8 +257,12 @@ export const INVOICE_WARNING_MESSAGE_KEYS = {
 	'exception.erp_payment_void_writeback_failed_unnamed': 'exceptions.description.erpPaymentVoidWritebackFailedUnnamed',
 	// The ERP shows this bill settled, at least in part by a vendor credit applied there. FeohLedger will not pay it until someone confirms what is still owed.
 	'exception.erp_credit_settlement': 'exceptions.description.erpCreditSettlement',
+	// The ERP shows nothing owing on this bill, but no payment against it: a credit was applied or the balance written off there. FeohLedger will not pay it until someone confirms what is still owed.
+	'exception.erp_settled_no_payment': 'exceptions.description.erpSettledNoPayment',
 	// The ERP shows this bill paid by a payment FeohLedger did not make, while a FeohLedger payment is scheduled for it. Stop or void one of them before both reach the supplier.
 	'exception.erp_paid_while_scheduled': 'exceptions.description.erpPaidWhileScheduled',
+	// The ERP shows this bill paid while FeohLedger's payment for it has not completed. Confirm whether that entry is FeohLedger's payment or a second one before voiding anything.
+	'exception.erp_paid_while_payment_in_flight': 'exceptions.description.erpPaidWhilePaymentInFlight',
 	// FeohLedger paid this invoice, and the ERP shows the bill also paid by a payment FeohLedger did not make — the supplier may have been paid twice. Recover one of the payments.
 	'exception.erp_paid_twice': 'exceptions.description.erpPaidTwice',
 	// The ERP shows part of this bill paid or credited outside FeohLedger; a FeohLedger payment for the full amount would overpay it. Reconcile what is still owed before paying.
@@ -327,6 +331,12 @@ export const INVOICE_WARNING_MESSAGE_KEYS = {
 	'exception.payment_dispatch_interrupted_failed': 'exceptions.description.paymentDispatchInterruptedFailed',
 	// Payment {paymentId} was cancelled, but an earlier attempt to send it was interrupted after it may already have reached the processor, so the money may or may not have moved. Confirm with the processor and void or re-pay — this invoice is blocked from a new payment run until this is resolved.
 	'exception.payment_dispatch_interrupted_cancelled': 'exceptions.description.paymentDispatchInterruptedCancelled',
+	// The card ending {lastFour} was charged after it was cancelled, so this invoice may have been paid twice. Check the charge with the card provider and the other payments on this invoice, and recover the duplicate — this invoice is blocked from a new payment run until this is resolved.
+	'exception.card_settled_after_cancel': 'exceptions.description.cardSettledAfterCancel',
+	// A settlement on the card ending {lastFour} was refused because it stated no usable amount, so money may have moved on the card without being recorded. Check the charge with the card provider — the card cannot be cancelled and this invoice is blocked from a new payment run until this is resolved.
+	'exception.card_settlement_refused': 'exceptions.description.cardSettlementRefused',
+	// A further charge on the card ending {lastFour} was not recorded, so the amount paid on this invoice may be more than shown. Check the charge with the card provider and record any difference — this invoice is blocked from a new payment run until this is resolved.
+	'exception.card_clearing_refused': 'exceptions.description.cardClearingRefused',
 	// Settlement currency mismatch: the processor reported {settledAmount} {settledCurrency} but this payment authorizes {authorizedAmount} {authorizedCurrency}. Money moved on a currency AP did not authorize — reconcile with the processor before releasing this invoice.
 	'exception.settlement_currency_mismatch': 'exceptions.description.settlementCurrencyMismatch',
 	// Settlement amount mismatch: the processor reported {settledAmount} {settledCurrency}, MORE than the authorized {authorizedAmount} {authorizedCurrency} (variance {variance}). Money moved at an amount AP did not authorize — reconcile with the processor before releasing this invoice.
@@ -458,7 +468,9 @@ export const INVOICE_WARNING_PARAM_KINDS = {
 	'exception.erp_payment_void_writeback_failed': { erp: 'text' },
 	'exception.erp_payment_void_writeback_failed_unnamed': {},
 	'exception.erp_credit_settlement': {},
+	'exception.erp_settled_no_payment': {},
 	'exception.erp_paid_while_scheduled': {},
+	'exception.erp_paid_while_payment_in_flight': {},
 	'exception.erp_paid_twice': {},
 	'exception.erp_partly_paid_outside': {},
 	'exception.erp_recorded_payment_withdrawn': {},
@@ -493,6 +505,9 @@ export const INVOICE_WARNING_PARAM_KINDS = {
 	'exception.payment_dispatch_in_doubt': { paymentId: 'text', failureCode: 'text' },
 	'exception.payment_dispatch_interrupted_failed': { paymentId: 'text' },
 	'exception.payment_dispatch_interrupted_cancelled': { paymentId: 'text' },
+	'exception.card_settled_after_cancel': { lastFour: 'text' },
+	'exception.card_settlement_refused': { lastFour: 'text' },
+	'exception.card_clearing_refused': { lastFour: 'text' },
 	'exception.settlement_currency_mismatch': { settledAmount: 'number', settledCurrency: 'text', authorizedAmount: 'number', authorizedCurrency: 'text' },
 	'exception.settlement_amount_over': { settledAmount: 'number', settledCurrency: 'text', authorizedAmount: 'number', authorizedCurrency: 'text', variance: 'number' },
 	'exception.settlement_amount_under': { settledAmount: 'number', settledCurrency: 'text', authorizedAmount: 'number', authorizedCurrency: 'text', variance: 'number' },

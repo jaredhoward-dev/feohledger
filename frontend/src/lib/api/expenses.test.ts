@@ -30,7 +30,8 @@ vi.mock('#lib/i18n/store.svelte.ts', async () => {
 	};
 });
 
-const { submitReport, getCardTransactionCounts } = await import('#lib/api/expenses.ts');
+const { submitReport, getCardTransactionCounts, searchAttachableExpenses, listExpenseReports } =
+	await import('#lib/api/expenses.ts');
 const de = { ...deMain, ...deRefusal };
 
 const fetchMock = vi.fn();
@@ -47,11 +48,13 @@ function respond(body: unknown, status: number) {
 beforeEach(() => {
 	fetchMock.mockReset();
 	vi.stubGlobal('fetch', fetchMock);
-	vi.stubGlobal('window', {});
-	vi.stubGlobal('localStorage', {
-		getItem: () => 'jwt-1',
-		setItem: () => {},
-		removeItem: () => {}
+	// The token is read through `window.localStorage` (`#lib/utils/safeStorage.ts`).
+	vi.stubGlobal('window', {
+		localStorage: {
+			getItem: () => 'jwt-1',
+			setItem: () => {},
+			removeItem: () => {}
+		}
 	});
 });
 
@@ -198,5 +201,40 @@ describe('getCardTransactionCounts', () => {
 			date_from: '2026-06-01',
 			date_to: '2026-06-30'
 		});
+	});
+});
+
+describe('the attach sources (decisions §515)', () => {
+	it('searchAttachableExpenses asks the server for the attachable set, newest first', async () => {
+		respond({ items: [], total: 0, page: 2, page_size: 25 }, 200);
+		await searchAttachableExpenses({ search: 'taxi', page: 2, page_size: 25 });
+		const url = new URL(String(fetchMock.mock.calls[0][0]));
+		expect(url.pathname).toBe('/api/expenses');
+		expect(Object.fromEntries(url.searchParams)).toEqual({
+			attachable: 'true',
+			search: 'taxi',
+			sort: 'expense_date',
+			order: 'desc',
+			page: '2',
+			page_size: '25'
+		});
+	});
+
+	it('an empty search term is not sent', async () => {
+		respond({ items: [], total: 0, page: 1, page_size: 25 }, 200);
+		await searchAttachableExpenses({ search: '', page: 1, page_size: 25 });
+		const url = new URL(String(fetchMock.mock.calls[0][0]));
+		expect(url.searchParams.has('search')).toBe(false);
+	});
+
+	it('listExpenseReports passes mine only when asked', async () => {
+		respond({ items: [], total: 0, page: 1, page_size: 100 }, 200);
+		respond({ items: [], total: 0, page: 1, page_size: 20 }, 200);
+		await listExpenseReports({ status: 'draft', mine: true, page_size: 100 });
+		await listExpenseReports();
+		const mine = new URL(String(fetchMock.mock.calls[0][0]));
+		expect(mine.searchParams.get('mine')).toBe('true');
+		expect(mine.searchParams.get('status')).toBe('draft');
+		expect(new URL(String(fetchMock.mock.calls[1][0])).searchParams.has('mine')).toBe(false);
 	});
 });

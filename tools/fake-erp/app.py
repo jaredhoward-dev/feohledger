@@ -4485,7 +4485,217 @@ def _netsuite_suiteql_table(query: str) -> list[dict] | None:
         return NETSUITE_SUITEQL_CURRENCY_FIXTURES
     if _SUITEQL_PERIOD_Q.match(query):
         return NETSUITE_SUITEQL_PERIOD_FIXTURES
+    # Status sync-back (decisions §536): what is applied to each bill, and the
+    # bills a keyset poll names (the fake ignores the date filter: every bill
+    # is "changed", which the adapter's caller narrows to bills it posted).
+    if _SUITEQL_LINKS_Q.match(query):
+        return _netsuite_links()
+    if _SUITEQL_CHANGED_BILLS_Q.match(query):
+        return [{"id": bill_id} for bill_id in STATE["netsuite_bills"]]
     return None
+
+
+_SUITEQL_LINKS_Q = re.compile(
+    r"^\s*SELECT\b.*\bFROM\s+NextTransactionLineLink\b", re.IGNORECASE | re.DOTALL
+)
+_SUITEQL_CHANGED_BILLS_Q = re.compile(
+    r"^\s*SELECT\s+id\s+FROM\s+transaction\s+WHERE\s+type\s*=\s*'VendBill'",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _netsuite_applied() -> dict[str, dict]:
+    """Transactions applied to bills: our vendorPayments and what a person
+    keyed in NetSuite (``POST /__netsuite/apply``). id -> record."""
+    return STATE.setdefault("netsuite_applied", {})
+
+
+def _netsuite_links() -> list[dict]:
+    """``NextTransactionLineLink`` joined to the applied transaction, one row
+    per (transaction, bill): the columns the adapter's query selects."""
+    rows = []
+    for txn in _netsuite_applied().values():
+        for item in txn["apply"]:
+            rows.append(
+                {
+                    "previousdoc": item["doc"],
+                    "nextdoc": txn["id"],
+                    "nexttype": txn["type"],
+                    "foreignamount": item["amount"],
+                    "externalid": txn.get("externalId"),
+                    "trandate": txn.get("tranDate"),
+                }
+            )
+    return rows
+
+
+def _netsuite_bill_open(bill_id: str) -> Decimal:
+    applied = sum(
+        (
+            Decimal(str(r["foreignamount"]))
+            for r in _netsuite_links()
+            if r["previousdoc"] == bill_id
+        ),
+        Decimal(0),
+    )
+    return Decimal(str(STATE["netsuite_bills"][bill_id]["total"])) - applied
+
+
+def _netsuite_restatus(bill_id: str) -> None:
+    """Like NetSuite: Paid In Full once nothing is open, Open otherwise."""
+    bill = STATE["netsuite_bills"].get(bill_id)
+    if bill is None or bill["status"]["id"] not in ("open", "paidInFull"):
+        return
+    paid = _netsuite_bill_open(bill_id) == 0
+    bill["status"] = (
+        {"id": "paidInFull", "refName": "Paid In Full"}
+        if paid
+        else {"id": "open", "refName": "Open"}
+    )
+
+
+def _netsuite_apply(txn_type: str, body: dict, *, external_id: str | None) -> str:
+    items = ((body.get("apply") or {}).get("items")) or []
+    applied = []
+    for item in items:
+        if not item.get("apply"):
+            continue
+        bill_id = str((item.get("doc") or {}).get("id") or "")
+        if bill_id not in STATE["netsuite_bills"]:
+            raise _netsuite_invalid_ref("doc")
+        if "disc" in item:
+            raise _netsuite_error(
+                400, "USER_ERROR", "Discounts are not accepted by this fake."
+            )
+        amount = Decimal(str(item.get("amount")))
+        if amount <= 0 or amount > _netsuite_bill_open(bill_id):
+            raise _netsuite_error(
+                400, "USER_ERROR", "The amount applied exceeds the amount due."
+            )
+        applied.append({"doc": bill_id, "amount": amount})
+    if not applied:
+        raise _netsuite_error(
+            400, "USER_ERROR", "You must apply the payment to a bill."
+        )
+    STATE["counters"]["netsuite"] += 1
+    txn_id = str(STATE["counters"]["netsuite"])
+    _netsuite_applied()[txn_id] = {
+        "id": txn_id,
+        "type": txn_type,
+        "externalId": external_id,
+        "tranDate": body.get("tranDate"),
+        "entity": body.get("entity"),
+        "account": body.get("account"),
+        "currency": body.get("currency"),
+        "memo": body.get("memo"),
+        "apply": applied,
+        "status": {"id": "deposited" if txn_type == "VendPymt" else "open"},
+    }
+    for item in applied:
+        _netsuite_restatus(item["doc"])
+    return txn_id
+
+
+netsuite_payments = APIRouter(prefix="/netsuite/services/rest/record/v1")
+
+
+@netsuite_payments.post("/vendorPayment")
+async def netsuite_create_vendor_payment(request: Request) -> Response:
+    """A vendorPayment applied to bills (``apply.items[]``: ``doc``, ``apply``,
+    ``amount``). Like NetSuite, a second record with the same ``externalId``
+    is refused. 204 with the new record's Location."""
+    _require_netsuite_auth(request)
+    body = _ns_json.loads(await request.body(), parse_float=Decimal)
+    external_id = body.get("externalId")
+    if external_id and any(
+        str(t.get("externalId") or "").lower() == str(external_id).lower()
+        for t in _netsuite_applied().values()
+    ):
+        raise _netsuite_error(
+            400, "DUP_RCRD", "A record with this external ID already exists."
+        )
+    if (body.get("entity") or {}).get("id") not in {
+        v["id"] for v in NETSUITE_VENDOR_FIXTURES
+    }:
+        raise _netsuite_invalid_ref("entity")
+    if (body.get("account") or {}).get("id") not in {
+        a["id"] for a in NETSUITE_ACCOUNT_FIXTURES
+    }:
+        raise _netsuite_invalid_ref("account")
+    txn_id = _netsuite_apply("VendPymt", body, external_id=external_id)
+    return Response(status_code=204, headers={"Location": f"{request.url}/{txn_id}"})
+
+
+def _netsuite_payment_id(doc_id: str) -> str:
+    if doc_id.startswith("eid:"):
+        external_id = doc_id.removeprefix("eid:").lower()
+        return next(
+            (
+                txn_id
+                for txn_id, t in _netsuite_applied().items()
+                if t["type"] == "VendPymt"
+                and str(t.get("externalId") or "").lower() == external_id
+            ),
+            doc_id,
+        )
+    return doc_id
+
+
+@netsuite_payments.get("/vendorPayment/{doc_id}")
+async def netsuite_get_vendor_payment(request: Request, doc_id: str) -> Response:
+    _require_netsuite_auth(request)
+    txn = _netsuite_applied().get(_netsuite_payment_id(doc_id))
+    if txn is None or txn["type"] != "VendPymt":
+        raise _netsuite_error(
+            404, "NONEXISTENT_ID", f"That record does not exist. id: {doc_id}"
+        )
+    return Response(content=_netsuite_json(txn), media_type="application/json")
+
+
+@netsuite_payments.delete("/vendorPayment/{doc_id}")
+async def netsuite_delete_vendor_payment(request: Request, doc_id: str) -> Response:
+    """Deleting a payment takes its application off the bill (REST has no void)."""
+    _require_netsuite_auth(request)
+    txn_id = _netsuite_payment_id(doc_id)
+    txn = _netsuite_applied().get(txn_id)
+    if txn is None or txn["type"] != "VendPymt":
+        raise _netsuite_error(
+            404, "NONEXISTENT_ID", f"That record does not exist. id: {doc_id}"
+        )
+    del _netsuite_applied()[txn_id]
+    for item in txn["apply"]:
+        _netsuite_restatus(item["doc"])
+    return Response(status_code=204)
+
+
+app.include_router(netsuite_payments)
+
+
+@app.post("/__netsuite/apply")
+async def netsuite_apply_outside(body: dict) -> dict:
+    """Test hook: a person in NetSuite applies a payment (``VendPymt``) or a
+    vendor credit (``VendCred``) to a bill. Body: ``{"bill": id, "type":
+    "VendPymt"|"VendCred", "amount": "12.34", "tranDate": "2026-11-20"}``."""
+    txn_type = body.get("type")
+    if txn_type not in ("VendPymt", "VendCred"):
+        raise ProviderError(400, {"detail": "type must be VendPymt or VendCred"})
+    txn_id = _netsuite_apply(
+        txn_type,
+        {
+            "tranDate": body.get("tranDate"),
+            "apply": {
+                "items": [
+                    {
+                        "doc": {"id": str(body.get("bill"))},
+                        "apply": True,
+                        "amount": body.get("amount"),
+                    }
+                ]
+            },
+        },
+        external_id=None,
+    )
+    return {"id": txn_id}
 
 
 netsuite_void = APIRouter(prefix="/netsuite/services/rest/record/v1")

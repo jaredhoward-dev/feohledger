@@ -2,10 +2,11 @@
 
 Phase 4 of the QuickBooks Online adapter: once a FeohLedger payment has
 settled and its invoice is ``paid``, ``payment_erp_sync`` hands the payment
-here, and an ERP that supports status sync (``ErpAdapter.supports_status_sync``
-— QuickBooks Online) records it as a payment of the bill the invoice was posted
-as. "The bill shows paid in QuickBooks" is what keeps a bookkeeper there from
-paying it a second time.
+here, and an ERP whose status sync is on for the tenant
+(``erp_adapters.base.reports_status_back`` — QuickBooks Online, Xero, and
+NetSuite only with its per-tenant opt-in, §541) records it as a payment of
+the bill the invoice was posted as. "The bill shows paid in QuickBooks" is
+what keeps a bookkeeper there from paying it a second time.
 
 Rules this module owns:
 
@@ -46,8 +47,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.invoice import Invoice
 from app.models.payment import Payment
 from app.services.audit_dispatch import dispatch_audit
-from app.services.erp_adapters.base import ErpAdapter, ErpPostResult, PaymentPayload
-from app.services.erp_link_realm import connection_realm, legacy_links_trusted
+from app.services.erp_adapters.base import (
+    ErpAdapter,
+    ErpPostResult,
+    PaymentPayload,
+    reports_status_back,
+)
+from app.services.erp_link_realm import MOCK_BILL_REALM, connection_realm, legacy_links_trusted
 from app.services.erp_status_sync import erp_finding, open_erp_reconciliation_exception
 from app.services.payment_methods import CARD_PAYMENT_METHODS
 from app.utils.dates import utc_today
@@ -178,7 +184,7 @@ async def write_back_payment(
     The caller has committed the invoice's ``paid`` transition first, so no
     row lock is held across the ERP call.
     """
-    if not adapter.supports_status_sync:
+    if not reports_status_back(adapter):
         return SKIPPED
     bill_id = bill_for_writeback(state_data, erp_config)
     if bill_id is None:
@@ -333,7 +339,7 @@ async def _org_adapter(org_id: uuid.UUID):
     if not erp_config:
         return None
     adapter = get_erp_adapter(erp_config)
-    if not getattr(adapter, "supports_status_sync", False):
+    if not reports_status_back(adapter):
         return None
     return org, erp_config, adapter
 
@@ -420,7 +426,13 @@ async def record_pending_erp_void(db: AsyncSession, *, invoice: Invoice, payment
         await db.execute(select(WorkflowInstance).where(WorkflowInstance.invoice_id == invoice.id))
     ).scalar_one_or_none()
     state = dict((instance.state_data if instance else None) or {})
-    if instance is None or not state.get("erp_reference") or not state.get("erp_realm"):
+    # A mock bill is never written back (``bill_for_writeback`` reads the
+    # connection realm, which the mock lacks), so it has nothing to void and a
+    # marker would only stay pending for ever (§538).
+    recorded = state.get("erp_realm")
+    if instance is None or not state.get("erp_reference"):
+        return False
+    if recorded in (None, "", MOCK_BILL_REALM):
         return False
     pending = [str(p) for p in state.get(PENDING_VOIDS_KEY) or []]
     if str(payment.id) not in pending:

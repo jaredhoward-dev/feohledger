@@ -4,18 +4,17 @@
 	import AuthBrandMark from '#lib/components/auth/AuthBrandMark.svelte';
 	import Spinner from '#lib/components/ui/Spinner.svelte';
 	import LegalAcceptCheckbox from '#lib/components/auth/LegalAcceptCheckbox.svelte';
+	import HCaptcha from '#lib/components/auth/HCaptcha.svelte';
 	import { ACCEPTED_LEGAL_VERSIONS } from '#lib/legal/acceptance.ts';
 	import IconMail from '~icons/material-symbols/mark-email-unread-outline';
 	import IconCheck from '~icons/material-symbols/check-circle';
 	import IconClose from '~icons/material-symbols/cancel';
-	import { tick, untrack } from 'svelte';
+	import { tick } from 'svelte';
 	import { api, ApiError, formatApiDetail } from '#lib/api.ts';
 	import { onMount } from 'svelte';
 	import { currentLocale, m } from '#lib/i18n/store.svelte.ts';
 	import { codedRefusalText, refusalField } from '#lib/api/codedRefusals.ts';
 	import type { MessageKey } from '#lib/i18n/messages.ts';
-	import { theme } from '#lib/stores/theme.svelte.ts';
-	import type { ResolvedTheme } from '#lib/theme.ts';
 	import type { PublicConfig } from '#lib/types/publicConfig.ts';
 	import {
 		WORKSPACE_ADDRESS_MAX,
@@ -55,16 +54,9 @@
 	let legalBox: LegalAcceptCheckbox | undefined = $state();
 	let captchaToken = $state<string | null>(null);
 	let captchaSitekey = $state<string>('');
-	// hCaptcha's API has loaded (its explicit-mode onload fired).
-	let captchaApiReady = $state(false);
-	// hCaptcha's script could not be loaded — almost always a content / ad
-	// blocker or a browser privacy shield. Shown where the widget would be.
+	// hCaptcha's script could not be loaded (`HCaptcha` sets it).
 	let captchaLoadFailed = $state(false);
-	// The widget currently drawn: which container, and in which palette. Plain,
-	// not $state — only the captcha effect reads it, and it must not re-run
-	// that effect by being written there.
-	let captchaWidget: { id: string; el: HTMLDivElement; theme: ResolvedTheme } | null = null;
-	const HCAPTCHA_ONLOAD = 'feohHCaptchaOnLoad';
+	let captcha: HCaptcha | undefined = $state();
 	// Host/port suffix shown after the slug input, derived from the backend
 	// tenant_url_template (e.g. "http://{slug}.localhost:7777" → ".localhost:7777").
 	let tenantUrlSuffix = $state<string>('.localhost:7777');
@@ -104,7 +96,6 @@
 	let slugCheckTimer: ReturnType<typeof setTimeout> | null = null;
 
 	let emailInput = $state<HTMLInputElement | null>(null);
-	let captchaEl = $state<HTMLDivElement | null>(null);
 	let successHeading = $state<HTMLHeadingElement | null>(null);
 
 	onMount(async () => {
@@ -116,7 +107,6 @@
 				return;
 			}
 			captchaSitekey = cfg.hcaptcha_sitekey || '';
-			if (captchaSitekey) loadHCaptcha();
 			const suffix = tenantHostSuffix(cfg.tenant_url_template);
 			if (suffix) {
 				tenantUrlSuffix = suffix;
@@ -126,60 +116,6 @@
 			// Non-fatal — backend may be unreachable; form will surface errors on submit.
 		}
 	});
-
-	/**
-	 * Load hCaptcha in EXPLICIT mode: it draws nothing by itself, and calls
-	 * `HCAPTCHA_ONLOAD` when its API is ready. Every widget is then drawn by the
-	 * effect below, which is the only way to give it a theme after the fact —
-	 * hCaptcha has no call to change a live widget's theme, so following the
-	 * page means removing the widget and drawing it again.
-	 *
-	 * **When the script cannot load** — a content blocker, a browser privacy
-	 * shield, a filtering proxy — the page used to say only "Please complete
-	 * the captcha" with nothing on screen to complete. The `<script>` element's
-	 * own events are the signal, not a timer: `error` when the request fails,
-	 * and `load` with no `hcaptcha` global when a blocker answered it with an
-	 * empty stand-in. Either way the failed element is removed, so the next
-	 * visit to the page asks again (the visitor may have allowed the page in
-	 * their blocker meanwhile) instead of finding an element that looks like it
-	 * is still loading. The listeners go on whichever element is in the head —
-	 * this visit's, or one an earlier visit added that is still in flight.
-	 */
-	function loadHCaptcha() {
-		const w = window as any;
-		w[HCAPTCHA_ONLOAD] = () => (captchaApiReady = true);
-		// Already loaded by an earlier visit to this page in the same session.
-		if (typeof w.hcaptcha?.render === 'function') {
-			captchaApiReady = true;
-			return;
-		}
-		let s = document.querySelector<HTMLScriptElement>('script[data-hcaptcha]');
-		if (!s) {
-			s = document.createElement('script');
-			s.src = `https://hcaptcha.com/1/api.js?render=explicit&onload=${HCAPTCHA_ONLOAD}`;
-			s.async = true;
-			s.defer = true;
-			s.setAttribute('data-hcaptcha', 'true');
-			document.head.appendChild(s);
-		}
-		const script = s;
-		const failed = () => {
-			script.remove();
-			captchaLoadFailed = true;
-		};
-		script.addEventListener('error', failed, { once: true });
-		// hCaptcha's api.js defines its `hcaptcha` global synchronously as it
-		// runs, so by `load` it exists; readiness itself is still the `onload`
-		// callback above. Only a script that ran and defined NOTHING — a
-		// blocker's empty stand-in — counts as failed here.
-		script.addEventListener(
-			'load',
-			() => {
-				if (!w.hcaptcha) failed();
-			},
-			{ once: true }
-		);
-	}
 
 	/**
 	 * What this form SAYS about each way an address can break the rule, which
@@ -266,85 +202,11 @@
 		// Kept, it would satisfy the client-side "captcha required" check and
 		// ride along on the retry, which the backend then rejects with no widget
 		// in view to solve again.
-		// The form's fresh `.h-captcha` container gets its widget from the
-		// effect below, which sees the new element.
+		// The form's fresh `HCaptcha` draws a widget of its own.
 		captchaToken = null;
 		await tick();
 		emailInput?.focus();
 		emailInput?.select();
-	}
-
-	/**
-	 * Keep exactly one hCaptcha widget in the form, drawn in the palette the
-	 * page is showing (docs/decisions.md §289, §290).
-	 *
-	 * The widget is an iframe and cannot see our palette, so it is told which
-	 * one is showing — a light widget on the dark form (or the reverse) is a
-	 * glaring box. It re-runs when the container is mounted (first paint, and
-	 * the form coming back from the confirmation screen), when the API finishes
-	 * loading, and when `theme.resolved` changes — a choice on the auth shell's
-	 * picker, or the OS switching scheme while System is chosen.
-	 *
-	 * A SOLVED widget is left alone on a theme change: redrawing it would
-	 * throw away a token the visitor already earned, for a cosmetic reason. It
-	 * is redrawn in the current palette once that token is gone — expired
-	 * (hCaptcha resets the widget then anyway) or spent on a submission.
-	 */
-	$effect(() => {
-		const el = captchaEl;
-		const wanted = theme.resolved;
-		const solved = captchaToken !== null;
-		if (!captchaSitekey || !captchaApiReady || !el) return;
-		untrack(() => syncCaptcha(el, wanted, solved));
-	});
-
-	function syncCaptcha(el: HTMLDivElement, wanted: ResolvedTheme, solved: boolean) {
-		const hcaptcha = (window as any).hcaptcha;
-		if (typeof hcaptcha?.render !== 'function') return;
-		if (captchaWidget) {
-			const sameContainer = captchaWidget.el === el;
-			if (sameContainer && (captchaWidget.theme === wanted || solved)) return;
-			try {
-				hcaptcha.remove(captchaWidget.id);
-			} catch {
-				// Its container left the DOM with the form; nothing to remove.
-			}
-			captchaWidget = null;
-		}
-		const id = hcaptcha.render(el, {
-			sitekey: captchaSitekey,
-			theme: wanted,
-			callback: (token: string) => (captchaToken = token),
-			'expired-callback': () => (captchaToken = null)
-		});
-		captchaWidget = { id, el, theme: wanted };
-	}
-
-	/**
-	 * Throw away a captcha token the server may already have spent.
-	 *
-	 * The backend verifies the captcha BEFORE it checks the slug is free or
-	 * sends the email, so a 409 or a 502 arrives with the token used up while
-	 * the widget still shows a tick. Kept, it satisfied the client-side check
-	 * and rode along on the retry, which the server refused with "Captcha
-	 * verification failed" — a misleading reason, with nothing on screen to
-	 * solve again. Cleared here on every answer from the server (a refusal
-	 * that came before verification costs the visitor one more tick; reusing
-	 * a spent token costs them a confusing dead end), and the widget is reset
-	 * so it looks as unsolved as it now is. The captcha effect redraws it
-	 * instead if the theme changed while it was solved.
-	 */
-	function discardCaptchaToken() {
-		if (captchaToken === null) return;
-		captchaToken = null;
-		const hcaptcha = (window as any).hcaptcha;
-		if (captchaWidget && typeof hcaptcha?.reset === 'function') {
-			try {
-				hcaptcha.reset(captchaWidget.id);
-			} catch {
-				// Its container already left the DOM; the effect draws a new one.
-			}
-		}
 	}
 
 	/** A Pydantic validation item's message, in the reader's language where we know its type. */
@@ -487,7 +349,7 @@
 			await tick();
 			successHeading?.focus();
 		} catch (err) {
-			discardCaptchaToken();
+			captcha?.reset();
 			if (err instanceof ApiError && err.code === 'legal_acceptance_required') {
 				// Submit only gets here with the box ticked, so the refusal means
 				// the Terms / Privacy versions changed since the page loaded. Say
@@ -708,21 +570,12 @@
 				onchange={() => (legalError = '')}
 			/>
 
-			{#if captchaSitekey}
-				{#if captchaLoadFailed}
-					<!-- Where the widget would have been, and announced on arrival:
-					     without it the only thing on screen was a "complete the
-					     captcha" request with nothing to complete. -->
-					<div class="error captcha-blocked" id="captcha-blocked" role="alert">
-						<strong>{m('auth.signup.captchaBlockedTitle')}</strong>
-						<span>{m('auth.signup.captchaBlockedBody')}</span>
-					</div>
-				{:else}
-					<!-- Drawn into by the captcha effect (explicit render), never by
-					     hCaptcha scanning for the class. -->
-					<div class="h-captcha" bind:this={captchaEl}></div>
-				{/if}
-			{/if}
+			<HCaptcha
+				bind:this={captcha}
+				sitekey={captchaSitekey}
+				bind:token={captchaToken}
+				bind:loadFailed={captchaLoadFailed}
+			/>
 
 			<!-- While the captcha cannot load, the button is described by the
 			     notice, so pressing it says why nothing can be sent. -->

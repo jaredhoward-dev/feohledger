@@ -18,7 +18,9 @@ from app.services.webhooks.dispatch import (
     emit_exception_raised,
     emit_invoice_approval_recalled,
     emit_invoice_approved,
+    emit_invoice_erp_bill_voided,
     emit_payment_settled,
+    emit_payment_voided,
 )
 from app.services.webhooks.signing import (
     SECRET_BRAND,
@@ -31,7 +33,9 @@ __all__ = [
     "emit_event",
     "emit_invoice_approved",
     "emit_invoice_approval_recalled",
+    "emit_invoice_erp_bill_voided",
     "emit_payment_settled",
+    "emit_payment_voided",
     "emit_exception_raised",
     "process_delivery",
     "deliver_due",

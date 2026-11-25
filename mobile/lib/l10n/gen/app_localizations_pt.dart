@@ -3851,8 +3851,16 @@ class AppLocalizationsPt extends AppLocalizations {
       'Segundo o ERP, esta fatura está quitada, ao menos em parte, por uma nota de crédito do fornecedor aplicada lá. O FeohLedger não vai pagá-la até que alguém confirme o que ainda é devido.';
 
   @override
+  String get exceptionDescriptionErpSettledNoPayment =>
+      'Segundo o ERP, não há nada em aberto nesta fatura, mas também nenhum pagamento vinculado a ela: um crédito foi aplicado ou o saldo foi baixado lá. O FeohLedger não vai pagá-la até que alguém confirme o que ainda é devido.';
+
+  @override
   String get exceptionDescriptionErpPaidWhileScheduled =>
       'Segundo o ERP, esta fatura foi paga por um pagamento que o FeohLedger não fez, enquanto há um pagamento do FeohLedger agendado para ela. Interrompa ou estorne um deles antes que os dois cheguem ao fornecedor.';
+
+  @override
+  String get exceptionDescriptionErpPaidWhilePaymentInFlight =>
+      'Segundo o ERP, esta fatura está paga, mas o pagamento do FeohLedger para ela ainda não foi concluído. Confirme se esse lançamento é o pagamento do FeohLedger ou um segundo pagamento antes de estornar qualquer coisa.';
 
   @override
   String get exceptionDescriptionErpPaidTwice =>
@@ -4072,6 +4080,21 @@ class AppLocalizationsPt extends AppLocalizations {
     String paymentId,
   ) {
     return 'O pagamento $paymentId foi cancelado, mas uma tentativa anterior de envio foi interrompida depois de talvez já ter chegado ao processador, então o dinheiro pode ou não ter saído. Confirme com o processador e anule ou pague de novo — esta fatura fica bloqueada para novos lotes de pagamento até que isso seja resolvido.';
+  }
+
+  @override
+  String exceptionDescriptionCardSettledAfterCancel(String lastFour) {
+    return 'O cartão com final $lastFour foi cobrado depois de cancelado, então esta fatura pode ter sido paga duas vezes. Confira a cobrança com o provedor do cartão e os outros pagamentos desta fatura e recupere o valor duplicado — esta fatura fica bloqueada para novos lotes de pagamento até que isso seja resolvido.';
+  }
+
+  @override
+  String exceptionDescriptionCardSettlementRefused(String lastFour) {
+    return 'Uma liquidação do cartão com final $lastFour foi recusada por não informar um valor utilizável, então pode ter havido movimentação de dinheiro no cartão sem registro. Confira a cobrança com o provedor do cartão — o cartão não pode ser cancelado e esta fatura fica bloqueada para novos lotes de pagamento até que isso seja resolvido.';
+  }
+
+  @override
+  String exceptionDescriptionCardClearingRefused(String lastFour) {
+    return 'Uma cobrança adicional no cartão com final $lastFour não foi registrada, então o valor pago nesta fatura pode ser maior que o exibido. Confira a cobrança com o provedor do cartão e registre a diferença — esta fatura fica bloqueada para novos lotes de pagamento até que isso seja resolvido.';
   }
 
   @override
@@ -4941,6 +4964,9 @@ class AppLocalizationsPt extends AppLocalizations {
 
   @override
   String get notificationEventChatMessage => 'Nova mensagem';
+
+  @override
+  String get notificationEventErpBillFlagged => 'Alerta em uma conta já lançada no ERP';
 
   @override
   String get notificationEventOther => 'Notificação';
@@ -8950,8 +8976,16 @@ class AppLocalizationsPtBr extends AppLocalizationsPt {
       'Segundo o ERP, esta fatura está quitada, ao menos em parte, por uma nota de crédito do fornecedor aplicada lá. O FeohLedger não vai pagá-la até que alguém confirme o que ainda é devido.';
 
   @override
+  String get exceptionDescriptionErpSettledNoPayment =>
+      'Segundo o ERP, não há nada em aberto nesta fatura, mas também nenhum pagamento vinculado a ela: um crédito foi aplicado ou o saldo foi baixado lá. O FeohLedger não vai pagá-la até que alguém confirme o que ainda é devido.';
+
+  @override
   String get exceptionDescriptionErpPaidWhileScheduled =>
       'Segundo o ERP, esta fatura foi paga por um pagamento que o FeohLedger não fez, enquanto há um pagamento do FeohLedger agendado para ela. Interrompa ou estorne um deles antes que os dois cheguem ao fornecedor.';
+
+  @override
+  String get exceptionDescriptionErpPaidWhilePaymentInFlight =>
+      'Segundo o ERP, esta fatura está paga, mas o pagamento do FeohLedger para ela ainda não foi concluído. Confirme se esse lançamento é o pagamento do FeohLedger ou um segundo pagamento antes de estornar qualquer coisa.';
 
   @override
   String get exceptionDescriptionErpPaidTwice =>
@@ -9171,6 +9205,21 @@ class AppLocalizationsPtBr extends AppLocalizationsPt {
     String paymentId,
   ) {
     return 'O pagamento $paymentId foi cancelado, mas uma tentativa anterior de envio foi interrompida depois de talvez já ter chegado ao processador, então o dinheiro pode ou não ter saído. Confirme com o processador e anule ou pague de novo — esta fatura fica bloqueada para novos lotes de pagamento até que isso seja resolvido.';
+  }
+
+  @override
+  String exceptionDescriptionCardSettledAfterCancel(String lastFour) {
+    return 'O cartão com final $lastFour foi cobrado depois de cancelado, então esta fatura pode ter sido paga duas vezes. Confira a cobrança com o provedor do cartão e os outros pagamentos desta fatura e recupere o valor duplicado — esta fatura fica bloqueada para novos lotes de pagamento até que isso seja resolvido.';
+  }
+
+  @override
+  String exceptionDescriptionCardSettlementRefused(String lastFour) {
+    return 'Uma liquidação do cartão com final $lastFour foi recusada por não informar um valor utilizável, então pode ter havido movimentação de dinheiro no cartão sem registro. Confira a cobrança com o provedor do cartão — o cartão não pode ser cancelado e esta fatura fica bloqueada para novos lotes de pagamento até que isso seja resolvido.';
+  }
+
+  @override
+  String exceptionDescriptionCardClearingRefused(String lastFour) {
+    return 'Uma cobrança adicional no cartão com final $lastFour não foi registrada, então o valor pago nesta fatura pode ser maior que o exibido. Confira a cobrança com o provedor do cartão e registre a diferença — esta fatura fica bloqueada para novos lotes de pagamento até que isso seja resolvido.';
   }
 
   @override
@@ -10040,6 +10089,9 @@ class AppLocalizationsPtBr extends AppLocalizationsPt {
 
   @override
   String get notificationEventChatMessage => 'Nova mensagem';
+
+  @override
+  String get notificationEventErpBillFlagged => 'Alerta em uma conta já lançada no ERP';
 
   @override
   String get notificationEventOther => 'Notificação';

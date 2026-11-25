@@ -41,11 +41,14 @@ function respond(body: unknown, status = 200) {
 beforeEach(() => {
 	fetchMock.mockReset();
 	vi.stubGlobal('fetch', fetchMock);
-	vi.stubGlobal('window', {});
-	vi.stubGlobal('localStorage', {
-		getItem: () => 'jwt-1',
-		setItem: () => {},
-		removeItem: () => {}
+	// The token is read through `window.localStorage` (`#lib/utils/safeStorage.ts`),
+	// which in a browser is the same object as the bare global.
+	vi.stubGlobal('window', {
+		localStorage: {
+			getItem: () => 'jwt-1',
+			setItem: () => {},
+			removeItem: () => {}
+		}
 	});
 });
 

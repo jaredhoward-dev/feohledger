@@ -159,6 +159,7 @@ describe('codedRefusalText', () => {
 		['workspace_close_incomplete', 'refusal.workspaceCloseIncomplete'],
 		['workspace_close_actor_not_admin', 'refusal.workspaceCloseActorNotAdmin'],
 		['credential_block_unopenable', 'refusal.credentialBlockUnopenable'],
+		['card_webhook_secret_format', 'refusal.cardWebhookSecretFormat'],
 		['signup_slug_held', 'refusal.signupSlugHeld'],
 		['expense_report_not_owner', 'refusal.expenseReportNotOwner'],
 		['expense_report_self_reject', 'refusal.expenseReportSelfReject'],
@@ -872,6 +873,40 @@ describe('recalling an approval (decisions §374)', () => {
 	it('falls back to the server sentence for a claim this build does not know', () => {
 		expect(codedRefusalText('invoice_recall_claimed', {}, enT)).toBeNull();
 		expect(codedRefusalText('invoice_recall_claimed', { claim: 'cheque' }, enT)).toBeNull();
+	});
+});
+
+describe('voiding a flagged bill in the ERP (decisions §539, §542, §545)', () => {
+	const locales = { en, de, fr, es, 'pt-BR': ptBR, ja } as const;
+
+	it('states every refusal the void door and its verdict answer with, in all six locales', () => {
+		const codes: [string, string][] = [
+			['erp_void_not_flagged', 'refusal.erpVoidNotFlagged'],
+			['erp_void_no_bill', 'refusal.erpVoidNoBill'],
+			['erp_void_claimed', 'refusal.erpVoidClaimed'],
+			['erp_void_bill_paid', 'refusal.erpVoidBillPaid'],
+			['erp_void_bill_settled', 'refusal.erpVoidBillSettled'],
+			['erp_void_draft_only', 'refusal.erpVoidDraftOnly'],
+			['erp_void_unsupported', 'refusal.erpVoidUnsupported'],
+			['erp_void_rejected', 'refusal.erpVoidRejected'],
+			['erp_void_failed', 'refusal.erpVoidFailed'],
+			['erp_void_unconfirmed', 'refusal.erpVoidUnconfirmed'],
+			['erp_void_in_progress', 'refusal.erpVoidInProgress'],
+			['erp_void_not_found', 'refusal.erpVoidNotFound'],
+			['erp_lookup_not_failed', 'refusal.erpLookupNotFailed'],
+			['erp_lookup_unsupported', 'refusal.erpLookupUnsupported'],
+			['erp_lookup_failed', 'refusal.erpLookupFailed']
+		];
+		for (const [loc, catalogue] of Object.entries(locales)) {
+			const t = translator(catalogue as typeof en, loc);
+			const cat = catalogue as Record<string, string>;
+			for (const [code, key] of codes) {
+				expect(cat[key], `${loc} ${key}`).toBeTruthy();
+				expect(codedRefusalText(code, {}, t)).toBe(cat[key]);
+			}
+		}
+		// An unconfirmed void must not claim nothing changed.
+		expect(en['refusal.erpVoidUnconfirmed']).not.toMatch(/nothing was changed/i);
 	});
 });
 

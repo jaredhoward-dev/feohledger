@@ -91,9 +91,11 @@ class GLAccount(Base, EntityMixin, TimestampMixin):
     erp_link_confirmed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     erp_link_confirmed_by: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
     #: ``{"realm", "reason", "accounts": [{"erp_account_id", "code", "name"}]}``
-    #: — the ERP accounts the last sync found this UNLINKED row could mean and
-    #: would not pick between. Non-NULL is "needs a decision"; cleared whenever
-    #: the row is linked.
+    #: — the ERP accounts the last sync found this row could mean and would not
+    #: pick between. Non-NULL is "needs a decision". Usually on an UNLINKED
+    #: row, and cleared when it is linked; on a LINKED row it is rule 4
+    #: questioning a link that kept posting (its own account is among the
+    #: candidates), until a person confirms one (docs/decisions.md §524).
     #:
     #: These four columns are the row's state in ONE ERP company. Its state in
     #: every other named company it was synced under is kept in

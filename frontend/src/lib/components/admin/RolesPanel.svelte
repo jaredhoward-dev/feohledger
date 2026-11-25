@@ -460,10 +460,12 @@
 		color: var(--text-muted);
 	}
 
+	/* Top-aligned so a permission name that wraps keeps its box on the
+	   first line. */
 	.perm-option {
 		display: flex;
 		flex-direction: row;
-		align-items: center;
+		align-items: flex-start;
 		gap: 8px;
 		font-size: 0.85rem;
 		cursor: pointer;

@@ -15,8 +15,7 @@ finding by the persona-card-processor review, and is fixed here.
 
 from __future__ import annotations
 
-import hashlib
-import hmac
+import base64
 import json
 import uuid
 from decimal import Decimal
@@ -28,7 +27,8 @@ from app.models.invoice import Invoice, InvoiceStatus
 from app.models.virtual_card import CardRebate, VirtualCard
 
 TENANT = "a"
-_SECRET = "cross-provider-test-secret"
+# `whsec_<base64>`: Lithic's key shape; Nium compares it as the partner key.
+_SECRET = "whsec_" + base64.b64encode(b"cross-provider-test-secret").decode()
 
 
 async def _default_entity_id(s):
@@ -76,8 +76,14 @@ async def _seed_charged_card(mk, org_id, *, provider: str, token: str) -> uuid.U
         return card.id
 
 
-def _sign(body: bytes) -> str:
-    return hmac.new(_SECRET.encode("utf-8"), body, hashlib.sha256).hexdigest()
+def _nium_headers(request_id: str | None = None) -> dict[str, str]:
+    """How Nium authenticates a delivery: the tenant's `x-partner-key`, and its
+    delivery id in `x-request-id` (decisions §555)."""
+    return {
+        "Content-Type": "application/json",
+        "x-request-id": request_id or str(uuid.uuid4()),
+        "x-partner-key": _SECRET,
+    }
 
 
 @pytest.mark.asyncio
@@ -94,10 +100,10 @@ async def test_settlement_posted_to_wrong_provider_path_does_not_settle_the_card
     # Shaped as a Nium settlement event, but referencing the LITHIC card's token.
     body = json.dumps(
         {
-            "eventType": "transaction.settled",
-            "webhookId": str(uuid.uuid4()),
+            "template": "CARD_SETTLEMENT_DEBIT_WEBHOOK",
             "cardHashId": token,
-            "amount": "250.00",
+            "authAmount": "250.00",
+            "authCurrency": "USD",
             "merchantName": "Attacker Merchant",
         }
     ).encode("utf-8")
@@ -106,7 +112,7 @@ async def test_settlement_posted_to_wrong_provider_path_does_not_settle_the_card
         resp = await c.post(
             "/api/cards/webhook/nium",
             content=body,
-            headers={"Content-Type": "application/json", "Webhook-Signature": _sign(body)},
+            headers=_nium_headers(),
         )
     assert resp.status_code == 204
 
@@ -129,10 +135,10 @@ async def test_settlement_posted_to_correct_provider_path_still_settles(realdb):
 
     body = json.dumps(
         {
-            "eventType": "transaction.settled",
-            "webhookId": str(uuid.uuid4()),
+            "template": "CARD_SETTLEMENT_DEBIT_WEBHOOK",
             "cardHashId": token,
-            "amount": "250.00",
+            "authAmount": "250.00",
+            "authCurrency": "USD",
             "merchantName": "Real Merchant",
         }
     ).encode("utf-8")
@@ -141,7 +147,7 @@ async def test_settlement_posted_to_correct_provider_path_still_settles(realdb):
         resp = await c.post(
             "/api/cards/webhook/nium",
             content=body,
-            headers={"Content-Type": "application/json", "Webhook-Signature": _sign(body)},
+            headers=_nium_headers(),
         )
     assert resp.status_code == 204
 

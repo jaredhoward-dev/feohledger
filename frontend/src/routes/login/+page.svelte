@@ -11,8 +11,9 @@
 	import { emailFromQuery } from '#lib/utils/prefillEmail.ts';
 	import { api, ApiError } from '#lib/api.ts';
 	import { loginNoticeKey, ownWorkspaceSignInUrl } from '#lib/api/sessionRejection.ts';
-	import { getApiBase, getTenantSlug, hasTenantContext } from '#lib/tenant.ts';
+	import { apexPage, getApiBase, getTenantSlug, hasTenantContext } from '#lib/tenant.ts';
 	import { m } from '#lib/i18n/store.svelte.ts';
+	import { storageAvailable, storageSet } from '#lib/utils/safeStorage.ts';
 	import type { MessageKey } from '#lib/i18n/messages.ts';
 	import { SSO_PROVIDER_LABELS } from '#lib/types/ssoSettings.ts';
 	import {
@@ -35,6 +36,10 @@
 	// another workspace). Information, not a failure: it renders as a neutral
 	// notice in a polite live region, and a submit clears it.
 	let notice = $state('');
+	// The session token lives in localStorage; where the browser blocks it a
+	// sign-in cannot last, so say so rather than fail silently (decisions §514).
+	// Read on mount: there is no storage to ask while the page is built.
+	let storageBlocked = $state(false);
 	// The account's own sign-in page, when the server refused a sign-in made
 	// on another workspace's page (`wrong_workspace`, decisions §288).
 	let ownWorkspaceUrl = $state<string | null>(null);
@@ -55,6 +60,11 @@
 	// `null` on the platform apex, which has no workspace. Read at init (the
 	// app is static, there is no server render), so it is there on first paint.
 	const workspaceHost = hasTenantContext() ? window.location.host : null;
+
+	// A failed sign-in may be the wrong workspace altogether: the apex's
+	// "email me my workspace address" form (decisions §518). `null` when the
+	// build declares no apex.
+	const lookupUrl = apexPage('/find-workspace#email');
 
 	// The page the user was sent here from (the auth wall, an ended session),
 	// already validated as a same-origin path; `null` means the dashboard.
@@ -89,6 +99,7 @@
 		// A sign-in link we built (the signup welcome email, the reset page's
 		// "go to sign in") names the account; the field is still editable.
 		email = emailFromQuery(page.url.searchParams);
+		storageBlocked = !storageAvailable();
 		// `api.ts` sends a session it had to end here with the reason in the
 		// URL — a token for another workspace than this page's.
 		const noticeKey = loginNoticeKey(page.url.searchParams);
@@ -165,7 +176,7 @@
 				// Stash the challenge in sessionStorage so the verify page can
 				// pick it up. sessionStorage clears on tab close — won't outlive
 				// the login attempt.
-				sessionStorage.setItem('mfa_challenge', JSON.stringify(result.challenge));
+				storageSet('mfa_challenge', JSON.stringify(result.challenge), 'session');
 				goto(withNext('/login/mfa', next));
 				return;
 			}
@@ -195,6 +206,9 @@
 		</div>
 
 		<div role="status" aria-live="polite">
+			{#if storageBlocked}
+				<div class="info storage-blocked">{m('auth.login.storageBlocked')}</div>
+			{/if}
 			{#if notice}
 				<div class="info">{notice}</div>
 			{/if}
@@ -211,6 +225,8 @@
 						<a class="own-workspace-link" href={ownWorkspaceUrl}>
 							{m('auth.login.goToOwnWorkspace')}
 						</a>
+					{:else if lookupUrl}
+						<a class="own-workspace-link" href={lookupUrl}>{m('auth.login.findWorkspace')}</a>
 					{/if}
 				</div>
 			{/if}

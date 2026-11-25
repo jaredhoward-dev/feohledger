@@ -3846,8 +3846,16 @@ class AppLocalizationsDe extends AppLocalizations {
       'Laut ERP ist diese Rechnung zumindest teilweise durch eine dort angewendete Lieferantengutschrift beglichen. FeohLedger bezahlt sie erst, wenn jemand bestätigt, was noch offen ist.';
 
   @override
+  String get exceptionDescriptionErpSettledNoPayment =>
+      'Laut ERP ist auf dieser Rechnung nichts mehr offen, aber auch keine Zahlung dazu verbucht: Dort wurde eine Gutschrift angewendet oder der Saldo ausgebucht. FeohLedger bezahlt sie erst, wenn jemand bestätigt, was noch offen ist.';
+
+  @override
   String get exceptionDescriptionErpPaidWhileScheduled =>
       'Laut ERP wurde diese Rechnung durch eine Zahlung beglichen, die nicht von FeohLedger stammt, während in FeohLedger eine Zahlung dafür geplant ist. Stoppen oder stornieren Sie eine der beiden, bevor beide beim Lieferanten ankommen.';
+
+  @override
+  String get exceptionDescriptionErpPaidWhilePaymentInFlight =>
+      'Laut ERP ist diese Rechnung bezahlt, während die Zahlung von FeohLedger dafür noch nicht abgeschlossen ist. Prüfen Sie, ob dieser Eintrag die Zahlung von FeohLedger oder eine zweite Zahlung ist, bevor Sie etwas stornieren.';
 
   @override
   String get exceptionDescriptionErpPaidTwice =>
@@ -4067,6 +4075,21 @@ class AppLocalizationsDe extends AppLocalizations {
     String paymentId,
   ) {
     return 'Die Zahlung $paymentId wurde abgebrochen, aber ein früherer Sendeversuch wurde unterbrochen, nachdem sie den Zahlungsdienstleister möglicherweise schon erreicht hatte; das Geld kann also geflossen sein oder nicht. Klären Sie es mit dem Zahlungsdienstleister und stornieren Sie oder zahlen Sie erneut – bis dahin ist diese Rechnung für neue Zahlungsläufe gesperrt.';
+  }
+
+  @override
+  String exceptionDescriptionCardSettledAfterCancel(String lastFour) {
+    return 'Die Karte mit der Endung $lastFour wurde nach ihrer Stornierung belastet; diese Rechnung wurde also möglicherweise doppelt bezahlt. Prüfen Sie die Belastung beim Kartenanbieter und die übrigen Zahlungen dieser Rechnung und holen Sie die doppelte Zahlung zurück – bis dahin ist diese Rechnung für neue Zahlungsläufe gesperrt.';
+  }
+
+  @override
+  String exceptionDescriptionCardSettlementRefused(String lastFour) {
+    return 'Eine Abrechnung der Karte mit der Endung $lastFour wurde abgelehnt, weil sie keinen verwertbaren Betrag enthielt; auf der Karte kann also Geld geflossen sein, ohne erfasst zu werden. Prüfen Sie die Belastung beim Kartenanbieter – die Karte kann nicht storniert werden, und diese Rechnung ist bis zur Klärung für neue Zahlungsläufe gesperrt.';
+  }
+
+  @override
+  String exceptionDescriptionCardClearingRefused(String lastFour) {
+    return 'Eine weitere Belastung der Karte mit der Endung $lastFour wurde nicht erfasst; für diese Rechnung wurde also möglicherweise mehr bezahlt als angezeigt. Prüfen Sie die Belastung beim Kartenanbieter und erfassen Sie die Differenz – bis dahin ist diese Rechnung für neue Zahlungsläufe gesperrt.';
   }
 
   @override
@@ -4947,6 +4970,9 @@ class AppLocalizationsDe extends AppLocalizations {
 
   @override
   String get notificationEventChatMessage => 'Neue Nachricht';
+
+  @override
+  String get notificationEventErpBillFlagged => 'Markierung einer bereits im ERP gebuchten Rechnung';
 
   @override
   String get notificationEventOther => 'Benachrichtigung';

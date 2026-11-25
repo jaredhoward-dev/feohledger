@@ -1356,17 +1356,37 @@ html.has-bulk-bar body {
 	flex-direction: column;
 	gap: 14px;
 }
-.modal label {
+/* The stacked-field recipe is for a caption over a text input. A label
+   that wraps its own checkbox or radio (`> input`) is a choice row, and a
+   `.radio-card` (below) is a choice card: neither is a stacked field, and
+   both rendered as a centred column of uppercase captions before the
+   exclusion (decisions §516). `:where()` keeps the selector's specificity
+   at (0,1,1), so a component's own scoped label rule still outranks it. */
+.modal label:where(:not(.radio-card, :has(> input[type='checkbox'], > input[type='radio']))) {
 	display: flex;
 	flex-direction: column;
 	gap: 4px;
 }
-.modal label > span {
+.modal label:where(:not(.radio-card, :has(> input[type='checkbox'], > input[type='radio']))) > span {
 	font-size: 0.78rem;
 	font-weight: 500;
 	color: var(--text-muted);
 	text-transform: uppercase;
 	letter-spacing: 0.03em;
+}
+/* The choice row: a label wrapping its own checkbox or radio lays out as
+   control-then-text on one line. Several dialogs' `.checkbox-label` rules set
+   only the direction and relied on the stacked rule for `display: flex`, so
+   the row keeps it here. Same (0,1,1) specificity: a component's own scoped
+   rule still wins. Top-aligned, not centred: a choice whose text wraps keeps
+   its box beside the first line rather than floating mid-paragraph. At the
+   dialog's normal line height a 16px box against one line of text sits
+   within a pixel of centre, so a one-line row looks the same. */
+.modal label:where(:not(.radio-card):has(> input[type='checkbox'], > input[type='radio'])) {
+	display: flex;
+	flex-direction: row;
+	align-items: flex-start;
+	gap: 8px;
 }
 /* `:not([type='checkbox']):not([type='radio'])` because this is the
    TEXT-entry recipe (a 1px border, 8px/10px padding, an opaque fill) and
@@ -1406,6 +1426,72 @@ html.has-bulk-bar body {
 .modal textarea::placeholder {
 	color: var(--text-muted);
 }
+/* --- Radio card (.radio-card, .radio-card-group) ---
+   One choice of a radio group drawn as a bordered row: the native radio,
+   then the option's own content in sentence case. The whole card is the
+   radio's <label>, so a click anywhere on it selects, the card's height
+   (padding + min-height) is the pointer target (WCAG 2.5.8, 24px), and
+   the arrow keys still move through the group natively.
+
+   `.modal label` above (the stacked field with uppercase muted captions)
+   skips this class, so a card needs no per-component reset (decisions
+   §516). Every radio wrapped in a <label> inside a dialog uses it —
+   guarded by `src/lib/a11y/radioCard.test.ts`, which also pins the
+   contrast below.
+
+   Selected: an --accent border plus a 1px --accent ring, never an
+   --accent-tint fill (muted text on that fill drops under 4.5:1 in the
+   dark theme). Focus: a 2px --accent outline on the card, offset, so the
+   ring the reader sees is around the target they clicked (the same move
+   as SegmentedControl). A disabled choice is drawn in --text-muted, never
+   with opacity, which would take its text under its contrast floor.
+   `.radio-card-group` stacks cards in a <fieldset> with even spacing; it
+   leaves the fieldset's own border and legend to the caller. */
+.radio-card-group {
+	display: flex;
+	flex-direction: column;
+	gap: 8px;
+	min-width: 0;
+}
+.radio-card {
+	display: flex;
+	flex-direction: row;
+	align-items: flex-start;
+	gap: 10px;
+	min-height: 24px;
+	min-width: 0;
+	padding: 10px 12px;
+	border: 1px solid var(--border);
+	border-radius: var(--radius-sm);
+	color: var(--text);
+	font-size: 0.88rem;
+	font-weight: 400;
+	line-height: 1.4;
+	text-transform: none;
+	letter-spacing: normal;
+	overflow-wrap: anywhere;
+	cursor: pointer;
+	transition: border-color 0.15s var(--ease-out), box-shadow 0.15s var(--ease-out);
+}
+/* Optically centre the 16px dot on the first line of text. */
+.radio-card > input[type='radio'] {
+	margin-top: 2px;
+}
+.radio-card:hover:not(:has(input:disabled)) {
+	border-color: var(--border-strong);
+}
+.radio-card:has(input:checked) {
+	border-color: var(--accent);
+	box-shadow: 0 0 0 1px var(--accent);
+}
+.radio-card:has(input:focus-visible) {
+	outline: 2px solid var(--accent);
+	outline-offset: 2px;
+}
+.radio-card:has(input:disabled) {
+	cursor: default;
+	color: var(--text-muted);
+}
 .modal-footer {
 	display: flex;
 	justify-content: flex-end;
@@ -1416,6 +1502,51 @@ html.has-bulk-bar body {
 .required {
 	color: var(--danger);
 	font-style: normal;
+}
+
+/* --- /organization settings panels (lib/components/organization/) ---
+   The layout rules every panel's form shares, once instead of a scoped copy
+   per panel (one copy lost its phone rule; decisions §530). A panel opts in
+   with `class="card org-panel"` on its root <section>.
+
+   Namespaced under `.org-panel` so nothing outside a panel is reached, and
+   at exactly the specificity the scoped copies had: `.org-panel .form-grid`
+   is 0-2-0, as Svelte's `.form-grid.svelte-<hash>` was. So a panel's own
+   compound rule (`label.switch-row`, 0-2-1) still wins as before.
+
+   Only class rules live here. The element rules (`label`, the text-entry
+   `input` recipe) stay scoped in each panel: under `.org-panel` they would
+   reach the inputs of a SecretField / CurrencyInput / picker nested in the
+   panel, which the scoped copies never touched. `.card`, `.card h2` and
+   `.card-hint` stay scoped too: panel-local rules override them at equal
+   specificity (`.getting-started`, `.field-gap`), which a global copy
+   would leave to stylesheet order. `organization/sharedPanelCss.test.ts`
+   refuses a scoped copy of these rules in any panel. */
+.org-panel .form-grid {
+	display: grid;
+	grid-template-columns: 1fr 1fr;
+	gap: 14px;
+	margin-top: 14px;
+}
+.org-panel .full-width {
+	grid-column: 1 / -1;
+}
+/* Wraps at 320px (WCAG 1.4.10): the row carries a Save button, an optional
+   Test button and an optional result, all `white-space: nowrap`, so without
+   a wrap it cannot shrink below its max-content width. */
+.org-panel .section-footer {
+	display: flex;
+	flex-wrap: wrap;
+	justify-content: flex-start;
+	gap: 12px;
+	margin-top: 16px;
+	padding-top: 14px;
+	border-top: 1px solid var(--border);
+}
+@media (max-width: 600px) {
+	.org-panel .form-grid {
+		grid-template-columns: 1fr;
+	}
 }
 
 /* --- KPI cards (KpiCard) --- */

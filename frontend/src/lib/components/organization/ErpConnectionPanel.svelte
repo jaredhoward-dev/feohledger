@@ -85,6 +85,7 @@
 		secretIsSaved,
 		selectedProviderKey,
 		statusSyncNowOffered,
+		storedErpStatusSyncNowOffered,
 		statusSyncStartedKey,
 		withoutOAuthReturn,
 		type ErpCatalog,
@@ -206,9 +207,16 @@
 	const scopeGapKeys = $derived(provider ? oauthScopeGapKeys(provider.key, oauthStatus) : []);
 	const offerReconnect = $derived(expiresSoon || scopeGapKeys.length > 0);
 	// "Check payments now" (decisions §392): offered only while the server says
-	// an on-request status-sync pass would run (`status_sync_available`).
+	// an on-request status-sync pass would run (`status_sync_available`): on a
+	// live OAuth connection, or on the saved stored-credential ERP that reports
+	// back (NetSuite opted in, §547, §551). A refusal hides it, as it always has
+	// for OAuth: every code is a configuration state, not one a click resolves.
 	const paymentCheckOffered = $derived(
-		provider ? statusSyncNowOffered(provider.key, oauthStatus) : false
+		!provider
+			? false
+			: isOAuth
+				? statusSyncNowOffered(provider.key, oauthStatus)
+				: storedErpStatusSyncNowOffered(provider, storedKey(), oauthStatus)
 	);
 	// Today's API calls on a shared-quota ERP (Blackbaud SKY, decisions §324):
 	// the count, its limit, and while calls are refused, until when. Nothing
@@ -310,7 +318,8 @@
 			catalog = loaded;
 			const onFile = storedKey();
 			select(onFile && loaded.providers.some((p) => p.key === onFile) ? onFile : '');
-			if (loaded.providers.some((p) => p.auth === 'oauth')) await loadOAuthStatus();
+			// Also the payment-check verdict for a stored-credential ERP (§551).
+			await loadOAuthStatus();
 		} catch {
 			catalogError = true;
 		}
@@ -556,8 +565,10 @@
 		try {
 			await persist(p);
 			toast(m('org.toast.sectionSaved', { section: m('org.section.erpSaved') }), 'success');
-			// Saving or removing an own app changes which app a connect uses.
-			if (p.auth === 'oauth') await loadOAuthStatus();
+			// Saving or removing an own app changes which app a connect uses, and
+			// any save can change whether a payment check would run (NetSuite's
+			// opt-in, decisions §551).
+			await loadOAuthStatus();
 			unopenable = false;
 		} catch (err) {
 			if (
@@ -687,6 +698,20 @@
 
 <svelte:window onclick={onWindowClick} />
 
+<!-- "Check payments now", for an OAuth connection or a stored-credential ERP
+     alike; its result lands in the shared live region below. -->
+{#snippet checkPaymentsButton(p: ErpProvider)}
+	<button
+		class="btn-test"
+		data-testid="erp-check-payments"
+		disabled={checkingPayments || !p.available}
+		aria-describedby="{uid}-check-payments-hint"
+		onclick={checkPayments}
+	>
+		{checkingPayments ? m('org.erp.oauth.checkingPayments') : m('org.erp.oauth.checkPayments')}
+	</button>
+{/snippet}
+
 {#snippet field(p: ErpProvider, f: ErpProviderField)}
 	{@const inputId = `${uid}-${f.name}`}
 	{@const helpId = f.help_key ? `${inputId}-help` : undefined}
@@ -736,7 +761,7 @@
 	</div>
 {/snippet}
 
-<section class="card" data-testid="erp-panel">
+<section class="card org-panel" data-testid="erp-panel">
 	<div class="help-row">
 		<h2>{m('org.section.erp')}</h2>
 		<HelpTip term="erp-sync" />
@@ -955,18 +980,7 @@
 									{testing ? m('org.common.testing') : m('org.common.testConnection')}
 								</button>
 								{#if paymentCheckOffered}
-									<!-- Its result lands in the shared live region below. -->
-									<button
-										class="btn-test"
-										data-testid="erp-check-payments"
-										disabled={checkingPayments || !provider.available}
-										aria-describedby="{uid}-check-payments-hint"
-										onclick={checkPayments}
-									>
-										{checkingPayments
-											? m('org.erp.oauth.checkingPayments')
-											: m('org.erp.oauth.checkPayments')}
-									</button>
+									{@render checkPaymentsButton(provider)}
 								{/if}
 								{#if offerReconnect}
 									<!-- A fresh consent replaces the expiring or narrower one
@@ -1013,6 +1027,11 @@
 					</div>
 				{:else}
 					<div class="action-row">
+						{#if paymentCheckOffered}
+							<p class="oauth-state" id="{uid}-check-payments-hint">
+								{m('org.erp.oauth.checkPaymentsHint', { erp: providerLabel(provider) })}
+							</p>
+						{/if}
 						<div class="action-buttons">
 							<button class="btn-save-section" disabled={saving || !provider.available} onclick={save}>
 								{saving ? m('org.common.saving') : m('org.erp.save')}
@@ -1020,6 +1039,9 @@
 							<button class="btn-test" disabled={testing || !provider.available} onclick={test}>
 								{testing ? m('org.common.testing') : m('org.common.testConnection')}
 							</button>
+							{#if paymentCheckOffered}
+								{@render checkPaymentsButton(provider)}
+							{/if}
 						</div>
 					</div>
 				{/if}
@@ -1084,17 +1106,6 @@
 
 	.failure-text {
 		color: var(--danger);
-	}
-
-	.form-grid {
-		display: grid;
-		grid-template-columns: 1fr 1fr;
-		gap: 14px;
-		margin-top: 14px;
-	}
-
-	.full-width {
-		grid-column: 1 / -1;
 	}
 
 	label {
@@ -1294,11 +1305,5 @@
 
 	.test-result.failure {
 		color: var(--danger);
-	}
-
-	@media (max-width: 600px) {
-		.form-grid {
-			grid-template-columns: 1fr;
-		}
 	}
 </style>

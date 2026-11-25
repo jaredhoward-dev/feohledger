@@ -182,12 +182,31 @@ nobody could ever edit, attach or delete it.
 **On `/expenses`** the page offers only what these gates allow. A colleague's
 loose line shows no Delete, and its modal opens with every claim field and the
 receipt upload read-only (a note says why) while the GL account stays editable;
-Save then PATCHes `gl_account_id` alone. The report's attach input suggests only
-the owner's own loose lines and refuses a loaded line it knows is someone
-else's before sending. The list ships no per-line verdict, so this reads one
-mirror of the two gates, `types/expense.ts::isLineCreator` / `canAuthorLooseLine`
+Save then PATCHes `gl_account_id` alone. The list ships no per-line verdict, so
+this reads one mirror of the loose-line gate, `types/expense.ts::canAuthorLooseLine`
 (`frontend/docs/ui-patterns.md` § Whether to offer an action); the server still
 refuses, localized, whatever the page cannot see.
+
+**Attaching from the page (decisions §515).** A draft report's attach control
+is `ui/ExpensePicker`, a server-paged, searchable picker over
+`GET /api/expenses?attachable=true`: the caller's own lines on no report and in
+`draft`, plus unrecorded (NULL-creator) ones — the attach gate's own rule, so
+the picker never offers a colleague's line to be refused. It replaced a
+free-text "Expense ID to attach" box (with a datalist of the loaded page's
+lines), which needed an id no screen shows. The expenses list's bulk bar adds
+**Add to report**: the selection goes onto one of the caller's own draft
+reports (`GET /api/expense-reports?mine=true&status=draft`, kept to the rows
+whose `actions.compose` is null) in ONE attach call. Only the selected lines
+an attach by the caller would take are sent (on no report, `draft`, theirs or
+unrecorded — `utils/expensePicker.splitAttachable` over the loaded rows, or
+`GET /api/expenses/ids?attachable=true` for a "select all N matching"
+selection); the rest are skipped and counted ("M of N added, K skipped"), so a
+line already on another report is never moved by an "add". With nothing
+attachable the bar says why instead of offering the button, and with no draft
+report it links to the Reports tab. The server still refuses the whole call on
+the first line it cannot take (a currency with no rate, a row changed since it
+loaded), so no partial report is left, and the page shows its localized
+refusal.
 
 The server is the
 control; the web app offers attach / detach / submit / approve / reject from
@@ -259,7 +278,7 @@ string-Decimal amounts — never PII.
 
 | Method | Path | Purpose |
 |--------|------|---------|
-| GET | `/api/expenses` | List, paginated, entity-scoped (`X-Entity-ID`); `?status=` + `?report_id=` + `?search=` filters, all composable. `search` ILIKEs the three free-text columns the row renders — `merchant`, `description`, `category`. Before it existed the page could only filter the rows it had already loaded, so a term matching an expense past the first page read as "nothing matched". |
+| GET | `/api/expenses` | List, paginated, entity-scoped (`X-Entity-ID`); `?status=` + `?report_id=` + `?search=` filters, all composable. `?attachable=true` (also on `GET /api/expenses/ids`, the select-all resolver) narrows to the lines an attach by the CALLER accepts — on no report, `draft`, created by the caller or by nobody recorded (`_attachable_by`, the attach gate's rule) — the report attach picker's source (decisions §515). `search` ILIKEs the three free-text columns the row renders — `merchant`, `description`, `category`. Before it existed the page could only filter the rows it had already loaded, so a term matching an expense past the first page read as "nothing matched". |
 | POST | `/api/expenses` | Create an expense, stamping the caller as `created_by_user_id` (the line's owner while it sits on no report — [Line ownership](#line-ownership--a-line-on-no-report-is-its-creators)). With `report_id`, only that report's owner may create it (**403** `expense_report_not_owner` — [Report ownership](#report-ownership--only-the-owner-composes-edits-or-submits-a-report)). `amount` must be **strictly positive** (`gt=0` → 422 otherwise; a negative line could net a report under the CFO threshold while hiding a large expense). Lands under the selected entity (or the tenant default). If `report_id` is supplied this **is** an attach and gates like one: the target report must still be a `draft` (**409** otherwise, same rule as `POST /api/expense-reports/{id}/expenses`), and its `total_amount` is then recomputed. Creating straight onto a locked report used to be the one attach path with no gate — it moved an approved report's total past the CFO threshold it was approved under, and nulled the locked `reporting_*` figure that decision was derived from. |
 | GET | `/api/expenses/receipt/{file_key:path}` | Download proxy for a stored receipt. The owning expense is parsed from the key, resolved within the selected entity, and must hold this key as its current `receipt_file_key` (`api/file_proxy`); every refusal is the same 404 as a missing file. Declared before `/{expense_id}` so `receipt` isn't captured as an id. |
 | POST | `/api/expenses/{id}/receipt` | Upload a receipt to S3 (`upload_expense_receipt`) and stamp `receipt_file_key`. On a line that sits on a report, owner only (**403** `expense_report_not_owner`); on a line on no report, its creator only (**403** `expense_not_creator`). **409** when the line sits on a locked report (submitted/pending_approval/approved/reimbursed) — the receipt is the evidence the approver reviewed, so it is frozen with the rest of the line (checked before the upload, so a refused replacement never reaches storage). A `rejected` report's lines stay uploadable. |
@@ -269,7 +288,7 @@ string-Decimal amounts — never PII.
 | GET | `/api/expenses/{id}` | Get one expense. |
 | PATCH | `/api/expenses/{id}` | Update mutable fields (`amount` still `gt=0`). On a line that sits on a report, any claim-field change and any `report_id` move (both ends) is owner only (**403** `expense_report_not_owner`); on a line on no report, a claim-field change is its creator's only (**403** `expense_not_creator`), and moving a line onto a report is refused unless its creator owns that report (**403** `expense_report_foreign_line`); `gl_account_id` is not gated. Audits only when a field actually changed. An `amount` change or a `report_id` move recomputes the affected report total(s) — and is **409** if any affected report has left `draft` into a locked state (submitted/pending_approval/approved/reimbursed), so an edit can't silently move a total the CFO gate / approval signature already ran against. Moving an expense **onto** a report is an attach, so the TARGET gates on `_require_draft_report` like the other two attach paths: a `rejected` / `cancelled` report is a **409** too (it can never be resubmitted, so the line would just vanish onto a dead row). Detaching (`report_id: null`) **from** a terminal report stays allowed — that is how its expenses get re-reported. **A line on a locked report is frozen whole, not just its amount:** a change to any claim field (`category`, `mileage_miles`, `expense_date`, `merchant`, `description`, `reimbursable`, `payment_method`, as well as `amount` / `currency`) is **409**. Submit is where the blocking policy rules ran and `category` decides which rules apply, so locking only the total let a line be filed under an uncontrolled category, submitted clean, then re-categorised in front of the approver into one demanding a pre-approval. `gl_account_id` stays editable — GL coding is the accountant's classification, done after approval, and `/bulk-gl-code` never gated on it — and card reconciliation's `payment_method` stamp is the card feed's evidence, not a claim edit. |
 | DELETE | `/api/expenses/{id}` | Delete an expense (owner only when it sits on a report — **403** `expense_report_not_owner`; creator only when it sits on none — **403** `expense_not_creator`); recomputes the owning report total if it was attached. **409** if the owning report is locked (submitted/approved/…) — deleting would shrink a total past its approval. Also **409** when a `CorporateCardTransaction` is reconciled to it (`matched_expense_id` is a real FK, so Postgres refused the DELETE and it surfaced as an unhandled `ForeignKeyViolationError` — a bare 500); the detail names the transaction to `/unmatch` first, the same posture `/ignore` takes. |
-| GET | `/api/expense-reports` | List, paginated, entity-scoped; `?status=` filter. Each item carries the caller's `actions` verdicts ([Action verdicts](#action-verdicts-actions--what-the-page-may-offer)). |
+| GET | `/api/expense-reports` | List, paginated, entity-scoped; `?status=` filter, and `?mine=true` for the caller's own reports (`employee_user_id`) — with `status=draft`, the bulk **Add to report** targets. Each item carries the caller's `actions` verdicts ([Action verdicts](#action-verdicts-actions--what-the-page-may-offer)). |
 | POST | `/api/expense-reports` | Create a report. `employee_user_id` is **always the authenticated caller** — a report can't be raised on someone else's behalf. The body field is accepted for wire compatibility and ignored (a stale client gets a report owned by itself rather than a 422), the same posture `POST /api/expense-preapprovals` takes with its `requester_user_id`. Honouring it would have handed the creator the one value approval checks SoD against, so one user could raise a report "for" an arbitrary uuid and then approve it themselves. |
 | GET | `/api/expense-reports/{id}` | Get one report (with its expenses and the caller's `actions` verdicts). |
 | GET | `/api/expense-reports/{id}/summary` | **(WF2)** Aggregate the report's attached expenses: `{ total, count, by_category: [{category, total, count}], by_status: [{status, total, count}] }`. SUMs run in Postgres over the `Numeric` column (exact); serialised as float to match `ExpenseResponse.amount` (read-only display rollup). Read RBAC (incl. CFO). |

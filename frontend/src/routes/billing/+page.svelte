@@ -1162,7 +1162,7 @@
 			{:else if availablePlans.length === 0}
 				<p class="state">{m('billing.plan.changeModal.empty')}</p>
 			{:else}
-				<fieldset class="plan-options" data-testid="billing-plan-options">
+				<fieldset class="plan-options radio-card-group" data-testid="billing-plan-options">
 					<!-- The dialog's own heading ("Choose a plan") already says what
 					     this is, so the legend names the group for assistive tech
 					     without printing a second caption under it. -->
@@ -1179,11 +1179,7 @@
 						{@const isScheduled = scheduledChange?.plan_code === p.code}
 						{@const highlights = planHighlightLines.get(p.code)}
 						{@const idBase = `plan-option-${p.code}`}
-						<label
-							class="plan-option"
-							class:selected={selectedPlanCode === p.code}
-							data-testid="billing-plan-option"
-						>
+						<label class="plan-option radio-card" data-testid="billing-plan-option">
 							<input
 								type="radio"
 								name="plan-code"
@@ -1592,62 +1588,28 @@
 	}
 
 	/* --- Plan-change modal: picker fieldset + result panel --- */
+	/* Each plan is a shared `.radio-card` (app.css: row layout, sentence
+	   case, selected ring, card focus ring, muted disabled); only the plan's
+	   own columns are styled here. */
 	.plan-options {
 		border: none;
 		padding: 0;
 		margin: 0 0 1rem;
-		display: flex;
-		flex-direction: column;
-		gap: 0.5rem;
 	}
 
-	/* A radio card. `.modal label` (app.css) is the stacked field recipe —
-	   column flex, and every direct-child span set as a small uppercase muted
-	   caption — so each rule below states the direction and type it means
-	   rather than inheriting a form label's. */
 	.plan-option {
-		display: flex;
-		flex-direction: row;
 		align-items: center;
 		gap: 0.75rem;
-		border: 1px solid var(--border);
-		border-radius: var(--radius-sm);
 		padding: 0.7rem 0.9rem;
-		cursor: pointer;
-		transition: border-color 0.15s var(--ease-out);
 	}
 
-	.plan-option:hover:not(:has(input:disabled)) {
-		border-color: var(--border-strong);
-	}
-
-	/* The ring goes on the card, not the 16px dot: the card is the target the
-	   reader sees (same move as SegmentedControl's segment). */
-	.plan-option:has(input:focus-visible) {
-		outline: 2px solid var(--accent);
-		outline-offset: 2px;
-	}
-
-	/* The plan you already have: de-emphasised with the muted colour token,
-	   never `opacity`, which takes the text below its contrast floor. */
-	.plan-option:has(input:disabled) {
-		cursor: default;
-		color: var(--text-muted);
-	}
-
-	/* Border + ring, no tinted fill: muted highlight text on --accent-tint
-	   over --surface is ~4.3:1 in the dark theme, under the 4.5:1 floor. */
-	.plan-option.selected {
-		border-color: var(--accent);
-		box-shadow: 0 0 0 1px var(--accent);
+	.plan-option > input[type='radio'] {
+		margin-top: 0;
 	}
 
 	.plan-option-body,
 	.plan-option-price {
-		text-transform: none;
-		letter-spacing: normal;
 		font-size: 0.9rem;
-		color: inherit;
 	}
 
 	.plan-option-body {

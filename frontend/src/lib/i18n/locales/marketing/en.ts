@@ -153,5 +153,16 @@ export const enMarketing = {
 	'marketing.findWorkspace.noWorkspace': 'New to {product}? {create}',
 	'marketing.findWorkspace.panelHeading': 'Why we ask for the address',
 	'marketing.findWorkspace.panelBody':
-		'Every company has its own workspace, with its own sign-in. We never look a workspace up from an email address, so nobody can use this page to find out where someone works.'
+		"Every company has its own workspace, with its own sign-in. This page never shows which workspace an email address belongs to: if you've forgotten yours, we email it to that address, so nobody can use this page to find out where someone works.",
+	'marketing.findWorkspace.lookup.heading': "Forgot your workspace address?",
+	'marketing.findWorkspace.lookup.intro': "Enter the email address you sign in with. If it has an account, we'll email it a link to its workspace's sign-in page.",
+	'marketing.findWorkspace.lookup.label': "Email address",
+	'marketing.findWorkspace.lookup.submit': "Email me my workspace address",
+	'marketing.findWorkspace.lookup.sending': "Sending…",
+	'marketing.findWorkspace.lookup.invalid': "Enter a valid email address.",
+	'marketing.findWorkspace.lookup.failed': "We couldn't send that. Check your connection and try again.",
+	'marketing.findWorkspace.lookup.sentHeading': "Check your email",
+	'marketing.findWorkspace.lookup.sent': "If {email} has an account, we've emailed it a link to its workspace's sign-in page. It can take a few minutes — check your spam folder too.",
+	'marketing.findWorkspace.lookup.again': "Use a different address",
+	'marketing.footer.findWorkspace': "Forgot your workspace?"
 };

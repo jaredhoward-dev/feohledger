@@ -175,13 +175,33 @@ FEOH_EMAIL_PROVIDER=ses
 FEOH_EMAIL_FROM=no-reply@feohledger.com
 FEOH_PUBLIC_URL=https://feohledger.com
 FEOH_TENANT_URL_TEMPLATE=https://{slug}.feohledger.com
-# Self-service signup: keep it on (the default) for a public SaaS, and set
-# both hCaptcha keys — the API refuses to boot without the secret while signup
-# is on. For an invite-only deployment whose tenants are provisioned by an
-# operator, set FEOH_SIGNUP_ENABLED=false instead and omit both keys.
+# Self-service signup: keep it on (the default) for a public SaaS; for an
+# invite-only deployment whose tenants are provisioned by an operator, set
+# FEOH_SIGNUP_ENABLED=false. Both hCaptcha keys are required EITHER WAY: the
+# public workspace lookup (/find-workspace) verifies the captcha whether signup
+# is open or not, and the API refuses to boot without them (decisions §553).
 FEOH_SIGNUP_ENABLED=true
 FEOH_HCAPTCHA_SECRET=<from hCaptcha dashboard>
 FEOH_HCAPTCHA_SITEKEY=<from hCaptcha dashboard>
+
+# Client IP behind the ALB — REQUIRED in production (refuses to boot empty,
+# decisions §553). Name the networks the ALB's nodes connect FROM: its subnets,
+# or the whole VPC (infra var.vpc_cidr, 10.40.0.0/16 by default) if you would
+# rather not track subnet changes. Empty would collapse every client into the
+# ALB's address and make every per-IP limit global. `none` only for an API
+# clients reach with no proxy in front.
+#
+# The ALB APPENDS to whatever X-Forwarded-For the client sent (its default
+# `routing.http.xff_header_processing.mode = append`), so the leftmost entry is
+# the client's own claim. The API therefore reads the header from the RIGHT,
+# skipping addresses inside this list, and keys on the first one outside it
+# (decisions §558) — the address the ALB itself wrote. Two consequences:
+#   - Never list a range real clients connect from (e.g. 0.0.0.0/0, or a
+#     corporate range that reaches the ALB): a client inside it is read as a
+#     proxy hop and its forged entries become the key.
+#   - Another proxy in front of the ALB (a CDN, a WAF appliance) must be listed
+#     too, or every user collapses into that proxy's addresses.
+FEOH_TRUSTED_PROXY_CIDRS=10.40.0.0/16
 ```
 
 See `docs/environment.md` for the full var list including extraction, ERP, and card platform keys.

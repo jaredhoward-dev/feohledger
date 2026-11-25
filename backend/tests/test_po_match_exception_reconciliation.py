@@ -185,6 +185,77 @@ async def test_billed_beyond_receipt_uses_the_exact_tolerance_boundary(realdb, a
     assert match.billed_beyond_receipt is beyond
 
 
+@pytest.mark.asyncio
+async def test_billing_the_server_on_a_cables_receipt_holds_payment(realdb):
+    """Nine cheap cables of a server order arrived. Pro rata that was 900.00
+    of 1000.00 received and a 900.00 bill passed the receipt leg; per line it
+    is 90.00, so the bill opens the payment-blocking row (decisions §519)."""
+    org_id = realdb.info(TENANT).org_id
+    mk = realdb.sessionmaker(TENANT)
+    number = f"PO-CABLE-{uuid.uuid4().hex[:6]}"
+    async with mk() as s:
+        ent = await _default_entity_id(s)
+        po = PurchaseOrder(
+            po_number=number,
+            total=Decimal("1000.00"),
+            currency="USD",
+            status="open",
+            organization_id=org_id,
+            entity_id=ent,
+        )
+        s.add(po)
+        await s.flush()
+        server = POLineItem(
+            po_id=po.id,
+            description="Server",
+            quantity=Decimal("1"),
+            unit_price=Decimal("910.00"),
+            total=Decimal("910.00"),
+        )
+        cables = POLineItem(
+            po_id=po.id,
+            description="Cable",
+            quantity=Decimal("9"),
+            unit_price=Decimal("10.00"),
+            total=Decimal("90.00"),
+        )
+        s.add_all([server, cables])
+        await s.flush()
+        gr = GoodsReceipt(
+            gr_number=f"GR-{uuid.uuid4().hex[:8]}",
+            po_id=po.id,
+            status="received",
+            organization_id=org_id,
+            entity_id=ent,
+        )
+        s.add(gr)
+        await s.flush()
+        s.add(
+            GRLineItem(
+                gr_id=gr.id,
+                po_line_item_id=cables.id,
+                description="Cable",
+                quantity_received=Decimal("9"),
+            )
+        )
+        inv = await _add_invoice(s, org_id, ent, po_number=number, amount="900.00")
+        cables_bill = await _add_invoice(s, org_id, ent, po_number=number, amount="90.00")
+        await s.commit()
+
+        await _refresh(s, inv)
+        await s.commit()
+        assert inv.po_match["received_value"] == 90.0
+        assert inv.po_match["billed_beyond_receipt"] is True
+        assert len(await _rows(s, inv.id)) == 1
+        assert await blocked_invoice_ids(s, [inv.id]) == {inv.id}
+
+        # The cables billed alone are what arrived: nothing holds them.
+        await _refresh(s, cables_bill)
+        await s.commit()
+        assert cables_bill.po_match["billed_beyond_receipt"] is False
+        assert await _rows(s, cables_bill.id) == []
+
+
 # --------------------------------------------------------------------------- #
 # Auto-close when the evidence catches up
 # --------------------------------------------------------------------------- #
@@ -885,6 +956,68 @@ async def test_a_split_across_two_currencies_is_held_with_no_combined_total(real
         assert flag["code"] == "po_currency_mismatch_invoice_currency_unknown"
         assert flag["params"] == {"poNumber": inv.po_number, "poCurrencies": "USD, EUR"}
         await s.rollback()
+
+
+@pytest.mark.asyncio
+async def test_a_split_values_each_short_leg_per_line(realdb):
+    """Each leg's receipt is valued at its own lines' prices (decisions §519):
+    leg A (600.00: one 550.00 unit, ten 5.00 units) has its ten cheap units
+    in, 50.00 of it; leg B (400.00) is not received at all and counts whole.
+    450.00 received, where pro rata leg A alone read 545.45…"""
+    org_id = realdb.info(TENANT).org_id
+    mk = realdb.sessionmaker(TENANT)
+    tag = uuid.uuid4().hex[:6]
+    async with mk() as s:
+        ent = await _default_entity_id(s)
+        leg_a = PurchaseOrder(
+            po_number=f"PO-LEGA-{tag}",
+            total=Decimal("600.00"),
+            currency="USD",
+            status="open",
+            organization_id=org_id,
+            entity_id=ent,
+        )
+        s.add(leg_a)
+        await s.flush()
+        dear = POLineItem(
+            po_id=leg_a.id, description="Unit", quantity=Decimal("1"), total=Decimal("550.00")
+        )
+        cheap = POLineItem(
+            po_id=leg_a.id, description="Part", quantity=Decimal("10"), unit_price=Decimal("5.00")
+        )
+        s.add_all([dear, cheap])
+        await s.flush()
+        gr = GoodsReceipt(
+            gr_number=f"GR-{uuid.uuid4().hex[:8]}",
+            po_id=leg_a.id,
+            status="received",
+            organization_id=org_id,
+            entity_id=ent,
+        )
+        s.add(gr)
+        await s.flush()
+        s.add(
+            GRLineItem(
+                gr_id=gr.id,
+                po_line_item_id=cheap.id,
+                description="Part",
+                quantity_received=Decimal("10"),
+            )
+        )
+        leg_b = await _add_po(s, org_id, ent, po_number=f"PO-LEGB-{tag}", total="400.00", qty="10")
+        inv = await _split_invoice(s, org_id, ent, [leg_a, leg_b], amount="1000.00")
+        await s.commit()
+
+        result = await match_invoice_to_po(s, inv)
+        assert result.received_value == Decimal("450.00")
+        assert result.billed_beyond_receipt is True
+        assert [leg["receipt_valuation"] for leg in result.details["legs"]] == [
+            "per_line",
+            None,
+        ]
+
+        inv.amount = Decimal("472.50")  # exactly 5 % over what arrived
+        assert (await match_invoice_to_po(s, inv)).billed_beyond_receipt is False
 
 
 @pytest.mark.asyncio

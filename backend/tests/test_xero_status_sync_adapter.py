@@ -257,7 +257,9 @@ def test_xero_reports_its_bills_back():
     assert adapter.supports_status_sync is True
     assert "xero" in status_sync_adapter_keys()
     assert "quickbooks_online" in status_sync_adapter_keys()
-    assert "netsuite" not in status_sync_adapter_keys()
+    # NetSuite is a candidate since §536 (its tenants opt in, §541); an ERP
+    # without the capability is not.
+    assert "dynamics_365_bc" not in status_sync_adapter_keys()
 
 
 def test_the_connection_asks_for_the_payments_scope():

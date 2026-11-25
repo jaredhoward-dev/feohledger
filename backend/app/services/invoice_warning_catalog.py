@@ -327,7 +327,7 @@ WARNING_SPECS: tuple[WarningSpec, ...] = (
         },
     ),
     # Cumulative, receipt leg: the same siblings plus this invoice bill past
-    # the received slice of the PO (`po_total × received / ordered`), though
+    # the received slice of the PO (`MatchResult.received_value`), though
     # each fits it alone (decisions §470). Same type, so it stops
     # every unattended approval as the total leg does; past approval it is
     # also the sentence of the payment-blocking `po_mismatch` it raises.
@@ -938,10 +938,25 @@ _ERP_UNNAMED_ONLY: dict[str, str] = {
         "The ERP shows this bill settled, at least in part by a vendor credit applied "
         "there. FeohLedger will not pay it until someone confirms what is still owed."
     ),
+    # The status polling sweep's `settled_no_payment` read (decisions §303, §532).
+    "erp_settled_no_payment": (
+        "The ERP shows nothing owing on this bill, but no payment against it: a credit "
+        "was applied or the balance written off there. FeohLedger will not pay it until "
+        "someone confirms what is still owed."
+    ),
     "erp_paid_while_scheduled": (
         "The ERP shows this bill paid by a payment FeohLedger did not make, while a "
         "FeohLedger payment is scheduled for it. Stop or void one of them before both "
         "reach the supplier."
+    ),
+    # The generic route and the status polling sweep (decisions §533, §535):
+    # unlike the QuickBooks sync they cannot tell whether the ERP's payment
+    # came from outside, and the usual cause is a bookkeeper recording our own
+    # in-flight payment there — so they never tell anyone to void one.
+    "erp_paid_while_payment_in_flight": (
+        "The ERP shows this bill paid while FeohLedger's payment for it has not "
+        "completed. Confirm whether that entry is FeohLedger's payment or a second one before "
+        "voiding anything."
     ),
     "erp_paid_twice": (
         "FeohLedger paid this invoice, and the ERP shows the bill also paid by a payment "
@@ -1212,6 +1227,44 @@ DIRECT_EXCEPTION_SPECS: tuple[WarningSpec, ...] = (
             {"paymentId": "text"},
         )
         for status, verb in (("failed", "failed"), ("cancelled", "was cancelled"))
+    ),
+    # `api/cards.card_webhook`: a clearing arrived on a card already cancelled
+    # (decisions §549) — a force post after a void, while another rail may
+    # have paid the invoice. The last four say WHICH card to chase; the amount
+    # is on the `card.settled_after_cancel` audit row and the exception's
+    # `erp_report`.
+    WarningSpec(
+        EXCEPTION_PREFIX + "card_settled_after_cancel",
+        "payment_reconciliation",
+        "The card ending {lastFour} was charged after it was cancelled, so this invoice "
+        "may have been paid twice. Check the charge with the card provider and the other "
+        "payments on this invoice, and recover the duplicate — this invoice is blocked "
+        "from a new payment run until this is resolved.",
+        {"lastFour": "text"},
+    ),
+    # `api/cards._record_settlement_refusal`: a clearing on a card not yet
+    # settled stated no usable figure (decisions §557, §562). Money may have
+    # moved, so the card is held as possibly spent and the invoice blocked.
+    WarningSpec(
+        EXCEPTION_PREFIX + "card_settlement_refused",
+        "payment_reconciliation",
+        "A settlement on the card ending {lastFour} was refused because it stated no usable "
+        "amount, so money may have moved on the card without being recorded. Check the "
+        "charge with the card provider — the card cannot be cancelled and this invoice is "
+        "blocked from a new payment run until this is resolved.",
+        {"lastFour": "text"},
+    ),
+    # `api/cards._record_further_clearing`: a further clearing on a settled card
+    # that was not applied — a second Nium settlement, or one with no figure
+    # (decisions §562). The amount is on the exception's `erp_report`.
+    WarningSpec(
+        EXCEPTION_PREFIX + "card_clearing_refused",
+        "payment_reconciliation",
+        "A further charge on the card ending {lastFour} was not recorded, so the amount "
+        "paid on this invoice may be more than shown. Check the charge with the card "
+        "provider and record any difference — this invoice is blocked from a new payment "
+        "run until this is resolved.",
+        {"lastFour": "text"},
     ),
     # `services/payment_settlement.discrepancy_finding`. The two sides can be
     # in different currencies (and either may be unknown), so the figures are

@@ -257,8 +257,17 @@ def test_status_sync_needs_the_flag_and_an_adapter_that_reports_back(monkeypatch
     assert status_sync_active(qbo) is False
     monkeypatch.setattr(settings, "erp_status_sync_enabled", True)
     assert status_sync_active(qbo) is True
-    # An ERP whose payments never flow back keeps closing at `done`.
+    # NetSuite can report back (§536) but only for a tenant that opted in
+    # (§541): without the opt-in its pushes keep closing at `done`.
     assert status_sync_active(netsuite) is False
+    assert status_sync_active({**netsuite, "netsuite_status_sync": "off"}) is False
+    assert status_sync_active({**netsuite, "netsuite_status_sync": "yes"}) is False
+    assert status_sync_active({**netsuite, "netsuite_status_sync": "on"}) is True
+    assert status_sync_active({**netsuite, "netsuite_status_sync": True}) is True
+    # The opt-in never overrides the deployment's own switch.
+    monkeypatch.setattr(settings, "erp_status_sync_enabled", False)
+    assert status_sync_active({**netsuite, "netsuite_status_sync": "on"}) is False
+    monkeypatch.setattr(settings, "erp_status_sync_enabled", True)
     assert status_sync_active(None) is False
     assert status_sync_active({"type": "no_such_erp", "integration_method": "direct"}) is False
 
@@ -615,6 +624,28 @@ async def test_call_erp_carries_an_unconfirmed_erp_job_to_the_next_attempt():
         # default config these tests send with.
         "erp_realm": "merge_dev:",
     }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("erp_config", [None, {"type": "mock", "integration_method": "direct"}])
+async def test_a_push_through_the_mock_records_the_mocks_own_company(erp_config):
+    """§538: a confirmed push through the mock (configured, or the default when
+    no ERP is) records ``MOCK_BILL_REALM``, so the webhook and the poll sweep
+    can attribute the bill under the one realm rule like a real ERP's."""
+    from app.services.erp import _call_erp
+    from app.services.erp_adapters.base import ErpPostResult
+    from app.services.erp_link_realm import MOCK_BILL_REALM
+
+    class _Adapter:
+        async def post_invoice(self, payload):
+            return ErpPostResult(success=True, erp_document_id="MOCK-1")
+
+    inst = _instance(state_data={"erp_retries": 0})
+    with patch("app.services.erp.get_erp_adapter", return_value=_Adapter()):
+        ref = await _call_erp(_line_items_db([]), _invoice(), erp_config, instance=inst)
+
+    assert ref == "MOCK-1"
+    assert inst.state_data["erp_realm"] == MOCK_BILL_REALM
 
 
 @pytest.mark.asyncio

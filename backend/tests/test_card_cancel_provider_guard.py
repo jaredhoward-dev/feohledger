@@ -62,6 +62,12 @@ async def _call_cancel(adapter, card, db):
         patch("app.services.card_adapters.get_card_adapter", return_value=adapter),
         patch("app.api.cards.settings_with_secrets", new=AsyncMock(return_value=org.settings)),
         patch("app.services.audit_dispatch.dispatch_audit", new=AsyncMock()),
+        # The fake `db` answers every query with the card, so the refused-
+        # settlement read (decisions §562) is stubbed to "none recorded".
+        patch(
+            "app.services.card_transaction_memory.settlement_refused",
+            new=AsyncMock(return_value=False),
+        ),
     ):
         return await cancel_card(card_id=card.id, db=db, org=org, user=_user(), entity_id=None)
 

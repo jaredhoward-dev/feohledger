@@ -3827,8 +3827,16 @@ class AppLocalizationsEn extends AppLocalizations {
       'The ERP shows this bill settled, at least in part by a vendor credit applied there. FeohLedger will not pay it until someone confirms what is still owed.';
 
   @override
+  String get exceptionDescriptionErpSettledNoPayment =>
+      'The ERP shows nothing owing on this bill, but no payment against it: a credit was applied or the balance written off there. FeohLedger will not pay it until someone confirms what is still owed.';
+
+  @override
   String get exceptionDescriptionErpPaidWhileScheduled =>
       'The ERP shows this bill paid by a payment FeohLedger did not make, while a FeohLedger payment is scheduled for it. Stop or void one of them before both reach the supplier.';
+
+  @override
+  String get exceptionDescriptionErpPaidWhilePaymentInFlight =>
+      'The ERP shows this bill paid while FeohLedger\'s payment for it has not completed. Confirm whether that entry is FeohLedger\'s payment or a second one before voiding anything.';
 
   @override
   String get exceptionDescriptionErpPaidTwice =>
@@ -4048,6 +4056,21 @@ class AppLocalizationsEn extends AppLocalizations {
     String paymentId,
   ) {
     return 'Payment $paymentId was cancelled, but an earlier attempt to send it was interrupted after it may already have reached the processor, so the money may or may not have moved. Confirm with the processor and void or re-pay — this invoice is blocked from a new payment run until this is resolved.';
+  }
+
+  @override
+  String exceptionDescriptionCardSettledAfterCancel(String lastFour) {
+    return 'The card ending $lastFour was charged after it was cancelled, so this invoice may have been paid twice. Check the charge with the card provider and the other payments on this invoice, and recover the duplicate — this invoice is blocked from a new payment run until this is resolved.';
+  }
+
+  @override
+  String exceptionDescriptionCardSettlementRefused(String lastFour) {
+    return 'A settlement on the card ending $lastFour was refused because it stated no usable amount, so money may have moved on the card without being recorded. Check the charge with the card provider — the card cannot be cancelled and this invoice is blocked from a new payment run until this is resolved.';
+  }
+
+  @override
+  String exceptionDescriptionCardClearingRefused(String lastFour) {
+    return 'A further charge on the card ending $lastFour was not recorded, so the amount paid on this invoice may be more than shown. Check the charge with the card provider and record any difference — this invoice is blocked from a new payment run until this is resolved.';
   }
 
   @override
@@ -4909,6 +4932,9 @@ class AppLocalizationsEn extends AppLocalizations {
 
   @override
   String get notificationEventChatMessage => 'New message';
+
+  @override
+  String get notificationEventErpBillFlagged => 'Flag on a bill already in the ERP';
 
   @override
   String get notificationEventOther => 'Notification';

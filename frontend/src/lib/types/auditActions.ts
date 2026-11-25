@@ -1,4 +1,5 @@
-// Human labels for `AuditLog.action` tokens on the /audit console.
+// Human labels for `AuditLog.action` tokens on the /audit console, and the
+// fallback for the invoice modal's Activity timeline (invoiceTimelineActions.ts).
 //
 // The backend has no single action registry: tokens are written at ~300
 // `dispatch_audit` / `log_action` call sites, plus a handful built from

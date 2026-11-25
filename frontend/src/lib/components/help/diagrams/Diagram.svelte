@@ -1,3 +1,41 @@
+<script module lang="ts">
+	import type { Component } from 'svelte';
+	import type { DiagramId } from '#lib/help/types.ts';
+
+	// Each drawing is its own lazy chunk: a guide shows one or two of the
+	// eight, and bundled together they were ~12 KB on /help/guides/[id], the
+	// route the web bundle budget gates. The guide page's `load` awaits
+	// `loadDiagrams` for the ids its guide uses, so the drawing is in hand on
+	// the first frame and nothing waits on it after render.
+	const DIAGRAMS: Record<DiagramId, () => Promise<{ default: Component }>> = {
+		'capture-channels': () => import('./CaptureChannels.svelte'),
+		'three-way-match': () => import('./ThreeWayMatch.svelte'),
+		'approval-chain': () => import('./ApprovalChain.svelte'),
+		'segregation-of-duties': () => import('./SegregationOfDuties.svelte'),
+		'bank-change-dual-control': () => import('./BankChangeDualControl.svelte'),
+		'payment-run': () => import('./PaymentRun.svelte'),
+		'exception-flow': () => import('./ExceptionFlow.svelte'),
+		'roles-overview': () => import('./RolesOverview.svelte')
+	};
+
+	const loaded = new Map<DiagramId, Component>();
+
+	function drawingFor(id: DiagramId): Component | Promise<Component> {
+		return (
+			loaded.get(id) ??
+			DIAGRAMS[id]().then(({ default: c }) => {
+				loaded.set(id, c);
+				return c;
+			})
+		);
+	}
+
+	/** Fetch the drawings `ids` name, before the page that shows them renders. */
+	export async function loadDiagrams(ids: Iterable<DiagramId>): Promise<void> {
+		await Promise.all([...new Set(ids)].map((id) => drawingFor(id)));
+	}
+</script>
+
 <script lang="ts">
 	/**
 	 * Renders the guide illustration `id` (see DIAGRAM_IDS in #lib/help/types.ts).
@@ -9,34 +47,16 @@
 	 * follows the column, not the window. The hidden copy is `display: none`,
 	 * which also takes it out of the accessibility tree; each carries the same
 	 * translated aria-label.
+	 *
+	 * A drawing `loadDiagrams` already fetched renders synchronously (an
+	 * `{#await}` on a plain value takes the `then` branch at once).
 	 */
-	import type { Component } from 'svelte';
-	import type { DiagramId } from '#lib/help/types.ts';
-	import CaptureChannels from './CaptureChannels.svelte';
-	import ThreeWayMatch from './ThreeWayMatch.svelte';
-	import ApprovalChain from './ApprovalChain.svelte';
-	import SegregationOfDuties from './SegregationOfDuties.svelte';
-	import BankChangeDualControl from './BankChangeDualControl.svelte';
-	import PaymentRun from './PaymentRun.svelte';
-	import ExceptionFlow from './ExceptionFlow.svelte';
-	import RolesOverview from './RolesOverview.svelte';
-
 	let { id }: { id: DiagramId } = $props();
 
-	const DIAGRAMS: Record<DiagramId, Component> = {
-		'capture-channels': CaptureChannels,
-		'three-way-match': ThreeWayMatch,
-		'approval-chain': ApprovalChain,
-		'segregation-of-duties': SegregationOfDuties,
-		'bank-change-dual-control': BankChangeDualControl,
-		'payment-run': PaymentRun,
-		'exception-flow': ExceptionFlow,
-		'roles-overview': RolesOverview
-	};
-	const Drawing = $derived(DIAGRAMS[id]);
+	const drawing = $derived(drawingFor(id));
 </script>
 
-<div class="diagram" data-diagram={id}><Drawing /></div>
+<div class="diagram" data-diagram={id}>{#await drawing then Drawing}<Drawing />{/await}</div>
 
 <style>
 	.diagram :global(svg) {

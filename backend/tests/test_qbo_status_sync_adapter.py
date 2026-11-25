@@ -698,6 +698,23 @@ def test_post_payment_is_idempotent_on_the_payment_id():
     assert len(qbo.posts()) == 1  # the retry found our own earlier write
 
 
+def test_a_re_sync_after_a_further_card_clearing_posts_no_second_bill_payment():
+    """Decisions §562: a further card clearing raises the leg's settled figure
+    and re-dispatches the payment sync, whose write-back reaches the adapter
+    again for a payment already in QuickBooks — now with a different amount.
+    Our earlier BillPayment is found by its PrivateNote marker and returned; no
+    second one is posted. The difference is the over-settlement flag's to
+    reconcile, not a second write."""
+    qbo = _Qbo()
+    qbo.bill(total="150.00")
+    first = _run(qbo, lambda: _adapter().post_payment(_payload()))
+    again = _run(qbo, lambda: _adapter().post_payment(_payload(amount=Decimal("150.00"))))
+    assert first.success and again.success
+    assert again.erp_document_id == first.erp_document_id
+    assert len(qbo.posts()) == 1
+    assert qbo.bills["501"]["Balance"] == Decimal("50.00")  # only the first write landed
+
+
 def test_a_card_payment_books_from_the_card_account():
     qbo = _Qbo()
     qbo.bill()
@@ -818,7 +835,8 @@ def test_an_erp_without_status_sync_answers_fail_closed_by_default():
     not a skeleton, but nothing it answers may read as "paid" or "open"."""
     from app.services.erp_adapters.dispatcher import get_erp_adapter
 
-    adapter = get_erp_adapter({"type": "netsuite", "integration_method": "direct"})
+    # NetSuite reported back from §536, so another direct ERP stands in.
+    adapter = get_erp_adapter({"type": "dynamics_365_bc", "integration_method": "direct"})
     assert adapter.supports_status_sync is False
     report = asyncio.run(adapter.bill_report("1"))
     assert report.state is ErpBillState.unknown

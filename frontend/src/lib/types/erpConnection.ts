@@ -117,7 +117,9 @@ export interface ErpOAuthStatus {
 	/** Today's call usage on a shared-quota ERP (Blackbaud); see `callUsageLines`. */
 	call_usage?: ErpCallUsage | null;
 	/** `POST …/oauth/status-sync` would run a pass now (decisions §392): the
-	 *  server's verdict, by the rule the POST itself applies. */
+	 *  server's verdict, by the rule the POST itself applies. The tenant's,
+	 *  stated with or without an OAuth connection (a stored-credential ERP
+	 *  that reports back runs the pass too, decisions §547, §551). */
 	status_sync_available?: boolean;
 	/** Why not, as the POST's 409 code (`status_sync_off` /
 	 *  `status_sync_unsupported` / `status_sync_needs_reconnect`). */
@@ -157,7 +159,9 @@ const OPTION_LABEL_KEYS: Record<string, MessageKey> = {
 	Approved: 'org.erp.option.Approved',
 	other: 'org.erp.option.other',
 	oauth2_m2m: 'org.erp.option.oauth2_m2m',
-	tba: 'org.erp.option.tba'
+	tba: 'org.erp.option.tba',
+	off: 'org.erp.option.off',
+	on: 'org.erp.option.on'
 };
 
 export function optionLabelKey(option: string): MessageKey | null {
@@ -484,6 +488,26 @@ export function disconnectMessage(result: ErpDisconnectResult | null | undefined
 export function statusSyncNowOffered(providerKey: string, status: ErpOAuthStatus | null): boolean {
 	return (
 		oauthConnectionState(providerKey, status) === 'connected' &&
+		status?.status_sync_available === true
+	);
+}
+
+/**
+ * The same offer for an ERP reached with stored credentials (NetSuite with
+ * its per-tenant opt-in, decisions §547, §551), which has no connection to be
+ * "connected": the verdict is the tenant's, so it applies only to the ERP the
+ * saved configuration names. A choice still unsaved in the dropdown is not
+ * what the pass would read, and is offered nothing. OAuth ERPs keep
+ * {@link statusSyncNowOffered}.
+ */
+export function storedErpStatusSyncNowOffered(
+	provider: Pick<ErpProvider, 'key' | 'auth'>,
+	savedKey: string | null,
+	status: ErpOAuthStatus | null
+): boolean {
+	return (
+		provider.auth !== 'oauth' &&
+		provider.key === savedKey &&
 		status?.status_sync_available === true
 	);
 }

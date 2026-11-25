@@ -455,7 +455,8 @@ export const VENDOR_GUIDES: Guide[] = [
 						type: 'steps',
 						items: [
 							'On the {ui:expenses.tab.reports} tab, select {ui:expenses.action.newReport}, give it a title and select {ui:expenses.newReport.create}.',
-							'Open the report and attach your expenses to it with {ui:expenses.reports.attach}. The total adds up the lines, converting any foreign-currency line into the report\'s currency.',
+							'Open the report. In {ui:expenses.reports.attachLabel}, search for one of your expenses by merchant, description or category, pick it, and select {ui:expenses.reports.attach}. The list shows only your own expenses that are not on a report yet. The total adds up the lines, converting any foreign-currency line into the report\'s currency.',
+							'To add several at once, tick them on the {ui:expenses.tab.expenses} tab, choose the report under {ui:expenses.bulk.chooseReport} in the bar that appears, and select **Add to report**. If any one of them can\'t go on the report, none is added and the message says why.',
 							'Select {ui:expenses.reports.submit}.'
 						]
 					},

@@ -182,7 +182,9 @@ with asymmetric algorithms only (`.claude/hooks/security-patterns.sh` rule
 4. Frontend POSTs `{ email, password }` to `/api/auth/login`
 5. Backend validates credentials against the **control-plane DB** (where users live)
 6. Backend returns `{ access_token, token_type }` (JWT with a unique `jti` claim)
-7. Frontend stores the JWT in `localStorage`
+7. Frontend stores the JWT in `localStorage` (through `#lib/utils/safeStorage.ts`;
+   where the browser blocks site storage the app reads as signed out and
+   `/login` says a sign-in cannot last there — decisions §514)
 8. All subsequent requests include both:
    - `Authorization: Bearer <token>` header
    - `X-Tenant-Slug: <slug>` header
@@ -1577,6 +1579,13 @@ exactly as before.
     `test_every_card_closing_route_gates_on_payment_void` (the three doors
     agree). See `backend/docs/virtual-cards.md` § Cancel → The gate is
     `payment.void`.
+  - **Voiding a flagged bill in the ERP is the same duty.**
+    `POST /api/exceptions/{id}/void-erp-bill` (decisions §539) is
+    `require_permission(payment.void)`: voiding the bill is how a payment out
+    of the ERP is stopped. An `ap_manager` works the duplicate / fraud flag but
+    does not void. The `erp_bill_flagged` notice that asks someone to void it
+    goes to holders of `payment.void` by effective permission (a custom role
+    granting it included), not to fixed system roles (decisions §542).
   - **The reads a `user.manage` holder needs to actually use the grant are
     migrated too.** `GET /api/admin/users` (the roster), `GET /api/admin/roles`
     (the picker `role_names` is chosen from) and `GET /api/admin/permissions`
@@ -3153,7 +3162,8 @@ behavioural suites cover (`test_slack_approvals`, `test_webhook_security`,
 | `POST /auth/sso/callback` | Server-minted single-use `state`, then the IdP's signed, nonce-bound ID token. |
 | `POST /auth/saml/acs`, `POST /auth/saml/exchange` | Server-minted single-use RelayState + python3-saml's signed-assertion verification; the exchange leg consumes a one-time handoff code. |
 | `POST /signup/complete` | The emailed `EmailVerification` token, taken `FOR UPDATE` and consumed so two calls can't double-provision a tenant. |
-| `POST /cards/webhook/{provider}`, `POST /erp/webhook/{erp_type}` | Per-tenant webhook signing secret (HMAC over the raw body) + Redis dedupe on the provider event id. |
+| `POST /cards/webhook/{provider}` | Per-tenant card webhook secret, checked the way each provider authenticates (Lithic Standard-Webhooks HMAC over `id.timestamp.body` + 5-minute window; Nium `x-partner-key`, which Nium documents in place of a signature; decisions §555) + Redis dedupe on the provider's delivery id (`webhook-id` / `x-request-id`). |
+| `POST /erp/webhook/{erp_type}` | Per-tenant webhook signing secret (HMAC over the raw body) + Redis dedupe on the provider event id. |
 | `POST /payments/webhook/{tenant_slug}/{provider}`, `POST /billing/webhook/{provider}` | The adapter's `parse_webhook` verifies the processor HMAC, then event-id dedupe. |
 | `POST /email-intake/inbound/{provider}` | Process-level HMAC over the raw body plus the opaque per-tenant token in the recipient address. |
 | `POST /peppol/inbound/{organization_id}` | Access Point HMAC; dedupe is the DB `uq_peppol_message_id` index. |

@@ -12,7 +12,9 @@ import { acceptConsent, expect, test } from '../fixtures/helpers';
  *  - the portal nav reaches it, and a guide renders inside the portal shell;
  *  - a `{ui:key}` reference renders the live catalogue label;
  *  - a glossary link lands on the portal's own glossary, not on /help;
- *  - the guide's "Open …" button goes to the portal page the work is on.
+ *  - the guide's "Open …" button goes to the portal page the work is on;
+ *  - the search field narrows the page, announces its count, keeps `?q=`
+ *    across a reload and shows an empty state (decisions §517).
  *
  * Signs in as the seeded portal user, like the other portal specs.
  */
@@ -82,6 +84,36 @@ test.describe('supplier portal help', () => {
 		await page.goto('/portal/help/no-such-guide');
 		await expect(page.getByRole('heading', { level: 1, name: 'Guide not found' })).toBeVisible();
 		await page.getByRole('link', { name: 'Back to the help center' }).click();
+		await expect(page).toHaveURL(/\/portal\/help$/);
+	});
+
+	test('the search field narrows the guides and terms, announces the count and keeps ?q=', async ({ page }) => {
+		await portalSignIn(page);
+		await page.goto('/portal/help');
+		const help = page.getByTestId('portal-help');
+		const status = page.getByTestId('portal-help-search-status');
+		await expect(status).toHaveAttribute('role', 'status');
+		await expect(status).toHaveText('');
+
+		await page.getByRole('textbox', { name: 'Search the supplier help' }).fill('bank details');
+		await expect(status).toContainText(/\d+ results? for “bank details”/);
+		// Best match first, and a guide that doesn't match is gone.
+		await expect(help.locator('.guides a').first()).toHaveText('Change your bank details');
+		await expect(help.getByRole('link', { name: 'Create an invoice from a purchase order' })).toHaveCount(0);
+		await expect(page).toHaveURL(/\/portal\/help\?q=bank\+details$/);
+
+		// A reload keeps the search.
+		await page.reload();
+		await expect(page.getByTestId('portal-help-search')).toHaveValue('bank details');
+		await expect(status).toContainText('for “bank details”');
+
+		// No match: the empty state says so, and Clear brings everything back.
+		await page.getByTestId('portal-help-search').fill('zzqqxx');
+		await expect(status).toHaveText('No guides or terms match “zzqqxx”. Try a shorter word, or clear the search to see them all.');
+		await expect(help.locator('.guides')).toHaveCount(0);
+		await page.getByTestId('portal-help-search-clear').click();
+		await expect(status).toHaveText('');
+		await expect(help.getByRole('link', { name: 'Create an invoice from a purchase order' })).toBeVisible();
 		await expect(page).toHaveURL(/\/portal\/help$/);
 	});
 });

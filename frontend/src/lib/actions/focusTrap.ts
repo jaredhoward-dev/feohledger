@@ -112,6 +112,15 @@ function notifyModals() {
  * Guard: `tests-e2e/a11y/screen-reader.spec.ts` (both the surviving-trigger and
  * the vanished-trigger cases).
  */
+/**
+ * Does Escape belong to `node`? A registered modal answers it only while it is
+ * the topmost; an unregistered trap (not `aria-modal`) always does. Pure, so
+ * the rule is unit-tested without a DOM.
+ */
+export function ownsEscape<T>(stack: readonly T[], node: T): boolean {
+	return !stack.includes(node) || stack.at(-1) === node;
+}
+
 function restoreFocus(prev: HTMLElement | null): void {
 	const active = document.activeElement;
 	if (active && active !== document.body && active.isConnected) return;
@@ -141,6 +150,14 @@ export const focusTrap: Action<HTMLElement, FocusTrapParams | undefined> = (node
 
 	function onKey(e: KeyboardEvent) {
 		if (e.key === 'Escape') {
+			// A dialog stacked inside another (a confirm a panel opens over its
+			// host) shares the host's DOM, so its Escape bubbles here too: only
+			// the topmost dialog closes, never the one under it as well.
+			if (!ownsEscape(openModals, node)) return;
+			// Handled: stop it here. Closing this dialog can unmount it (and
+			// pop it off the stack) before the same event bubbles on to the
+			// host's trap, which would then find itself topmost and close too.
+			e.stopPropagation();
 			onEscape?.();
 			return;
 		}

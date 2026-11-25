@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { formatMoney } from '#lib/utils/money.ts';
-	import { formatPeriod } from '#lib/utils/time.ts';
+	import { formatPeriod, formatPeriodLong } from '#lib/utils/time.ts';
 	import { m } from '#lib/i18n/store.svelte.ts';
 	import type { CashPositionResult } from '#lib/types/cashFlow.ts';
 
@@ -23,7 +23,10 @@
 	let points = $derived(
 		result.periods.map((p) => ({
 			period: p.period,
+			// The axis is dense, so its two-digit year; the point's <title> is
+			// read out and hovered, so it spells the year in full (§534).
 			label: formatPeriod(p.period),
+			longLabel: formatPeriodLong(p.period),
 			closing: num(p.closing),
 			below: p.below_threshold,
 			raw: p
@@ -88,7 +91,7 @@
 			start: fmt(result.opening_balance),
 			end: points.length ? fmt(points[points.length - 1].raw.closing) : fmt(result.opening_balance),
 			shortfall: result.first_shortfall_period
-				? m('cashFlow.chart.ariaShortfall', { period: formatPeriod(result.first_shortfall_period) })
+				? m('cashFlow.chart.ariaShortfall', { period: formatPeriodLong(result.first_shortfall_period) })
 				: m('cashFlow.chart.ariaHealthy')
 		})
 	);
@@ -109,7 +112,7 @@
 		<p class="chart-breach" role="alert">
 			{m('cashFlow.chart.breach', { n: breachCount })}
 			{#if result.first_shortfall_period}
-				<span class="breach-when">{m('cashFlow.chart.firstShortfall', { period: formatPeriod(result.first_shortfall_period) })}</span>
+				<span class="breach-when">{m('cashFlow.chart.firstShortfall', { period: formatPeriodLong(result.first_shortfall_period) })}</span>
 			{/if}
 		</p>
 	{/if}
@@ -145,7 +148,7 @@
 					cy={y(p.closing)}
 					r="4"
 				>
-					<title>{p.label}: {fmt(p.raw.closing)}</title>
+					<title>{p.longLabel}: {fmt(p.raw.closing)}</title>
 				</circle>
 			{/each}
 		</svg>

@@ -281,3 +281,186 @@ __all__ = [
     "record_completion",
     "record_settlement",
 ]
+
+
+# ── A run's virtual-card leg (decisions §537, §543) ───────────────────────
+#
+# A run's card leg books a `completed` `Payment` the moment the card is MINTED
+# (`api/payments._execute_single_payment`), but money moves only when the vendor
+# charges the card — and the card webhook recorded that charge on the
+# `VirtualCard` row alone. With `settled_amount` NULL, `settlement_coverage`
+# failed OPEN, so the payment sync and an ERP `paid` report both closed the
+# invoice while the card was still spendable. These two functions are the whole
+# fix: the card's charge is written onto the payment it pays, and coverage of a
+# card leg asks the card. Only a SETTLED charge counts (§543): an authorization
+# can still be reversed or expire, so it leaves the leg in flight.
+
+CARD_LEG_METHOD = "virtual_card"
+#: The card status that means the vendor's charge CLEARED — money moved. The
+#: card webhook sets it on a settlement event; ``charged`` is only the
+#: authorization, a hold that can still be reversed or expire (decisions §543).
+CARD_SETTLED_STATUS = "completed"
+
+
+async def card_leg_card(db: AsyncSession, payment: Payment):
+    """The card a run's card leg paid with, preferring one that was charged.
+
+    The card the leg minted names the payment (`virtual_cards.payment_id`); a
+    leg that converged onto an unlinked `/cards/generate` card links it too.
+    The invoice's still-unlinked card is read as a fallback, so a leg never
+    loses sight of the card that pays its invoice.
+    """
+    from sqlalchemy import case, or_
+
+    from app.models.virtual_card import VirtualCard
+    from app.services.card_issuance import CARD_SPENT_STATUSES
+
+    clauses = [VirtualCard.payment_id == payment.id]
+    if payment.invoice_id is not None:
+        clauses.append(
+            (VirtualCard.invoice_id == payment.invoice_id) & VirtualCard.payment_id.is_(None)
+        )
+    spent_first = case((VirtualCard.status.in_(CARD_SPENT_STATUSES), 0), else_=1)
+    return (
+        await db.execute(
+            select(VirtualCard)
+            .where(or_(*clauses))
+            .order_by(spent_first, VirtualCard.created_at.desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+
+
+async def payment_coverage(db: AsyncSession, payment: Payment, invoice_currency: str | None):
+    """``settlement_coverage`` for one payment, honest about a card leg.
+
+    Every caller that decides whether a payment discharges its invoice goes
+    through here — the payment sync (`payment_erp_sync`) and an ERP's `paid`
+    report (`erp_status_report`, webhook and poll alike) — so they cannot
+    disagree about a card leg.
+
+    A card leg counts only a SETTLED charge (decisions §543). Its card is read
+    every time: not yet settled (``created`` / ``sent`` / ``active``, merely
+    authorized as ``charged``, cancelled, or no card found) is ``in_flight``,
+    whatever the payment carries, because an authorization is a hold the
+    network can still reverse or let expire — no money has moved. Settled
+    (``completed``), the figure the webhook stamped on the payment
+    (:func:`record_card_spend`) is judged like any rail's, falling back to the
+    card's own ``amount_charged`` when nothing was stamped.
+    """
+    from app.services.payment_settlement import settlement_coverage
+
+    settled = payment.settled_amount
+    settled_currency = payment.settled_currency
+    unstorable = bool(payment.settled_amount_unstorable)
+    awaiting = False
+    if payment.method == CARD_LEG_METHOD:
+        card = await card_leg_card(db, payment)
+        if card is None or card.status != CARD_SETTLED_STATUS:
+            # Not money yet: a figure an earlier build stamped at the
+            # authorization (§537) is not evidence of a settled charge either.
+            awaiting = True
+            settled, settled_currency, unstorable = None, None, False
+        elif settled is None and not unstorable:
+            settled, unstorable = persistable_settled_amount(card.amount_charged)
+            settled_currency = card.currency
+    return settlement_coverage(
+        settled_amount=settled,
+        settled_currency=settled_currency,
+        target_amount=payment.amount,
+        target_currency=invoice_currency,
+        source_amount=payment.source_amount,
+        source_currency=payment.source_currency,
+        settled_amount_unstorable=unstorable,
+        awaiting_card_spend=awaiting,
+    )
+
+
+async def record_card_spend(db: AsyncSession, card) -> Payment | None:
+    """Write a card's SETTLED charge onto the run payment it pays; return it.
+
+    Called by the card webhook on settlement only (decisions §543): an
+    authorization is a hold, not money moved — the network can reverse it or
+    let it expire, and a card provider sends those as their own events — so the
+    leg stays ``in_flight`` (:func:`payment_coverage`) until the charge clears.
+    Then ``payments.settled_amount`` is what the vendor actually took: a short
+    charge holds the invoice exactly as a short ACH does, and
+    ``/settlement/accept`` and ``/void`` are its exits.
+
+    Returns ``None`` — nothing written — for a card not yet settled, a card no
+    run payment owns (``/cards/generate``), a non-card or non-completed
+    payment, or a charge with no amount. Idempotent: the same card writes the
+    same figure.
+    """
+    if card.payment_id is None or card.amount_charged is None or card.status != CARD_SETTLED_STATUS:
+        return None
+    payment = await db.get(Payment, card.payment_id)
+    if payment is None or payment.method != CARD_LEG_METHOD or payment.status != "completed":
+        return None
+    amount, unstorable = persistable_settled_amount(card.amount_charged)
+    payment.settled_amount = amount
+    payment.settled_currency = card.currency
+    payment.settled_amount_unstorable = unstorable
+    return payment
+
+
+#: `Exception.erp_report["kind"]` of the flag a card charged past what it pays
+#: opens (decisions §554); deduped by kind like every reconciliation flag (§535).
+CARD_OVER_SETTLED_KIND = "card_over_settled"
+
+
+async def flag_card_over_settlement(db: AsyncSession, card, payment: Payment | None) -> bool:
+    """Open a payment-blocking reconciliation flag when a settled card's total
+    cleared figure exceeds what it pays; return whether one was opened.
+
+    Decisions §554. A card can clear more than once (an incremental capture, a
+    tip, a force post past the limit), and over-settlement is ``covered`` by
+    design (``settlement_coverage``), so without this nothing would tell a
+    person the vendor took more than AP authorized. The target is the run
+    payment's amount when a payment owns the card, else the invoice's. The
+    verdict is ``verify_settlement``'s, with its tolerance and currency rule:
+    a card in another currency than the invoice is not judged here (the
+    settlement verdict for a cross-currency leg is the rail's, not the card's).
+    The finding is the catalogue's ``settlement_amount_over``; the exception is
+    deduped by kind (``card_over_settled``), so each further clearing past the
+    figure does not pile up rows. Does not commit.
+    """
+    from app.services.erp_status_sync import (
+        PAYMENT_RECONCILIATION_EXCEPTION_TYPE,
+        open_erp_reconciliation_exception,
+    )
+    from app.services.payment_settlement import OUTCOME_AMOUNT_MISMATCH
+
+    if card.amount_charged is None or card.status != CARD_SETTLED_STATUS:
+        return False
+    invoice = await db.get(Invoice, card.invoice_id)
+    if invoice is None:
+        return False
+    target = payment.amount if payment is not None else invoice.amount
+    verification = verify_settlement(
+        reported_amount=card.amount_charged,
+        reported_currency=card.currency,
+        target_amount=target,
+        target_currency=invoice.currency,
+        source_amount=payment.source_amount if payment is not None else None,
+        source_currency=payment.source_currency if payment is not None else None,
+    )
+    if verification.outcome != OUTCOME_AMOUNT_MISMATCH or not (
+        verification.variance is not None and verification.variance > 0
+    ):
+        return False
+    logger.warning("Card settled past the amount it pays; flagged for reconciliation")
+    return await open_erp_reconciliation_exception(
+        db,
+        invoice,
+        org_id=card.organization_id,
+        finding=discrepancy_finding(verification),
+        exception_type=PAYMENT_RECONCILIATION_EXCEPTION_TYPE,
+        erp_report={
+            "kind": CARD_OVER_SETTLED_KIND,
+            "virtual_card_id": str(card.id),
+            "settled_amount": str(card.amount_charged),
+            "authorized_amount": str(verification.authorized_amount),
+            "currency": card.currency,
+        },
+    )

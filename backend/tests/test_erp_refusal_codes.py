@@ -38,6 +38,11 @@ NOT_REFUSALS = {
     "METHOD_MERGE_DEV",
     "AUTH_TBA",  # NetSuite sign-in methods (`auth_method`)
     "AUTH_OAUTH2_M2M",
+    "STATUS_SYNC_KEY",  # NetSuite's per-tenant status-sync opt-in (decisions §541)
+    "STATUS_SYNC_OFF",
+    "STATUS_SYNC_ON",
+    "BILL_VOID_ANY",  # an adapter's bill-void scope (decisions §542)
+    "BILL_VOID_DRAFT_ONLY",
 }
 
 _CONSTANT = re.compile(r'^([A-Z][A-Z0-9_]*) = "([a-z][a-z0-9_]*)"$', re.MULTILINE)

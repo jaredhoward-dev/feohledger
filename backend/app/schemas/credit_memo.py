@@ -42,6 +42,14 @@ class CreditMemoCreate(BaseModel):
     issued_date: date | None = None
     reason: str | None = None
     invoice_id: uuid.UUID | None = None  # optional: link (and apply) at creation time
+    # Optional: this memo IS the accepted early-payment discount on that
+    # invoice, taken as a credit (decisions §520). Needs `invoice_id`, and
+    # `amount` must be the offer's savings to the cent. The payment path then
+    # does not deduct the offer again, and the settlement captures it. Only a
+    # memo created with this link counts as the discount — never one whose
+    # amount merely equals the savings. Not editable afterwards: a linked memo
+    # is applied at creation, and only an open memo is editable.
+    discount_offer_id: uuid.UUID | None = None
 
 
 class CreditMemoUpdate(BaseModel):
@@ -89,6 +97,8 @@ class CreditMemoResponse(BaseModel):
     status: str
     applied_at: str | None = None
     applied_by: str | None = None
+    # The accepted discount offer this memo takes, when it is one (§520).
+    discount_offer_id: str | None = None
     created_at: str
 
 

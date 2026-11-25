@@ -89,11 +89,15 @@ _EMAIL_ACK = (200, b'{"status":"received"}')
 
 WEBHOOKS: dict[str, Webhook] = {
     "/api/cards/webhook/{provider}": Webhook(
-        scheme="hex HMAC-SHA256 of the raw body, the owning tenant's sealed card key",
+        scheme=(
+            "per provider, the owning tenant's sealed card key (decisions §555): Lithic "
+            "Standard-Webhooks HMAC-SHA256 of 'id.timestamp.body', whsec_ key, 5-min window; "
+            "Nium the static x-partner-key header (Nium signs nothing); mock hex HMAC of the body"
+        ),
         reject=_SILENT,
         decision=_SILENT,
-        signs_timestamp=False,
-        dedup="cards:<provider event id>",
+        signs_timestamp=True,  # Lithic does; Nium documents no signature at all
+        dedup="<provider>:<webhook-id (Lithic) | x-request-id (Nium) | body event_id (mock)>",
         depth=(
             "test_webhook_security.py::test_card_webhook_dedups_replayed_event",
             "test_card_money_path_regression.py::"
@@ -328,45 +332,68 @@ async def _assert_all(probes: dict[str, tuple[int, bytes]], expected: tuple[int,
 
 async def test_cards_rejections_are_one_answer_and_a_replay_settles_once(realdb):
     from app.models.virtual_card import CardRebate, VirtualCard
+    from app.services.webhook_security import sign_standard_webhook
+    from tests.test_card_webhook_provider_cross_check import _SECRET as card_key
     from tests.test_card_webhook_provider_cross_check import (
         _seed_charged_card,
         _set_webhook_secret,
     )
-    from tests.test_card_webhook_provider_cross_check import _sign as card_sign
 
     row = WEBHOOKS["/api/cards/webhook/{provider}"]
     org_id = realdb.info("a").org_id
     mk = realdb.sessionmaker("a")
     token = f"tok_{uuid.uuid4().hex[:12]}"
-    card_id = await _seed_charged_card(mk, org_id, provider="nium", token=token)
+    # Lithic: the provider whose scheme signs a timestamp (decisions §555).
+    card_id = await _seed_charged_card(mk, org_id, provider="lithic", token=token)
     await _set_webhook_secret(realdb, org_id=org_id)
 
-    def event(card_token: str, event_id: str) -> bytes:
+    def event(card_token: str) -> bytes:
+        # `card_transaction.updated`: the Transaction plus `event_type`.
         return json.dumps(
             {
-                "eventType": "transaction.settled",
-                "webhookId": event_id,
-                "cardHashId": card_token,
-                "amount": "250.00",
-                "merchantName": "Contract Merchant",
+                "event_type": "card_transaction.updated",
+                "token": str(uuid.uuid4()),
+                "card_token": card_token,
+                "status": "SETTLED",
+                "amount": 25000,
+                "merchant": {"descriptor": "Contract Merchant"},
             }
         ).encode()
 
-    url = "/api/cards/webhook/nium"
-    body = event(token, str(uuid.uuid4()))
-    unknown = event(f"tok_{uuid.uuid4().hex[:12]}", str(uuid.uuid4()))
+    def signed(raw: bytes, *, msg_id: str, ts: int | None = None, sig_body=None) -> dict:
+        ts = int(time.time()) if ts is None else ts
+        return {
+            "webhook-id": msg_id,
+            "webhook-timestamp": str(ts),
+            "webhook-signature": sign_standard_webhook(
+                card_key, msg_id, ts, raw if sig_body is None else sig_body
+            ),
+        }
+
+    url = "/api/cards/webhook/lithic"
+    body = event(token)
+    unknown = event(f"tok_{uuid.uuid4().hex[:12]}")
+    msg_id = str(uuid.uuid4())
     async with _client(realdb) as c:
         rejected = {
             "unsigned": await _post(c, url, body, {"Content-Type": "application/json"}),
-            "bad signature": await _post(c, url, body, {"Webhook-Signature": "0" * 64}),
+            "bad signature": await _post(
+                c,
+                url,
+                body,
+                {**signed(body, msg_id=msg_id), "webhook-signature": "v1," + "A" * 43 + "="},
+            ),
             "signed for another body": await _post(
-                c, url, body, {"Webhook-Signature": card_sign(b"{}")}
+                c, url, body, signed(body, msg_id=msg_id, sig_body=b"{}")
+            ),
+            "stale timestamp, correctly signed": await _post(
+                c, url, body, signed(body, msg_id=msg_id, ts=int(time.time()) - 3600)
             ),
             "unknown card, correctly signed": await _post(
-                c, url, unknown, {"Webhook-Signature": card_sign(unknown)}
+                c, url, unknown, signed(unknown, msg_id=str(uuid.uuid4()))
             ),
             "unknown provider": await _post(
-                c, "/api/cards/webhook/nope", body, {"Webhook-Signature": card_sign(body)}
+                c, "/api/cards/webhook/nope", body, signed(body, msg_id=msg_id)
             ),
         }
         await _assert_all(rejected, row.reject)
@@ -375,9 +402,9 @@ async def test_cards_rejections_are_one_answer_and_a_replay_settles_once(realdb)
             card = await s.get(VirtualCard, card_id)
             assert card.status == "charged"
 
-        signed = {"Webhook-Signature": card_sign(body)}
-        first = await _post(c, url, body, signed)
-        replay = await _post(c, url, body, signed)
+        headers = signed(body, msg_id=msg_id)
+        first = await _post(c, url, body, headers)
+        replay = await _post(c, url, body, headers)
     assert first == replay == row.decision
 
     async with mk() as s:

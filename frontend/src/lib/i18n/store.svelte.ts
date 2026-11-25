@@ -2,6 +2,7 @@ import { browser } from '$app/env';
 import { en } from './locales/en';
 import { CATALOGUE_LOADERS, EN_FALLBACK, PRELOADED_SLICES, SLICE_LOADERS, SLICE_NAMES, sliceOf } from './catalogues';
 import { interpolate } from './interpolate';
+import { storageGet, storageSet } from '#lib/utils/safeStorage.ts';
 import { setActiveFormatLocale } from './formatLocale';
 import type { MessageKey, Messages, SliceName } from './messages';
 import { DEFAULT_LOCALE, dirForLocale, isSupportedLocale, negotiateLocale, type Locale } from './locale';
@@ -165,11 +166,8 @@ function applyDocumentLocale(next: Locale): void {
 	// helpers) in sync with the active locale.
 	setActiveFormatLocale(resolveFormatLocale(next));
 	if (!browser) return;
-	try {
-		localStorage.setItem(STORAGE_KEY, next);
-	} catch {
-		/* storage may be unavailable (private mode / quota) — non-fatal */
-	}
+	// Storage may be unavailable (blocked, private mode, quota) — non-fatal.
+	storageSet(STORAGE_KEY, next);
 	document.documentElement.lang = next;
 	document.documentElement.dir = dirForLocale(next);
 }
@@ -213,12 +211,7 @@ export async function setLocale(next: Locale): Promise<void> {
  */
 export function initLocale(): void {
 	if (!browser) return;
-	let stored: string | null = null;
-	try {
-		stored = localStorage.getItem(STORAGE_KEY);
-	} catch {
-		/* ignore */
-	}
+	const stored = storageGet(STORAGE_KEY);
 	const navLangs =
 		typeof navigator !== 'undefined'
 			? (navigator.languages?.length ? [...navigator.languages] : (navigator.language ?? null))

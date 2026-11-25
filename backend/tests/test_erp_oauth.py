@@ -2655,6 +2655,66 @@ async def test_status_sync_now_is_audited_first_and_runs_after_the_response(real
     assert row.details == {"provider": PROVIDER}
 
 
+def _netsuite_config(status_sync: str | None) -> dict:
+    """A NetSuite tenant reached with stored credentials: no OAuth block."""
+    config = {"type": "netsuite", "integration_method": "direct", "account_id": "TSTDRV1"}
+    if status_sync is not None:
+        config["netsuite_status_sync"] = status_sync
+    return config
+
+
+@pytest.mark.plan("scale")
+async def test_status_sync_now_runs_for_an_opted_in_netsuite_tenant(realdb, monkeypatch):
+    """Not OAuth-only (decisions §547): an ERP reached with stored credentials
+    whose bills report back for this tenant runs the same audited pass."""
+    from app.services import erp_status_sync
+
+    await _set_settings(realdb, {"erp": _netsuite_config("on")})
+    monkeypatch.setattr(settings, "erp_status_sync_enabled", True)
+    dispatch = AsyncMock(return_value=True)
+    monkeypatch.setattr(erp_status_sync, "dispatch_sync_org_now", dispatch)
+    async with realdb.client(key="a", role="admin") as c:
+        resp = await c.post("/api/organization/erp/oauth/status-sync")
+    assert resp.status_code == 202, resp.text
+    assert resp.json() == {"started": True}
+    dispatch.assert_awaited_once()
+    [row] = await _audit_actions(realdb)
+    assert row.action == "organization.erp_status_sync_requested"
+    assert row.details == {"provider": "netsuite"}
+
+
+@pytest.mark.plan("scale")
+@pytest.mark.parametrize("opt_in", [None, "off"])
+async def test_status_sync_now_refuses_netsuite_without_the_opt_in(realdb, monkeypatch, opt_in):
+    from app.services import erp_status_sync
+
+    await _set_settings(realdb, {"erp": _netsuite_config(opt_in)})
+    monkeypatch.setattr(settings, "erp_status_sync_enabled", True)
+    dispatch = AsyncMock(return_value=True)
+    monkeypatch.setattr(erp_status_sync, "dispatch_sync_org_now", dispatch)
+    async with realdb.client(key="a", role="admin") as c:
+        resp = await c.post("/api/organization/erp/oauth/status-sync")
+    assert resp.status_code == 409
+    assert resp.json()["detail"]["code"] == "status_sync_unsupported"
+    dispatch.assert_not_awaited()
+    assert await _audit_actions(realdb) == []
+
+
+@pytest.mark.plan("scale")
+@pytest.mark.parametrize("role", ["ap_manager", "ap_clerk", "cfo"])
+async def test_status_sync_now_stays_admin_only_for_netsuite(realdb, monkeypatch, role):
+    from app.services import erp_status_sync
+
+    await _set_settings(realdb, {"erp": _netsuite_config("on")})
+    monkeypatch.setattr(settings, "erp_status_sync_enabled", True)
+    dispatch = AsyncMock(return_value=True)
+    monkeypatch.setattr(erp_status_sync, "dispatch_sync_org_now", dispatch)
+    async with realdb.client(key="a", role=role) as c:
+        resp = await c.post("/api/organization/erp/oauth/status-sync")
+    assert resp.status_code == 403
+    dispatch.assert_not_awaited()
+
+
 @pytest.mark.plan("scale")
 async def test_status_sync_now_refuses_a_connection_that_needs_reconnecting(realdb, monkeypatch):
     block = {**_connected_block(realdb.info("a").org_id), "needs_reconnect": True}
@@ -2687,6 +2747,31 @@ async def test_status_states_whether_a_payment_check_would_run_now(realdb, monke
     body = await _status_body(realdb)
     assert body["status_sync_available"] is False
     assert body["status_sync_refusal"] == "status_sync_needs_reconnect"
+
+
+@pytest.mark.plan("scale")
+async def test_status_states_the_payment_check_verdict_without_an_oauth_connection(
+    realdb, monkeypatch
+):
+    """A stored-credential ERP has no OAuth block, and its verdict is still
+    stated (decisions §551), so the settings page draws "check payments now"
+    for an opted-in NetSuite tenant exactly when the POST would run a pass."""
+    monkeypatch.setattr(settings, "erp_status_sync_enabled", True)
+    await _set_settings(realdb, {"erp": _netsuite_config("on")})
+    body = await _status_body(realdb)
+    assert body["connected"] is False and body["provider"] is None
+    assert body["status_sync_available"] is True and body["status_sync_refusal"] is None
+
+    await _set_settings(realdb, {"erp": _netsuite_config("off")})
+    body = await _status_body(realdb)
+    assert body["status_sync_available"] is False
+    assert body["status_sync_refusal"] == "status_sync_unsupported"
+
+    monkeypatch.setattr(settings, "erp_status_sync_enabled", False)
+    await _set_settings(realdb, {"erp": _netsuite_config("on")})
+    body = await _status_body(realdb)
+    assert body["status_sync_available"] is False
+    assert body["status_sync_refusal"] == "status_sync_off"
 
 
 @pytest.mark.plan("scale")

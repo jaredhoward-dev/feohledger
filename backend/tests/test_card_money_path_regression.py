@@ -29,6 +29,7 @@ Runs against the opt-in `realdb` fixture (skips without `pnpm db:up`).
 
 from __future__ import annotations
 
+import base64
 import contextlib
 import hashlib
 import hmac
@@ -52,7 +53,10 @@ from app.models.workflow import AuditLog
 pytestmark = pytest.mark.asyncio
 
 TENANT = "a"
-_SECRET = "card-money-path-regression-secret"
+# One tenant secret serves every provider: Lithic needs the `whsec_<base64>`
+# shape (decisions §555); Nium compares it as the `x-partner-key` value; the
+# mock HMACs with it as text.
+_SECRET = "whsec_" + base64.b64encode(b"card-money-path-regression-secret").decode()
 
 
 # ---------------------------------------------------------------------------
@@ -416,19 +420,73 @@ async def _set_card_settings(realdb, org_id, **extra) -> None:
 
 
 def _sign(body: bytes) -> str:
+    """The mock provider's own signature (hex HMAC in `Webhook-Signature`)."""
     return hmac.new(_SECRET.encode("utf-8"), body, hashlib.sha256).hexdigest()
 
 
-def _settlement_body(token: str, *, amount, event_id: str | None = None) -> bytes:
-    payload = {
-        "eventType": "transaction.settled",
-        "webhookId": event_id or str(uuid.uuid4()),
-        "cardHashId": token,
-        "merchantName": "Acme Fuel",
-    }
-    if amount is not None:
-        payload["amount"] = amount
-    return json.dumps(payload).encode("utf-8")
+def _webhook_headers(
+    provider: str,
+    body: bytes,
+    *,
+    event_id: str | None = None,
+    credential: str | None = None,
+    timestamp: int | None = None,
+) -> dict[str, str]:
+    """The headers ``provider`` really authenticates a delivery with
+    (decisions §555): Lithic's Standard-Webhooks trio, Nium's `x-partner-key`
+    + `x-request-id`, the mock's hex HMAC. ``credential`` overrides the
+    signature / partner key (a forged one); ``event_id`` is the delivery id."""
+    import time
+
+    from app.services.webhook_security import sign_standard_webhook
+
+    event_id = event_id or str(uuid.uuid4())
+    headers = {"Content-Type": "application/json"}
+    if provider == "lithic":
+        ts = int(time.time()) if timestamp is None else timestamp
+        headers["webhook-id"] = event_id
+        headers["webhook-timestamp"] = str(ts)
+        headers["webhook-signature"] = (
+            credential
+            if credential is not None
+            else sign_standard_webhook(_SECRET, event_id, ts, body)
+        )
+    elif provider == "nium":
+        headers["x-request-id"] = event_id
+        headers["x-partner-key"] = credential if credential is not None else _SECRET
+    else:
+        headers["Webhook-Signature"] = credential if credential is not None else _sign(body)
+    return headers
+
+
+#: Where Nium's documentation puts each template's figure and its currency
+#: (decisions §557; docs.nium.com …/issuing-and-card-events/settlement-debit,
+#: …/pos-approved, …/transaction-reversal, checked 2026-11-25). Stated here
+#: independently of the handler's own table so a drift in either is caught.
+NIUM_AMOUNT_FIELDS = {
+    "CARD_POS_APPROVED_WEBHOOK": ("transactionAmount", "transactionCurrency"),
+    "CARD_SETTLEMENT_DEBIT_WEBHOOK": ("authAmount", "authCurrency"),
+    "CARD_TRANSACTION_REVERSAL_WEBHOOK": ("transactionAmount", "transactionCurrency"),
+    "CARD_TRANSACTION_REVERSAL_ADVICE_WEBHOOK": ("transactionAmount", "transactionCurrency"),
+}
+
+
+def _nium_payload(template: str, token: str, *, amount=None, currency="USD", **extra) -> dict:
+    """A Nium delivery shaped as its documentation shows it: the figure, a
+    string in major units, in the field ``template`` names (§557)."""
+    payload = {"template": template, "cardHashId": token, "merchantName": "Acme Fuel", **extra}
+    fields = NIUM_AMOUNT_FIELDS.get(template)
+    if fields is not None and amount is not None:
+        payload[fields[0]] = str(amount)
+        if currency is not None:
+            payload[fields[1]] = currency
+    return payload
+
+
+def _settlement_body(token: str, *, amount, currency="USD") -> bytes:
+    return json.dumps(
+        _nium_payload("CARD_SETTLEMENT_DEBIT_WEBHOOK", token, amount=amount, currency=currency)
+    ).encode("utf-8")
 
 
 async def _seed_charged_card(
@@ -457,12 +515,12 @@ async def _seed_charged_card(
         return card.id
 
 
-async def _post_settlement(realdb, body: bytes) -> int:
+async def _post_settlement(realdb, body: bytes, *, event_id: str | None = None) -> int:
     async with realdb.client(key=TENANT, role=None) as c:
         resp = await c.post(
             "/api/cards/webhook/nium",
             content=body,
-            headers={"Content-Type": "application/json", "Webhook-Signature": _sign(body)},
+            headers=_webhook_headers("nium", body, event_id=event_id),
         )
     return resp.status_code
 
@@ -516,10 +574,70 @@ async def test_rebate_is_computed_on_the_settled_amount_not_the_authorization(re
     assert audits[0].details["rebate_base_source"] == "settled"
 
 
-async def test_a_settlement_with_no_amount_rebates_on_the_charged_figure(realdb):
-    """Some rails send a bare settlement envelope. The AUTHORIZED figure is
-    then the best evidence available — and the audit row says so, so a
-    reconciliation against the processor's statement can tell the two apart."""
+async def _refusals(mk, card_id) -> list:
+    async with mk() as s:
+        return list(
+            (
+                await s.execute(
+                    select(AuditLog).where(
+                        AuditLog.entity_id == card_id,
+                        AuditLog.action == "card.settlement_refused",
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+
+
+@pytest.mark.parametrize(
+    ("amount_charged", "amount", "currency"),
+    [
+        # A bare settlement envelope on an authorized card: the hold is not
+        # what cleared, so it is not written as if it were.
+        (Decimal("100.00"), None, "USD"),
+        # No figure anywhere: never the $10,000 limit, never zero either.
+        (None, 0, "USD"),
+        (Decimal("100.00"), "not-a-number", "USD"),
+        # A figure in another currency is not this card's figure.
+        (Decimal("100.00"), "80.00", "SGD"),
+    ],
+)
+async def test_a_settlement_with_no_usable_figure_is_refused_not_guessed(
+    realdb, amount_charged, amount, currency
+):
+    """Decisions §557. A clearing that states no usable figure is refused: the
+    card keeps its state and figure, no rebate is minted, no `card.settled`
+    row, and one `card.settlement_refused` row (reason `no_amount`) is left
+    for a person. The limit is never a stand-in, nor is the authorization."""
+    org_id = realdb.info(TENANT).org_id
+    mk = realdb.sessionmaker(TENANT)
+    token = f"tok_{uuid.uuid4().hex[:12]}"
+    card_id = await _seed_charged_card(
+        mk, org_id, token=token, limit=Decimal("10000.00"), amount_charged=amount_charged
+    )
+    await _set_card_settings(realdb, org_id)
+
+    body = _settlement_body(token, amount=amount, currency=currency)
+    with patch(
+        "app.services.payment_erp_sync.dispatch_payment_sync", new=AsyncMock()
+    ) as dispatched:
+        assert await _post_settlement(realdb, body) == 204
+    dispatched.assert_not_awaited()
+
+    card, rebates, audits = await _read_settlement(mk, card_id)
+    assert card.status == "charged"
+    assert card.amount_charged == amount_charged
+    assert rebates == [] and audits == []
+    (row,) = await _refusals(mk, card_id)
+    assert row.details["reason"] == "no_amount"
+    assert token not in json.dumps(row.details)
+
+
+async def test_a_nium_settlement_is_read_by_its_documented_auth_amount(realdb):
+    """Nium's `CARD_SETTLEMENT_DEBIT_WEBHOOK` states its figure in `authAmount`
+    (+ `authCurrency`), not `amount` / `transactionAmount` (§557). A body
+    carrying only the old, undocumented `amount` is no figure at all."""
     org_id = realdb.info(TENANT).org_id
     mk = realdb.sessionmaker(TENANT)
     token = f"tok_{uuid.uuid4().hex[:12]}"
@@ -528,39 +646,36 @@ async def test_a_settlement_with_no_amount_rebates_on_the_charged_figure(realdb)
     )
     await _set_card_settings(realdb, org_id)
 
-    assert await _post_settlement(realdb, _settlement_body(token, amount=None)) == 204
+    undocumented = json.dumps(
+        {
+            "template": "CARD_SETTLEMENT_DEBIT_WEBHOOK",
+            "cardHashId": token,
+            "amount": "95.00",
+            "transactionAmount": "95.00",
+        }
+    ).encode("utf-8")
+    assert await _post_settlement(realdb, undocumented) == 204
+    card, _rebates, audits = await _read_settlement(mk, card_id)
+    assert card.status == "charged" and audits == []
+    assert len(await _refusals(mk, card_id)) == 1
 
-    card, rebates, audits = await _read_settlement(mk, card_id)
-    # 1% of the $100 authorization — NOT 1% of the $10,000 limit.
-    assert rebates[0].amount == Decimal("1.00")
-    assert card.amount_charged == Decimal("100.00")
-    assert audits[0].details["rebate_base"] == "100.00"
-    assert audits[0].details["rebate_base_source"] == "authorized"
-
-
-async def test_no_usable_amount_anywhere_rebates_on_zero_not_the_limit(realdb):
-    """The headline case from the lead: a $10,000 card, a settlement carrying
-    no amount, and no authorization figure either. Pre-fix the `or` fallback
-    reached the card's authorization CEILING and booked a $100.00 rebate on
-    money that was never even claimed to have moved."""
-    org_id = realdb.info(TENANT).org_id
-    mk = realdb.sessionmaker(TENANT)
-    token = f"tok_{uuid.uuid4().hex[:12]}"
-    card_id = await _seed_charged_card(
-        mk, org_id, token=token, limit=Decimal("10000.00"), amount_charged=None
-    )
-    await _set_card_settings(realdb, org_id)
-
-    assert await _post_settlement(realdb, _settlement_body(token, amount=0)) == 204
-
+    # The documented shape, as Nium's example shows it: a string, major units.
+    documented = json.dumps(
+        {
+            "template": "CARD_SETTLEMENT_DEBIT_WEBHOOK",
+            "cardHashId": token,
+            "authAmount": "95.10",
+            "authCurrency": "usd",
+            "authCode": "417224",
+            "originalAuthCode": "417224",
+        }
+    ).encode("utf-8")
+    assert await _post_settlement(realdb, documented) == 204
     card, rebates, audits = await _read_settlement(mk, card_id)
     assert card.status == "completed"
-    assert rebates[0].amount == Decimal("0.00")
-    assert rebates[0].amount != Decimal("100.00"), "rebated on the card's limit"
-    assert audits[0].details["rebate_base"] == "0"
-    assert audits[0].details["rebate_base_source"] == "unknown"
-    # The limit is never written onto the spend column either.
-    assert card.amount_charged is None
+    assert card.amount_charged == Decimal("95.10")  # exact, never 0.9510 or float
+    assert rebates[0].amount == Decimal("0.95")
+    assert audits[0].details["rebate_base_source"] == "settled"
 
 
 async def test_an_over_settlement_rebates_on_what_actually_settled(realdb):
@@ -642,9 +757,9 @@ async def test_a_replayed_settlement_event_does_not_re_rebate_or_re_stamp(realdb
     await _set_card_settings(realdb, org_id)
 
     event_id = str(uuid.uuid4())
-    body = _settlement_body(token, amount="80.00", event_id=event_id)
-    assert await _post_settlement(realdb, body) == 204
-    assert await _post_settlement(realdb, body) == 204
+    body = _settlement_body(token, amount="80.00")
+    assert await _post_settlement(realdb, body, event_id=event_id) == 204
+    assert await _post_settlement(realdb, body, event_id=event_id) == 204
 
     card, rebates, audits = await _read_settlement(mk, card_id)
     assert len(rebates) == 1
@@ -725,20 +840,14 @@ async def test_an_authorization_event_still_stamps_the_authorized_figure(realdb)
         card_id = card.id
     await _set_card_settings(realdb, org_id)
 
-    body = json.dumps(
-        {
-            "eventType": "authorization.approved",
-            "webhookId": str(uuid.uuid4()),
-            "cardHashId": token,
-            "amount": "100.00",
-            "merchantName": "Acme Fuel",
-        }
-    ).encode("utf-8")
+    body = json.dumps(_nium_payload("CARD_POS_APPROVED_WEBHOOK", token, amount="100.00")).encode(
+        "utf-8"
+    )
     async with realdb.client(key=TENANT, role=None) as c:
         resp = await c.post(
             "/api/cards/webhook/nium",
             content=body,
-            headers={"Content-Type": "application/json", "Webhook-Signature": _sign(body)},
+            headers=_webhook_headers("nium", body),
         )
     assert resp.status_code == 204
 
@@ -747,6 +856,205 @@ async def test_an_authorization_event_still_stamps_the_authorized_figure(realdb)
     assert card.amount_charged == Decimal("100.00")
     assert rebates == []
     assert audits == []
+
+
+async def _post_card_event(realdb, event_type: str, token: str, amount: str) -> int:
+    body = json.dumps(_nium_payload(event_type, token, amount=amount)).encode("utf-8")
+    async with realdb.client(key=TENANT, role=None) as c:
+        resp = await c.post(
+            "/api/cards/webhook/nium",
+            content=body,
+            headers=_webhook_headers("nium", body),
+        )
+    return resp.status_code
+
+
+async def _post_card_event_id(realdb, event_type: str, token: str, amount: str, event_id: str):
+    body = json.dumps(_nium_payload(event_type, token, amount=amount)).encode("utf-8")
+    async with realdb.client(key=TENANT, role=None) as c:
+        resp = await c.post(
+            "/api/cards/webhook/nium",
+            content=body,
+            headers=_webhook_headers("nium", body, event_id=event_id),
+        )
+    return resp.status_code
+
+
+async def _run_card_leg(realdb, amount=Decimal("100.00")):
+    """A run's card leg as the run's execution leaves it: the payment
+    `completed`, its card issued (`active`) and linked to it."""
+    org_id = realdb.info(TENANT).org_id
+    mk = realdb.sessionmaker(TENANT)
+    token = f"tok_{uuid.uuid4().hex[:12]}"
+    inv = await _seed_invoice(mk, org_id, amount=amount)
+    run_id, pay_id = await _seed_run(mk, org_id, inv, amount=amount, creator_id=None)
+    async with mk() as s:
+        await s.execute(
+            Payment.__table__.update().where(Payment.id == pay_id).values(status="completed")
+        )
+        card = _card_row(inv, org_id, provider_card_id=token, limit=amount, provider="nium")
+        card.payment_id = pay_id
+        s.add(card)
+        await s.commit()
+    await _set_card_settings(realdb, org_id)
+    return org_id, run_id, pay_id, token
+
+
+async def _leg(realdb, pay_id):
+    """The run payment and its coverage, read the way the money callers read it."""
+    from app.services.payment_settlement_record import payment_coverage
+
+    async with realdb.sessionmaker(TENANT)() as s:
+        payment = await s.get(Payment, pay_id)
+        return payment, (await payment_coverage(s, payment, "USD")).state
+
+
+async def test_an_authorization_alone_leaves_the_run_card_leg_in_flight(realdb):
+    """Decisions §543: an authorization is a hold the network can still reverse
+    or let expire — no money moved. The card reads `charged`, but nothing is
+    written onto the run payment, coverage is `in_flight`, and the payment
+    sync is not dispatched (it would only skip the leg)."""
+    _org_id, _run_id, pay_id, token = await _run_card_leg(realdb)
+
+    with patch(
+        "app.services.payment_erp_sync.dispatch_payment_sync", new=AsyncMock()
+    ) as dispatched:
+        assert await _post_card_event(realdb, "CARD_POS_APPROVED_WEBHOOK", token, "100.00") == 204
+
+    payment, state = await _leg(realdb, pay_id)
+    assert payment.settled_amount is None and payment.settled_currency is None
+    assert state == "in_flight"
+    dispatched.assert_not_awaited()
+
+
+async def test_the_settlement_writes_the_charge_onto_its_payment_and_dispatches_once(realdb):
+    """Decisions §537 / §543: the settlement is the money. Its figure is written
+    onto the leg's payment, coverage judges it (here short: 90 of 100), and the
+    run's payment sync is re-dispatched exactly once, with the run and org."""
+    org_id, run_id, pay_id, token = await _run_card_leg(realdb)
+
+    with patch(
+        "app.services.payment_erp_sync.dispatch_payment_sync", new=AsyncMock()
+    ) as dispatched:
+        assert await _post_card_event(realdb, "CARD_POS_APPROVED_WEBHOOK", token, "100.00") == 204
+        dispatched.assert_not_awaited()
+        assert (
+            await _post_card_event(realdb, "CARD_SETTLEMENT_DEBIT_WEBHOOK", token, "90.00") == 204
+        )
+
+    dispatched.assert_awaited_once_with(run_id, org_id)
+    payment, state = await _leg(realdb, pay_id)
+    assert (payment.settled_amount, payment.settled_currency) == (Decimal("90.00"), "USD")
+    assert state == "short"
+
+
+async def test_a_full_settlement_covers_the_leg(realdb):
+    _org_id, _run_id, pay_id, token = await _run_card_leg(realdb)
+
+    with patch("app.services.payment_erp_sync.dispatch_payment_sync", new=AsyncMock()):
+        assert await _post_card_event(realdb, "CARD_POS_APPROVED_WEBHOOK", token, "100.00") == 204
+        assert (
+            await _post_card_event(realdb, "CARD_SETTLEMENT_DEBIT_WEBHOOK", token, "100.00") == 204
+        )
+
+    payment, state = await _leg(realdb, pay_id)
+    assert payment.settled_amount == Decimal("100.00")
+    assert state == "covered"
+
+
+@pytest.mark.parametrize(
+    "follow_up", ["authorization.reversal", "authorization.expired", "authorization.declined"]
+)
+async def test_a_reversed_or_expired_authorization_never_counts_as_paid(realdb, follow_up):
+    """The case §543 exists for: an authorization that is then reversed,
+    expires or is declined moved no money. The leg was never counted (the
+    authorization wrote nothing), so it stays in flight; nothing to undo."""
+    _org_id, _run_id, pay_id, token = await _run_card_leg(realdb)
+
+    with patch(
+        "app.services.payment_erp_sync.dispatch_payment_sync", new=AsyncMock()
+    ) as dispatched:
+        assert await _post_card_event(realdb, "CARD_POS_APPROVED_WEBHOOK", token, "100.00") == 204
+        assert await _post_card_event(realdb, follow_up, token, "100.00") == 204
+
+    payment, state = await _leg(realdb, pay_id)
+    assert payment.settled_amount is None
+    assert state == "in_flight"
+    dispatched.assert_not_awaited()
+
+
+async def test_a_figure_stamped_at_the_authorization_does_not_count_until_settled(realdb):
+    """A leg whose payment carries a figure while its card is only authorized
+    (what the §537 build wrote at the authorization, before §543) reads
+    `in_flight`: only the card's settlement is evidence of money moved."""
+    _org_id, _run_id, pay_id, token = await _run_card_leg(realdb)
+    with patch("app.services.payment_erp_sync.dispatch_payment_sync", new=AsyncMock()):
+        assert await _post_card_event(realdb, "CARD_POS_APPROVED_WEBHOOK", token, "100.00") == 204
+    async with realdb.sessionmaker(TENANT)() as s:
+        await s.execute(
+            Payment.__table__.update()
+            .where(Payment.id == pay_id)
+            .values(settled_amount=Decimal("100.00"), settled_currency="USD")
+        )
+        await s.commit()
+
+    _payment, state = await _leg(realdb, pay_id)
+    assert state == "in_flight"
+
+
+async def test_a_replayed_settlement_records_once_and_dispatches_once(realdb):
+    """The same delivery twice (the provider's retry): deduped by event id, so
+    the figure is written once and the sync is dispatched once."""
+    org_id, run_id, pay_id, token = await _run_card_leg(realdb)
+    settle_id = str(uuid.uuid4())
+
+    with patch(
+        "app.services.payment_erp_sync.dispatch_payment_sync", new=AsyncMock()
+    ) as dispatched:
+        assert await _post_card_event(realdb, "CARD_POS_APPROVED_WEBHOOK", token, "100.00") == 204
+        for _ in range(2):
+            assert (
+                await _post_card_event_id(
+                    realdb, "CARD_SETTLEMENT_DEBIT_WEBHOOK", token, "100.00", settle_id
+                )
+                == 204
+            )
+
+    dispatched.assert_awaited_once_with(run_id, org_id)
+    payment, _ = await _leg(realdb, pay_id)
+    assert payment.settled_amount == Decimal("100.00")
+    async with realdb.sessionmaker(TENANT)() as s:
+        rebates = (
+            (
+                await s.execute(
+                    select(CardRebate).join(VirtualCard).where(VirtualCard.payment_id == pay_id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+    assert len(rebates) == 1
+
+
+async def test_a_charge_on_a_card_no_run_payment_owns_writes_no_payment(realdb):
+    """A `/cards/generate` card books no `Payment`: nothing to write, nothing
+    to dispatch."""
+    org_id = realdb.info(TENANT).org_id
+    mk = realdb.sessionmaker(TENANT)
+    token = f"tok_{uuid.uuid4().hex[:12]}"
+    inv = await _seed_invoice(mk, org_id, amount=Decimal("100.00"))
+    async with mk() as s:
+        s.add(
+            _card_row(inv, org_id, provider_card_id=token, limit=Decimal("100.00"), provider="nium")
+        )
+        await s.commit()
+    await _set_card_settings(realdb, org_id)
+
+    with patch(
+        "app.services.payment_erp_sync.dispatch_payment_sync", new=AsyncMock()
+    ) as dispatched:
+        assert await _post_card_event(realdb, "CARD_POS_APPROVED_WEBHOOK", token, "100.00") == 204
+    dispatched.assert_not_awaited()
 
 
 # ===========================================================================
@@ -1385,3 +1693,360 @@ async def test_every_rebate_aggregate_carries_the_entity_scope(realdb):
     assert rebate_aggregates >= 3, (
         f"expected the month, YTD and exclusion-count aggregates; found {rebate_aggregates}"
     )
+
+
+# --- Further clearings on a settled card (decisions §554) -----------------
+
+
+def _lithic_events(*tokens: str) -> list[dict]:
+    return [{"token": t, "type": "CLEARING"} for t in tokens]
+
+
+async def _clearing_rows(realdb, card_id) -> list:
+    from app.models.virtual_card import CardTransactionEvent
+
+    async with realdb.sessionmaker(TENANT)() as s:
+        return list(
+            (
+                await s.execute(
+                    select(CardTransactionEvent).where(
+                        CardTransactionEvent.virtual_card_id == card_id,
+                        CardTransactionEvent.kind == "clearing",
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+
+
+async def _card_audits(realdb, card_id, action):
+    async with realdb.sessionmaker(TENANT)() as s:
+        return list(
+            (
+                await s.execute(
+                    select(AuditLog).where(AuditLog.entity_id == card_id, AuditLog.action == action)
+                )
+            )
+            .scalars()
+            .all()
+        )
+
+
+async def _over_flags(realdb, card_id):
+    from app.models.exception import Exception as APException
+
+    async with realdb.sessionmaker(TENANT)() as s:
+        card = await s.get(VirtualCard, card_id)
+        return [
+            e
+            for e in (
+                await s.execute(
+                    select(APException).where(
+                        APException.invoice_id == card.invoice_id,
+                        APException.exception_type == "payment_reconciliation",
+                    )
+                )
+            )
+            .scalars()
+            .all()
+            if (e.erp_report or {}).get("kind") == "card_over_settled"
+        ]
+
+
+async def test_a_lithic_incremental_capture_adds_to_the_card_and_the_run_payment(realdb):
+    """Lithic reports the transaction's CUMULATIVE settled amount, its events
+    in order. A second clearing on the settled card adds the difference: the
+    card and the run payment carry the total (exact Decimal), the pending
+    rebate is re-based on it, one `card.clearing_added` row, the payment sync
+    re-dispatched once more. A redelivery of that clearing under a new delivery
+    id (past the Redis dedupe) changes nothing."""
+    from tests.test_card_authorization_lapse import _body, _leg_with_card, _post
+
+    card_id, pay_id, token = await _leg_with_card(realdb, "lithic", amount=Decimal("150.00"))
+    both = _lithic_events("c1", "c2")
+    with patch(
+        "app.services.payment_erp_sync.dispatch_payment_sync", new=AsyncMock()
+    ) as dispatched:
+        for body in (
+            _body("lithic", token, "authorization", amount="150.00"),
+            _body("lithic", token, "settlement", amount="100.00", events=_lithic_events("c1")),
+            _body("lithic", token, "settlement", amount="150.00", events=both),
+            # The same second clearing, delivered again under another id.
+            _body("lithic", token, "settlement", amount="150.00", events=both),
+        ):
+            assert await _post(realdb, "lithic", body) == 204
+    assert dispatched.await_count == 2  # first settlement + the one further clearing
+
+    async with realdb.sessionmaker(TENANT)() as s:
+        card = await s.get(VirtualCard, card_id)
+        rebate = (
+            await s.execute(select(CardRebate).where(CardRebate.virtual_card_id == card_id))
+        ).scalar_one()
+    assert card.status == "completed" and card.amount_charged == Decimal("150.00")
+    assert rebate.amount == Decimal("1.50")  # 1% of the total cleared
+    payment, state = await _leg(realdb, pay_id)
+    assert payment.settled_amount == Decimal("150.00") and state == "covered"
+    (row,) = await _card_audits(realdb, card_id, "card.clearing_added")
+    assert row.details["cleared_amount"] == "50.00"  # string Decimal, never float
+    assert row.details["amount_charged"] == "150.00"
+    assert row.details["rebate_amount"] == "1.50"
+    assert token not in json.dumps(row.details)
+    assert sorted(r.event_key for r in await _clearing_rows(realdb, card_id)) == [
+        "event:c1",
+        "event:c2",
+    ]
+    assert await _over_flags(realdb, card_id) == []
+    # The run payment's settled figure changed after it completed: that is a
+    # payment-state change with its own row on the payment (decisions §562).
+    async with realdb.sessionmaker(TENANT)() as s:
+        (changed,) = (
+            (
+                await s.execute(
+                    select(AuditLog).where(
+                        AuditLog.entity_id == pay_id,
+                        AuditLog.action == "payment.settled_amount_changed",
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+    assert changed.entity_type == "payment"
+    assert changed.details["from"] == "100.00" and changed.details["to"] == "150.00"
+    assert changed.details["currency"] == "USD"
+    assert token not in json.dumps(changed.details)
+
+
+async def test_a_lithic_retry_is_deduped_and_a_second_clearing_still_applies(realdb):
+    """Decisions §555 + §554 together. Lithic's `webhook-id` is one per
+    delivery and the same on every retry: a retry of the first clearing
+    (same id) is deduped, while the second clearing — a new delivery, a new id
+    — is applied once, keyed by its own `events` token, not its delivery id."""
+    from tests.test_card_authorization_lapse import _body, _leg_with_card, _post
+
+    card_id, pay_id, token = await _leg_with_card(realdb, "lithic", amount=Decimal("150.00"))
+    first = _body("lithic", token, "settlement", amount="100.00", events=_lithic_events("c1"))
+    second = _body(
+        "lithic", token, "settlement", amount="150.00", events=_lithic_events("c1", "c2")
+    )
+    first_id, second_id = str(uuid.uuid4()), str(uuid.uuid4())
+    with patch(
+        "app.services.payment_erp_sync.dispatch_payment_sync", new=AsyncMock()
+    ) as dispatched:
+        assert await _post(realdb, "lithic", first, event_id=first_id) == 204
+        assert await _post(realdb, "lithic", first, event_id=first_id) == 204  # retry
+        assert await _post(realdb, "lithic", second, event_id=second_id) == 204
+        assert await _post(realdb, "lithic", second, event_id=second_id) == 204  # retry
+    assert dispatched.await_count == 2
+
+    payment, state = await _leg(realdb, pay_id)
+    assert payment.settled_amount == Decimal("150.00") and state == "covered"
+    assert len(await _card_audits(realdb, card_id, "card.settled")) == 1
+    (row,) = await _card_audits(realdb, card_id, "card.clearing_added")
+    assert row.details["cleared_amount"] == "50.00"
+
+
+async def test_a_lithic_clearing_without_events_is_keyed_by_its_delivery(realdb):
+    """No `events` list: the delivery id (with the transaction token and its
+    cumulative figure) names the clearing (decisions §561). A higher total
+    applies once; a retry of that delivery (same `webhook-id`) is a replay; the
+    same total under a NEW delivery adds nothing and is refused on the record."""
+    from tests.test_card_authorization_lapse import _body, _leg_with_card, _post
+
+    card_id, pay_id, token = await _leg_with_card(realdb, "lithic", amount=Decimal("150.00"))
+    second_id = str(uuid.uuid4())
+    with patch("app.services.payment_erp_sync.dispatch_payment_sync", new=AsyncMock()):
+        for amount, event_id in (
+            ("100.00", None),
+            ("150.00", second_id),
+            ("150.00", second_id),  # retry of the same delivery
+            ("150.00", None),  # the same total, another delivery
+        ):
+            body = _body("lithic", token, "settlement", amount=amount)
+            assert await _post(realdb, "lithic", body, event_id=event_id) == 204
+    payment, _state = await _leg(realdb, pay_id)
+    assert payment.settled_amount == Decimal("150.00")
+    assert len(await _card_audits(realdb, card_id, "card.clearing_added")) == 1
+    (refused,) = await _card_audits(realdb, card_id, "card.clearing_refused")
+    assert refused.details["reason"] == "not_an_increase"
+    keys = [r.event_key for r in await _clearing_rows(realdb, card_id)]
+    assert len(keys) == 3 and all(k.startswith("delivery:") for k in keys)
+
+
+async def test_a_lithic_clearing_return_clearing_without_events_is_three_clearings(realdb):
+    """Decisions §561: a clearing to 100.00, a RETURN to 80.00 and a clearing
+    back to 100.00, none carrying `events`. Keyed by the cumulative total the
+    third collided with the first and was dropped unseen, leaving the refused
+    return as the last word on the card. Keyed by delivery, each is recorded:
+    the card stays at 100.00 (a return is never applied, §544), and both
+    the return and the re-clearing are on the record for the refund flow."""
+    from tests.test_card_authorization_lapse import _body, _leg_with_card, _post
+
+    card_id, pay_id, token = await _leg_with_card(realdb, "lithic", amount=Decimal("100.00"))
+    with patch(
+        "app.services.payment_erp_sync.dispatch_payment_sync", new=AsyncMock()
+    ) as dispatched:
+        for amount in ("100.00", "80.00", "100.00"):
+            body = _body("lithic", token, "settlement", amount=amount)
+            assert await _post(realdb, "lithic", body) == 204
+    assert dispatched.await_count == 1  # the first settlement only
+
+    async with realdb.sessionmaker(TENANT)() as s:
+        card = await s.get(VirtualCard, card_id)
+    assert card.amount_charged == Decimal("100.00")
+    payment, state = await _leg(realdb, pay_id)
+    assert payment.settled_amount == Decimal("100.00") and state == "covered"
+    assert await _card_audits(realdb, card_id, "card.clearing_added") == []
+    refused = await _card_audits(realdb, card_id, "card.clearing_refused")
+    assert [r.details["reason"] for r in refused] == ["not_an_increase", "not_an_increase"]
+    rows = await _clearing_rows(realdb, card_id)
+    assert len(rows) == 3
+    assert len({r.event_key for r in rows}) == 3
+
+
+async def test_clearings_past_what_the_card_pays_open_one_blocking_flag(realdb):
+    """The total crosses the run payment's amount: the overcharge is recorded
+    (the money moved) and ONE payment-blocking `payment_reconciliation` flag,
+    `card_over_settled`, with the catalogue's settlement-over finding, however
+    many clearings pass the figure."""
+    from app.services.payment_gates import PAYMENT_BLOCKING_EXCEPTION_TYPES
+    from tests.test_card_authorization_lapse import _body, _leg_with_card, _post
+
+    card_id, pay_id, token = await _leg_with_card(realdb, "mock")
+    with patch("app.services.payment_erp_sync.dispatch_payment_sync", new=AsyncMock()):
+        for amount in ("100.00", "20.00", "5.00"):
+            assert (
+                await _post(realdb, "mock", _body("mock", token, "settlement", amount=amount))
+                == 204
+            )
+
+    async with realdb.sessionmaker(TENANT)() as s:
+        card = await s.get(VirtualCard, card_id)
+    assert card.amount_charged == Decimal("125.00")
+    payment, _state = await _leg(realdb, pay_id)
+    assert payment.settled_amount == Decimal("125.00")
+    (flag,) = await _over_flags(realdb, card_id)
+    assert "payment_reconciliation" in PAYMENT_BLOCKING_EXCEPTION_TYPES
+    assert flag.status == "open"
+    assert flag.description_code == "exception.settlement_amount_over"
+    assert flag.erp_report["virtual_card_id"] == str(card_id)
+    assert flag.erp_report["settled_amount"] == "120.00"  # the total that crossed it
+    assert flag.erp_report["authorized_amount"] == "100.00"
+    assert token not in json.dumps(flag.erp_report)
+    assert len(await _card_audits(realdb, card_id, "card.clearing_added")) == 2
+
+
+@pytest.mark.parametrize(
+    ("provider", "second", "reason"),
+    [
+        ("lithic", "60.00", "not_an_increase"),  # a RETURN lowered the total
+        ("mock", "-10.00", "not_an_increase"),
+        ("nium", "20.00", "provider_single_settlement"),
+    ],
+)
+async def test_a_further_clearing_that_cannot_be_applied_is_refused_explicitly(
+    realdb, provider, second, reason
+):
+    """A decrease is a refund, a different flow (as a reversal after settlement
+    is, §544), and Nium documents one settlement per authorization: the card,
+    the run's figure and the rebate stand, nothing is re-dispatched, and a
+    `card.clearing_refused` row names why."""
+    from tests.test_card_authorization_lapse import _body, _leg_with_card, _post
+
+    card_id, pay_id, token = await _leg_with_card(realdb, provider)
+    events_2 = (
+        [{"token": "c1", "type": "CLEARING"}, {"token": "r1", "type": "RETURN"}]
+        if provider == "lithic"
+        else None
+    )
+    with patch(
+        "app.services.payment_erp_sync.dispatch_payment_sync", new=AsyncMock()
+    ) as dispatched:
+        assert (
+            await _post(
+                realdb,
+                provider,
+                _body(
+                    provider,
+                    token,
+                    "settlement",
+                    amount="100.00",
+                    events=_lithic_events("c1") if provider == "lithic" else None,
+                ),
+            )
+            == 204
+        )
+        assert (
+            await _post(
+                realdb,
+                provider,
+                _body(provider, token, "settlement", amount=second, events=events_2),
+            )
+            == 204
+        )
+    assert dispatched.await_count == 1  # the first settlement only
+
+    payment, state = await _leg(realdb, pay_id)
+    assert payment.settled_amount == Decimal("100.00") and state == "covered"
+    async with realdb.sessionmaker(TENANT)() as s:
+        card = await s.get(VirtualCard, card_id)
+        rebate = (
+            await s.execute(select(CardRebate).where(CardRebate.virtual_card_id == card_id))
+        ).scalar_one()
+    assert card.amount_charged == Decimal("100.00") and rebate.amount == Decimal("1.00")
+    assert await _card_audits(realdb, card_id, "card.clearing_added") == []
+    (row,) = await _card_audits(realdb, card_id, "card.clearing_refused")
+    assert row.details["reason"] == reason
+    assert row.details["amount_charged"] == "100.00"
+
+    # A further clearing that may hide money moved (a Nium second settlement)
+    # reaches a person as a blocking reconciliation flag, not only an audit
+    # row; a decrease (a refund) is the refund flow's (decisions §562).
+    from tests.test_card_authorization_lapse import _reconciliation_flags
+
+    flags = await _reconciliation_flags(realdb, card_id)
+    if reason == "provider_single_settlement":
+        (flag,) = flags
+        assert flag.status == "open"
+        assert flag.erp_report["kind"] == "card_clearing_refused"
+        assert flag.erp_report["reason"] == reason
+        assert flag.description_code == "exception.card_clearing_refused"
+        assert token not in json.dumps(flag.erp_report)
+    else:
+        assert flags == []
+    async with realdb.sessionmaker(TENANT)() as s:
+        assert (
+            await s.execute(
+                select(AuditLog).where(
+                    AuditLog.entity_id == pay_id,
+                    AuditLog.action == "payment.settled_amount_changed",
+                )
+            )
+        ).scalars().all() == []
+
+
+async def test_a_lithic_partly_cleared_transaction_is_read_by_its_settled_amount(realdb):
+    """A multi-completion transaction: authorized 500.00, cleared 200.00 then
+    300.00. Lithic's deprecated `amount` may still read the whole 500.00 while
+    `settled_amount` reads what cleared, so the settled figure is the one
+    recorded: 200.00 at the first clearing, 500.00 after the second."""
+    from tests.test_card_authorization_lapse import _body, _leg_with_card, _post
+
+    card_id, pay_id, token = await _leg_with_card(realdb, "lithic", amount=Decimal("500.00"))
+
+    def _settled(settled: int, events):
+        body = json.loads(_body("lithic", token, "settlement", amount="500.00", events=events))
+        body["settled_amount"] = settled  # minor units
+        return json.dumps(body).encode("utf-8")
+
+    with patch("app.services.payment_erp_sync.dispatch_payment_sync", new=AsyncMock()):
+        assert await _post(realdb, "lithic", _settled(20000, _lithic_events("c1"))) == 204
+        payment, state = await _leg(realdb, pay_id)
+        assert payment.settled_amount == Decimal("200.00") and state == "short"
+        assert await _post(realdb, "lithic", _settled(50000, _lithic_events("c1", "c2"))) == 204
+
+    payment, state = await _leg(realdb, pay_id)
+    assert payment.settled_amount == Decimal("500.00") and state == "covered"
+    (row,) = await _card_audits(realdb, card_id, "card.clearing_added")
+    assert row.details["cleared_amount"] == "300.00"

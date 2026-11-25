@@ -203,6 +203,10 @@ ERP_PRODUCER_MODULES = (
     "app/api/erp_webhook.py",
     "app/services/erp_payment_writeback.py",
     "app/services/payment_erp_sync.py",
+    # The generic webhook's transition, shared with the polling sweep (§528).
+    "app/services/erp_status_report.py",
+    # The status polling sweep's `settled_no_payment` flag (decisions §532).
+    "app/services/erp_status_poll_sweep.py",
 )
 
 
@@ -221,6 +225,9 @@ DIRECT_EXCEPTION_PRODUCER_MODULES = (
     "app/services/payment_settlement.py",
     # The void's payee comparison (decisions §383).
     "app/services/payee_stamp.py",
+    # A clearing on a cancelled card (decisions §549), opened through the
+    # reconciliation helper so it dedupes by kind.
+    "app/api/cards.py",
 )
 
 #: Direct `create_exception` callers whose description is a PERSON's words, so

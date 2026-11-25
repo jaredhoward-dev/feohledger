@@ -7,7 +7,8 @@ surface; the second shipped **outbound webhooks** (see [Outbound
 webhooks](#outbound-webhooks)); the third shipped the **published, versioned
 OpenAPI spec + a developer docs page** for the `/api/v1` surface (see
 [Published OpenAPI spec](#published-openapi-spec) and [Versioning &
-deprecation policy](#versioning--deprecation-policy)).
+deprecation policy](#versioning--deprecation-policy)). Changes within `v1`
+are announced, dated, in [Changes](#changes).
 
 ## Auth model
 
@@ -315,6 +316,40 @@ build against it safely:
 - **The kill switch is not a deprecation.** `FEOH_PUBLIC_API_ENABLED=false` is an
   operational stop (incident response), not a contract change; it 404s the whole
   surface immediately and uniformly.
+- **A change within `v1` is announced in [Changes](#changes)**, dated, not by
+  bumping `info.version` (which tracks the path prefix).
+
+## Changes
+
+Changes to the `v1` contract an integrator has to act on, newest first. The
+list is one constant, `app/api/v1_changelog.py::PUBLIC_API_CHANGES`, published
+as `info.x-changelog` in `/api/v1/openapi.json` and under **Changes** on
+`/api/v1/docs`; each entry below carries its id, and
+`tests/test_public_api_changelog.py` fails when this section and the constant
+disagree. Changes before 2026-11-25 are not listed.
+
+Nothing changes a customer's subscriptions for them (decisions §548). For each
+entry, `python scripts/public_api_change_report.py --change <id>` lists,
+read-only, the active subscriptions it affects that lack the event types it
+asks for, so the operator can tell those organisations directly.
+
+### 2026-11-25: A voided payment sends payment.voided, no longer invoice.approved
+
+Id `2026-11-25-void-events` (decisions §542). A payment void
+(`POST /api/payments/{id}/void`) takes the invoice from `payment_scheduled` /
+`paid` back to `approved` without anyone approving it. That return used to send
+a second `invoice.approved`; it now sends **`payment.voided`** instead, with the
+same invoice fields, and `invoice.approved` is sent only for an approval.
+
+- **If your receiver re-queued a bill, or undid a settlement, on the
+  `invoice.approved` that followed a void**, subscribe to `payment.voided` and
+  do it there. Without the subscription you receive nothing for a void.
+- **New in the same release: `invoice.erp_bill_voided`**, sent when an
+  invoice's bill is voided in the ERP from a duplicate or fraud flag. It is not
+  an approval: never re-post the bill on it.
+- Affects subscriptions to `invoice.approved`; subscribe to `payment.voided`
+  and `invoice.erp_bill_voided`. Existing subscriptions are not changed for
+  you. Payloads: [§ Payload](#payload).
 
 ## Config
 
@@ -375,8 +410,8 @@ gated on the `organizations` table existing — mirrors 0055).
 
 ### Event catalog
 
-`invoice.approved`, `invoice.approval_recalled`, `payment.settled`,
-`exception.raised` (see `app/models/webhook.py::WEBHOOK_EVENT_TYPES`). The
+`invoice.approved`, `invoice.approval_recalled`, `invoice.erp_bill_voided`,
+`payment.settled`, `payment.voided`, `exception.raised` (see `app/models/webhook.py::WEBHOOK_EVENT_TYPES`). The
 catalog is plain strings, so adding one needs no migration — but it does need a
 `data` model and summary in `app/schemas/webhook_events.py` and an entry in the
 admin page's picker (`frontend/src/lib/types/webhooks.ts`);
@@ -389,6 +424,16 @@ back (`POST /api/invoices/{id}/recall-approval`). The invoice is back at
 `ready_for_review` and is not payable until it is approved again, which emits a
 fresh `invoice.approved`. A receiver that queued a bill or told the supplier it
 would be paid on the approval should undo that here.
+
+**`invoice.erp_bill_voided`** and **`payment.voided`** (decisions §542) are the
+two ways an invoice returns to `approved` without anyone approving it: its bill
+was voided in the ERP from a duplicate / fraud flag (§539), or a payment on it
+was voided (`POST /api/payments/{id}/void`). Neither emits `invoice.approved`:
+a receiver that posts approved invoices to its ERP would post the bill again,
+on a flagged invoice in the first case. `invoice.erp_bill_voided` carries the
+invoice fields plus the voided bill's `erp_document_id`; do not re-post the
+invoice. `payment.voided` carries the invoice fields; a receiver that acted on
+`payment.settled` should undo that.
 
 ### Signing
 
@@ -462,13 +507,43 @@ records the prefix and the window — never either secret.
             "amount": "123.45", "currency": "USD", "status": "approved" } }
 ```
 
+`payment.settled` and `payment.voided` carry the same invoice fields, as the
+invoice stood after the transition (`status` is `paid` for a settlement and
+`approved` after a void):
+
+```jsonc
+{ "id": "payment.settled:<occurrence-id>", "type": "payment.settled",
+  "created_at": "<iso8601>", "organization_id": "<org-id>",
+  "data": { "invoice_id": "…", "invoice_number": "…", "vendor_name": "…",
+            "amount": "123.45", "currency": "USD", "status": "paid" } }
+```
+
+```jsonc
+{ "id": "payment.voided:<occurrence-id>", "type": "payment.voided",
+  "created_at": "<iso8601>", "organization_id": "<org-id>",
+  "data": { "invoice_id": "…", "invoice_number": "…", "vendor_name": "…",
+            "amount": "123.45", "currency": "USD", "status": "approved" } }
+```
+
+`invoice.erp_bill_voided` carries the invoice fields plus `erp_document_id`, the
+ERP's id of the bill that was voided (the invoice no longer holds it). The
+invoice is back at `approved`; its duplicate or fraud flag stays open:
+
+```jsonc
+{ "id": "invoice.erp_bill_voided:<occurrence-id>", "type": "invoice.erp_bill_voided",
+  "created_at": "<iso8601>", "organization_id": "<org-id>",
+  "data": { "invoice_id": "…", "invoice_number": "…", "vendor_name": "…",
+            "amount": "123.45", "currency": "USD", "status": "approved",
+            "erp_document_id": "…" } }
+```
+
 #### The event id identifies the OCCURRENCE, not the entity
 
 `<occurrence-id>` is a fresh id minted by `workflow_engine.transition_invoice`
 for the transition it just committed — **not** the invoice id. An invoice
-reaches `approved` more than once (`POST /api/payments/{id}/void` takes a paid
-invoice back to `approved`) and `paid` more than once (a later run re-pays it),
-and the integrator has to hear about each one.
+reaches `approved` more than once (recalled and approved again) and `paid` more
+than once (voided, then re-paid by a later run), and the integrator has to hear
+about each one.
 
 Keyed on the invoice, the second occurrence was permanently undeliverable: the
 `(subscription_id, event_id)` unique index rejected the insert and the emitter
@@ -624,6 +699,11 @@ paths) emits exactly once, here — once per *transition*, each carrying the
 occurrence id that transition minted, and only once the caller commits
 the transition.
 
+**`invoice.erp_bill_voided` / `payment.voided`** come from the same hook,
+keyed off the transition's action (`workflow_engine.ERP_VOID_ACTION` /
+`PAYMENT_VOID_ACTION`) and matched before the `approved` status, so neither
+also emits `invoice.approved`.
+
 **`invoice.approval_recalled`** comes from the same hook, but keyed off the
 transition's action (`workflow_engine.RECALL_ACTION`, the one action allowed to
 walk the recall edges) rather than its resulting status — `ready_for_review` is
@@ -736,9 +816,10 @@ writes a PII-free audit row (`webhook_subscription.created/updated/deleted`,
 These are explicitly **out of scope** for the current slices and tracked as
 later roadmap work:
 
-- **Full developer portal** — the published [OpenAPI spec + Swagger UI docs
-  page](#published-openapi-spec) ship now; a richer hosted portal (guides,
-  changelog, API-key self-service from the docs) is later work.
+- **Full developer portal** — the published [OpenAPI spec + docs
+  page](#published-openapi-spec) and the dated [Changes](#changes) list ship
+  now; a richer hosted portal (guides, API-key self-service from the docs) is
+  later work.
 - **Write scopes + endpoints** — only `read` is minted today. The scope plumbing
   (`scopes` column + `require_api_scope`) is in place for it.
 - ~~**Frontend key-management UI**~~ — **shipped** (corrected 2026-09-06; this

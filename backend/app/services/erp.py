@@ -20,7 +20,7 @@ from app.services.erp_adapters import (
 from app.services.erp_adapters.base import ACCOUNT_NOT_LINKED, NOT_CONNECTED
 from app.services.erp_adapters.deep_links import erp_document_url
 from app.services.erp_export_gate import erp_export_refusal
-from app.services.erp_link_realm import connection_realm, legacy_links_trusted
+from app.services.erp_link_realm import bill_realm, connection_realm, legacy_links_trusted
 from app.services.erp_status_sync import status_sync_active
 from app.services.gl_chart import resolve_erp_account_ids
 from app.services.vendor_erp_links import vendor_erp_ids
@@ -375,9 +375,13 @@ async def retry_erp(
     invoice: Invoice,
     *,
     actor_id: uuid.UUID | None = None,
+    details: dict | None = None,
 ) -> None:
     """Prepare a failed ERP push for retry. Only valid if the invoice was
     previously approved.
+
+    ``details``: fixed literals for the ``invoice.erp_retried`` row (the
+    call-budget re-send sweep marks its retry, decisions §521).
 
     Resets the retry counter and transitions to sending_to_erp; the actual
     ERP call is the caller's job via `dispatch_erp` (which resolves the
@@ -412,6 +416,7 @@ async def retry_erp(
         InvoiceStatus.sending_to_erp,
         actor_id=actor_id,
         action_name="invoice.erp_retried",
+        details=details,
     )
     await db.commit()
 
@@ -1041,8 +1046,9 @@ async def _call_erp(
             # leave a confirmed bill reading as never posted.
             new_state["erp_reference"] = reference
             # The ERP company the bill lives in: an ERP's ids are per company,
-            # so the status sync matches a bill id only within it (§295).
-            new_state["erp_realm"] = connection_realm(config)
+            # so the status sync matches a bill id only within it (§295). The
+            # mock's bills are its own company's (``MOCK_BILL_REALM``, §538).
+            new_state["erp_realm"] = bill_realm(config)
         if result.pending_job_id != payload.pending_job_id:
             new_state[PENDING_JOB_KEY] = result.pending_job_id
         if result.success:

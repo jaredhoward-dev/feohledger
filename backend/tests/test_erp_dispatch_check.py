@@ -890,3 +890,60 @@ async def test_verify_takes_nothing_out_on_a_failed_read(realdb):
         assert (await _payment(realdb, invoice_id)).status == "pending"
         assert await _blocking(realdb, invoice_id) == []
     assert (await _run_row(realdb, run_id)).status == "exported"
+
+
+# ---------------------------------------------------------------------------
+# A stored-credential ERP (NetSuite, §536 / §541)
+# ---------------------------------------------------------------------------
+
+
+async def test_a_netsuite_bill_is_read_with_its_stored_credentials(realdb):
+    """NetSuite keeps its signing secrets sealed beside `settings.erp`, never
+    in it. The dispatch check built its adapter from `settings.erp` alone, so
+    no read could be signed and every opted-in tenant's run was held
+    `erp_bill_unverified`: an open bill was never paid. The adapter must be
+    built from the block with its stored secrets, as every other ERP read is."""
+    from app.services.erp_adapters.netsuite import NetSuiteAdapter
+    from app.services.erp_link_realm import connection_realm
+
+    erp = {
+        "type": "netsuite",
+        "integration_method": "direct",
+        "account_id": "FAKE123",
+        "consumer_key": "ck",
+        "token_id": "tid",
+        "netsuite_status_sync": "on",
+    }
+    async with realdb.control_sessionmaker()() as s:
+        org = await s.get(Organization, realdb.info("a").org_id)
+        org.settings = {**(org.settings or {}), "erp": erp}
+        await s.commit()
+    await realdb.store_provider_secrets("a", "erp", {"consumer_secret": "cs", "token_secret": "ts"})
+    invoice_id = await _posted_invoice(realdb, bill_id="1001", realm=connection_realm(erp))
+    run_id = await _run(realdb, [invoice_id])
+
+    read_with: list[dict] = []
+
+    class SignedNetSuite(FakeQbo):
+        """The bill is open in NetSuite; a read the adapter could not sign
+        raises, as the real adapter's config check does before any request."""
+
+        erp_type = "netsuite"
+
+        def __init__(self, config: dict):
+            super().__init__()
+            self.adapter = NetSuiteAdapter(config)
+
+        async def bill_report(self, bill_id: str) -> ErpBillReport:
+            read_with.append(self.adapter.config)
+            await self.adapter._check_config()
+            return await super().bill_report(bill_id)
+
+    from unittest.mock import patch
+
+    with patch.object(erp_status_sync, "_adapter_or_none", side_effect=SignedNetSuite):
+        await _execute(realdb, run_id)
+
+    assert [(c.get("consumer_secret"), c.get("token_secret")) for c in read_with] == [("cs", "ts")]
+    payment = await _payment(realdb, invoice_id)
+    assert (payment.status, payment.failure_reason) == ("completed", None)

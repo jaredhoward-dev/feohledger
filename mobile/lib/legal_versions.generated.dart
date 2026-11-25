@@ -13,4 +13,4 @@
 const String kTermsVersion = '2026-11-21';
 
 /// Privacy Policy version in force (its effective date).
-const String kPrivacyVersion = '2026-11-21';
+const String kPrivacyVersion = '2026-11-25';

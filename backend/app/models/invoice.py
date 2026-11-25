@@ -178,6 +178,13 @@ class Invoice(Base, EntityMixin, TimestampMixin):
     # when a delivery carries no correlation id (decisions §417).
     erp_document_id: Mapped[str | None] = mapped_column(String(255), index=True)
     erp_document_url: Mapped[str | None] = mapped_column(String(1024))
+    # An ERP bill void in flight (`services/erp_bill_void`, decisions §545):
+    # `{attempt_id, exception_id, document_id, actor_id, reason, started_at}`
+    # while `POST /api/exceptions/{id}/void-erp-bill` is calling the ERP with no
+    # row lock held, SQL NULL otherwise. While it is live the flag it names
+    # cannot be cleared (so every payment / card / push gate keeps holding the
+    # invoice) and a second click is refused. Migration 0146.
+    erp_void_pending: Mapped[dict | None] = mapped_column(JSONB(none_as_null=True))
     # Free-form per-invoice metadata bag. Currently holds the cached
     # audit-log summary under `meta["audit_summary"]`:
     #   {"text": str, "confidence_context": str|None,

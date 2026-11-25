@@ -278,6 +278,7 @@ CLOSURE_ALLOWED: dict[str, str] = {
     "payment_schedules": _covered_by("payments"),
     "card_rebates": _covered_by("virtual_cards"),
     "card_reveal_tokens": _covered_by("virtual_cards"),
+    "card_transaction_events": _covered_by("virtual_cards"),
     "bank_transactions": _covered_by("bank_statements"),
     "vendor_statement_recon_lines": _covered_by("vendor_statement_reconciliations"),
     "expenses": _covered_by("expense_reports"),

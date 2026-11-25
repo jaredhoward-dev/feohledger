@@ -8,6 +8,8 @@
 	import { safePortalNextPath, withPortalNext } from '#lib/utils/postLoginRedirect.ts';
 	import { page } from '$app/state';
 	import { m } from '#lib/i18n/store.svelte.ts';
+	import { onMount } from 'svelte';
+	import { storageAvailable } from '#lib/utils/safeStorage.ts';
 
 	// Prefilled from `?email=` — the set-password page's "Go to sign in" link
 	// passes the account it just set a password for.
@@ -15,6 +17,12 @@
 	let password = $state('');
 	let error = $state('');
 	let loading = $state(false);
+	// The portal token lives in localStorage too: where the browser blocks it,
+	// say so instead of a sign-in that silently does not last (decisions §514).
+	let storageBlocked = $state(false);
+	onMount(() => {
+		storageBlocked = !storageAvailable();
+	});
 
 	// MFA second-factor step. When login returns a challenge, we swap the
 	// password form for the code form (stashing the challenge token). The vendor
@@ -201,6 +209,13 @@
 			<h1>{portalBrand.productName}</h1>
 			<p class="subtitle">{m('portal.login.subtitle')}</p>
 
+			<!-- Always in the DOM, so the notice set on mount is announced, and
+			     neutral information rather than a failure — as on /login. -->
+			<div role="status" aria-live="polite">
+				{#if storageBlocked}
+					<div class="info storage-blocked">{m('auth.login.storageBlocked')}</div>
+				{/if}
+			</div>
 			<div role="alert" aria-live="assertive">
 				{#if error}
 					<div class="error">{error}</div>
@@ -319,6 +334,18 @@
 		padding: 10px 14px;
 		border-radius: 4px;
 		font-size: 0.85rem;
+	}
+	/* Information, not a failure: the storage notice. The same accent-tint
+	   recipe as AuthShell's `.info`, which this page does not mount. */
+	.info {
+		background: var(--accent-tint);
+		border: 1px solid color-mix(in srgb, var(--accent) 28%, transparent);
+		color: var(--text);
+		padding: 10px 14px;
+		border-radius: 4px;
+		font-size: 0.85rem;
+		line-height: 1.5;
+		overflow-wrap: anywhere;
 	}
 	label {
 		display: flex;

@@ -47,6 +47,7 @@ import httpx
 
 from app.config import settings
 from app.services.erp_adapters.base import (
+    BILL_VOID_DRAFT_ONLY,
     POSTED_TOTAL_MISMATCH,
     POSTED_TOTAL_UNCONFIRMED,
     VENDOR_NOT_LINKED,
@@ -169,6 +170,9 @@ class BusinessCentralAdapter(ErpAdapter):
     """
 
     erp_type = "dynamics_365_bc"
+    #: ``void_invoice`` deletes a purchaseInvoice only while it is a draft; a
+    #: posted one is reversed by a corrective credit memo in BC (decisions §542).
+    bill_void_scope = BILL_VOID_DRAFT_ONLY
     # Nothing to revoke (decisions §407): Microsoft publishes no revocation
     # endpoint for a client-credentials token, and ending the client secret or
     # the BC record needs rights our BC-scoped token does not carry. Deleting
@@ -865,10 +869,19 @@ class BusinessCentralAdapter(ErpAdapter):
         # `Corrective` marks an invoice BC created by cancelling a posted
         # credit memo — a live document, not a cancelled one, and never one we
         # pushed — so it is `unknown`, as is BC's blank status.
+        #
+        # BC's `Paid` is NOT a payment (decisions §303, §546): the API derives
+        # it from the posted invoice's `Closed` flag (`Purch. Inv. Aggregator`,
+        # `SetStatusOptionFromPurchaseInvoiceHeader`), and a vendor ledger
+        # entry closes when anything is applied to it in full — a credit memo
+        # as much as a payment. API v2.0 exposes no vendor ledger entry or
+        # application to tell them apart, so nothing owing with no payment we
+        # can see is `settled_no_payment`: a person records it, the poll never
+        # books it as cash.
         status_map = {
             "draft": ErpInvoiceStatus.draft,
             "open": ErpInvoiceStatus.open,
-            "paid": ErpInvoiceStatus.paid,
+            "paid": ErpInvoiceStatus.settled_no_payment,
             "canceled": ErpInvoiceStatus.cancelled,
         }
         return status_map.get(bc_status, ErpInvoiceStatus.unknown)

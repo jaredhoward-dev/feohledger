@@ -88,6 +88,11 @@ def test_no_outgoing_edges_target_a_predecessor_other_than_explicit_resets():
         # Recalling an approval (decisions §374): only through
         # `POST /{id}/recall-approval`, refused by `POST /bulk/status`.
         (InvoiceStatus.approved, InvoiceStatus.ready_for_review),
+        # The bill was voided in the ERP from a duplicate / fraud flag
+        # (decisions §539): only through `POST /api/exceptions/{id}/
+        # void-erp-bill` (`ERP_VOID_EDGES`), refused to every other caller.
+        (InvoiceStatus.sent_to_erp, InvoiceStatus.approved),
+        (InvoiceStatus.posted_in_erp, InvoiceStatus.approved),
     }
 
     # Build a notion of "linear progress" order. Anything that goes

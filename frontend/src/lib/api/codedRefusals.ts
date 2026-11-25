@@ -419,6 +419,24 @@ const BUILDERS: Record<string, Builder> = {
 	// sentence.
 	invoice_not_recallable: fixed('refusal.invoiceNotRecallable'),
 	invoice_recall_in_erp: fixed('refusal.invoiceRecallInErp'),
+	// `services/erp_bill_void` — `POST /api/exceptions/{id}/void-erp-bill` and
+	// the queue's `void_erp_bill_refusal` verdict (decisions §539).
+	erp_void_not_flagged: fixed('refusal.erpVoidNotFlagged'),
+	erp_void_no_bill: fixed('refusal.erpVoidNoBill'),
+	erp_void_claimed: fixed('refusal.erpVoidClaimed'),
+	erp_void_bill_paid: fixed('refusal.erpVoidBillPaid'),
+	erp_void_unsupported: fixed('refusal.erpVoidUnsupported'),
+	erp_void_rejected: fixed('refusal.erpVoidRejected'),
+	erp_void_failed: fixed('refusal.erpVoidFailed'),
+	erp_void_unconfirmed: fixed('refusal.erpVoidUnconfirmed'),
+	erp_void_bill_settled: fixed('refusal.erpVoidBillSettled'),
+	erp_void_draft_only: fixed('refusal.erpVoidDraftOnly'),
+	erp_void_in_progress: fixed('refusal.erpVoidInProgress'),
+	// The bill a failed push left in the ERP (decisions §556).
+	erp_void_not_found: fixed('refusal.erpVoidNotFound'),
+	erp_lookup_not_failed: fixed('refusal.erpLookupNotFailed'),
+	erp_lookup_unsupported: fixed('refusal.erpLookupUnsupported'),
+	erp_lookup_failed: fixed('refusal.erpLookupFailed'),
 	invoice_recall_claimed: (params, t) => {
 		const claim = str(params, 'claim');
 		if (claim === 'payment') return t('refusal.paymentBlocksRecall');
@@ -1083,6 +1101,8 @@ const BUILDERS: Record<string, Builder> = {
 	workspace_close_incomplete: fixed('refusal.workspaceCloseIncomplete'),
 	// A credential block whose stored value will not open (decisions §464).
 	credential_block_unopenable: fixed('refusal.credentialBlockUnopenable'),
+	// A Lithic card webhook secret without its `whsec_` prefix (decisions §562).
+	card_webhook_secret_format: fixed('refusal.cardWebhookSecretFormat'),
 	// A CSV invoice row whose number is the same payable as another once
 	// formatting is ignored (`services/csv_import`, decisions §77) — a row error.
 	csv_invoice_number_matches_existing: (p, t) => {

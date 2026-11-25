@@ -566,3 +566,18 @@ SSO_LINK_EXPIRED = "sso_link_expired"
 SSO_LINK_EXPIRED_DETAIL = coded_refusal(
     SSO_LINK_EXPIRED, "This login link has expired. Please sign in again."
 )
+
+
+#: A Lithic card webhook signing secret saved without Lithic's `whsec_` prefix
+#: (`PUT /api/organization/credentials/cards`, decisions §562). Lithic signs
+#: with a Standard-Webhooks secret, and the verifier refuses one without the
+#: prefix (`webhook_security.verify_standard_webhook`), so saving it would
+#: silently drop every real delivery. A 422 whose `params.provider` names the
+#: issuer; nothing is saved.
+CARD_WEBHOOK_SECRET_FORMAT = "card_webhook_secret_format"
+CARD_WEBHOOK_SECRET_FORMAT_DETAIL = coded_refusal(
+    CARD_WEBHOOK_SECRET_FORMAT,
+    'This is not a Lithic webhook signing secret: it must start with "whsec_". Copy the '
+    "signing secret of the webhook from the Lithic dashboard. Nothing was saved.",
+    provider="lithic",
+)

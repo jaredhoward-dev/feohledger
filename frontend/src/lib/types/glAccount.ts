@@ -37,10 +37,12 @@ export interface GlAccount {
 	/** `null` = shared across every entity. See the note above. */
 	entity_id: string | null;
 	/**
-	 * "Needs a decision": the ERP accounts the last sync found this UNLINKED
-	 * row could mean and would not choose between (a pre-§284 QuickBooks row
+	 * "Needs a decision": the ERP accounts the last sync found this row could
+	 * mean and would not choose between (a pre-§284 QuickBooks row
 	 * "Depreciation" may be the top-level account or "Truck:Depreciation").
-	 * A person picks one through `POST /api/gl-accounts/{id}/erp-link`.
+	 * Usually on an unlinked row; on a LINKED one the sync kept the link but
+	 * questions it (decisions §524) and it keeps posting meanwhile. A person
+	 * picks one through `POST /api/gl-accounts/{id}/erp-link`.
 	 * Absent from older responses; `null` when there is nothing to decide.
 	 */
 	erp_link_candidates?: GlAccountErpLinkCandidates | null;
@@ -48,7 +50,7 @@ export interface GlAccount {
 	erp_link_confirmed_at?: string | null;
 }
 
-/** One ERP account an unlinked row could mean. */
+/** One ERP account a row could mean. */
 export interface GlAccountErpCandidate {
 	erp_account_id: string;
 	code: string;
@@ -61,9 +63,11 @@ export interface GlAccountErpLinkCandidates {
 	accounts: GlAccountErpCandidate[];
 }
 
-/** Is this row waiting for a person to say which ERP account it means? */
+/** Is this row waiting for a person to say which ERP account it means?
+ *  Linked or not: a linked row with candidates is one the sync questions
+ *  (decisions §524). */
 export function needsErpDecision(account: Pick<GlAccount, 'erp_account_id' | 'erp_link_candidates'>): boolean {
-	return !account.erp_account_id && (account.erp_link_candidates?.accounts.length ?? 0) > 0;
+	return (account.erp_link_candidates?.accounts.length ?? 0) > 0;
 }
 
 /**

@@ -3852,8 +3852,16 @@ class AppLocalizationsEs extends AppLocalizations {
       'Según el ERP, esta factura está liquidada, al menos en parte, con una nota de crédito del proveedor aplicada allí. FeohLedger no la pagará hasta que alguien confirme lo que aún se adeuda.';
 
   @override
+  String get exceptionDescriptionErpSettledNoPayment =>
+      'Según el ERP, esta factura no tiene saldo pendiente, pero tampoco ningún pago registrado contra ella: allí se aplicó una nota de crédito o se dio de baja el saldo. FeohLedger no la pagará hasta que alguien confirme lo que aún se adeuda.';
+
+  @override
   String get exceptionDescriptionErpPaidWhileScheduled =>
       'Según el ERP, esta factura se pagó con un pago que FeohLedger no hizo, mientras hay un pago de FeohLedger programado para ella. Detenga o anule uno de los dos antes de que ambos lleguen al proveedor.';
+
+  @override
+  String get exceptionDescriptionErpPaidWhilePaymentInFlight =>
+      'Según el ERP, esta factura está pagada mientras el pago de FeohLedger para ella aún no se ha completado. Confirme si ese registro es el pago de FeohLedger o un segundo pago antes de anular nada.';
 
   @override
   String get exceptionDescriptionErpPaidTwice =>
@@ -4073,6 +4081,21 @@ class AppLocalizationsEs extends AppLocalizations {
     String paymentId,
   ) {
     return 'El pago $paymentId se canceló, pero un intento anterior de enviarlo se interrumpió cuando quizá ya había llegado al procesador, así que el dinero puede haberse movido o no. Confírmelo con el procesador y anule o vuelva a pagar: esta factura queda bloqueada para nuevas ejecuciones de pago hasta resolverlo.';
+  }
+
+  @override
+  String exceptionDescriptionCardSettledAfterCancel(String lastFour) {
+    return 'La tarjeta terminada en $lastFour recibió un cargo después de cancelarse, así que esta factura puede haberse pagado dos veces. Revise el cargo con el proveedor de la tarjeta y los demás pagos de esta factura, y recupere el duplicado: esta factura queda bloqueada para nuevas ejecuciones de pago hasta resolverlo.';
+  }
+
+  @override
+  String exceptionDescriptionCardSettlementRefused(String lastFour) {
+    return 'Se rechazó una liquidación de la tarjeta terminada en $lastFour porque no indicaba un importe utilizable, así que puede haberse movido dinero en la tarjeta sin registrarse. Revise el cargo con el proveedor de la tarjeta: la tarjeta no se puede cancelar y esta factura queda bloqueada para nuevas ejecuciones de pago hasta resolverlo.';
+  }
+
+  @override
+  String exceptionDescriptionCardClearingRefused(String lastFour) {
+    return 'No se registró un cargo adicional en la tarjeta terminada en $lastFour, así que lo pagado por esta factura puede ser mayor de lo que se muestra. Revise el cargo con el proveedor de la tarjeta y registre la diferencia: esta factura queda bloqueada para nuevas ejecuciones de pago hasta resolverlo.';
   }
 
   @override
@@ -4940,6 +4963,9 @@ class AppLocalizationsEs extends AppLocalizations {
 
   @override
   String get notificationEventChatMessage => 'Mensaje nuevo';
+
+  @override
+  String get notificationEventErpBillFlagged => 'Alerta sobre una factura ya registrada en el ERP';
 
   @override
   String get notificationEventOther => 'Notificación';
