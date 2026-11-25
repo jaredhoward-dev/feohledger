@@ -890,6 +890,79 @@ async def test_erp_webhook_a_source_cycling_tenants_is_cut_off(fake_redis, monke
         assert await _from_one_address(_org_with_erp_secret("real"), "guess") == (None, expected)
 
 
+@pytest.fixture
+def erp_unseal_budget(monkeypatch):
+    """The limiter on, with a small budget: 2 distinct tenants per source."""
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "rate_limit_enabled", True)
+    monkeypatch.setattr(settings, "erp_webhook_unverified_tenants_per_source_limit", 2)
+    return settings
+
+
+async def _erp_from(source: str, org, signature: str, body: bytes, opened=None):
+    """One generic-route delivery from ``source`` with the unseal as a spy;
+    returns (result, opened)."""
+    from app.api.erp_webhook import erp_webhook
+
+    opened = opened or AsyncMock(side_effect=lambda o, *_a, **_k: o.settings["erp"])
+    req = _fake_request(body, {"X-Webhook-Signature": signature})
+    req.client.host = source
+    with (
+        patch("app.api.erp_webhook.control_session_factory", _ctrl_session_for_org(org)),
+        patch("app.api.erp_webhook.provider_config", opened),
+        patch("app.api.erp_webhook.get_tenant_engine") as engine,
+    ):
+        result = await erp_webhook(erp_type="generic", request=req)
+    engine.assert_not_called()
+    return result, opened
+
+
+@pytest.mark.asyncio
+async def test_erp_webhook_a_wrong_signature_spends_the_source_budget(
+    fake_redis, erp_unseal_budget
+):
+    """Parity with the Merge route (§525): a wrong signature at the generic
+    route spends the source's budget, per DISTINCT tenant — repeats against
+    one tenant are one entry — and the third tenant is refused unopened with
+    the same silent 204, while another address still opens it."""
+    body = _erp_body()
+    wrong = _sign("attacker", body)
+    acme, globex, initech = (_org_with_erp_secret("real") for _ in range(3))
+
+    for _ in range(4):
+        result, opened = await _erp_from("198.51.100.7", acme, wrong, body)
+        assert result is None
+        opened.assert_awaited_once()
+    result, opened = await _erp_from("198.51.100.7", globex, wrong, body)
+    opened.assert_awaited_once()
+
+    result, opened = await _erp_from("198.51.100.7", initech, wrong, body)
+    assert result is None
+    opened.assert_not_awaited()
+
+    _result, opened = await _erp_from("192.0.2.44", initech, wrong, body)
+    opened.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_erp_webhook_a_key_that_cannot_be_opened_spends_the_budget_too(
+    fake_redis, erp_unseal_budget
+):
+    """A failed opening still cost the KMS call the budget bounds (parity
+    with the Merge route)."""
+    from app.services.credential_crypto import CredentialCryptoError
+
+    body = _erp_body()
+    failing = AsyncMock(side_effect=CredentialCryptoError("kms"))
+    for _ in range(3):
+        result, _opened = await _erp_from(
+            "198.51.100.7", _org_with_erp_secret("real"), _sign("real", body), body, failing
+        )
+        assert result is None
+    assert failing.await_count == 2  # the third tenant was refused before opening
+
+
 @pytest.mark.asyncio
 async def test_erp_webhook_credentials_that_cannot_be_opened_are_a_silent_204(fake_redis):
     """Not a 503: the signature cannot be checked without the key, and a 503
