@@ -235,8 +235,10 @@ const LIST_PAGES: ListPage[] = [
 	{ href: '/vendor-statements', fixedTable: '.recon-table table' },
 	{ href: '/positive-pay', fixedTable: '.ppay-table table' },
 	{ href: '/experiments', fixedTable: '.experiment-table table' },
+	{ href: '/adaptive', fixedTable: '.suggestions-table table' },
 	{ href: '/workflows', fixedTable: '.wf-table table' },
 	{ href: '/admin?tab=users', fixedTable: '.users-table table' },
+	{ href: '/admin?tab=roles', fixedTable: '.system-roles table' },
 	{ href: '/admin/entities', fixedTable: '.entities-table table' },
 	{ href: '/admin/api-keys', fixedTable: '.keys-table table' },
 	{ href: '/admin/access-review', fixedTable: '.review-table table' },
@@ -279,8 +281,10 @@ const LOCALE_SIZED = new Set([
 	'/vendor-statements',
 	'/positive-pay',
 	'/experiments',
+	'/adaptive',
 	'/workflows',
 	'/admin?tab=users',
+	'/admin?tab=roles',
 	'/admin/entities',
 	'/admin/api-keys',
 	'/admin/access-review',
@@ -306,6 +310,11 @@ const LOCALE_SIZED_VIEWS: (ListPage & { fixedTable: string; label: string })[] =
 		href: '/admin/webhooks',
 		fixedTable: '.deliveries-table table',
 		label: '/admin/webhooks deliveries'
+	},
+	{
+		href: '/admin?tab=roles',
+		fixedTable: '.custom-roles table',
+		label: '/admin?tab=roles custom roles'
 	}
 ];
 
@@ -320,17 +329,14 @@ const OVERFLOW_LOCALES = ['de', 'es', 'fr', 'pt-BR', 'ja'] as const;
 /**
  * Sidebar destinations deliberately outside the budget, each with its reason.
  * "Unmeasured list page" entries are list pages the budget does not cover yet
- * (docs/followups.md § "The layout-shift budget covers twenty-nine pages"): moving
+ * (docs/followups.md § "The layout-shift budget covers thirty-one pages"): moving
  * one into `LIST_PAGES` is the whole change once its reason is fixed.
  */
 const NOT_LIST_PAGES: Record<string, string> = {
 	'/discounts':
 		'Unmeasured: the warning banners and the optimizer panel above the offers table mount once the dashboard lands — see docs/followups.md',
-	'/adaptive': 'Unmeasured list page — see docs/followups.md',
 	'/tax':
 		'Unmeasured: a loading placeholder stands where the box-allocation panel and the table mount once the report lands — see docs/followups.md',
-	'/admin?tab=roles':
-		'Unmeasured: the system-roles table shows no loading row and grows from its empty row to the four system roles, pushing the custom-roles section down — see docs/followups.md',
 	'/admin/partner':
 		'Unmeasured: the e2e tenant is not a partner, so the page settles on its "not a partner" state and the children table never renders — see docs/followups.md',
 	'/assistant': 'A conversation, not a list',
@@ -708,6 +714,47 @@ const WEBHOOK_DELIVERIES = ['pending', 'delivered', 'failed', 'dead'].map((statu
 	created_at: '2026-11-01T09:00:00Z'
 }));
 
+/** /adaptive's widest suggestion rows: one per status (pt-BR "DESATUALIZADA"),
+ *  the open and stale ones carrying their Dismiss button (the backend's
+ *  `dismiss_refusal` verdicts). The e2e seed need not hold a
+ *  suggestion, so the list is answered with these rows. */
+const SUGGESTION_PER_STATUS = (['open', 'dismissed', 'applied', 'stale'] as const).map(
+	(status, i) => ({
+		id: `00000000-0000-4000-8000-00000000039${i}`,
+		kind: 'auto_approve_threshold',
+		vendor_id: '00000000-0000-4000-8000-000000000400',
+		vendor_name: 'Layout Fixture Supplies International',
+		title: 'Auto-approve invoices from this vendor under the usual amount',
+		rationale: 'Every one of the last 40 invoices was approved unchanged.',
+		payload: {},
+		confidence_pct: '97.5',
+		status,
+		created_at: '2026-11-01T09:00:00Z',
+		dismissed_at: null,
+		actions: {
+			dismiss:
+				status === 'open' || status === 'stale'
+					? null
+					: {
+							code: 'workflow_suggestion_not_dismissable',
+							message: `A suggestion that is ${status} cannot be dismissed.`,
+							params: { status }
+						}
+		}
+	})
+);
+
+/** A custom role for /admin?tab=roles' second table, appended to the real
+ *  roles list (the e2e seed holds only the four system roles), so its Edit /
+ *  Delete actions cell is on screen. */
+const CUSTOM_ROLE = {
+	id: '00000000-0000-4000-8000-000000000410',
+	name: 'Layout Fixture Reviewer',
+	description: 'Reviews vendor bank changes',
+	is_system: false,
+	permissions: ['vendor.bank_change.approve', 'vendor.block']
+};
+
 test.describe('fixed list tables fit their longest locale', () => {
 	for (const locale of OVERFLOW_LOCALES) {
 		const tables = [
@@ -769,6 +816,26 @@ test.describe('fixed list tables fit their longest locale', () => {
 								: route.fallback()
 					);
 				}
+				if (href === '/adaptive') {
+					await page.route(
+						(url) => url.pathname === '/api/adaptive/suggestions',
+						(route) =>
+							route.request().method() === 'GET'
+								? route.fulfill({ json: { suggestions: SUGGESTION_PER_STATUS } })
+								: route.fallback()
+					);
+				}
+				if (label === '/admin?tab=roles custom roles') {
+					await page.route(
+						(url) => url.pathname === '/api/admin/roles',
+						async (route) => {
+							if (route.request().method() !== 'GET') return route.fallback();
+							const response = await route.fetch();
+							const roles = await response.json();
+							await route.fulfill({ response, json: [...roles, CUSTOM_ROLE] });
+						}
+					);
+				}
 				const widest = WIDEST_ROW[href];
 				if (widest) await patchFirstRow(page, widest.pathname, widest.patch);
 				await page.addInitScript((lc) => localStorage.setItem('feoh_locale', lc), locale);
@@ -790,6 +857,15 @@ test.describe('fixed list tables fit their longest locale', () => {
 				if (href === '/admin/webhooks') {
 					await expect(page.getByTestId('overlap-pill')).toBeVisible();
 					await expect(page.locator('.deliveries-table .badge.dead')).toBeVisible();
+				}
+				if (href === '/adaptive') {
+					for (const { status } of SUGGESTION_PER_STATUS) {
+						await expect(table.locator(`.badge.${status}`)).toBeVisible();
+					}
+					await expect(table.locator('td.actions button')).toHaveCount(2);
+				}
+				if (label === '/admin?tab=roles custom roles') {
+					await expect(table.locator('td.actions button')).toHaveCount(2);
 				}
 				if (label === '/payments cards') {
 					for (const status of CARD_STATUSES) {

@@ -11,13 +11,21 @@
 	import { errorMessage } from '#lib/utils/apiError.ts';
 
 	// $derived so the column headers re-render when the locale changes.
-	let SYSTEM_COLUMNS = $derived([{ label: m('admin.roles.col.name') }, { label: m('admin.roles.col.description') }]);
+	let SYSTEM_COLUMNS = $derived([
+		{ label: m('admin.roles.col.name'), class: 'col-name' },
+		{ label: m('admin.roles.col.description') }
+	]);
 	let CUSTOM_COLUMNS = $derived([
-		{ label: m('admin.roles.col.name') },
+		{ label: m('admin.roles.col.name'), class: 'col-name' },
 		{ label: m('admin.roles.col.description') },
 		{ label: m('admin.roles.col.permissions') },
 		{ class: 'actions-col' }
 	]);
+
+	// Both tables are mounted from first paint with DataTable's loading row
+	// until the first roles load settles — they used to claim "No system
+	// roles." / "No custom roles." before anything had been fetched.
+	let rolesPending = $derived(!adminStore.rolesLoaded);
 
 	let creating = $state(false);
 	let newName = $state('');
@@ -160,11 +168,19 @@
 			<HelpTip term="role" />
 		</p>
 	</div>
+	<!-- `fixed`, locale-sized columns, and a scroll region whose height is
+	     reserved for the four system roles (`SYSTEM_ROLES`, a fixed set): the
+	     custom-roles section below no longer drops as the rows replace the
+	     loading row. -->
+	<div class="system-roles">
 	<DataTable
+	fixed
 	columns={SYSTEM_COLUMNS}
 	isEmpty={systemRoles.length === 0}
+	loading={rolesPending}
 	errored={adminStore.rolesErrored}
 	empty={m('admin.roles.system.empty')}
+	ariaLabel={m('admin.roles.system.heading')}
 >
 		{#snippet body()}
 			{#each systemRoles as role (role.id)}
@@ -177,6 +193,7 @@
 			{/each}
 		{/snippet}
 	</DataTable>
+	</div>
 </section>
 
 <section class="role-section">
@@ -190,11 +207,15 @@
 			<HelpTip term="segregation-of-duties" />
 		</p>
 	</div>
+	<div class="custom-roles">
 	<DataTable
+	fixed
 	columns={CUSTOM_COLUMNS}
 	isEmpty={customRoles.length === 0}
+	loading={rolesPending}
 	errored={adminStore.rolesErrored}
 	empty={m('admin.roles.custom.empty')}
+	ariaLabel={m('admin.roles.custom.heading')}
 >
 		{#snippet body()}
 			{#each customRoles as role (role.id)}
@@ -235,6 +256,7 @@
 			{/each}
 		{/snippet}
 	</DataTable>
+	</div>
 </section>
 
 <Modal
@@ -336,6 +358,44 @@
 		margin: 0;
 		color: var(--text-muted);
 		font-size: 0.82rem;
+	}
+
+	/* Both tables are `fixed` (DataTable's `fixed`): under `auto` the columns
+	   were sized against the loading row and re-sized against the real rows.
+	   Widths fit the widest string in the six locales, measured with each
+	   cell's own font metrics (frontend/docs/ui-patterns.md § Data tables):
+	   the Name column holds the widest system-role badge, fr "Responsable
+	   comptes fournisseurs" (≈258px in its cell, ×1.25 for CI's fallback
+	   font → 330px); the custom table's actions hold two buttons, de
+	   "Bearbeiten" + "Bestätigen" (≈218px → 280px). Description and
+	   Permissions carry no width and share the rest; the `min-width` keeps
+	   them readable, past which the table scrolls in its region. DataTable
+	   renders the `<th>`, so the selectors go through `:global` under a
+	   panel-owned wrapper (the /gl-accounts pattern). */
+	.system-roles,
+	.custom-roles {
+		min-width: 0;
+	}
+	.system-roles :global(table) { min-width: 640px; }
+	.custom-roles :global(table) { min-width: 900px; }
+	.system-roles :global(th.col-name),
+	.custom-roles :global(th.col-name) { width: 330px; }
+	.custom-roles :global(th.actions-col) { width: 280px; }
+	/* The system-roles table sits ABOVE the custom-roles section, and its
+	   rows are a fixed set — the four `SYSTEM_ROLES` — so its region's height
+	   is reserved for them from first paint: the header and four one-line
+	   rows measure ≈205px, and 15rem leaves room for CI's taller fallback
+	   font. A `min-height` rather than the scrolling `height` /audit and
+	   /admin/webhooks use, because the row count cannot grow; where a narrow
+	   viewport wraps the descriptions the table simply grows. */
+	.system-roles :global(.grid-container) {
+		min-height: 15rem;
+	}
+	/* A custom role's name is data an admin typed (up to 50 characters), so
+	   in the fixed column it wraps rather than overprinting Description. */
+	.custom-roles .role-badge {
+		white-space: normal;
+		overflow-wrap: anywhere;
 	}
 
 	.muted-cell {
