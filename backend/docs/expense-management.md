@@ -31,10 +31,10 @@ mapped to `varchar` columns (`native_enum=False`). All five live in
 | Table | Model | Purpose |
 |-------|-------|---------|
 | `expense_reports` | `ExpenseReport` | A grouping of expenses an employee submits for approval + reimbursement. `report_number`, `title`, `employee_user_id` (control-plane User id, no cross-DB FK), `status` (draft → submitted → pending_approval → approved/rejected → reimbursed/cancelled), `submitted_at`/`approved_at`/`approved_by`, `total_amount` (recomputed from attached expenses, denominated in `currency`), `currency`, `reporting_currency`/`reporting_amount`/`reporting_fx_rate`/`reporting_fx_locked_at` (the total re-expressed in the org reporting currency, rate locked at submit — what the CFO gate compares), `notes`. |
-| `expenses` | `Expense` | A single expense line. `report_id` (nullable — an expense can exist before being grouped), `expense_date`, `merchant`, `category`, `description`, `amount`, `currency`, `converted_currency`/`converted_amount`/`converted_fx_rate`/`converted_fx_locked_at` (the line re-expressed in the owning report's currency, rate locked on attach/edit), `gl_account_id` (FK → `gl_accounts`), `receipt_file_key`, `payment_method` (out_of_pocket / corporate_card / virtual_card), `card_transaction_id`, `policy_violations` (JSONB list), `status`, `reimbursable`, `mileage_miles` (distance driven, schema-bounded `ge=0` — NULL = not a trip, which is what makes the mileage rule skippable per line, and a negative would have switched it off silently). |
+| `expenses` | `Expense` | A single expense line. `report_id` (nullable — an expense can exist before being grouped), `expense_date`, `merchant`, `category`, `description`, `amount`, `currency`, `converted_currency`/`converted_amount`/`converted_fx_rate`/`converted_fx_locked_at` (the line re-expressed in the owning report's currency, rate locked on attach/edit), `gl_account_id` (FK → `gl_accounts`), `receipt_file_key`, `payment_method` (out_of_pocket / corporate_card / virtual_card), `card_transaction_id`, `policy_violations` (JSONB list), `status`, `reimbursable`, `mileage_miles` (distance driven, schema-bounded `ge=0` — NULL = not a trip, which is what makes the mileage rule skippable per line, and a negative would have switched it off silently). `preapproval_id` (FK → `expense_preapprovals`) / `preapproval_drawn_amount` (migration 0149): the approved pre-approval this line draws down and how much, set at report submit, cleared at report reject. |
 | `expense_policies` | `ExpensePolicy` | A reimbursement policy. `name`, `active`, `category` (NULL = all), `threshold_currency` (the unit **every** money threshold below is denominated in; NULL = the org's reporting currency — migration `0077`), `per_diem_amount`/`per_diem_currency` (the latter descriptive only, kept in step with `threshold_currency`), `mileage_rate` (per mile), `category_limit`, `requires_preapproval_above`, `requires_receipt_above`, `rules` (JSONB). Every one of these is read by the WF3 engine — `mileage_rate` was the last one that wasn't, and is now enforced as `mileage_amount_mismatch` (below). |
 | `corporate_card_transactions` | `CorporateCardTransaction` | A card transaction feed row reconciled to an expense. `card_ref`, `card_last_four`, `virtual_card_id` (FK → `virtual_cards`), `txn_date`/`posted_date`, `merchant`, `amount`, `currency`, `external_txn_id` (provider id, drives import idempotency), `matched_expense_id`, `reconciliation_status` (unmatched/matched/ignored), `import_batch`, `raw` (JSONB). *Model in WF1; import/reconcile in WF4.* |
-| `expense_preapprovals` | `ExpensePreapproval` | A spend pre-approval raised before an expense is incurred. `requester_user_id`, `title`, `estimated_amount`, `currency`, `category`, `justification`, `status` (pending/approved/rejected), `decided_by`/`decided_at`, `expense_report_id`. *Model in WF1; gating in WF3.* |
+| `expense_preapprovals` | `ExpensePreapproval` | A spend pre-approval raised before an expense is incurred. `requester_user_id`, `title`, `estimated_amount`, `currency`, `category`, `justification`, `status` (pending/approved/rejected), `decided_by`/`decided_at`, `expense_report_id`. *Model in WF1; gating in WF3.* Its remaining balance is `estimated_amount` minus the draws recorded on the lines it covers (§ Pre-approval cover is drawn down). |
 
 ### Circular FK (expenses ↔ corporate_card_transactions)
 
@@ -294,9 +294,9 @@ string-Decimal amounts — never PII.
 | GET | `/api/expense-reports/{id}/summary` | **(WF2)** Aggregate the report's attached expenses: `{ total, count, by_category: [{category, total, count}], by_status: [{status, total, count}] }`. SUMs run in Postgres over the `Numeric` column (exact); serialised as float to match `ExpenseResponse.amount` (read-only display rollup). Read RBAC (incl. CFO). |
 | PATCH | `/api/expense-reports/{id}` | Update mutable report fields. Owner only (**403** `expense_report_not_owner`). **409** once the report is locked (submitted/pending_approval/approved/reimbursed) — report-level fields (currency in particular) reinterpret a total the approval already ran against. |
 | POST | `/api/expense-reports/{id}/expenses` | Attach (or `detach: true`) expense ids; recomputes `total_amount`. Owner only — of the target, and of any report a line is moved off (**403** `expense_report_not_owner`) — and every line attached must have been created by the target's owner (**403** `expense_report_foreign_line`, `params.expense_id`; a pre-0134 line with no recorded creator is exempt). Each id is looked up in this tenant's `expenses` table, so a cross-tenant/unknown id is a 404. Detaching nulls `report_id` (the expense outlives the report). Composition is only mutable while the **target** report is a `draft` (**409** otherwise), and an expense can't be moved off a **locked** source report (**409**) — terminal `rejected`/`cancelled` reports stay detachable so their expenses can be re-reported. Every attached/detached line's `policy_violations` is re-evaluated, as every other expense write does: the attach locks a conversion that may resolve a threshold comparison, and it sets the line's owner, which pre-approval cover depends on (a report-currency change re-evaluates its lines for the same reason). |
-| POST | `/api/expense-reports/{id}/submit` | **(WF3)** `draft → submitted`. Runs the policy engine over the report's expenses; if any BLOCKING violation (missing required receipt, or required pre-approval absent) is present, returns **422** with `{ detail: { code: "expense_report_policy_blocked", message, params: { count }, violations: [...] } }` and does NOT transition. A line with no rate locked into the report currency is refused first, **422** `expense_report_lines_unconverted` with `params: { count, currency }` and `expense_ids`. On success stamps `submitted_at` and moves every child expense to `submitted`. Invalid source status → 422. RBAC `admin`/`ap_manager`/`ap_clerk`, and **only the owner** — anyone else is **403** `expense_report_not_owner`, checked before the status guard. Audited `expense_report.submitted`. |
+| POST | `/api/expense-reports/{id}/submit` | **(WF3)** `draft → submitted`. Runs the policy engine over the report's expenses; if any BLOCKING violation (missing required receipt, or required pre-approval absent) is present, returns **422** with `{ detail: { code: "expense_report_policy_blocked", message, params: { count }, violations: [...] } }` and does NOT transition. A line with no rate locked into the report currency is refused first, **422** `expense_report_lines_unconverted` with `params: { count, currency }` and `expense_ids`. Each line that needs a pre-approval is drawn down against one with enough left, under a row lock (§ Pre-approval cover is drawn down); a line none can cover is `preapproval_required`, and the 422 rolls every draw back. On success stamps `submitted_at` and moves every child expense to `submitted`. Invalid source status → 422. RBAC `admin`/`ap_manager`/`ap_clerk`, and **only the owner** — anyone else is **403** `expense_report_not_owner`, checked before the status guard. Audited `expense_report.submitted`. |
 | POST | `/api/expense-reports/{id}/approve` | **(WF3)** `submitted → approved`. Segregation of duties: the approver must differ from the report's `employee_user_id` (reuses `approval_chain.check_segregation` → **403**) — the complete author set, because only the owner can compose, edit or submit a report. CFO gate: when `total_amount` exceeds `Organization.settings.expense_approval.cfo_threshold` (default `5000`, Decimal math), only `cfo`/`admin` may approve (else 403, coded `expense_cfo_required` with params `amount` — the report total in the reporting currency, `null` when it could not be expressed — `currency`, `limit` — `null` for a malformed or non-finite threshold — and `report_currency`; the SoD 403 is `approval_segregation`). Stamps `approved_at` + `approved_by` (the approver's user id) and moves child expenses to `approved`. Invalid source status → 422. RBAC `admin`/`ap_manager`/`cfo`. Gates: `expense_controls.report_approve_refusal` (the row's `actions.approve`). Audited `expense_report.approved`. |
-| POST | `/api/expense-reports/{id}/reject` | **(WF3)** `submitted → rejected`. Body `{ reason? }`. Returns each child expense to `draft` so they can be corrected and re-reported (`rejected` is terminal for the report row). Invalid source status → 422. **The report's owner is refused** (403 `expense_report_self_reject`, the same segregation rule as approve under its own sentence) — the decider is never the submitting employee, for reject as for approve; the endpoint used to accept it, so an owner with a manager role could record a review decision on their own claim and unlock its lines, and only the page stopped it. RBAC `admin`/`ap_manager` — deliberately NARROWER than approve, which also allows `cfo`. The frontend used one predicate for both, so a CFO saw no Approve button on exactly the over-threshold reports the CFO gate escalates TO them; the two are now split there as well. Audited `expense_report.rejected`. |
+| POST | `/api/expense-reports/{id}/reject` | **(WF3)** `submitted → rejected`. Body `{ reason? }`. Returns each child expense to `draft` so they can be corrected and re-reported (`rejected` is terminal for the report row), and clears each line's pre-approval draw so the balance is handed back (decisions §563). Invalid source status → 422. **The report's owner is refused** (403 `expense_report_self_reject`, the same segregation rule as approve under its own sentence) — the decider is never the submitting employee, for reject as for approve; the endpoint used to accept it, so an owner with a manager role could record a review decision on their own claim and unlock its lines, and only the page stopped it. RBAC `admin`/`ap_manager` — deliberately NARROWER than approve, which also allows `cfo`. The frontend used one predicate for both, so a CFO saw no Approve button on exactly the over-threshold reports the CFO gate escalates TO them; the two are now split there as well. Audited `expense_report.rejected`. |
 
 **Every report write that checks the report's status locks the report row.**
 `submit` / `approve` / `reject`, and every composition or content change gated on
@@ -531,6 +531,52 @@ owner yet, so nothing covers it: its `preapproval_required` stays raised as an
 advisory flag until it is attached (the attach re-evaluates it) — submit, which
 always has a report, is the gate.
 
+#### Pre-approval cover is drawn down
+
+An approved pre-approval is a **running budget bounded by its estimate**, not a
+pass (decisions §563). The largest matching estimate used to cover each line on
+its own (`covered >= amount`), so one "500 USD, travel" approval cleared
+`preapproval_required` on any number of 400 USD lines across any number of
+reports — the split-to-evade shape an approval limit exists to stop. The rules
+live in `services/expense_preapproval_cover.py`:
+
+- **Submit draws.** Report submit first evaluates the lines with no cover; each
+  line that raises `preapproval_required` is linked to ONE approved
+  pre-approval with enough left (one raised for this report first, then the
+  oldest decision) and records the draw: `expenses.preapproval_id` +
+  `preapproval_drawn_amount` (migration 0149). A line no balance can cover
+  stays unlinked, the second pass raises `preapproval_required` for it, and the
+  422 rolls every draw back. A line is covered whole or not at all — never split
+  across two estimates.
+- **Only lines that need cover draw.** A line under every
+  `requires_preapproval_above` is not charged to the budget, so small receipts
+  cannot exhaust the estimate the large one needs.
+- **What consumes.** Only submit writes a link, so submitted / approved
+  (and reimbursed) lines draw; a draft line draws nothing, so an abandoned draft
+  cannot hold balance. **Report reject** hands its lines back to draft and
+  clears their draws in the same transaction; a deleted line takes its draw
+  with it.
+- **Same currency, no conversion.** The draw is in the pre-approval's currency,
+  which cover already requires to equal the line's; a line in any other
+  currency, or a pre-approval with no currency, is never covered (fail closed).
+- **Concurrency.** Every candidate pre-approval is locked `FOR UPDATE` in id
+  order before any balance is read, so two reports submitted at once cannot both
+  draw the last remainder — the second waits, then sees the first's draw.
+- **Advisory flags read the remaining balance.** `_approved_preapproval_amount`
+  returns a linked line's own draw, otherwise the largest *remaining* balance, so
+  a draft line written after the estimate is spent shows `preapproval_required`
+  before anyone presses submit.
+- **No expiry.** The model has no validity window and none is invented; an
+  approved estimate stays usable until it is spent.
+- **No backfill.** A line submitted before 0149 has no link and draws nothing;
+  choosing one for it now would manufacture a refusal or an absolution (§141).
+  Every approved pre-approval therefore started 0149 with its whole estimate.
+
+The pre-approval responses carry `drawn_amount` and `remaining_amount` (NULL
+unless approved); each expense carries `preapproval_id` /
+`preapproval_drawn_amount`. The **Pre-approvals** tab shows a Remaining column
+(with the drawn amount, or "Used up"), and a covered line a "Pre-approved" badge.
+
 Report submit runs **one pass per entity** over its lines rather than one pass
 with a merged policy list — `evaluate_report` applies every policy handed to it
 to every expense, so a single list would re-open the same bleed at report level.
@@ -672,7 +718,7 @@ reused for a EUR threshold — it says nothing about it.
 | Threshold | Blocking? | Behaviour when the comparison can't be made |
 |---|---|---|
 | `requires_receipt_above` | yes | **Requires the receipt.** The violation is raised unless a `receipt_file_key` is present — a receipt is evidence that doesn't depend on the rate, so the rule stays satisfiable. |
-| `requires_preapproval_above` | yes | **Requires the pre-approval.** Raised unless an approved pre-approval covers the expense *in the expense's own currency* (`_approved_preapproval_amount` filters on `ExpensePreapproval.currency`, so that check stands on its own — a €500 pre-approval never satisfies a $500 expense). |
+| `requires_preapproval_above` | yes | **Requires the pre-approval.** Raised unless an approved pre-approval covers the expense *in the expense's own currency* (`_approved_preapproval_amount` filters on `ExpensePreapproval.currency`, so that check stands on its own — a €500 pre-approval never satisfies a $500 expense) **with enough of its estimate left** — submit draws the line down against it (§ Pre-approval cover is drawn down). |
 | `category_limit` | no | Flagged for review (advisory badge). |
 | `per_diem_amount` | no | Flagged for review (advisory badge). |
 
@@ -702,9 +748,9 @@ the API keeps it in step with `threshold_currency` on write.
 | GET | `/api/expense-policies` | List policies; `?active=&category=` filters. Read RBAC (all four roles). |
 | POST | `/api/expense-policies` | Create a policy. `threshold_currency` is optional (uppercased + shape-checked as a 3-letter ISO 4217 code; omitted / blank → NULL = the org's reporting currency) and, when given, also sets `per_diem_currency` unless that was named explicitly. Mutation RBAC (`admin`/`ap_manager`). Audited `expense_policy.created`. |
 | GET/PATCH/DELETE | `/api/expense-policies/{id}` | Get / update / delete. Mutations `admin`/`ap_manager`, audited. |
-| GET | `/api/expense-preapprovals` | List requests; `?status=&requester_user_id=` filters. Read RBAC (all four). |
+| GET | `/api/expense-preapprovals` | List requests; `?status=&requester_user_id=` filters. Each row carries `drawn_amount` (the sum of its lines' recorded draws) and `remaining_amount` (estimate − drawn; NULL unless approved), read in one grouped query per page. Read RBAC (all four). |
 | POST | `/api/expense-preapprovals` | Raise a request — `requester_user_id` is always the authenticated user (the body field is ignored so SoD on the decision side stays meaningful); status `pending`. RBAC `admin`/`ap_manager`/`ap_clerk`. Audited. |
-| GET | `/api/expense-preapprovals/{id}` | Get one. Read RBAC. |
+| GET | `/api/expense-preapprovals/{id}` | Get one, with `drawn_amount` / `remaining_amount`. Read RBAC. |
 | POST | `/api/expense-preapprovals/{id}/approve` \| `/reject` | Decide. `check_segregation` blocks the requester from deciding their own request (403). Stamps `decided_by` + `decided_at` + status; invalid source status → 422. RBAC `admin`/`ap_manager`. Audited `expense_preapproval.{approved,rejected}`. |
 
 ### CFO approval threshold

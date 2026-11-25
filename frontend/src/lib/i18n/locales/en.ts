@@ -2513,6 +2513,11 @@ export const en = {
 	'expenses.preapprovals.col.category': 'Category',
 	'expenses.preapprovals.col.estimated': 'Estimated',
 	'expenses.preapprovals.col.status': 'Status',
+	'expenses.preapprovals.col.remaining': 'Remaining',
+	'expenses.preapprovals.drawn': 'Drawn {amount}',
+	'expenses.preapprovals.exhausted': 'Used up',
+	'expenses.preapprovalDraw.badge': 'Pre-approved',
+	'expenses.preapprovalDraw.title': 'Draws {amount} from an approved pre-approval',
 
 	// Pre-approval request status labels (#lib/types/expense.ts)
 	'expenses.preapprovals.status.pending': 'Pending',
