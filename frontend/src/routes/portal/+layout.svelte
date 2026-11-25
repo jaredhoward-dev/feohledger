@@ -2,6 +2,7 @@
 	import { portalAuth } from '#lib/stores/portalAuth.svelte.ts';
 	import { portalBrand } from '#lib/stores/portalBrand.svelte.ts';
 	import BrandMark from '#lib/components/ui/BrandMark.svelte';
+	import LegalAcceptStep from '#lib/components/layout/LegalAcceptStep.svelte';
 	import { page } from '$app/state';
 	import { goto } from '$app/navigation';
 	import { browser } from '$app/env';
@@ -120,6 +121,33 @@
 			<a href="/legal">{m('portal.shell.footerPlatformLegal')}</a>
 		</footer>
 	</div>
+{:else if portalAuth.loggedIn && portalAuth.user && !portalAuth.user.must_change_password && portalAuth.user.legal_acceptance_required}
+	<!--
+		The Privacy Policy re-prompt (docs/decisions.md §500), in the shell's
+		place like the employee step (§497): no portal page mounts behind it, so
+		none of their reads run before the supplier has acknowledged, and the URL
+		is left alone, so the page they asked for renders the moment the flag
+		clears. The forced password change comes first (its route is standalone,
+		above). The tenant's white-label mark stands in for ours, as in the header.
+	-->
+	<LegalAcceptStep
+		documents="privacy"
+		onaccept={portalAuth.acknowledgeLegal}
+		onlogout={handleLogout}
+	>
+		{#snippet mark()}
+			{#if portalBrand.mark.kind === 'logo'}
+				<img
+					class="step-logo"
+					src={portalBrand.logoUrl}
+					alt={portalBrand.productName}
+					draggable="false"
+				/>
+			{:else if portalBrand.mark.kind === 'platform'}
+				<BrandMark size={36} />
+			{/if}
+		{/snippet}
+	</LegalAcceptStep>
 {:else if portalAuth.loggedIn && portalAuth.user && !portalAuth.user.must_change_password}
 	<div class="portal-shell">
 		<!-- WCAG 2.4.1 Bypass Blocks. -->
@@ -226,6 +254,13 @@
 		display: grid;
 		place-items: center;
 		color: var(--text-muted);
+	}
+
+	.step-logo {
+		max-height: 36px;
+		max-width: 160px;
+		object-fit: contain;
+		align-self: flex-start;
 	}
 
 	.portal-shell {

@@ -38,6 +38,7 @@ from app.schemas.auth import (
 )
 from app.schemas.portal import (
     PortalChangePasswordRequest,
+    PortalLegalAcknowledgementRequest,
     PortalLoginRequest,
     PortalMeResponse,
     PortalMFAChallengeResponse,
@@ -355,6 +356,38 @@ async def portal_logout(authorization: str = Header()):
             await end_session(vu_id, jti, ttl)
 
 
+async def _portal_me_response(
+    db: AsyncSession, vu: VendorUser, vendor: Vendor | None = None
+) -> PortalMeResponse:
+    """The signed-in supplier's profile — the ONE builder every route returning
+    `PortalMeResponse` goes through, so a field (the locale, the Privacy Policy
+    flag) cannot be set by `/me` and silently dropped by a sibling that answers
+    with the same shape and replaces the portal's copy of it.
+
+    `legal_acceptance_required` is true while the vendor user has not
+    acknowledged the Privacy Policy version in force: a user who set their
+    password before §499, or anyone after a version bump. The portal draws its
+    blocking step until `POST /portal/auth/legal-acknowledgement` clears it
+    (decisions §500).
+    """
+    if vendor is None:
+        vendor = (
+            await db.execute(select(Vendor).where(Vendor.id == vu.vendor_id))
+        ).scalar_one_or_none()
+    return PortalMeResponse(
+        id=str(vu.id),
+        email=vu.email,
+        full_name=vu.full_name,
+        must_change_password=vu.must_change_password,
+        mfa_enabled=vu.mfa_enabled,
+        vendor_id=str(vu.vendor_id),
+        vendor_name=vendor.name if vendor else "",
+        vendor_status=vendor.status if vendor else "unknown",
+        locale=vu.locale,
+        legal_acceptance_required=bool(await portal_legal_acceptance.missing_documents(db, vu.id)),
+    )
+
+
 @router.get("/me", response_model=PortalMeResponse)
 async def portal_me(
     vu: VendorUser = Depends(get_current_vendor_user),
@@ -366,17 +399,7 @@ async def portal_me(
     if not vendor:
         # Vendor deleted out from under the portal user — treat as broken session.
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Vendor not found")
-    return PortalMeResponse(
-        id=str(vu.id),
-        email=vu.email,
-        full_name=vu.full_name,
-        must_change_password=vu.must_change_password,
-        mfa_enabled=vu.mfa_enabled,
-        vendor_id=str(vendor.id),
-        vendor_name=vendor.name,
-        vendor_status=vendor.status,
-        locale=vu.locale,
-    )
+    return await _portal_me_response(db, vu, vendor)
 
 
 @router.patch("/me", response_model=PortalMeResponse)
@@ -405,20 +428,60 @@ async def portal_update_me(
             )
     await db.commit()
 
-    vendor = (
-        await db.execute(select(Vendor).where(Vendor.id == vu.vendor_id))
-    ).scalar_one_or_none()
-    return PortalMeResponse(
-        id=str(vu.id),
-        email=vu.email,
-        full_name=vu.full_name,
-        must_change_password=vu.must_change_password,
-        mfa_enabled=vu.mfa_enabled,
-        vendor_id=str(vu.vendor_id),
-        vendor_name=vendor.name if vendor else "",
-        vendor_status=vendor.status if vendor else "unknown",
-        locale=vu.locale,
+    return await _portal_me_response(db, vu)
+
+
+#: Per vendor user, like the employee twin (`api/auth.LEGAL_ACCEPTANCE_RATE_LIMIT_PER_MINUTE`).
+PORTAL_LEGAL_ACKNOWLEDGEMENT_RATE_LIMIT_PER_MINUTE = 10
+
+
+@router.post("/legal-acknowledgement", response_model=PortalMeResponse)
+async def portal_acknowledge_legal(
+    body: PortalLegalAcknowledgementRequest,
+    request: Request,
+    vu: VendorUser = Depends(get_current_vendor_user),
+    db: AsyncSession = Depends(get_tenant_db),
+):
+    """Record the signed-in supplier's acknowledgement of the Privacy Policy in force.
+
+    The portal re-prompt (decisions §500): the backend of the step the portal
+    draws while `legal_acceptance_required` is true on `/me`, for a supplier
+    who set a password before acknowledgement was collected (§499) or meets a
+    version bump. The vendor user is the one the portal JWT names — the body
+    carries only the version shown — and the row goes to the tenant DB beside
+    the `vendor_users` row. Only the version in force passes (422
+    `privacy_acknowledgement_required`), and re-acknowledging is harmless: the
+    record is append-only and keeps its first `accepted_at`.
+    """
+    # A tenant write plus, on a first acknowledgement, a shipped audit row:
+    # capped per account like the employee endpoint (a per-IP bucket would
+    # lump one supplier office's users together).
+    await check_rate_limit(
+        "portal_auth_legal_acknowledgement",
+        limit=PORTAL_LEGAL_ACKNOWLEDGEMENT_RATE_LIMIT_PER_MINUTE,
+        window_seconds=60,
+        subject=str(vu.id),
     )
+    if not portal_legal_acceptance.acknowledges_current(body.accepted_privacy_version):
+        raise HTTPException(
+            status_code=422, detail=portal_legal_acceptance.acknowledgement_refusal()
+        )
+    missing = await portal_legal_acceptance.missing_documents(db, vu.id)
+    await portal_legal_acceptance.record_acknowledgement(
+        db, vendor_user_id=vu.id, source=portal_legal_acceptance.SOURCE_REPROMPT
+    )
+    await db.commit()
+    if missing:
+        await _audit_portal_mfa_event(
+            vu,
+            action="portal.legal.accepted",
+            details={
+                "versions": portal_legal_acceptance.current_portal_versions(),
+                "source": portal_legal_acceptance.SOURCE_REPROMPT,
+                "ip": resolve_client_ip(request),
+            },
+        )
+    return await _portal_me_response(db, vu)
 
 
 @router.post("/change-password", response_model=PortalMeResponse)
@@ -482,20 +545,7 @@ async def portal_change_password(
             details={"scope": "others", "revoked": len(revoked), "reason": "password_changed"},
         )
 
-    vendor = (
-        await db.execute(select(Vendor).where(Vendor.id == vu.vendor_id))
-    ).scalar_one_or_none()
-    return PortalMeResponse(
-        id=str(vu.id),
-        email=vu.email,
-        full_name=vu.full_name,
-        must_change_password=vu.must_change_password,
-        mfa_enabled=vu.mfa_enabled,
-        vendor_id=str(vu.vendor_id),
-        vendor_name=vendor.name if vendor else "",
-        vendor_status=vendor.status if vendor else "unknown",
-        locale=vu.locale,
-    )
+    return await _portal_me_response(db, vu)
 
 
 # ---------------------------------------------------------------------------
@@ -1105,19 +1155,7 @@ async def portal_mfa_verify(
         vu, action="portal.mfa.enrolled", details={"factor": "totp", "replaced": replaced}
     )
 
-    vendor = (
-        await db.execute(select(Vendor).where(Vendor.id == vu.vendor_id))
-    ).scalar_one_or_none()
-    return PortalMeResponse(
-        id=str(vu.id),
-        email=vu.email,
-        full_name=vu.full_name,
-        must_change_password=vu.must_change_password,
-        mfa_enabled=vu.mfa_enabled,
-        vendor_id=str(vu.vendor_id),
-        vendor_name=vendor.name if vendor else "",
-        vendor_status=vendor.status if vendor else "unknown",
-    )
+    return await _portal_me_response(db, vu)
 
 
 @router.post("/mfa/disable", response_model=PortalMeResponse)
@@ -1151,16 +1189,4 @@ async def portal_mfa_disable(
     await mfa.clear_pending_vendor_totp_secret(vu.id)
     await _audit_portal_mfa_event(vu, action="portal.mfa.disabled", details={"factor": "totp"})
 
-    vendor = (
-        await db.execute(select(Vendor).where(Vendor.id == vu.vendor_id))
-    ).scalar_one_or_none()
-    return PortalMeResponse(
-        id=str(vu.id),
-        email=vu.email,
-        full_name=vu.full_name,
-        must_change_password=vu.must_change_password,
-        mfa_enabled=vu.mfa_enabled,
-        vendor_id=str(vu.vendor_id),
-        vendor_name=vendor.name if vendor else "",
-        vendor_status=vendor.status if vendor else "unknown",
-    )
+    return await _portal_me_response(db, vu)

@@ -24,8 +24,17 @@
 	 *
 	 * `onaccept` is `auth.acceptLegal`, `onlogout` is `auth.logout`, passed in so
 	 * this stays presentational.
+	 *
+	 * `documents="privacy"` is the supplier portal's step (§500): the portal
+	 * layout draws it in place of the portal shell, with
+	 * `portalAuth.acknowledgeLegal` / `portalAuth.logout`. A Supplier User is
+	 * not a party to the Terms (§499), so the copy, the box and the coded
+	 * stale-versions refusal (`privacy_acknowledgement_required`) are the
+	 * Privacy Policy acknowledgement's; `mark` replaces the FeohLedger mark with
+	 * the tenant's white-label one, which the portal shell shows everywhere
+	 * else.
 	 */
-	import { onMount, tick } from 'svelte';
+	import { onMount, tick, type Snippet } from 'svelte';
 	import BrandMark from '#lib/components/ui/BrandMark.svelte';
 	import LegalAcceptCheckbox from '#lib/components/auth/LegalAcceptCheckbox.svelte';
 	import { ApiError } from '#lib/api.ts';
@@ -35,9 +44,20 @@
 	interface Props {
 		onaccept: () => Promise<void>;
 		onlogout: () => void;
+		/** What is asked: the employee pair (Terms + Privacy, §497) or the
+		 *  supplier portal's Privacy Policy acknowledgement (§500). */
+		documents?: 'terms_privacy' | 'privacy';
+		/** The brand mark above the heading; FeohLedger's when omitted. */
+		mark?: Snippet;
 	}
 
-	let { onaccept, onlogout }: Props = $props();
+	let { onaccept, onlogout, documents = 'terms_privacy', mark }: Props = $props();
+
+	let privacyOnly = $derived(documents === 'privacy');
+	// The coded 422 a TICKED box meets when the versions moved under this tab.
+	let staleCode = $derived(
+		privacyOnly ? 'privacy_acknowledgement_required' : 'legal_acceptance_required'
+	);
 
 	let accepted = $state(false);
 	let legalError = $state('');
@@ -60,7 +80,7 @@
 		if (submitting) return;
 		error = '';
 		if (!accepted) {
-			legalError = m('auth.legal.acceptRequired');
+			legalError = m(privacyOnly ? 'auth.legal.privacyAckRequired' : 'auth.legal.acceptRequired');
 			box?.focus();
 			return;
 		}
@@ -72,7 +92,7 @@
 			if (
 				err instanceof ApiError &&
 				err.status === 422 &&
-				err.code === 'legal_acceptance_required'
+				err.code === staleCode
 			) {
 				// The box was ticked and still refused: this tab can only send the
 				// versions built into it, so re-ticking is a dead end. Say the
@@ -81,7 +101,10 @@
 				await tick();
 				box?.focus();
 			} else {
-				error = apiErrorMessage(err, m('shell.legalAccept.failed'));
+				error = apiErrorMessage(
+					err,
+					m(privacyOnly ? 'shell.privacyAck.failed' : 'shell.legalAccept.failed')
+				);
 			}
 		} finally {
 			submitting = false;
@@ -99,13 +122,20 @@
      mounted, so without one the page has no main landmark (WCAG 1.3.1). -->
 <main class="legal-step" data-testid="legal-accept-step">
 	<form class="panel" onsubmit={submit} novalidate>
-		<BrandMark size={36} />
-		<h1 bind:this={heading} tabindex="-1">{m('shell.legalAccept.heading')}</h1>
-		<p class="body">{m('shell.legalAccept.body')}</p>
+		{#if mark}
+			{@render mark()}
+		{:else}
+			<BrandMark size={36} />
+		{/if}
+		<h1 bind:this={heading} tabindex="-1">
+			{m(privacyOnly ? 'shell.privacyAck.heading' : 'shell.legalAccept.heading')}
+		</h1>
+		<p class="body">{m(privacyOnly ? 'shell.privacyAck.body' : 'shell.legalAccept.body')}</p>
 		<LegalAcceptCheckbox
 			bind:this={box}
 			id="legal-reprompt-accept"
 			bind:checked={accepted}
+			{documents}
 			error={legalError}
 			{versionsChanged}
 			onchange={() => (legalError = '')}
@@ -115,7 +145,9 @@
 		{/if}
 		<div class="actions">
 			<button type="submit" class="btn-primary" aria-disabled={submitting}>
-				{submitting ? m('shell.legalAccept.continuing') : m('shell.legalAccept.continue')}
+				{submitting
+					? m('shell.legalAccept.continuing')
+					: m(privacyOnly ? 'shell.privacyAck.continue' : 'shell.legalAccept.continue')}
 			</button>
 			<button type="button" class="btn-cancel" onclick={logout} aria-disabled={loggingOut}>
 				{m('shell.logOut')}

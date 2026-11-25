@@ -100,6 +100,12 @@ export const en = {
 	'shell.legalAccept.continue': 'Accept and continue',
 	'shell.legalAccept.continuing': 'Saving…',
 	'shell.legalAccept.failed': 'Your acceptance wasn\'t saved. Try again.',
+	// The supplier portal's re-prompt (decisions §500): the Privacy Policy
+	// alone, acknowledged as read, not agreed to (§499).
+	'shell.privacyAck.heading': 'Confirm you have read our Privacy Policy',
+	'shell.privacyAck.body': 'Before you continue, read the current Privacy Policy, which explains how the platform handles the details you enter here. If you\'d rather not, log out.',
+	'shell.privacyAck.continue': 'Confirm and continue',
+	'shell.privacyAck.failed': 'Your confirmation wasn\'t saved. Try again.',
 
 	// Common buttons / states (reused across surfaces)
 	'common.save': 'Save',

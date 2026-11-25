@@ -25568,6 +25568,53 @@ plane would hold ids it cannot resolve or erase against, and the portal's
 auth never touches the control plane. *Reusing the `legal_acceptance_required`
 code*: its message asks for the Terms, which a supplier is not asked for.
 
+## 500. The supplier portal asks for the Privacy Policy acknowledgement after sign-in, with the web step reused (round 39)
+
+**Problem.** §499 asked suppliers to acknowledge the Privacy Policy only when
+they redeem a set-password link, so a portal user who set a password before
+it, or any portal user after a Privacy Policy bump, was never asked; and the
+server-side gate (§495) cannot land while a population has no screen to
+answer it on.
+
+**Decision.**
+
+- **Backend.** `GET /api/portal/auth/me` carries `legal_acceptance_required`
+  (from `portal_legal_acceptance.missing_documents`), and `POST
+  /api/portal/auth/legal-acknowledgement` records the version in force for the
+  vendor user the portal JWT names — the body carries only the version shown,
+  never an id — in the tenant `vendor_user_legal_acceptances`, source
+  `reprompt` (the employee endpoint's value: the same control, a different
+  population). Anything but the version in force is the coded 422
+  `privacy_acknowledgement_required`; 10/min per vendor user, like the
+  employee endpoint; a first acknowledgement is audited
+  `portal.legal.accepted` through the same helper as the set-password path; a
+  repeat writes nothing. It answers with the profile so the client needs no
+  second `/me`.
+- **One profile builder.** Every route that answers with `PortalMeResponse`
+  (`/me`, `PATCH /me`, change-password, MFA verify / disable) goes through
+  `_portal_me_response`. The portal store replaces its copy of the user with
+  whichever of them answered, so a sibling that left the flag at its default
+  would have cleared the step with nothing recorded. The same fix restores
+  the `locale` the two MFA routes were dropping.
+- **Frontend: the web step, extended, not forked.** `layout/LegalAcceptStep`
+  takes `documents="privacy"` (Privacy Policy copy, the box's `privacy` form,
+  `privacy_acknowledgement_required` as the stale-versions code) and an
+  optional `mark` snippet, through which the portal shows the tenant's
+  white-label mark instead of ours (§173). The portal layout draws it in the
+  shell's place, for §497's reasons: nothing behind it mounts or fetches, the
+  URL is kept, and the page renders when the flag clears. The forced password
+  change comes first, as on the web. Its copy keys are `shell.privacyAck.*` in
+  the main catalogue, because a shared component renders them (§300).
+- **Seeds.** `scripts/seed.py` records the acknowledgement for every portal
+  user of each tenant it seeds (source `seed`), on the already-seeded path
+  too, so neither the demo supplier nor any portal e2e spec meets the step.
+
+**Rejected.** *A portal-only component wrapping `LegalAcceptCheckbox`*: a
+second copy of the step's focus, validation and error handling to drift from
+the first. *Gating server-side in the same change*: still blocked on API
+callers (`docs/followups.md`), and the portal step is what makes the portal
+half of it safe.
+
 ## 501. /admin/partner's "not a partner" state is the children table's empty row (round 39)
 
 **Context.** /admin/partner was the last sidebar list page outside the

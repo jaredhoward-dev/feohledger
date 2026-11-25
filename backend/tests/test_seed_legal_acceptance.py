@@ -65,3 +65,32 @@ def test_e2e_control_plane_records_acceptance_for_every_worker_tenant():
     assert "created" in ast.unparse(calls[0].args[1])
     loops = [n for n in ast.walk(fn) if isinstance(n, ast.For)]
     assert all(calls[0].lineno > loop.end_lineno for loop in loops if _calls(loop, "User"))
+
+
+# ---------------------------------------------------------------------------
+# Supplier-portal users (decisions §499, §500)
+# ---------------------------------------------------------------------------
+
+_PORTAL_HELPER = "ensure_seeded_portal_users_acknowledged_privacy"
+
+
+def test_portal_helper_records_through_the_service_with_the_seed_source():
+    helper = _functions()[_PORTAL_HELPER]
+    calls = _calls(helper, "record_acknowledgement")
+    assert len(calls) == 1, "the helper must write through record_acknowledgement"
+    source = {k.arg: k.value for k in calls[0].keywords}["source"]
+    assert isinstance(source, ast.Name) and source.id == "SEED_LEGAL_SOURCE"
+
+
+def test_every_tenant_seed_acknowledges_for_its_portal_users_on_both_paths():
+    """Both tenant seeds create a portal user; each calls the helper on the
+    fresh path (after the user is added) and on the early "already seeded"
+    return, so the portal re-prompt never meets a seeded supplier."""
+    functions = _functions()
+    for name in ("seed_tenant", "seed_tenant_lean"):
+        fn = functions[name]
+        calls = _calls(fn, _PORTAL_HELPER)
+        assert len(calls) == 2, name
+        adds = _calls(fn, "_make_portal_user")
+        assert adds, name
+        assert max(c.lineno for c in calls) > max(a.lineno for a in adds), name

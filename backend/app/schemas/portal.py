@@ -132,6 +132,17 @@ class PortalMeResponse(BaseModel):
     # outbound supplier email copy only — never portal UI. See
     # docs/notifications.md § Localized email.
     locale: str | None = None
+    # True while the vendor user has not acknowledged the Privacy Policy
+    # version in force (`services/portal_legal_acceptance`): the portal draws
+    # its blocking step until `POST /portal/auth/legal-acknowledgement`
+    # records it (decisions §499, §500).
+    legal_acceptance_required: bool = False
+
+
+class PortalLegalAcknowledgementRequest(BaseModel):
+    """The Privacy Policy version the portal step showed; only the one in force passes."""
+
+    accepted_privacy_version: str | None = Field(default=None, max_length=32)
 
 
 class PortalUpdateProfileRequest(BaseModel):
