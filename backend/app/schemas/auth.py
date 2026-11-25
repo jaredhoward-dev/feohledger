@@ -241,13 +241,15 @@ class WebAuthnAuthFinishRequest(BaseModel):
 # The closed set of operations a step-up can authorize: the four factor changes
 # (`api/auth._require_mfa_step_up`) plus the sensitive actions gated by
 # `api/auth.require_sensitive_step_up` — the unmasked-banking DSAR export and
-# closing the workspace (`api/organization_close`). A step-up assertion is
+# closing the workspace (`api/organization_close`) and minting / rotating the
+# SCIM provisioning token (`api/organization.mint_scim_token`). A step-up assertion is
 # bound to exactly one of these (it selects the Redis challenge slot), so an
 # assertion obtained for one can't be replayed against another. Keep in
 # lockstep with the `operation=` literals at those call sites and with the
 # pattern below.
 STEP_UP_OPERATION_DSAR_UNMASKED = "dsar_unmasked_export"
 STEP_UP_OPERATION_WORKSPACE_CLOSE = "workspace_close"
+STEP_UP_OPERATION_SCIM_TOKEN_MINT = "scim_token_mint"
 STEP_UP_OPERATIONS = (
     "totp_enroll",
     "totp_disable",
@@ -255,6 +257,7 @@ STEP_UP_OPERATIONS = (
     "passkey_delete",
     STEP_UP_OPERATION_DSAR_UNMASKED,
     STEP_UP_OPERATION_WORKSPACE_CLOSE,
+    STEP_UP_OPERATION_SCIM_TOKEN_MINT,
 )
 
 
@@ -272,7 +275,7 @@ class WebAuthnStepUpStartRequest(BaseModel):
         ...,
         pattern=(
             "^(totp_enroll|totp_disable|passkey_register|passkey_delete"
-            "|dsar_unmasked_export|workspace_close)$"
+            "|dsar_unmasked_export|workspace_close|scim_token_mint)$"
         ),
     )
 

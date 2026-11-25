@@ -13,16 +13,31 @@
 	 * stored, logged or put in a URL. Rotating and revoking each ask first,
 	 * because both cut off the identity provider's current connection.
 	 *
+	 * Generating or rotating demands a second factor (decisions §510): the
+	 * server answers `sensitive_step_up_required` until a code or passkey proof
+	 * is sent, and the panel collects one in `ui/StepUpPrompt` and resends —
+	 * the same flow as `CloseWorkspacePanel` (§306). Revoking needs none.
+	 *
+	 * Focus: Generate and Revoke each replace the button that was pressed, so
+	 * when their dialog closes focus goes to the panel's new primary action
+	 * (Rotate after a mint, Generate after a revoke) instead of falling back
+	 * to the page landmark (WCAG 2.4.3).
+	 *
 	 * Admin-only end to end: `readOnly` renders the notice and makes no read.
 	 */
+	import { tick } from 'svelte';
+	import LinkedMessage from '#lib/components/ui/LinkedMessage.svelte';
+	import StepUpPrompt from '#lib/components/ui/StepUpPrompt.svelte';
 	import OrgSettingPanel from '#lib/components/organization/OrgSettingPanel.svelte';
 	import Modal from '#lib/components/ui/Modal.svelte';
 	import PlanUpgradeNotice from '#lib/components/ui/PlanUpgradeNotice.svelte';
 	import SecretReveal from '#lib/components/ui/SecretReveal.svelte';
 	import { toast } from '#lib/components/ui/Toast.svelte';
+	import { ApiError } from '#lib/api.ts';
+	import { authErrorMessage } from '#lib/api/authRefusals.ts';
 	import { getSsoSettings, mintScimToken, revokeScimToken } from '#lib/api/ssoSettings.ts';
 	import { m } from '#lib/i18n/store.svelte.ts';
-	import { auth } from '#lib/stores/auth.svelte.ts';
+	import { auth, type StepUpProof } from '#lib/stores/auth.svelte.ts';
 	import { getApiBase } from '#lib/tenant.ts';
 	import { FEATURE_SCIM } from '#lib/types/planFeatures.ts';
 	import type { ScimTokenMinted } from '#lib/types/ssoSettings.ts';
@@ -49,6 +64,11 @@
 	/** The one-time plaintext. Lives only while the reveal dialog is open. */
 	let minted = $state<ScimTokenMinted | null>(null);
 	let requested = false;
+	let stepUpOpen = $state(false);
+	let stepUpError = $state<string | null>(null);
+	let noFactor = $state(false);
+	let generateButton = $state<HTMLButtonElement | null>(null);
+	let rotateButton = $state<HTMLButtonElement | null>(null);
 
 	const entitled = $derived(auth.hasFeature(FEATURE_SCIM));
 	const actions = $derived(configured === null ? [] : scimActions(configured, entitled));
@@ -74,15 +94,37 @@
 		void load();
 	});
 
-	async function generate() {
+	/** Move focus to whichever primary action the panel now shows, once the
+	 *  DOM has settled (the pressed button may just have been replaced). */
+	async function focusPrimary() {
+		await tick();
+		(configured ? rotateButton : generateButton)?.focus();
+	}
+
+	async function generate(stepUp?: StepUpProof) {
 		confirming = null;
 		working = true;
+		noFactor = false;
 		try {
-			minted = await mintScimToken();
+			minted = await mintScimToken(stepUp);
+			stepUpOpen = false;
+			stepUpError = null;
 			configured = true;
 			toast(m('org.scim.generated'), 'success');
 		} catch (err) {
-			toast(errorMessage(err, m('org.scim.actionFailed')), 'error');
+			const code = err instanceof ApiError ? err.code : null;
+			if (code === 'sensitive_step_up_required') {
+				stepUpError = null;
+				stepUpOpen = true;
+			} else if (code === 'sensitive_step_up_failed' && stepUpOpen) {
+				stepUpError = authErrorMessage(err, m, 'stepUpPrompt.failed');
+			} else if (code === 'sensitive_step_up_no_factor') {
+				stepUpOpen = false;
+				noFactor = true;
+			} else {
+				stepUpOpen = false;
+				toast(errorMessage(err, m('org.scim.actionFailed')), 'error');
+			}
 		} finally {
 			working = false;
 		}
@@ -95,6 +137,7 @@
 			await revokeScimToken();
 			configured = false;
 			toast(m('org.scim.revoked'), 'success');
+			void focusPrimary();
 		} catch (err) {
 			toast(errorMessage(err, m('org.scim.actionFailed')), 'error');
 		} finally {
@@ -104,6 +147,7 @@
 
 	function dismissMinted() {
 		minted = null;
+		void focusPrimary();
 	}
 </script>
 
@@ -132,6 +176,16 @@
 		/>
 		<p id="{uid}-endpoint-hint" class="field-hint">{m('org.scim.endpointHint')}</p>
 	</div>
+	{#if noFactor}
+		<p class="no-factor" role="alert" data-testid="scim-no-factor">
+			<LinkedMessage
+				text={m('org.scim.noFactor')}
+				links={{
+					profile: { href: '/profile?section=mfa', label: m('org.scim.noFactorLink') }
+				}}
+			/>
+		</p>
+	{/if}
 	{#if userLoaded && !entitled}
 		<PlanUpgradeNotice feature={FEATURE_SCIM} testId="scim-plan-upgrade" />
 	{/if}
@@ -144,7 +198,8 @@
 				type="button"
 				class="btn-primary"
 				disabled={working}
-				onclick={generate}
+				bind:this={generateButton}
+				onclick={() => generate()}
 				data-testid="scim-generate"
 			>
 				{working ? m('org.scim.working') : m('org.scim.generate')}
@@ -155,6 +210,7 @@
 				type="button"
 				class="btn-primary"
 				disabled={working}
+				bind:this={rotateButton}
 				onclick={() => (confirming = 'rotate')}
 				data-testid="scim-rotate"
 			>
@@ -200,12 +256,25 @@
 				{m('org.scim.revoke')}
 			</button>
 		{:else}
-			<button type="button" class="btn-primary" onclick={generate} data-testid="scim-confirm">
+			<button type="button" class="btn-primary" onclick={() => generate()} data-testid="scim-confirm">
 				{m('org.scim.rotate')}
 			</button>
 		{/if}
 	</div>
 </Modal>
+
+<StepUpPrompt
+	open={stepUpOpen}
+	operation="scim_token_mint"
+	hint={m('org.scim.stepUpHint')}
+	busy={working}
+	error={stepUpError}
+	onproof={(proof) => generate(proof)}
+	oncancel={() => {
+		stepUpOpen = false;
+		stepUpError = null;
+	}}
+/>
 
 <SecretReveal
 	open={minted !== null}
@@ -255,6 +324,12 @@
 		font-size: 0.78rem;
 		color: var(--text-muted);
 		margin: 4px 0 0;
+	}
+
+	.no-factor {
+		font-size: 0.85rem;
+		color: var(--danger);
+		margin: 0 0 14px;
 	}
 
 	.help-link {

@@ -605,6 +605,9 @@ export const enSettings = {
 	'org.scim.reveal.copyFailed': "Could not copy. Select the token and copy it by hand.",
 	'org.scim.reveal.done': "Done",
 	'org.scim.reveal.prefix': "Token ID",
+	'org.scim.stepUpHint': "A SCIM token can create users and grant roles. Enter a current code from your authenticator app, or use a registered passkey.",
+	'org.scim.noFactor': "Generating a SCIM token needs a second factor, and a password alone cannot authorize it. {profile} first.",
+	'org.scim.noFactorLink': "Set up an authenticator app or a passkey on your profile",
 	'org.section.fraud': 'Fraud Detection',
 	'org.section.fraudSaved': 'Fraud detection',
 	'org.fraud.hint':
