@@ -1241,6 +1241,61 @@ async def cancel_card(
     return {"success": True, "message": "Card cancelled"}
 
 
+def _card_transaction_id(provider: str, body: dict) -> str | None:
+    """The provider's id for the transaction an event belongs to, shared by its
+    authorization, lapse and clearings (decisions §554), or None.
+
+    * Lithic: a `card_transaction.updated` body IS the transaction; its
+      `token` is the same on every update (https://docs.lithic.com/docs/transactions).
+    * Nium: `authCode` ("authorization code of the transaction") on the
+      authorization and reversal webhooks, else `rhaTransactionId` (the
+      Delegated Model transaction id). Not verified against a live Nium
+      program that the reversal repeats its authorization's `authCode`.
+    * Mock: the simulator's `transaction_id`.
+    """
+    if provider == "lithic":
+        if str(body.get("type") or body.get("event_type") or "").lower() != _LITHIC_CARD_TXN_EVENT:
+            return None
+        value = body.get("token")
+    elif provider == "nium":
+        value = body.get("authCode") or body.get("rhaTransactionId")
+    else:
+        value = body.get("transaction_id")
+    return str(value) if value else None
+
+
+#: Lithic's financial event types, the ones that move the settled amount
+#: (https://docs.lithic.com/docs/transactions, checked 2026-11-25).
+_LITHIC_FINANCIAL_EVENTS = frozenset({"CLEARING", "RETURN", "RETURN_REVERSAL"})
+
+
+def _clearing_key(provider: str, body: dict, transaction_id, event_id, cleared) -> str | None:
+    """The identity of the clearing a settlement delivery reports (§554).
+
+    Lithic sends the whole transaction on every update, its `events` in order,
+    and a transaction can clear more than once ("any permutation of Clearing,
+    Return, Authorization Reversal, and Authorization Expiry messages on this
+    same transaction", https://docs.lithic.com/docs/transaction-flow, checked
+    2026-11-25). The newest financial event's token names this delivery's
+    clearing; without `events`, the transaction token and its cumulative
+    settled figure do (a different total is a different clearing). Nium and the
+    mock: the delivery id."""
+    if provider == "lithic":
+        tokens = [
+            e.get("token")
+            for e in (body.get("events") or [])
+            if isinstance(e, dict)
+            and str(e.get("type") or "").upper() in _LITHIC_FINANCIAL_EVENTS
+            and e.get("token")
+        ]
+        if tokens:
+            return f"event:{tokens[-1]}"
+        if transaction_id and cleared is not None:
+            return f"total:{transaction_id}:{cleared}"
+        return None
+    return f"delivery:{event_id}" if event_id else None
+
+
 #: `Exception.erp_report["kind"]` of the flag a clearing on a cancelled card
 #: opens (decisions §549); deduped by kind like every reconciliation flag (§535).
 CARD_SETTLED_AFTER_CANCEL_KIND = "card_settled_after_cancel"
@@ -1313,6 +1368,124 @@ async def _record_settlement_after_cancel(
             "currency": card.currency,
         },
     )
+
+
+async def _record_further_clearing(
+    db: AsyncSession,
+    *,
+    provider: str,
+    card: VirtualCard,
+    reported: Decimal | None,
+    clearing_key: str | None,
+    transaction_id: str | None,
+):
+    """A clearing on a card that already settled (decisions §554); returns the
+    run payment it re-stamped, or None.
+
+    An incremental capture (lodging, fuel, a split shipment) clears the same
+    transaction again, and before this nothing matched a `completed` card, so
+    spend after the first settlement was never recorded. Now:
+
+    * *Lithic* reports the transaction's CUMULATIVE settled figure, so the
+      clearing adds `reported - amount_charged`. *Mock* reports each clearing's
+      own figure. *Nium* is not applied: its documented card webhooks describe
+      one settlement per authorization and no incremental capture, so a further
+      settlement is recorded (`card.clearing_refused`, reason
+      `provider_single_settlement`) for a person and changes nothing.
+    * Each clearing is recorded once (`card_transaction_memory.record_clearing`,
+      keyed by `_clearing_key`); a replay changes nothing.
+    * An increase is added to `amount_charged` (exact Decimal), written onto the
+      run payment by `record_card_spend`, the pending rebate is re-based on the
+      total, a `card.clearing_added` row is written, and a total past what the
+      card pays opens the `card_over_settled` flag. The caller re-dispatches
+      the payment sync once, after its commit.
+    * A clearing that does not increase the total (a Lithic RETURN, a negative
+      mock clearing) is REFUSED: the card, the payment and the rebate stand,
+      and `card.clearing_refused` (reason `not_an_increase`) records it for the
+      refund flow, as a reversal after settlement is (§544).
+    """
+    from app.services import card_transaction_memory as memory
+    from app.services.audit_dispatch import dispatch_audit
+    from app.services.payment_settlement_record import (
+        flag_card_over_settlement,
+        record_card_spend,
+    )
+
+    if clearing_key is None:
+        logger.warning("Card webhook: further clearing with no identity; left unapplied")
+        return None
+    if await memory.clearing_seen(db, card, clearing_key):
+        return None
+
+    current = card.amount_charged or Decimal("0")
+    reason = None
+    if provider == "nium":
+        reason = "provider_single_settlement"
+        added = None
+    elif reported is None:
+        reason = "no_amount"
+        added = None
+    else:
+        added = reported - current if provider == "lithic" else reported
+        if added <= 0:
+            reason = "not_an_increase"
+
+    await memory.record_clearing(
+        db, card, clearing_key=clearing_key, transaction_id=transaction_id, amount=added
+    )
+    if reason is not None:
+        logger.warning("Card webhook: further clearing on a settled card refused (%s)", reason)
+        await dispatch_audit(
+            db,
+            correlation_id=card.correlation_id or uuid.uuid4(),
+            organization_id=card.organization_id,
+            actor_id=None,
+            action="card.clearing_refused",
+            entity_type="virtual_card",
+            entity_id=card.id,
+            details={
+                "last_four": card.last_four,
+                "reason": reason,
+                "cleared_amount": str(added) if added is not None else None,
+                "amount_charged": str(current),
+                "currency": card.currency,
+            },
+        )
+        return None
+
+    card.amount_charged = current + added
+    payment = await record_card_spend(db, card)
+
+    rebate = (
+        await db.execute(select(CardRebate).where(CardRebate.virtual_card_id == card.id))
+    ).scalar_one_or_none()
+    rebate_amount = None
+    if rebate is not None and rebate.status == "pending":
+        # Re-based on the total cleared, at the rate it was created with. A
+        # confirmed or paid rebate is the processor's statement and stands.
+        rebate.amount = (card.amount_charged * rebate.rate).quantize(
+            Decimal("0.01"), rounding=ROUND_HALF_UP
+        )
+        rebate_amount = str(rebate.amount)
+
+    await dispatch_audit(
+        db,
+        correlation_id=card.correlation_id or uuid.uuid4(),
+        organization_id=card.organization_id,
+        actor_id=None,
+        action="card.clearing_added",
+        entity_type="virtual_card",
+        entity_id=card.id,
+        details={
+            "last_four": card.last_four,
+            "cleared_amount": str(added),
+            "amount_charged": str(card.amount_charged),
+            "currency": card.currency,
+            "rebate_amount": rebate_amount,
+        },
+    )
+    await flag_card_over_settlement(db, card, payment)
+    return payment
 
 
 @router.post("/webhook/{provider}", status_code=status.HTTP_204_NO_CONTENT)
@@ -1495,15 +1668,72 @@ async def card_webhook(provider: str, request: Request):
                 is_auth, is_settled = _classify_card_event(stage)
                 lapse = _classify_card_lapse(stage)
 
+                from app.services import card_transaction_memory as card_memory
                 from app.services.audit_dispatch import dispatch_audit
                 from app.services.payment_settlement_record import (
                     CARD_SETTLED_STATUS,
+                    flag_card_over_settlement,
                     record_card_spend,
                 )
 
                 # The run payment this charge pays, once written (§537).
                 spent_payment = None
+                txn_id = _card_transaction_id(provider, body)
+                # A lapse of this same transaction that arrived FIRST (§554):
+                # the authorization is applied as already lapsed. A partial
+                # reversal (a figure below the authorized one) leaves part of the
+                # hold, as it does in order (§544), so the card is charged.
+                early_lapse = None
                 if is_auth and card.status in ("created", "sent", "active"):
+                    early_lapse = await card_memory.lapse_for(db, card, txn_id)
+                    if early_lapse is not None and provider != "lithic":
+                        authorized = _normalize_charge_amount(provider, amount, None, card.currency)
+                        if (
+                            early_lapse.lapse == CARD_LAPSE_REVERSAL
+                            and early_lapse.amount is not None
+                            and authorized is not None
+                            and 0 < early_lapse.amount < authorized
+                        ):
+                            logger.info(
+                                "Card webhook: an earlier partial reversal left this "
+                                "authorization standing"
+                            )
+                            early_lapse = None
+                if early_lapse is not None:
+                    # The provider DID authorize, so the card was used: a
+                    # single-use card is closed at the provider by it whatever
+                    # happened to the hold, and `first_authorized_at` is what a
+                    # re-run refuses on (§549). The hold itself is already gone,
+                    # so the card stays (or returns to) unspent and nothing is
+                    # written onto the run's card leg.
+                    prior_status = card.status
+                    if card.first_authorized_at is None:
+                        card.first_authorized_at = datetime.now(UTC)
+                    card.status = CARD_LAPSED_STATUS
+                    card.amount_charged = None
+                    card.charged_at = None
+                    card.merchant_name = None
+                    released = _normalize_charge_amount(
+                        provider, amount, card.amount_limit, card.currency
+                    )
+                    await dispatch_audit(
+                        db,
+                        correlation_id=card.correlation_id or uuid.uuid4(),
+                        organization_id=card.organization_id,
+                        actor_id=None,
+                        action="card.authorization_lapsed",
+                        entity_type="virtual_card",
+                        entity_id=card.id,
+                        details={
+                            "last_four": card.last_four,
+                            "from": prior_status,
+                            "to": CARD_LAPSED_STATUS,
+                            "lapse": early_lapse.lapse,
+                            "released_amount": str(released) if released is not None else None,
+                            "out_of_order": True,
+                        },
+                    )
+                elif is_auth and card.status in ("created", "sent", "active"):
                     prior_status = card.status
                     card.status = "charged"
                     card.amount_charged = _normalize_charge_amount(
@@ -1578,6 +1808,28 @@ async def card_webhook(provider: str, request: Request):
                                 ),
                             },
                         )
+                elif lapse in (CARD_LAPSE_REVERSAL, CARD_LAPSE_EXPIRY) and card.status in (
+                    "created",
+                    "sent",
+                    "active",
+                ):
+                    # No hold to release: the lapse came before its
+                    # authorization (§554). Remember it under the provider's
+                    # transaction id so that authorization, when it arrives, is
+                    # applied as lapsed instead of charging the card. Nothing
+                    # changes on the card now, so no audit row yet; the one the
+                    # authorization writes carries `out_of_order: true`.
+                    if txn_id:
+                        await card_memory.remember_lapse(
+                            db,
+                            card,
+                            transaction_id=txn_id,
+                            lapse=lapse,
+                            amount=_normalize_charge_amount(provider, amount, None, card.currency),
+                        )
+                        logger.info("Card webhook: lapse before its authorization remembered")
+                    else:
+                        logger.info("Card webhook: lapse on an unspent card with no transaction id")
                 elif lapse in (CARD_LAPSE_REVERSAL, CARD_LAPSE_EXPIRY) and (
                     card.status == CARD_SETTLED_STATUS
                 ):
@@ -1630,6 +1882,19 @@ async def card_webhook(provider: str, request: Request):
                     # Money moved: the settled figure is written onto the run's
                     # card leg, the only figure it counts (decisions §537, §543).
                     spent_payment = await record_card_spend(db, card)
+                    # Remember this clearing, so a further one is told apart
+                    # from its replay (§554), and flag a charge past what the
+                    # card pays: over-settlement reads `covered` by design.
+                    clearing_key = _clearing_key(provider, body, txn_id, event_id, settled_amount)
+                    if clearing_key is not None:
+                        await card_memory.record_clearing(
+                            db,
+                            card,
+                            clearing_key=clearing_key,
+                            transaction_id=txn_id,
+                            amount=settled_amount,
+                        )
+                    await flag_card_over_settlement(db, card, spent_payment)
 
                     # Create rebate at the org's negotiated rate (not a hardcoded
                     # 1%), quantized to cents — the rate field was documented on
@@ -1685,6 +1950,23 @@ async def card_webhook(provider: str, request: Request):
                             "rebate_base": str(_rebate_base),
                             "rebate_base_source": rebate_base_source,
                         },
+                    )
+
+                elif is_settled and card.status == CARD_SETTLED_STATUS:
+                    # A further clearing of a settled card (§554).
+                    spent_payment = await _record_further_clearing(
+                        db,
+                        provider=provider,
+                        card=card,
+                        reported=_normalize_charge_amount(provider, amount, None, card.currency),
+                        clearing_key=_clearing_key(
+                            provider,
+                            body,
+                            txn_id,
+                            event_id,
+                            _normalize_charge_amount(provider, amount, None, card.currency),
+                        ),
+                        transaction_id=txn_id,
                     )
 
                 await db.commit()

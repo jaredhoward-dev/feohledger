@@ -51,6 +51,8 @@ export const messages = {
 	'audit.action.card.cancel_failed': "Falha no cancelamento do cartão",
 	'audit.action.card.cancelled': "Cartão cancelado",
 	'audit.action.card.charged': "Cartão cobrado",
+	'audit.action.card.clearing_added': "Liquidação adicional do cartão registrada",
+	'audit.action.card.clearing_refused': "Liquidação adicional do cartão recusada",
 	'audit.action.card.authorization_lapsed': "Autorização do cartão expirada",
 	'audit.action.card.reversal_after_settlement': "Estorno em cartão liquidado",
 	'audit.action.card.settled_after_cancel': "Cartão cobrado após o cancelamento",

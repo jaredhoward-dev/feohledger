@@ -108,3 +108,54 @@ class CardRebate(Base, TimestampMixin):
     organization_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), nullable=False, index=True
     )
+
+
+class CardTransactionEvent(Base, TimestampMixin):
+    """One provider transaction event the card webhook must remember beyond
+    the delivery that carried it (decisions §554; migration 0148).
+
+    Two kinds, keyed per card by ``(kind, event_key)``:
+
+    * ``lapse`` — a reversal / expiry that arrived BEFORE its authorization, on
+      a card with no hold to release. ``event_key`` is the provider's
+      transaction id, so the late authorization of that same transaction finds
+      it and is applied as already lapsed instead of charging the card.
+    * ``clearing`` — each clearing applied to the card. ``event_key`` is that
+      clearing's own identity (Lithic's clearing event token, else the
+      transaction token and its cumulative settled figure; the delivery id for
+      the mock), so an incremental capture is added exactly once even when the
+      Redis event-id claim is gone.
+
+    Not the audit log: in ``lambda`` audit mode those rows ship to SQS and may
+    not be in the tenant database, and this is read back by the webhook.
+    """
+
+    __tablename__ = "card_transaction_events"
+    __table_args__ = (
+        Index(
+            "uq_card_transaction_events_card_kind_key",
+            "virtual_card_id",
+            "kind",
+            "event_key",
+            unique=True,
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    virtual_card_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("virtual_cards.id", ondelete="CASCADE"), nullable=False
+    )
+    kind: Mapped[str] = mapped_column(String(20), nullable=False)
+    event_key: Mapped[str] = mapped_column(String(255), nullable=False)
+    provider_transaction_id: Mapped[str | None] = mapped_column(String(255))
+    # `reversal` / `expiry` on a lapse row; NULL on a clearing.
+    lapse: Mapped[str | None] = mapped_column(String(20))
+    # Major units. A lapse: the figure it named, if any (a partial reversal is
+    # told apart by it). A clearing: what this clearing added (negative for a
+    # refused decrease, recorded so a replay of it stays quiet).
+    amount: Mapped[Decimal | None] = mapped_column(Numeric(15, 2))
+    currency: Mapped[str | None] = mapped_column(String(3))
+
+    organization_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), nullable=False, index=True
+    )

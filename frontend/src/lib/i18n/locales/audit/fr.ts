@@ -51,6 +51,8 @@ export const messages = {
 	'audit.action.card.cancel_failed': "Échec de l'annulation de carte",
 	'audit.action.card.cancelled': "Carte annulée",
 	'audit.action.card.charged': "Carte débitée",
+	'audit.action.card.clearing_added': "Règlement supplémentaire de carte enregistré",
+	'audit.action.card.clearing_refused': "Règlement supplémentaire de carte refusé",
 	'audit.action.card.authorization_lapsed': "Autorisation de carte expirée",
 	'audit.action.card.reversal_after_settlement': "Annulation sur une carte réglée",
 	'audit.action.card.settled_after_cancel': "Carte débitée après annulation",

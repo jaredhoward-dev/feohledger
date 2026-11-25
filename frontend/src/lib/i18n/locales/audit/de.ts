@@ -51,6 +51,8 @@ export const messages = {
 	'audit.action.card.cancel_failed': "Kartenstornierung fehlgeschlagen",
 	'audit.action.card.cancelled': "Karte storniert",
 	'audit.action.card.charged': "Karte belastet",
+	'audit.action.card.clearing_added': "Weitere Kartenabrechnung erfasst",
+	'audit.action.card.clearing_refused': "Weitere Kartenabrechnung abgelehnt",
 	'audit.action.card.authorization_lapsed': "Kartenautorisierung verfallen",
 	'audit.action.card.reversal_after_settlement': "Stornierung einer abgerechneten Karte",
 	'audit.action.card.settled_after_cancel': "Karte nach Stornierung belastet",
