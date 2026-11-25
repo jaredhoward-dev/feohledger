@@ -26,15 +26,33 @@
 		overdueLabel: string;
 		/** `formatDate` options (e.g. no year in a compact list). */
 		opts?: Intl.DateTimeFormatOptions;
+		/**
+		 * Which edge the date, its badge and the "rescheduled from" line hug: the
+		 * start (a table cell) or the end (a right-aligned list column, such as
+		 * the dashboard's upcoming list).
+		 */
+		align?: 'start' | 'end';
 	}
 
-	let { due, own = null, overdue, overdueLabel, opts = undefined }: Props = $props();
+	let {
+		due,
+		own = null,
+		overdue,
+		overdueLabel,
+		opts = undefined,
+		align = 'start'
+	}: Props = $props();
 
 	let from = $derived(rescheduledFrom(due, own));
 	let fmt = (d: string | null | undefined) => (opts ? formatDate(d, '—', opts) : formatDate(d));
 </script>
 
-<span class="due-date" data-testid="due-date" data-rescheduled={from ? 'true' : undefined}>
+<span
+	class="due-date"
+	class:end={align === 'end'}
+	data-testid="due-date"
+	data-rescheduled={from ? 'true' : undefined}
+>
 	<span class="due-main">
 		{fmt(due)}
 		{#if overdue}
@@ -52,13 +70,27 @@
 	.due-date {
 		display: inline-flex;
 		flex-direction: column;
+		align-items: flex-start;
 		gap: 2px;
 	}
 
+	.due-date.end {
+		align-items: flex-end;
+	}
+
+	/* The date and its overdue pill were two inline runs once and could break
+	   between them; a flex row has to be told to keep doing that, or a narrow
+	   viewport scrolls sideways (SC 1.4.10). */
 	.due-main {
 		display: inline-flex;
 		align-items: center;
+		justify-content: flex-start;
+		flex-wrap: wrap;
 		gap: 6px;
+	}
+
+	.due-date.end .due-main {
+		justify-content: flex-end;
 	}
 
 	.due-from {

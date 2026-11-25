@@ -35,4 +35,9 @@ describe('DueDate', () => {
 		expect(html({ overdue: true })).toContain('Overdue');
 		expect(html({ overdue: false })).not.toContain('Overdue');
 	});
+
+	it('hugs the start edge by default and the end edge on align="end"', () => {
+		expect(html({})).not.toMatch(/class="due-date[^"]*\bend\b/);
+		expect(html({ align: 'end' })).toMatch(/class="due-date[^"]*\bend\b/);
+	});
 });
