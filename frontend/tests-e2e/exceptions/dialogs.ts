@@ -19,3 +19,17 @@ export function bulkResolveDialog(page: Page): Locator {
 		.getByRole('dialog')
 		.filter({ has: page.getByTestId('exception-bulk-resolve-form') });
 }
+
+/**
+ * The orphan-bill void confirm (`ErpOrphanBill.svelte`), stacked over the
+ * resolve dialog. A stacked `Modal` renders in its host's DOM (`focusTrap`'s
+ * `ownsEscape`, `modalInert`), so the resolve dialog CONTAINS this form too and
+ * a bare `has:` filter matches both. The confirm is the dialog with the form
+ * and no dialog inside it.
+ */
+export function orphanVoidDialog(page: Page): Locator {
+	return page
+		.getByRole('dialog')
+		.filter({ has: page.getByTestId('exception-erp-orphan-void-form') })
+		.filter({ hasNot: page.getByRole('dialog') });
+}

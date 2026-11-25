@@ -10,7 +10,7 @@ import {
   tenantPsql,
   test,
 } from "../fixtures/helpers";
-import { resolveDialog } from "./dialogs";
+import { orphanVoidDialog, resolveDialog } from "./dialogs";
 import { exceptionSummary } from "./summary";
 
 /**
@@ -157,9 +157,7 @@ test.describe("/exceptions — the bill a failed push left in the ERP", () => {
       modal.getByTestId("exception-erp-orphan-open-invoice"),
     ).toHaveAttribute("href", `/invoices?id=${INVOICE}`);
     await modal.getByTestId("exception-erp-orphan-void-open").click();
-    const confirm = page
-      .getByRole("dialog")
-      .filter({ has: page.getByTestId("exception-erp-orphan-void-form") });
+    const confirm = orphanVoidDialog(page);
     // Escape on the stacked confirm closes only it.
     await expect(confirm).toBeVisible();
     await page.keyboard.press("Escape");
@@ -250,9 +248,7 @@ test.describe("/exceptions — the bill a failed push left in the ERP", () => {
     await modal.getByTestId("exception-erp-orphan-find").click();
     await expect(error).toHaveCount(0);
     await modal.getByTestId("exception-erp-orphan-void-open").click();
-    const confirm = page
-      .getByRole("dialog")
-      .filter({ has: page.getByTestId("exception-erp-orphan-void-form") });
+    const confirm = orphanVoidDialog(page);
     await confirm.getByTestId("exception-erp-orphan-void-reason").fill("dup");
     await confirm.getByTestId("exception-erp-orphan-void-confirm").click();
     await expect(
