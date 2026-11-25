@@ -3545,6 +3545,8 @@ export const messages = {
 	'auth.signup.legalConsent': 'Acepto los {terms} y la {privacy}, incluido el {dpa} que rige los datos de proveedores y facturas que cargue en el espacio de trabajo.',
 	'auth.legal.acceptLabel': 'Acepto los {terms} y la {privacy}.',
 	'auth.legal.acceptRequired': 'Marca la casilla para aceptar los términos del servicio y la política de privacidad.',
+	'auth.legal.versionsChanged': 'Los términos del servicio o la política de privacidad cambiaron después de cargar esta página. Vuelve a cargar la página para leer y aceptar las versiones vigentes.',
+	'auth.legal.reload': 'Volver a cargar la página',
 	'auth.signup.footerPre': '¿Ya tienes un espacio de trabajo? Visita ',
 	'auth.signup.footerPost': ' para iniciar sesión.',
 	// Auth shell brand panel (lib/components/auth/AuthShell.svelte) — signup's

@@ -3487,6 +3487,8 @@ export const messages = {
 	'auth.signup.legalConsent': '{terms}および{privacy}に同意します。これには、ワークスペースに読み込む取引先データおよび請求書データを規定する{dpa}が含まれます。',
 	'auth.legal.acceptLabel': '{terms}および{privacy}に同意します。',
 	'auth.legal.acceptRequired': '利用規約とプライバシーポリシーに同意するには、チェックボックスをオンにしてください。',
+	'auth.legal.versionsChanged': 'このページを読み込んだ後に利用規約またはプライバシーポリシーが更新されました。ページを再読み込みして、最新の内容を確認し同意してください。',
+	'auth.legal.reload': 'ページを再読み込み',
 	'auth.signup.footerPre': 'すでにワークスペースをお持ちですか？',
 	'auth.signup.footerPost': 'にアクセスしてサインインしてください。',
 	// Auth shell brand panel (lib/components/auth/AuthShell.svelte) — signup's

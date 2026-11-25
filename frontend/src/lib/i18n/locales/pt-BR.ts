@@ -3548,6 +3548,8 @@ export const messages = {
 	'auth.signup.legalConsent': 'Concordo com os {terms} e a {privacy}, incluindo o {dpa} que rege os dados de fornecedores e faturas que eu carregar no espaço de trabalho.',
 	'auth.legal.acceptLabel': 'Concordo com os {terms} e a {privacy}.',
 	'auth.legal.acceptRequired': 'Marque a caixa para aceitar os termos de serviço e a política de privacidade.',
+	'auth.legal.versionsChanged': 'Os termos de serviço ou a política de privacidade mudaram depois que esta página foi carregada. Recarregue a página para ler e aceitar as versões vigentes.',
+	'auth.legal.reload': 'Recarregar página',
 	'auth.signup.footerPre': 'Já tem um espaço de trabalho? Acesse ',
 	'auth.signup.footerPost': ' para entrar.',
 	// Auth shell brand panel (lib/components/auth/AuthShell.svelte) — signup's

@@ -11,6 +11,17 @@
 	 * (`docs/decisions.md` §174). The whole sentence is the checkbox's label, so
 	 * a screen reader names the control by what ticking it agrees to, and the
 	 * links inside stay ordinary links.
+	 *
+	 * `aria-required`, not `required`: the pages validate the box themselves
+	 * and show the localized `error` below; a native `required` let the
+	 * browser block the submit first with its own bubble, in the browser's
+	 * language, on a form without `novalidate` (/signup).
+	 *
+	 * `versionsChanged` is the dead end a stale tab hits: the versions sent are
+	 * built into the bundle, so a tab opened before a deploy that bumped the
+	 * Terms or Privacy Policy is refused (`legal_acceptance_required`) however
+	 * often the box is ticked. Only a reload fetches the current documents and
+	 * versions, so the message says so and offers the reload beside the box.
 	 */
 	import LinkedMessage from '#lib/components/ui/LinkedMessage.svelte';
 	import { m } from '#lib/i18n/store.svelte.ts';
@@ -21,6 +32,7 @@
 		id,
 		error = '',
 		withDpa = false,
+		versionsChanged = false,
 		onchange
 	}: {
 		checked?: boolean;
@@ -28,10 +40,14 @@
 		/** Shown beside the box, and announced, when a submit found it unticked. */
 		error?: string;
 		withDpa?: boolean;
+		/** The server refused a TICKED box: the documents changed since the page
+		 *  loaded. Shown in place of `error`, with a reload action. */
+		versionsChanged?: boolean;
 		onchange?: () => void;
 	} = $props();
 
 	let input: HTMLInputElement | undefined = $state();
+	let described = $derived(Boolean(error) || versionsChanged);
 
 	/** Move focus to the box (a submit that found it unticked). */
 	export function focus() {
@@ -46,9 +62,9 @@
 		type="checkbox"
 		bind:checked
 		{onchange}
-		required
-		aria-invalid={error ? 'true' : undefined}
-		aria-describedby={error ? `${id}-error` : undefined}
+		aria-required="true"
+		aria-invalid={described ? 'true' : undefined}
+		aria-describedby={described ? `${id}-error` : undefined}
 	/>
 	<label for={id}>
 		<LinkedMessage
@@ -61,7 +77,14 @@
 		/>
 	</label>
 </div>
-{#if error}
+{#if versionsChanged}
+	<div id="{id}-error" class="hint bad versions-changed" role="alert">
+		<span>{m('auth.legal.versionsChanged')}</span>
+		<button type="button" class="reload" onclick={() => location.reload()}>
+			{m('auth.legal.reload')}
+		</button>
+	</div>
+{:else if error}
 	<small id="{id}-error" class="hint bad" role="alert">{error}</small>
 {/if}
 
@@ -74,6 +97,13 @@
 		font-size: 0.85rem;
 		line-height: 1.55;
 		color: var(--text);
+	}
+	/* Beats AuthShell's `.form-wrap :where(label)` column flex, which would
+	   otherwise stack each text run and link of the sentence as its own row. */
+	.legal-consent label {
+		display: block;
+		flex: 1 1 auto;
+		min-width: 0;
 	}
 	.legal-consent input {
 		/* WCAG 2.5.8: a 24px target. */
@@ -89,5 +119,23 @@
 	.hint.bad {
 		font-size: 0.8rem;
 		color: var(--danger);
+	}
+	.versions-changed {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: center;
+		gap: 6px 10px;
+	}
+	.reload {
+		/* WCAG 2.5.8: a 24px target. */
+		min-height: 24px;
+		padding: 2px 10px;
+		font: inherit;
+		font-weight: 600;
+		color: var(--accent-on-tint);
+		background: transparent;
+		border: 1px solid currentColor;
+		border-radius: 6px;
+		cursor: pointer;
 	}
 </style>

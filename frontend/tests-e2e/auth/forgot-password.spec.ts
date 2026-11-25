@@ -246,6 +246,67 @@ test.describe('/login/reset-password', () => {
 		]);
 	});
 
+	test('a TICKED box the server still refuses (the documents changed since load) offers a reload, not another tick', async ({
+		page
+	}) => {
+		// The versions sent are built into the bundle, so a tab opened before a
+		// deploy that bumped the Terms or Privacy Policy is refused however
+		// often the box is ticked. Re-asking for the tick was a dead end.
+		let redeems = 0;
+		await page.route(
+			(url) => url.pathname === '/api/auth/reset-password/check',
+			(route) =>
+				route.fulfill({
+					json: { email: 'invitee@acme.example', legal_acceptance_required: true }
+				})
+		);
+		await page.route(
+			(url) => url.pathname === '/api/auth/reset-password',
+			(route) => {
+				redeems += 1;
+				return route.fulfill({
+					status: 422,
+					json: {
+						detail: {
+							code: 'legal_acceptance_required',
+							message: 'Please accept the current Terms of Service and Privacy Policy to continue.'
+						}
+					}
+				});
+			}
+		);
+		await page.goto('/login/reset-password?token=stubbed-token&mode=set');
+		const box = page.getByRole('checkbox', { name: /I agree to the Terms of Service/ });
+		await page.locator('input[type="password"]').first().fill('MyOwnChoice!2026');
+		await page.locator('input[type="password"]').nth(1).fill('MyOwnChoice!2026');
+		await box.check();
+		await page.getByRole('button', { name: 'Set password' }).click();
+
+		const message = page.locator('.legal-consent + [role="alert"]');
+		await expect(message).toContainText(
+			'The Terms of Service or Privacy Policy changed since this page loaded.'
+		);
+		// Still ticked — the box was never the problem — and described by the message.
+		await expect(box).toBeChecked();
+		await expect(box).toBeFocused();
+		await expect(box).toHaveAttribute('aria-invalid', 'true');
+		const describedBy = await box.getAttribute('aria-describedby');
+		expect(describedBy).toBeTruthy();
+		await expect(page.locator(`[id="${describedBy}"]`)).toContainText('changed since this page loaded');
+		await expect(
+			page.getByText('Tick the box to accept the Terms of Service and Privacy Policy.')
+		).toHaveCount(0);
+		expect(redeems).toBe(1);
+
+		// The reload keeps the token (opening the link never spends it) and
+		// fetches the current documents and versions.
+		const reloaded = page.waitForEvent('load');
+		await message.getByRole('button', { name: 'Reload page' }).click();
+		await reloaded;
+		await expect(page).toHaveURL(/token=stubbed-token/);
+		await expect(page.getByRole('checkbox', { name: /I agree to the Terms of Service/ })).not.toBeChecked();
+	});
+
 	test('a failed check is not reported as a dead link, and can be retried', async ({ page }) => {
 		let fail = true;
 		await page.route(

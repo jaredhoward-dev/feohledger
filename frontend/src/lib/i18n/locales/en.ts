@@ -3727,6 +3727,8 @@ export const en = {
 	'auth.signup.legalConsent': 'I agree to the {terms} and the {privacy}, including the {dpa} that governs supplier and invoice data I load into the workspace.',
 	'auth.legal.acceptLabel': 'I agree to the {terms} and the {privacy}.',
 	'auth.legal.acceptRequired': 'Tick the box to accept the Terms of Service and Privacy Policy.',
+	'auth.legal.versionsChanged': 'The Terms of Service or Privacy Policy changed since this page loaded. Reload the page to read and accept the current versions.',
+	'auth.legal.reload': 'Reload page',
 	'auth.signup.footerPre': 'Already have a workspace? Visit ',
 	'auth.signup.footerPost': ' to sign in.',
 	// Auth shell brand panel (lib/components/auth/AuthShell.svelte) — signup's

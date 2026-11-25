@@ -3550,6 +3550,8 @@ export const messages = {
 	'auth.signup.legalConsent': 'Ich stimme den {terms} und der {privacy} zu, einschließlich des {dpa}, der die von mir geladenen Lieferanten- und Rechnungsdaten regelt.',
 	'auth.legal.acceptLabel': 'Ich stimme den {terms} und der {privacy} zu.',
 	'auth.legal.acceptRequired': 'Setzen Sie das Häkchen, um die Nutzungsbedingungen und die Datenschutzerklärung zu akzeptieren.',
+	'auth.legal.versionsChanged': 'Die Nutzungsbedingungen oder die Datenschutzerklärung haben sich geändert, seit diese Seite geladen wurde. Laden Sie die Seite neu, um die aktuellen Fassungen zu lesen und zu akzeptieren.',
+	'auth.legal.reload': 'Seite neu laden',
 	'auth.signup.footerPre': 'Haben Sie bereits einen Arbeitsbereich? Besuchen Sie ',
 	'auth.signup.footerPost': ', um sich anzumelden.',
 	// Auth shell brand panel (lib/components/auth/AuthShell.svelte) — signup's

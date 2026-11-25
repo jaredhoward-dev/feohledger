@@ -323,6 +323,9 @@
 	<!-- A failed run is not an empty trail: "no entries" under the error would
 	     tell an auditor the period had no activity. Before the first run the
 	     row says a query has not been run, which is not a claim about the trail.
+	     A first run in flight has no rows yet, so the row says it is loading
+	     rather than leaving the reserved height blank; a re-run keeps the
+	     previous rows on screen until the new ones land.
 
 	     The trail is the result of a run, and the verification panel sits
 	     below it, so the trail's region has a reserved height and scrolls
@@ -333,7 +336,8 @@
 		fixed
 		stickyHeader
 		columns={COLUMNS}
-		isEmpty={!ran || (!loading && !queryError && entries.length === 0)}
+		isEmpty={!ran || (!queryError && entries.length === 0)}
+		loading={loading && entries.length === 0}
 		empty={ran ? m('audit.empty') : m('audit.notRun')}
 		ariaLabel={m('audit.title')}
 	>

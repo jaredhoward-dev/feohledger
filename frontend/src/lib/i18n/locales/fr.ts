@@ -3551,6 +3551,8 @@ export const messages = {
 	'auth.signup.legalConsent': 'J\'accepte les {terms} et la {privacy}, ainsi que le {dpa} qui régit les données fournisseurs et factures que j\'importe dans l\'espace de travail.',
 	'auth.legal.acceptLabel': 'J\'accepte les {terms} et la {privacy}.',
 	'auth.legal.acceptRequired': 'Cochez la case pour accepter les conditions d\'utilisation et la politique de confidentialité.',
+	'auth.legal.versionsChanged': 'Les conditions d\'utilisation ou la politique de confidentialité ont changé depuis le chargement de cette page. Rechargez la page pour lire et accepter les versions en vigueur.',
+	'auth.legal.reload': 'Recharger la page',
 	'auth.signup.footerPre': 'Vous avez déjà un espace de travail ? Rendez-vous sur ',
 	'auth.signup.footerPost': ' pour vous connecter.',
 	// Auth shell brand panel (lib/components/auth/AuthShell.svelte) — signup's

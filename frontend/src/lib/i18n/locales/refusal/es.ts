@@ -142,7 +142,7 @@ export const messages = {
 	'refusal.signupLinkInvalid': "Este enlace de verificación no es válido o ha caducado. Regístrate de nuevo.",
 	'refusal.signupUnavailable': "La creación de espacios de trabajo no está disponible temporalmente. Inténtalo de nuevo más tarde.",
 	'refusal.signupProvisioningFailed': "Algo salió mal al crear tu espacio de trabajo. Ponte en contacto con soporte.",
-	'refusal.legalAcceptanceRequired': "Acepta los términos del servicio y la política de privacidad vigentes para continuar.",
+	'refusal.legalAcceptanceRequired': "Acepte los términos del servicio y la política de privacidad vigentes para continuar.",
 	// The shared limiter's 429 (`services/rate_limit.py`, `rate_limited`): the wait,
 	// rounded up to the largest whole unit, never which limit tripped.
 	'refusal.rateLimitedSeconds': "Demasiados intentos. Espere {n, plural, one {# segundo} other {# segundos}} e inténtelo de nuevo.",
