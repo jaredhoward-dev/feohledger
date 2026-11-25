@@ -334,6 +334,17 @@ ERP_PROVIDERS: list[dict[str, Any]] = [
             _field("consumer_secret", secret=True, show_when=_NETSUITE_TBA),
             _field("token_id", show_when=_NETSUITE_TBA),
             _field("token_secret", secret=True, show_when=_NETSUITE_TBA),
+            # Status sync is a per-tenant opt-in (decisions §541): its calls
+            # are not yet proven against a real NetSuite account, so it starts
+            # off, a block without the key reads off, and the help text says
+            # to pass a sandbox account first. Not a destination.
+            _field(
+                "netsuite_status_sync",
+                required=False,
+                options=["off", "on"],
+                stored_default="off",
+                help_key="org.erp.help.netsuiteStatusSync",
+            ),
         ],
         "docs_url": "https://docs.oracle.com/en/cloud/saas/netsuite/ns-online-help/section_4247337262.html",
     },

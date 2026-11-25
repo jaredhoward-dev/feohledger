@@ -66,6 +66,7 @@ from app.models.invoice import Invoice
 from app.models.organization import Organization
 from app.models.payment import Payment
 from app.services.credential_crypto import CredentialCryptoError
+from app.services.erp_adapters.base import reports_status_back
 from app.services.erp_status_sync import live_erp_report_of_kind
 from app.services.exception_service import create_exception
 from app.services.invoice_warning_catalog import exception_finding
@@ -472,7 +473,7 @@ async def _sync_one_leg(
         # transition: the money moved.
         if (
             adapter is not None
-            and getattr(adapter, "supports_status_sync", False) is True
+            and reports_status_back(adapter)
             and invoice is not None
             and invoice.status.value == "paid"
         ):

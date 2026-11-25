@@ -215,6 +215,14 @@ AUTH_TBA = "tba"
 AUTH_OAUTH2_M2M = "oauth2_m2m"
 AUTH_METHODS: tuple[str, ...] = (AUTH_OAUTH2_M2M, AUTH_TBA)
 
+#: The per-tenant opt-in for status sync (``settings.erp`` key) and its values
+#: (decisions §541). The ERP form offers ``off`` first, so a new connection
+#: starts off; a block without the key is off too.
+STATUS_SYNC_KEY = "netsuite_status_sync"
+STATUS_SYNC_OFF = "off"
+STATUS_SYNC_ON = "on"
+STATUS_SYNC_CHOICES: tuple[str, ...] = (STATUS_SYNC_OFF, STATUS_SYNC_ON)
+
 #: The step a deleted tenant's customer takes in NetSuite, per sign-in method
 #: (``NetSuiteAdapter.provider_side_disconnect``, decisions §406). Menu paths
 #: from Oracle's "Viewing, Editing, Creating, and Revoking TBA Tokens"
@@ -386,10 +394,22 @@ class NetSuiteAdapter(ErpAdapter):
     """
 
     erp_type = "netsuite"
-    #: Bills sync back and our payments are written back (decisions §536).
-    #: A bill carries our marker (its ``externalId`` is the invoice's
-    #: correlation id), so it is matched by that, as QuickBooks' are.
+    #: Bills can sync back and our payments can be written back (decisions
+    #: §536). A bill carries our marker (its ``externalId`` is the invoice's
+    #: correlation id), so it is matched by that, as QuickBooks' are. Only for
+    #: a tenant that opted in (:meth:`status_sync_on`, §541): the calls are not
+    #: yet proven against a real NetSuite account.
     supports_status_sync = True
+
+    def status_sync_on(self) -> bool:
+        """Status sync is a per-tenant opt-in for NetSuite (decisions §541):
+        ``settings.erp.netsuite_status_sync`` set to ``"on"`` (the ERP form's
+        choice) or ``true`` (set by hand). Absent, ``"off"`` or anything else
+        is off, and the tenant behaves as before §536: a push closes at
+        ``done``, the status-sync sweep skips it, nothing is written back, and
+        the §528 poll sweep keeps polling it."""
+        value = self.config.get(STATUS_SYNC_KEY)
+        return value is True or value == STATUS_SYNC_ON
 
     def _auth_method(self) -> str:
         """The configured sign-in method. Absent is TBA; anything else that is

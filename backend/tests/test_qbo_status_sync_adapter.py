@@ -818,7 +818,8 @@ def test_an_erp_without_status_sync_answers_fail_closed_by_default():
     not a skeleton, but nothing it answers may read as "paid" or "open"."""
     from app.services.erp_adapters.dispatcher import get_erp_adapter
 
-    adapter = get_erp_adapter({"type": "netsuite", "integration_method": "direct"})
+    # NetSuite reported back from §536, so another direct ERP stands in.
+    adapter = get_erp_adapter({"type": "dynamics_365_bc", "integration_method": "direct"})
     assert adapter.supports_status_sync is False
     report = asyncio.run(adapter.bill_report("1"))
     assert report.state is ErpBillState.unknown

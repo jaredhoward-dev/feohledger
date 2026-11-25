@@ -257,8 +257,17 @@ def test_status_sync_needs_the_flag_and_an_adapter_that_reports_back(monkeypatch
     assert status_sync_active(qbo) is False
     monkeypatch.setattr(settings, "erp_status_sync_enabled", True)
     assert status_sync_active(qbo) is True
-    # An ERP whose payments never flow back keeps closing at `done`.
+    # NetSuite can report back (§536) but only for a tenant that opted in
+    # (§541): without the opt-in its pushes keep closing at `done`.
     assert status_sync_active(netsuite) is False
+    assert status_sync_active({**netsuite, "netsuite_status_sync": "off"}) is False
+    assert status_sync_active({**netsuite, "netsuite_status_sync": "yes"}) is False
+    assert status_sync_active({**netsuite, "netsuite_status_sync": "on"}) is True
+    assert status_sync_active({**netsuite, "netsuite_status_sync": True}) is True
+    # The opt-in never overrides the deployment's own switch.
+    monkeypatch.setattr(settings, "erp_status_sync_enabled", False)
+    assert status_sync_active({**netsuite, "netsuite_status_sync": "on"}) is False
+    monkeypatch.setattr(settings, "erp_status_sync_enabled", True)
     assert status_sync_active(None) is False
     assert status_sync_active({"type": "no_such_erp", "integration_method": "direct"}) is False
 

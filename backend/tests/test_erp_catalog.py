@@ -149,6 +149,8 @@ def test_existing_direct_adapters_keep_their_fields():
         "consumer_secret",
         "token_id",
         "token_secret",
+        # Per-tenant status-sync opt-in (decisions §541)
+        "netsuite_status_sync",
     }
     assert set(by_key["dynamics_365_bc"]) == {
         "base_url",
@@ -182,6 +184,21 @@ def test_netsuite_offers_oauth2_first_and_reads_a_saved_block_as_tba():
             f for f, spec in fields.items() if name in spec.get("show_when", {}).get("values", [])
         }
         assert shown == set(required), name
+
+
+def test_netsuite_status_sync_is_an_opt_in_that_starts_and_reads_off():
+    """The form's choice is the adapter's key and values (decisions §541): a new
+    connection starts on "off", a saved block without the key shows "off", and
+    the field is never a destination (toggling it keeps the stored secrets)."""
+    from app.services.erp_adapters import netsuite
+
+    field = {f["name"]: f for f in catalog.provider("netsuite")["fields"]}[netsuite.STATUS_SYNC_KEY]
+    assert field["options"] == list(netsuite.STATUS_SYNC_CHOICES)
+    assert field["options"][0] == netsuite.STATUS_SYNC_OFF
+    assert field["stored_default"] == netsuite.STATUS_SYNC_OFF
+    assert field["required"] is False and field["destination"] is False
+    assert field["help_key"] == "org.erp.help.netsuiteStatusSync"
+    assert netsuite.NetSuiteAdapter({}).status_sync_on() is False
 
 
 def test_secret_keys_cover_every_secret_field_and_the_webhook_key():

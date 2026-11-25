@@ -73,7 +73,12 @@ from app.models.invoice_status import PAYABLE_STATUSES
 from app.models.organization import Organization
 from app.models.payment import Payment
 from app.models.workflow import WorkflowInstance
-from app.services.erp_adapters.base import ErpAdapter, ErpBillReport, ErpBillState
+from app.services.erp_adapters.base import (
+    ErpAdapter,
+    ErpBillReport,
+    ErpBillState,
+    reports_status_back,
+)
 from app.services.exception_service import create_exception
 from app.services.invoice_warning_catalog import (
     ERP_UNNAMED_SUFFIX,
@@ -958,6 +963,10 @@ async def read_back_unstated_figure(
     erp_config = (org.settings or {}).get("erp")
     if not isinstance(erp_config, dict) or resolve_adapter_key(erp_config) != erp_type:
         return unconfirmed  # another ERP is connected now: this bill cannot be read
+    if not reports_status_back(_adapter_or_none(erp_config)):
+        # The connected ERP has the capability but not this tenant's opt-in
+        # (NetSuite, §541): its bills are not read back, as before §536.
+        return ReadBackFigure(needed=False)
     state = (
         await db.execute(
             select(WorkflowInstance.state_data).where(WorkflowInstance.invoice_id == invoice.id)
@@ -1037,11 +1046,12 @@ async def hold_unconfirmed_erp_payment(
 def status_sync_active(erp_config: dict | None) -> bool:
     """Does a confirmed push to ``erp_config``'s ERP leave the invoice payable
     at ``posted_in_erp``? Only when the operator has status sync on AND the
-    adapter reports its bills' payments back (``supports_status_sync``)."""
+    adapter reports its bills' payments back for this tenant
+    (:func:`reports_status_back`: the capability, plus NetSuite's per-tenant
+    opt-in, §541)."""
     if not settings.erp_status_sync_enabled or not isinstance(erp_config, dict):
         return False
-    adapter = _adapter_or_none(erp_config)
-    return bool(adapter is not None and adapter.supports_status_sync)
+    return reports_status_back(_adapter_or_none(erp_config))
 
 
 def _adapter_or_none(erp_config: dict) -> ErpAdapter | None:
@@ -1807,7 +1817,7 @@ async def sync_bills(org: Organization, bill_ids: list[str], *, event_id: str | 
 
     erp_config = await _resolved_erp(org)
     adapter = _adapter_or_none(erp_config or {})
-    if adapter is None or not adapter.supports_status_sync:
+    if not reports_status_back(adapter):
         return 0
     realm = connection_realm(erp_config)
     factory = async_sessionmaker(get_tenant_engine(org.db_name), expire_on_commit=False)
@@ -2031,7 +2041,7 @@ async def sync_org(org: Organization, *, now: datetime, result: StatusSyncResult
     oauth_meta = ((org.settings or {}).get("erp") or {}).get("oauth") or {}
     erp_config = await _resolved_erp(org)
     adapter = _adapter_or_none(erp_config or {})
-    if adapter is None or not adapter.supports_status_sync:
+    if not reports_status_back(adapter):
         return
     # An OAuth ERP keeps its mark on its connection block; one reached with
     # stored credentials (NetSuite, §536) has no such block, so its mark is
@@ -2170,6 +2180,10 @@ async def run_status_sync_once(*, now: datetime | None = None) -> StatusSyncResu
         # a `type` left behind under a Merge.dev integration is not swept.
         if not isinstance(erp_settings, dict) or resolve_adapter_key(erp_settings) not in keys:
             continue
+        if not reports_status_back(_adapter_or_none(erp_settings)):
+            # The capability without this tenant's opt-in (NetSuite, §541):
+            # not swept, as before §536 (the §528 poll sweep reads it instead).
+            continue
         oauth_meta = erp_settings.get("oauth") or {}
         if oauth_meta.get("provider") == erp_settings.get("type") and oauth_meta.get(
             "needs_reconnect"
@@ -2218,7 +2232,7 @@ async def status_sync_now_refusal(org: Organization) -> str | None:
     if oauth_meta.get("needs_reconnect"):
         return STATUS_SYNC_NEEDS_RECONNECT
     adapter = _adapter_or_none(await _resolved_erp(org) or {})
-    if adapter is None or not adapter.supports_status_sync:
+    if not reports_status_back(adapter):
         return STATUS_SYNC_UNSUPPORTED
     return None
 
