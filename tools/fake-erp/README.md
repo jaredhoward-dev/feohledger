@@ -444,9 +444,11 @@ non-empty `Bb-Api-Subscription-Key`, as the real gateway does.
   `139` `OnHold` — `vendor_status`), `GET /accountspayable/v1/vendors/{id}`
   (the `VendorDetail`), `/purchaseorders` (`1001` 1250.00 open, `1002` 980.50
   closed, `1003` with no `order_total`; each carries `vendor_id`),
-  `GET /generalledger/v1/accounts` (`01-5000-00`, `01-5100-00`, `01-2000-00`,
-  and `01-5900-00`, whose job fails) — `{"count", "value"}` with `limit` /
-  `offset` (limit capped at 500).
+  `GET /generalledger/v1/accounts` (`account_id` 1–4: `01-5000-00`,
+  `01-5100-00`, `01-2000-00`, and `01-5900-00`, whose job fails) —
+  `{"count", "value"}` with `limit` / `offset` (limit capped at 500). The
+  backend links each by `account_id` (`id:1`, decisions §494) and posts the
+  number it reads here at push time.
 - `GET /generalledger/v1/fiscalyears` — calendar years 2024–2030: FY 2024
   `Closed`, Jan–Mar 2025 periods `closed`, everything else open.
 - `GET /accountspayable/v1/invoices?search_text=` — matches invoice number,
@@ -460,7 +462,8 @@ non-empty `Bb-Api-Subscription-Key`, as the real gateway does.
   `backgroundProcess/{id}/status` → 5, `backgroundProcess/{id}/result` →
   `{"record_id"}` — except a create touching `01-5900-00`, whose job ends at 7
   (failed) with no record.
-  `GET /accountspayable/v1/invoices/{id}` returns `status` / `amount` / `balance`.
+  `GET /accountspayable/v1/invoices/{id}` returns `status` / `amount` / `balance`,
+  and `distributions` (each one's `account_number` and `type_code` as sent).
 - `POST /blackbaud/__set-status` — test hook `{"invoice_id", "status", "balance"}`.
 - `POST /blackbaud/__throttle` — test hook `{"status": 429|403, "retry_after": <s>,
   "count": <n>}`: the next `n` SKY calls answer SKY's rate-limit 429 or

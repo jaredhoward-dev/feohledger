@@ -3884,6 +3884,12 @@ async def blackbaud_create_invoice(request: Request) -> dict:
         "balance": str(body["amount"]),
         "status": body.get("approval_status") or "Pending",
         "post_status": body.get("post_status") or "NotYetPosted",
+        # Each distribution's account as sent, so a spec can read back which
+        # account number an id-linked GL account resolved to (§494).
+        "distributions": [
+            {"account_number": d["account_number"], "type_code": d["type_code"]}
+            for d in body["distributions"]
+        ],
     }
     state["next_job"] += 1
     state["jobs"][state["next_job"]] = invoice_id

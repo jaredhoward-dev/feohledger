@@ -360,6 +360,120 @@ def test_per_line_debits_and_a_negative_line_flips_side():
     ]
 
 
+# ---------------------------------------------------------------------------
+# GL links by account_id, posted by the current number (decisions §494)
+# ---------------------------------------------------------------------------
+
+_CHART = "/generalledger/v1/accounts"
+
+
+def _chart(fake: FakeSky, rows: list[dict], filler: int = 0) -> None:
+    """The GL chart: ``filler`` unrelated accounts first, then ``rows``."""
+    pad = [{"account_id": 1000 + i, "account_number": f"09-{i:04d}-00"} for i in range(filler)]
+    fake.collections[_CHART] = pad + rows
+
+
+def test_an_id_link_posts_by_the_accounts_current_number_from_one_chart_read():
+    """Account 1 was renumbered 01-5000-00 → 01-5050-00 in FE NXT: the link
+    follows the account, and every distribution reads one chart walk — the
+    walk stops at the page holding the last id it needs, not at the chart's end."""
+    fake = FakeSky()
+    _chart(
+        fake,
+        [
+            {"account_id": 1, "account_number": "01-5050-00"},
+            {"account_id": 2, "account_number": "01-5100-00"},
+        ],
+        filler=50,
+    )
+    fake.collections[_CHART] += [
+        {"account_id": 3000 + i, "account_number": f"08-{i:04d}-00"} for i in range(300)
+    ]
+    lines = [
+        LineItemPayload(line_number=1, total=Decimal("60.00"), gl_account_erp_id="id:1"),
+        LineItemPayload(line_number=2, total=Decimal("30.00"), gl_account_erp_id="id:2"),
+        LineItemPayload(line_number=3, total=Decimal("10.00"), gl_account_erp_id="id:1"),
+    ]
+    assert _post(fake, line_items=lines).success
+    body, _ = _create_json(fake)
+    assert [(d["account_number"], d["type_code"]) for d in body["distributions"]] == [
+        ("01-5050-00", "Debit"),
+        ("01-5100-00", "Debit"),
+        ("01-5050-00", "Debit"),
+        ("01-2000-00", "Credit"),
+    ]
+    assert len(fake.of("GET", _CHART)) == 1
+    assert "id:" not in _create_json(fake)[1]
+
+
+def test_an_id_on_a_later_page_is_found_by_walking_on():
+    fake = FakeSky()
+    _chart(fake, [{"account_id": 7, "account_number": "01-5000-00"}], filler=150)
+    assert _post(fake, gl_account_erp_id="id:7").success
+    body, _ = _create_json(fake)
+    assert body["distributions"][0]["account_number"] == "01-5000-00"
+    offsets = [r.url.params["offset"] for r in fake.of("GET", _CHART)]
+    assert offsets == ["0", "100"]
+
+
+def test_a_linked_id_gone_from_the_chart_refuses_before_the_create():
+    fake = FakeSky()
+    _chart(fake, [{"account_id": 2, "account_number": "01-5100-00"}])
+    result = _post(fake, gl_account="6100", gl_account_erp_id="id:1")
+    assert not result.success and not result.retryable
+    assert result.refusal_code == "account_inactive"
+    assert result.refusal_params == {"accounts": ["6100"]}
+    assert result.message == "Blackbaud FE NXT post refused: account_inactive"
+    assert fake.of("POST", "/invoices/process") == []
+
+
+def test_a_linked_account_closed_to_data_entry_refuses_before_the_create():
+    fake = FakeSky()
+    _chart(fake, [{"account_id": 1, "account_number": "01-5000-00", "prevent_data_entry": True}])
+    result = _post(fake, gl_account="6100", gl_account_erp_id="id:1")
+    assert result.refusal_code == "account_inactive"
+    assert result.refusal_params == {"accounts": ["6100"]}
+    assert fake.of("POST", "/invoices/process") == []
+
+
+def test_a_failed_chart_read_creates_nothing_and_may_retry():
+    fake = FakeSky()
+    _chart(fake, [{"account_id": 1, "account_number": "01-5000-00"}])
+    fake.collection_fail_offset = 0
+    result = _post(fake, gl_account_erp_id="id:1")
+    assert not result.success and result.retryable
+    assert result.refusal_code is None
+    assert fake.of("POST", "/invoices/process") == []
+
+
+def test_a_legacy_number_link_posts_as_is_without_reading_the_chart():
+    """A link from before §494 holds the number; until the next chart sync
+    re-keys it, it posts by that number and costs no chart read."""
+    fake = FakeSky()
+    assert _post(fake, gl_account_erp_id="01-5000-00").success
+    body, _ = _create_json(fake)
+    assert body["distributions"][0]["account_number"] == "01-5000-00"
+    assert fake.of("GET", _CHART) == []
+
+
+def test_the_push_reserve_counts_the_chart_walk_only_for_id_links(monkeypatch):
+    asked: list[int] = []
+    real_check = erp_call_budget.CallBudget.check
+
+    async def check(self, *, reserve=1, now=None):
+        asked.append(reserve)
+        return await real_check(self, reserve=reserve, now=now)
+
+    monkeypatch.setattr(erp_call_budget.CallBudget, "check", check)
+    fake = FakeSky()
+    _chart(fake, [{"account_id": 1, "account_number": "01-5000-00"}])
+    assert _post(fake, gl_account_erp_id="01-5000-00").success
+    assert _post(fake, gl_account_erp_id="id:1", invoice_number="INV-2").success
+    assert asked[0] == bb.push_call_reserve(False)
+    assert asked[-1] == bb.push_call_reserve(False, 1, bb.CHART_RESOLVE_MAX_PAGES)
+    assert bb.CHART_RESOLVE_MAX_PAGES == SYNC_LISTING_MAX_ROWS // 100
+
+
 def test_configured_project_codes_and_approval_are_sent():
     fake = FakeSky()
     tcv = [{"id": 1, "value": "None"}, {"id": 2, "value": "Spendable"}]
@@ -994,18 +1108,23 @@ def test_inactive_and_on_hold_vendors_are_emitted_inactive():
     ]
 
 
-def test_list_gl_accounts_keys_by_number_and_emits_locked_accounts_inactive():
-    """A locked account still exists: dropping it made a row linked to it look
-    like a dead link, which a sync re-judging links unlinks (§284)."""
+def test_list_gl_accounts_links_by_id_and_emits_locked_accounts_inactive():
+    """Linked by the GL API's ``account_id`` (``id:<id>``, decisions §494),
+    coded by the number. A locked account still exists: dropping it made a
+    row linked to it look like a dead link, which a sync re-judging links
+    unlinks (§284). An account with no id gets no link — never a number
+    fallback that would mix the two forms."""
     fake = FakeSky()
     fake.collections["/generalledger/v1/accounts"] = [
         {"account_id": 1, "account_number": "01-5000-00", "description": "Supplies"},
         {"account_id": 2, "account_number": "01-1000-00", "prevent_data_entry": True},
+        {"account_number": "01-9000-00", "description": "No id"},
     ]
     accounts = _run(fake, lambda: BlackbaudFeNxtAdapter(CONFIG).list_gl_accounts())
     assert [(a.code, a.erp_account_id, a.name, a.account_type, a.active) for a in accounts] == [
-        ("01-5000-00", "01-5000-00", "Supplies", None, True),
-        ("01-1000-00", "01-1000-00", "01-1000-00", None, False),
+        ("01-5000-00", "id:1", "Supplies", None, True),
+        ("01-1000-00", "id:2", "01-1000-00", None, False),
+        ("01-9000-00", "", "No id", None, True),
     ]
 
 

@@ -7,6 +7,7 @@ import {
 	expect,
 	signInAndWait,
 	tenantBase,
+	tenantPsql,
 	test
 } from '../fixtures/helpers';
 import { SERVICES, skipUnlessReachable } from '../fixtures/services';
@@ -18,6 +19,7 @@ import {
 	deleteInvoice,
 	erpFailureFromAudit,
 	erpReferenceFromAudit,
+	glErpLinks,
 	sendToErpAndAwaitTerminal,
 	setErpSettings,
 	syncErpGlAccounts,
@@ -66,6 +68,12 @@ import {
  *   5. Disconnect — clears the connection and answers `revocation:
  *      'unsupported'`: SKY API has no revocation endpoint, so the grant ends
  *      only when the customer disconnects the app in Blackbaud (decisions §371).
+ *   6. GL links by `account_id` (decisions §494) — the chart sync links
+ *      01-5000-00 as `id:1` and the full send's debit names the number the
+ *      push read for it; a legacy link (the bare number, as stored before
+ *      §494) still posts by that number and the next sync re-keys the same
+ *      row, recorded in `link_changes`; a linked id the chart no longer holds
+ *      is refused `account_inactive` before anything is created.
  */
 
 const PROVIDER = 'blackbaud_fe_nxt';
@@ -168,9 +176,23 @@ async function sendBillAndReadBack(page: Page, request: APIRequestContext): Prom
 		expect(posted.vendor_id).toBe(136);
 		expect(posted.amount).toBe(1234.56);
 		expect(posted.balance).toBe(1234.56);
+		// Linked by account_id; the debit names the number the push read for it.
+		expect(await glErpLinks(page, '01-5000-00')).toContain('id:1');
+		expect(posted.distributions).toEqual([
+			{ account_number: '01-5000-00', type_code: 'Debit' },
+			{ account_number: '01-2000-00', type_code: 'Credit' }
+		]);
 	} finally {
 		await deleteInvoice(page, inv.id);
 	}
+}
+
+/** Point 01-5000-00's link at `link` directly in the tenant DB (same realm). */
+function relinkSupplies(link: string): void {
+	tenantPsql(
+		`UPDATE gl_accounts SET erp_account_id = '${link}' ` +
+			"WHERE code = '01-5000-00' AND erp_account_id = 'id:1'"
+	);
 }
 
 test.describe('/erp blackbaud_fe_nxt adapter against fake-erp', () => {
@@ -224,6 +246,67 @@ test.describe('/erp blackbaud_fe_nxt adapter against fake-erp', () => {
 			fill: { 'AP account number': '01-2000-00', 'Ledger currency': 'USD' }
 		});
 		await sendBillAndReadBack(page, request);
+	});
+
+	test('a legacy number-keyed link posts by number, then the next sync re-keys it', async ({
+		page,
+		request
+	}) => {
+		await setLedgerConfig(page, 'USD');
+		await syncErpVendors(page);
+		await syncErpGlAccounts(page);
+		relinkSupplies('01-5000-00');
+		expect(await glErpLinks(page, '01-5000-00')).toContain('01-5000-00');
+		const inv = await createApprovedInvoice(page, {
+			prefix: 'E2E-BB-LEGACY',
+			invoiceDate: '2026-10-02',
+			dueDate: '2026-11-01',
+			amount: '310.40',
+			currency: 'USD',
+			vendor: SUPPLIER,
+			glAccount: '01-5000-00'
+		});
+		try {
+			expect(await sendToErpAndAwaitTerminal(page, inv.id)).toBe('done');
+			const posted = await blackbaudInvoice(request, await erpReferenceFromAudit(page, inv.id));
+			expect(posted.distributions[0]).toEqual({ account_number: '01-5000-00', type_code: 'Debit' });
+
+			const changes = await syncErpGlAccounts(page);
+			expect(changes).toContainEqual({ code: '01-5000-00', from: '01-5000-00', to: 'id:1' });
+			const links = await glErpLinks(page, '01-5000-00');
+			expect(links).toContain('id:1');
+			expect(links).not.toContain('01-5000-00');
+		} finally {
+			await deleteInvoice(page, inv.id);
+			await syncErpGlAccounts(page);
+		}
+	});
+
+	test('a linked account_id the chart no longer holds is refused before the create', async ({
+		page
+	}) => {
+		await setLedgerConfig(page, 'USD');
+		await syncErpVendors(page);
+		await syncErpGlAccounts(page);
+		relinkSupplies('id:999');
+		const inv = await createApprovedInvoice(page, {
+			prefix: 'E2E-BB-GONE',
+			invoiceDate: '2026-10-03',
+			dueDate: '2026-11-02',
+			currency: 'USD',
+			vendor: SUPPLIER,
+			glAccount: '01-5000-00'
+		});
+		try {
+			expect(await sendToErpAndAwaitTerminal(page, inv.id)).toBe('failed');
+			expect(await erpFailureFromAudit(page, inv.id)).toBe(
+				'Blackbaud FE NXT post refused: account_inactive'
+			);
+		} finally {
+			await deleteInvoice(page, inv.id);
+			// The sync re-links the row by code (id:999 is not a live id).
+			await syncErpGlAccounts(page);
+		}
 	});
 
 	test('an invoice whose vendor never synced is refused, not posted', async ({ page }) => {

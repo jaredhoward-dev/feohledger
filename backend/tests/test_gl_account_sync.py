@@ -23,6 +23,7 @@ from sqlalchemy import select
 
 from app.models.gl_account import GL_CODE_MAX_LENGTH, GLAccount
 from app.services.erp_adapters.base import GLAccountPayload
+from app.services.erp_adapters.blackbaud_fe_nxt import gl_link_id as fe_nxt_link_id
 from app.services.erp_adapters.dynamics_365_bc import _bc_account_to_payload
 from app.services.erp_adapters.netsuite import _netsuite_account_to_payload
 from app.services.erp_adapters.quickbooks_online import QuickBooksOnlineAdapter
@@ -682,3 +683,88 @@ async def test_a_legacy_number_link_is_never_mistaken_for_an_equal_record_key(re
     chart = await _rows(realdb)
     assert chart["61"].erp_account_id == "key:7"
     assert chart["6100"].erp_account_id == "key:61"
+
+
+# ---------------------------------------------------------------------------
+# Blackbaud FE NXT links by account_id, not account number (decisions §494)
+# ---------------------------------------------------------------------------
+
+_FE_NXT_REALM = "blackbaud_fe_nxt:p-env-123"
+
+
+async def _fe_nxt_sync(realdb, accounts):
+    async with realdb.sessionmaker(TENANT)() as s:
+        result = await sync_chart_from_erp(
+            s,
+            organization_id=realdb.info(TENANT).org_id,
+            entity_id=None,
+            accounts=accounts,
+            realm=_FE_NXT_REALM,
+        )
+        await s.commit()
+    return result
+
+
+def _fe_nxt(account_id: int, number: str) -> GLAccountPayload:
+    return GLAccountPayload(
+        code=number, name=f"Account {number}", erp_account_id=fe_nxt_link_id(account_id)
+    )
+
+
+async def test_an_fe_nxt_renumbering_updates_the_id_linked_row_and_creates_no_duplicate(realdb):
+    """01-5000-00 renumbered to 01-5050-00 in FE NXT: its account_id is the
+    same, so our row is matched by id, keeps its code and reports the drift —
+    no second row, and the push resolves the id to the new number."""
+    row_id = await _add(
+        realdb,
+        code="01-5000-00",
+        name="Account 01-5000-00",
+        erp_account_id="id:1",
+        erp_link_realm=_FE_NXT_REALM,
+    )
+    result = await _fe_nxt_sync(realdb, [_fe_nxt(1, "01-5050-00")])
+
+    assert (result.created, result.linked) == (0, 0)
+    assert result.code_drift == [{"code": "01-5000-00", "erp_code": "01-5050-00"}]
+    assert result.link_changes == []
+    chart = await _rows(realdb)
+    assert list(chart) == ["01-5000-00"]
+    assert (chart["01-5000-00"].id, chart["01-5000-00"].erp_account_id) == (row_id, "id:1")
+
+
+async def test_a_number_keyed_fe_nxt_link_is_rekeyed_once_and_recorded(realdb):
+    """A link from before §494 holds the bare number. The first id-keyed pull
+    re-links the same row by code and records it in ``link_changes``; a second
+    pull changes nothing."""
+    row_id = await _add(
+        realdb,
+        code="01-5000-00",
+        name="Account 01-5000-00",
+        erp_account_id="01-5000-00",
+        erp_link_realm=_FE_NXT_REALM,
+    )
+    pull = [_fe_nxt(1, "01-5000-00"), _fe_nxt(2, "01-5100-00")]
+    result = await _fe_nxt_sync(realdb, pull)
+
+    assert (result.created, result.linked, result.conflicts) == (1, 1, [])
+    assert result.link_changes == [{"code": "01-5000-00", "from": "01-5000-00", "to": "id:1"}]
+    chart = await _rows(realdb)
+    assert sorted(chart) == ["01-5000-00", "01-5100-00"]
+    assert (chart["01-5000-00"].id, chart["01-5000-00"].erp_account_id) == (row_id, "id:1")
+    assert chart["01-5000-00"].erp_link_realm == _FE_NXT_REALM
+
+    again = await _fe_nxt_sync(realdb, pull)
+    assert (again.created, again.linked, again.link_changes) == (0, 0, [])
+
+
+async def test_a_legacy_fe_nxt_number_is_never_mistaken_for_an_equal_account_id(realdb):
+    """An account numbered 7 and account_id 7 are different accounts here. The
+    prefix keeps them apart: the row linked by the NUMBER 7 is re-keyed to the
+    account numbered 7 (id 40), never matched by id to account_id 7."""
+    await _add(realdb, code="7", name="Account 7", erp_account_id="7", erp_link_realm=_FE_NXT_REALM)
+    result = await _fe_nxt_sync(realdb, [_fe_nxt(7, "01-5000-00"), _fe_nxt(40, "7")])
+
+    assert result.code_drift == []
+    chart = await _rows(realdb)
+    assert chart["7"].erp_account_id == "id:40"
+    assert chart["01-5000-00"].erp_account_id == "id:7"
