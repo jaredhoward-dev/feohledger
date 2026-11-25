@@ -1518,6 +1518,7 @@ export const messages = {
 	'exceptions.poRematch.note': "Le bon de commande {po} a changé dans {erp} le {date} et une nouvelle vérification concorde désormais. Examinez-le pour lever le blocage.",
 	'exceptions.poRematch.noteNoDate': "Le bon de commande {po} a changé dans {erp} et une nouvelle vérification concorde désormais. Examinez-le pour lever le blocage.",
 	'exceptions.poRematch.noteNoPo': "Le bon de commande a changé dans {erp} et une nouvelle vérification concorde désormais. Examinez-le pour lever le blocage.",
+	'exceptions.discountCredit.failed': "L'escompte n'a pas été comptabilisé dans {erp} comme avoir fournisseur, bien que l'avoir d'escompte soit activé ; la facture y reste ouverte du montant de l'escompte jusqu'à ce que quelqu'un le comptabilise.",
 	'exceptions.erpVoid.title': "Annuler la facture dans {erp}",
 	'exceptions.erpVoid.intro': "La facture fournisseur est déjà dans {erp}, qui peut encore la payer. Si le signalement est fondé, annulez-la là-bas. Le signalement reste ouvert jusqu'à votre décision.",
 	'exceptions.erpVoid.open': "Annuler la facture…",

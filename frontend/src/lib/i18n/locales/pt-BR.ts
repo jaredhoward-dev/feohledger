@@ -1519,6 +1519,7 @@ export const messages = {
 	'exceptions.poRematch.note': "O PC {po} mudou no {erp} em {date} e uma nova verificação agora confere. Revise para liberar a retenção.",
 	'exceptions.poRematch.noteNoDate': "O PC {po} mudou no {erp} e uma nova verificação agora confere. Revise para liberar a retenção.",
 	'exceptions.poRematch.noteNoPo': "O pedido de compra mudou no {erp} e uma nova verificação agora confere. Revise para liberar a retenção.",
+	'exceptions.discountCredit.failed': "O desconto por pagamento antecipado não foi registrado em {erp} como crédito de fornecedor, embora o crédito de desconto esteja ativado; a fatura continua em aberto lá pelo valor do desconto até que alguém o registre.",
 	'exceptions.erpVoid.title': "Anular a conta no {erp}",
 	'exceptions.erpVoid.intro': "A conta desta fatura já está no {erp}, que ainda pode pagá-la. Se o alerta for real, anule-a lá. O alerta continua aberto até você decidir.",
 	'exceptions.erpVoid.open': "Anular a conta…",
