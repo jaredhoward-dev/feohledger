@@ -1114,6 +1114,10 @@ async def _open_stalled_flag(
             discount_credit_document_id=credit_id,
             attempts=attempts,
         ),
+        # One live flag per payment and reason: an open "unidentified" flag
+        # for one payment never hides a later "not ours" with its id, nor
+        # another payment's stall on the same invoice (decisions §583).
+        dedupe_on=("payment_id", "reason"),
     )
 
 
@@ -1309,18 +1313,32 @@ async def void_written_payment(org_id: uuid.UUID, payment_id: uuid.UUID) -> str:
                 # Xero's unconfirmed lookup by number.
                 or ((state or {}).get(BOOKED_CREDITS_KEY) or {}).get(str(payment_id))
             )
+            # Since §581 every credit we create is preceded by a committed
+            # reservation, so a credit of ours always has an entry in one of
+            # these maps. Without one there is nothing of ours to reverse, and
+            # no lookup is run: Xero's is by an unconfirmed number filter, and
+            # a rejection there would stop every void before ``void_payment``
+            # for an org that never opted in (decisions §583).
+            has_credit_entry = any(
+                str(payment_id) in ((state or {}).get(key) or {})
+                for key in (PENDING_CREDITS_KEY, PENDING_VOID_CREDITS_KEY, BOOKED_CREDITS_KEY)
+            )
             # A write-back that re-arms this void while it calls the ERP
             # changes this token; the clear below compares it (§582).
             rearm_token = ((state or {}).get(VOID_REARMED_KEY) or {}).get(str(payment_id))
+            # Likewise the booked id: one written while this void calls the
+            # ERP is a credit this pass may not have reversed (§583).
+            booked_then = ((state or {}).get(BOOKED_CREDITS_KEY) or {}).get(str(payment_id))
             # Nothing held across the ERP call. A rollback expires the loaded
             # rows, so what is needed after it was read above.
             await db.rollback()
             # Our discount credit first (§575), whatever the opt-in says now:
-            # it may have been booked while it was on. A failure stops here,
-            # the marker stays, and the retry starts from the credit again.
+            # it may have been booked while it was on — its entry above says
+            # so. A failure stops here, the marker stays, and the retry starts
+            # from the credit again.
             credit = None
             credit_id = known_credit
-            if getattr(adapter, "supports_discount_credit", False) is True:
+            if has_credit_entry and getattr(adapter, "supports_discount_credit", False) is True:
                 credit_payload = DiscountCreditPayload(
                     payment_id=str(payment_id),
                     bill_id=bill_id,
@@ -1412,16 +1430,21 @@ async def void_written_payment(org_id: uuid.UUID, payment_id: uuid.UUID) -> str:
                 # re-armed this void (its BillPayment may stand) leaves it
                 # pending for the next pass (§582).
                 token_now = (current.get(VOID_REARMED_KEY) or {}).get(str(payment_id))
+                booked_now = (current.get(BOOKED_CREDITS_KEY) or {}).get(str(payment_id))
                 if (
                     instance is not None
                     and not (rearmed and rearmed != credit_id)
                     and token_now == rearm_token
+                    and booked_now == booked_then
                 ):
                     await _clear_pending(db, invoice_id, payment_id)
                     _write_entry(instance, PENDING_VOID_CREDITS_KEY, payment_id, None)
                     _write_entry(instance, VOID_REARMED_KEY, payment_id, None)
-                    if credit is not None:
-                        # Reversed (or confirmed gone) by the id read above.
+                    if credit is not None and booked_now == credit_id:
+                        # Compare, then clear: only the id this void reversed
+                        # (or confirmed gone). Any other booked id is a credit
+                        # this pass did not reverse, and its id is kept
+                        # (decisions §583).
                         _write_entry(instance, BOOKED_CREDITS_KEY, payment_id, None)
                     unidentified = (
                         credit is not None

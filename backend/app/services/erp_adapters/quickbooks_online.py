@@ -1397,10 +1397,15 @@ class QuickBooksOnlineAdapter(OAuthErpAdapter):
             return await self._apply_discount_credit(
                 payload, bill, vendor, note, bill_currency, str(credit_id)
             )
+        # A token failure is raised before a request goes out, or after
+        # QuickBooks answered one 401 and the refresh failed: either way the
+        # create was never taken, whatever ``sent`` says (decisions §583).
+        # ``_apply_discount_credit`` catches its own, so none raised after
+        # the credit exists reaches here.
         except erp_oauth.ErpTokenRefreshError as exc:
-            return failed(ErpPostResult(success=False, message=str(exc)))
+            return _nothing_posted(ErpPostResult(success=False, message=str(exc)))
         except erp_oauth.ErpNotConnectedError:
-            return failed(erp_refusal(PROVIDER, NOT_CONNECTED))
+            return _nothing_posted(erp_refusal(PROVIDER, NOT_CONNECTED))
         except QboRequestError as exc:
             return failed(erp_http_failure(PROVIDER, exc.status_code))
         except httpx.HTTPError:

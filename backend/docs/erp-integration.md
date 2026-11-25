@@ -714,11 +714,30 @@ void reads it before its ERP call and clears the payment only if it is
 unchanged, so a write-back that lands mid-void leaves the void pending for the
 next pass. In both adapters any failure before the create request goes out
 (a 5xx or network error reading the bill, a token refresh) is `not_posted`, so
-the reservation is dropped and retried instead of stalling as `unidentified`;
-Xero keeps a just-created note's id on every later failure. A recorded credit
+the reservation is dropped instead of stalling as `unidentified`; QuickBooks
+also reads a token failure on the create call itself as `not_posted`, since
+the create was never taken (decisions §583). A dropped reservation is **not**
+retried automatically: the sweep (`resume_pending_credits`) walks only
+existing records, so the one retry is a manual write-back re-run (`POST
+/api/payments/runs/{id}/sync-erp`) while the invoice is `paid`. Until then
+the bill shows the discount open, and the `payment_writeback_balance_open` flag
+carries the reason as `discount_credit_failure` (decisions §583). Xero keeps
+a just-created note's id on every later failure. A recorded credit
 that reads back without our marker is refused as `discount_credit_not_ours` by
 both adapters' void and post: the record is held and flagged (`reason:
 discount_credit_not_ours`), never dropped or reported reversed.
+
+**A void reverses only a credit it has an entry for** (decisions §583). Every
+credit of ours is preceded by a committed reservation, so it always has an
+entry in `erp_discount_credits_pending`, `erp_discount_credit_voids_pending`
+or `erp_discount_credits_booked`. A payment void with none of them goes
+straight to `void_payment`: no lookup by number, so an org that never opted
+in never depends on Xero's unconfirmed filter. The void clears the booked
+entry only if it still holds the id it reversed, and a booked id that changed
+during the void's ERP call leaves the void pending. The
+`discount_credit_stalled` flag is kept one per payment and reason, so a live
+`unidentified` flag never hides a later `discount_credit_not_ours` with its
+id, nor another payment's stall on the same invoice.
 
 The code is exercised against `tools/fake-erp` and the adapter doubles only,
 not yet a real company; a read-back that is not what we wrote fails closed

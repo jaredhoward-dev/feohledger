@@ -1150,6 +1150,34 @@ def test_a_token_refresh_failure_before_the_create_is_not_posted():
     assert not _bodies(qbo, "vendorcredit")
 
 
+@pytest.mark.parametrize(
+    "error",
+    [
+        erp_oauth.ErpTokenRefreshError("quickbooks_online", "unreachable"),
+        erp_oauth.ErpNotConnectedError("quickbooks_online"),
+    ],
+    ids=["refresh_failed", "not_connected"],
+)
+def test_a_token_failure_on_the_create_call_is_not_posted(error):
+    """The create was answered 401 and the refresh failed: QuickBooks never
+    took it, so ``not_posted`` even though the request had gone out (§583).
+    Kept not-``not_posted`` it would leave a ``credit_id: null`` record that
+    stalls as "unidentified" for a credit that does not exist."""
+    qbo = _Qbo()
+    _discounted(qbo)
+    _failing(qbo, lambda m, u: m == "POST" and u.endswith("/vendorcredit"), _resp(401, {}))
+
+    async def token(provider, config, rejected_token=None):
+        if rejected_token is not None:
+            raise error
+        return "tok-1"
+
+    with patch.object(erp_oauth, "get_access_token", new=token):
+        result = _run(qbo, lambda: _adapter().post_discount_credit(_credit()))
+    assert not result.success and result.not_posted
+    assert qbo.vendor_credits == {}
+
+
 def test_a_create_whose_answer_is_lost_is_not_not_posted():
     """Once the create is sent, a lost answer may stand in QuickBooks."""
     qbo = _Qbo()
