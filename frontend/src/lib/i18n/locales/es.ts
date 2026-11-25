@@ -95,6 +95,7 @@ export const messages = {
 	'shell.privacyAck.failed': 'No se guardó tu confirmación. Inténtalo de nuevo.',
 
 	// Common buttons / states
+	'common.dueDate.rescheduledFrom': 'reprogramada desde el {date}',
 	'common.save': 'Guardar',
 	'common.saving': 'Guardando…',
 	'common.cancel': 'Cancelar',

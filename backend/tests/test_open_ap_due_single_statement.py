@@ -39,6 +39,16 @@ _READERS = {
     APP / "api" / "invoices.py": "overdue_invoice_ids",
 }
 
+#: The per-row readers that keep a population of their own (the payment queue,
+#: the aging bands, which reconcile with the AP balance) but must time each row
+#: by the same effective due date (decisions §565), and the names they read it
+#: through.
+_PER_ROW_READERS = {
+    APP / "api" / "payments.py": {"effective_due_by_invoice", "is_overdue"},
+    APP / "services" / "dashboard_metrics.py": {"effective_due_by_invoice", "aging_band"},
+    APP / "services" / "ap_commitments.py": {"effective_due_by_invoice", "aging_band"},
+}
+
 
 def _names(tree: ast.AST) -> set[str]:
     out: set[str] = set()
@@ -74,6 +84,27 @@ def test_every_overdue_surface_reads_the_shared_select():
         if name not in _names(ast.parse(path.read_text()))
     ]
     assert not missing, "\n".join(missing)
+
+
+def test_every_per_row_reader_times_rows_by_the_effective_due_date():
+    missing = []
+    for reader, names in _PER_ROW_READERS.items():
+        absent = names - _names(ast.parse(reader.read_text()))
+        if absent:
+            missing.append(f"{reader.relative_to(APP.parent)} does not use {sorted(absent)}")
+    assert not missing, "\n".join(missing)
+
+
+def test_no_reader_times_a_row_on_the_invoice_due_date_alone():
+    """`today - Invoice.due_date` or `Invoice.due_date < today` in a reader is
+    how the per-row readings drifted from the count (decisions §565)."""
+    offenders = []
+    for reader in {*_READERS, *_PER_ROW_READERS}:
+        src = reader.read_text()
+        for needle in ("today - Invoice.due_date", "Invoice.due_date < today", "due_date < today"):
+            if needle in src:
+                offenders.append(f"{reader.relative_to(APP.parent)}: {needle!r}")
+    assert not offenders, "\n".join(offenders)
 
 
 def test_overdue_ids_keep_their_own_from_inside_an_invoice_query():

@@ -29563,3 +29563,61 @@ reads each bill once; a truncated listing narrows the window and moves nothing
 else; a failed window does not advance; the narrowest window fails);
 `test_merge_dev_adapter.py` (the feed's `deleted` and `modified_before`, no
 bound without `until`, a naive `until` refused before any call).
+
+## 565. Every per-row overdue flag, date shown and aging band reads `open_ap_due`'s effective due date; a paid-out invoice is not owed (§485 follow-up, round 48)
+
+§485 put the overdue and due-soon counts on one select but left three readers
+timing a row on `Invoice.due_date`: the dashboard's ten-row upcoming list, the
+payment queue row, and the aging bands (dashboard and the `aging_snapshot`
+builder). An invoice whose payment schedule moved its date could be flagged
+overdue in a list the overdue count left it out of, or the reverse.
+
+**The product call §485 deferred: an invoice with a completed payment is not
+owed.** One live payment per invoice (the payments partial unique index), so a
+`completed` one pays it in full; between that and the `payment_scheduled →
+paid` sync-back the invoice was still in the outflow population. The count
+showed a paid bill as overdue and the forecast projected an outflow that had
+already left the bank. `open_ap_due.paid_out()` now takes it out of
+`open_ap_due_population`, once, so the dashboard counts, `?overdue=true`, the
+/cfo card, the forecast and the upcoming list all drop it together. The
+upcoming list's own "no completed `Payment`" filter was that rule stated a
+second time; it is gone, and the list joins the population (which also drops
+the rejected / paid / done invoices its any-status population used to show).
+
+**One effective date for the per-row readers.**
+`open_ap_due.effective_due_by_invoice()` is the same `effective_due_date` for
+every invoice regardless of status, for readers that keep a population of
+their own. The payment queue joins it: its row's `due_date` is the effective
+date, `is_overdue` is `open_ap_due.is_overdue` on it in the same SELECT, and
+the queue (and `/queue/ids`) order on it, so a rescheduled invoice sorts where
+its date reads. The aging bands band on it through `open_ap_due.aging_band`,
+one CASE for both builders.
+
+**Aging keeps the AP balance's population (F-4).** It is reconciled to
+`accounts_payable_balance`, which is status-based, so a paid-out invoice
+awaiting its sync-back still bands (on its effective date) while the count
+leaves it out. That is the one deliberate difference, stated in
+`backend/docs/analytics.md`. Rejected: taking paid-out invoices out of the AP
+balance too, which changes a CFO figure and its reconciliation in a lane about
+due dates; worth doing only together with the balance.
+
+**Both dates on the wire.** The upcoming row and the queue row carry `due_date`
+(effective) and `own_due_date` (the invoice's). The web renders both through
+one component, `ui/DueDate.svelte`: the effective date, the server's flag
+(never recomputed in the browser, whose local date is not the UTC date the
+count is judged on) and "rescheduled from …" when the two differ
+(`utils/time.ts::rescheduledFrom`, `common.dueDate.rescheduledFrom` in six
+locales). `due_date` keeps its name and now means the effective date on both
+rows; the mobile app reads it unchanged and gets the date its flag reads, but
+does not yet show the "rescheduled from" line.
+
+**Tests.** `backend/tests/test_dashboard_aggregates.py`
+(`test_a_rescheduled_invoice_reads_the_same_overdue_state_everywhere`: one
+invoice rescheduled forward, one back, one paid out; the count, `?overdue=true`,
+the upcoming list, the queue row and order, and both aging builders agree);
+`test_open_ap_due_single_statement.py` (each per-row reader reads
+`effective_due_by_invoice` and its window, and no reader compares
+`Invoice.due_date` with today); `test_dashboard_aggregations.py` (the row
+carries the SQL flag and both dates); `frontend/src/lib/utils/time.test.ts`,
+`components/ui/DueDate.test.ts`; the e2e
+`tests-e2e/dashboard/kpi-rollup-disclosures.spec.ts` rescheduled-row case.

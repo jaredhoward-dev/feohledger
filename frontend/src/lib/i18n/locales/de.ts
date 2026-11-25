@@ -95,6 +95,7 @@ export const messages = {
 	'shell.privacyAck.failed': 'Ihre Bestätigung wurde nicht gespeichert. Versuchen Sie es erneut.',
 
 	// Common buttons / states
+	'common.dueDate.rescheduledFrom': 'verschoben vom {date}',
 	'common.save': 'Speichern',
 	'common.saving': 'Wird gespeichert …',
 	'common.cancel': 'Abbrechen',

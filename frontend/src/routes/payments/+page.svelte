@@ -26,6 +26,7 @@
 	import SearchBox from '#lib/components/ui/SearchBox.svelte';
 	import StatusBadge from '#lib/components/ui/StatusBadge.svelte';
 	import Badge from '#lib/components/ui/Badge.svelte';
+	import DueDate from '#lib/components/ui/DueDate.svelte';
 	import PageHeader from '#lib/components/ui/PageHeader.svelte';
 	import FilterChips from '#lib/components/ui/FilterChips.svelte';
 	import DataTable from '#lib/components/ui/DataTable.svelte';
@@ -267,7 +268,10 @@
 		// Exact Decimal STRING money (never float); coerce with Number() to sum.
 		amount: string;
 		currency: string;
+		// The EFFECTIVE due date (current payment schedule's, else the
+		// invoice's own) — what `is_overdue` reads — and the invoice's own.
 		due_date: string | null;
+		own_due_date?: string | null;
 		payment_terms: string | null;
 		status: string;
 		is_overdue: boolean;
@@ -2464,10 +2468,12 @@
 							     row: `<Badge>` owns colour and metrics, the caller owns
 							     placement. -->
 							<span class="due-cell">
-								{formatDate(item.due_date)}
-								{#if item.is_overdue}
-									<Badge tone="danger" variant="overdue-badge">{m('payments.overdue')}</Badge>
-								{/if}
+								<DueDate
+									due={item.due_date}
+									own={item.own_due_date}
+									overdue={item.is_overdue}
+									overdueLabel={m('payments.overdue')}
+								/>
 							</span>
 						</td>
 						<td>

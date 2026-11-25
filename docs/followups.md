@@ -1391,32 +1391,6 @@ user-visible halves still open.
 
 ### Surfaced by round 15 (2026-11-18, round PR #731, decisions §445–§453)
 
-### Surfaced by the round-32 money-path review (2026-11-20, PR #738)
-
-- [ ] **(c) Three per-row "overdue" readings still time an invoice on its own
-      due date, not `open_ap_due`'s effective one.** The counted surfaces now
-      share one select (`open_ap_due.open_ap_due_population`, decisions §485),
-      but three readers outside it still compare `Invoice.due_date` with today:
-      the web dashboard's ten-row `upcoming_payments` list
-      (`dashboard_metrics.upcoming_payments`: its population is "no completed
-      `Payment`", any status, and its `is_overdue` flag), the payment queue's
-      per-row `is_overdue` (`api/payments.py`, which joins the latest schedule
-      for discount terms but shows and flags the invoice's own date), and the
-      aging bands (`dashboard_metrics.aging`, `ap_commitments.aging_snapshot_buckets`).
-      A rescheduled invoice can therefore be flagged overdue in a list while
-      the overdue count leaves it out, or the reverse. Not changed in §485
-      because each needs a product call the count did not: the upcoming list
-      deliberately drops an invoice whose payment completed but whose
-      `payment_scheduled → paid` sync-back has not run, which the outflow
-      population keeps; the queue row's flag must agree with the date it
-      prints; and aging is reconciled to the AP balance (F-4) by date as well
-      as population. **Durable fix:** decide whether an invoice with a
-      completed payment is still owed (and, if not, put that in the population
-      once), then have the three read `effective_due` from
-      `open_ap_due_population` and show it. **Trigger:** the next change to
-      any of the three, or a customer report of a rescheduled invoice shown as
-      overdue.
-
 ### Surfaced by registering the Xero developer app (2026-10-20; tracked 2026-11-21)
 
 Accepting the Xero Developer Platform Terms (updated 2025-12-04) puts two duties

@@ -108,6 +108,7 @@ export const en = {
 	'shell.privacyAck.failed': 'Your confirmation wasn\'t saved. Try again.',
 
 	// Common buttons / states (reused across surfaces)
+	'common.dueDate.rescheduledFrom': 'rescheduled from {date}',
 	'common.save': 'Save',
 	'common.saving': 'Saving…',
 	'common.cancel': 'Cancel',

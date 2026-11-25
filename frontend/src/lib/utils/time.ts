@@ -203,3 +203,19 @@ export function formatPeriodLong(p: string): string {
 	if (/^\d{4}-\d{2}$/.test(p)) return formatMonth(p);
 	return formatDate(p, p);
 }
+
+/**
+ * The invoice's own due date when a payment schedule moved it — i.e. when the
+ * EFFECTIVE due date a list shows (`due_date`: the current schedule's, else the
+ * invoice's own, the date `is_overdue` and the overdue count read) differs from
+ * the invoice's own (`own_due_date`). `null` when there is nothing to say:
+ * either date missing, or the two the same. Compared on the `YYYY-MM-DD` key,
+ * so a timestamp suffix never reads as a reschedule. Decisions §565.
+ */
+export function rescheduledFrom(
+	effective: string | null | undefined,
+	own: string | null | undefined
+): string | null {
+	if (!effective || !own) return null;
+	return effective.slice(0, 10) === own.slice(0, 10) ? null : own;
+}
