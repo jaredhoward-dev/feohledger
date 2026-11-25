@@ -297,6 +297,7 @@ const Map<String, Map<String, String>> invoiceWarningParamKinds = {
   'exception.erp_payment_void_writeback_failed': {'erp': 'text'},
   'exception.erp_payment_void_writeback_failed_unnamed': {},
   'exception.erp_credit_settlement': {},
+  'exception.erp_settled_no_payment': {},
   'exception.erp_paid_while_scheduled': {},
   'exception.erp_paid_twice': {},
   'exception.erp_partly_paid_outside': {},
@@ -1174,6 +1175,9 @@ String? _localizeWarningCode(
     // The ERP shows this bill settled, at least in part by a vendor credit applied there. FeohLedger will not pay it until someone confirms what is still owed.
     case 'exception.erp_credit_settlement':
       return l.exceptionDescriptionErpCreditSettlement;
+    // The ERP shows nothing owing on this bill, but no payment against it: a credit was applied or the balance written off there. FeohLedger will not pay it until someone confirms what is still owed.
+    case 'exception.erp_settled_no_payment':
+      return l.exceptionDescriptionErpSettledNoPayment;
     // The ERP shows this bill paid by a payment FeohLedger did not make, while a FeohLedger payment is scheduled for it. Stop or void one of them before both reach the supplier.
     case 'exception.erp_paid_while_scheduled':
       return l.exceptionDescriptionErpPaidWhileScheduled;

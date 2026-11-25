@@ -426,14 +426,27 @@ been confirmed after the ERP went live (§428) when that moment is known.
   `services/erp_status_report.apply_erp_status_report`, the very function the
   webhook calls, as the webhook's own words: `open` → `posted`, `paid` →
   `paid`, `cancelled` → `cancelled`. The audit rows are the webhook's, with
-  `source: poll` on a transition. `draft`, `partially_paid`, `unknown` and
-  `settled_no_payment` have no webhook equivalent and are not applied (since
-  §303 `paid` is the ERP's own paid status or a payment it records, never a
-  zero balance alone).
+  `source: poll` on a transition. `draft`, `partially_paid` and `unknown`
+  have no webhook equivalent and are not applied (since §303 `paid` is the
+  ERP's own paid status or a payment it records, never a zero balance alone).
+- **Settled with no payment (§532).** `settled_no_payment` — nothing owing in
+  the ERP and no payment behind it (a credit applied, a write-off) — is never
+  a payment (§303), and the invoice is not moved. The sweep opens one
+  payment-blocking `payment_reconciliation` exception (code
+  `exception.erp_settled_no_payment`, `erp_report.kind` `settled_no_payment`,
+  with the ERP, document id, `source: poll` and the invoice's status), so no
+  payment run pays a bill the ERP already shows settled until a person says
+  what is still owed. It goes through
+  `erp_status_sync.open_erp_reconciliation_exception`, so it is skipped while a
+  `payment_reconciliation` is already live on the invoice. This branch lives in
+  the sweep, not `apply_erp_status_report`: the generic webhook has no word for
+  the status.
 - **Only a change.** The last status read is kept in the latest workflow
   instance's `state_data["erp_status_poll"]`; a read equal to it applies
   nothing, so an unchanged `open` bill costs one call and no trail row, and a
-  "voided after posting" exception a person resolved is not re-opened.
+  "voided after posting" or "settled with no payment" exception a person
+  resolved or dismissed is not re-opened — only a read that changes away and
+  back raises it again.
 - **Idempotent across replicas.** The ERP is read outside any transaction;
   the result is applied under the invoice row lock after asking again whether
   the invoice is still a candidate with the same document id, and the record

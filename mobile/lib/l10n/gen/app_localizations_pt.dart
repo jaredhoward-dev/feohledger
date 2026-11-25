@@ -3851,6 +3851,10 @@ class AppLocalizationsPt extends AppLocalizations {
       'Segundo o ERP, esta fatura está quitada, ao menos em parte, por uma nota de crédito do fornecedor aplicada lá. O FeohLedger não vai pagá-la até que alguém confirme o que ainda é devido.';
 
   @override
+  String get exceptionDescriptionErpSettledNoPayment =>
+      'Segundo o ERP, não há nada em aberto nesta fatura, mas também nenhum pagamento vinculado a ela: um crédito foi aplicado ou o saldo foi baixado lá. O FeohLedger não vai pagá-la até que alguém confirme o que ainda é devido.';
+
+  @override
   String get exceptionDescriptionErpPaidWhileScheduled =>
       'Segundo o ERP, esta fatura foi paga por um pagamento que o FeohLedger não fez, enquanto há um pagamento do FeohLedger agendado para ela. Interrompa ou estorne um deles antes que os dois cheguem ao fornecedor.';
 
@@ -8948,6 +8952,10 @@ class AppLocalizationsPtBr extends AppLocalizationsPt {
   @override
   String get exceptionDescriptionErpCreditSettlement =>
       'Segundo o ERP, esta fatura está quitada, ao menos em parte, por uma nota de crédito do fornecedor aplicada lá. O FeohLedger não vai pagá-la até que alguém confirme o que ainda é devido.';
+
+  @override
+  String get exceptionDescriptionErpSettledNoPayment =>
+      'Segundo o ERP, não há nada em aberto nesta fatura, mas também nenhum pagamento vinculado a ela: um crédito foi aplicado ou o saldo foi baixado lá. O FeohLedger não vai pagá-la até que alguém confirme o que ainda é devido.';
 
   @override
   String get exceptionDescriptionErpPaidWhileScheduled =>

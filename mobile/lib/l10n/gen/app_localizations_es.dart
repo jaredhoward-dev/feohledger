@@ -3852,6 +3852,10 @@ class AppLocalizationsEs extends AppLocalizations {
       'Según el ERP, esta factura está liquidada, al menos en parte, con una nota de crédito del proveedor aplicada allí. FeohLedger no la pagará hasta que alguien confirme lo que aún se adeuda.';
 
   @override
+  String get exceptionDescriptionErpSettledNoPayment =>
+      'Según el ERP, esta factura no tiene saldo pendiente, pero tampoco ningún pago registrado contra ella: allí se aplicó una nota de crédito o se dio de baja el saldo. FeohLedger no la pagará hasta que alguien confirme lo que aún se adeuda.';
+
+  @override
   String get exceptionDescriptionErpPaidWhileScheduled =>
       'Según el ERP, esta factura se pagó con un pago que FeohLedger no hizo, mientras hay un pago de FeohLedger programado para ella. Detenga o anule uno de los dos antes de que ambos lleguen al proveedor.';
 

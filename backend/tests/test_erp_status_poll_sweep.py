@@ -12,6 +12,9 @@ Pinned here, on real Postgres, with the mock adapter (the local default):
   it to `paid`;
 * an unchanged status writes nothing to the trail, and a void after posting
   opens one exception that a later tick does not re-open after it is resolved;
+* a bill the ERP shows settled with no payment behind it (§303) leaves the
+  invoice where it is and opens one payment-blocking `payment_reconciliation`
+  exception, raised again only after the status changes away and back (§532);
 * two replicas at once apply once;
 * a tenant whose ERP credentials cannot be opened is logged and skipped;
 * the call budget ends a tenant's pass (pre-check, and a read it refuses);
@@ -35,6 +38,7 @@ from app.config import Settings, settings
 from app.models.exception import Exception as ApException
 from app.models.invoice import Invoice, InvoiceStatus
 from app.models.organization import Organization
+from app.models.payment import Payment
 from app.models.workflow import AuditLog, WorkflowInstance
 from app.services import erp_status_poll_sweep as sweep
 from app.services.erp_adapters.base import ErpCallBudgetExhausted, ErpInvoiceStatus
@@ -251,13 +255,112 @@ async def test_a_status_with_no_webhook_equivalent_is_not_applied(realdb, erp_re
     reads, _ = erp_reads
     await _write_erp(realdb, MOCK_ERP)
     inv_id = await _seed(realdb, InvoiceStatus.posted_in_erp)
-    reads[await _doc(realdb, inv_id)] = ErpInvoiceStatus.settled_no_payment
+    reads[await _doc(realdb, inv_id)] = ErpInvoiceStatus.partially_paid
 
     result = await sweep.run_status_poll_sweep_once()
 
     assert result.invoices_applied == 0 and result.invoices_unchanged == 1
     assert await _status(realdb, inv_id) == InvoiceStatus.posted_in_erp
     assert await _exceptions(realdb, inv_id) == []
+
+
+# ---------------------------------------------------------------------------
+# settled with no payment behind it: flagged for a person, never paid (§303, §532)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("status", [InvoiceStatus.posted_in_erp, InvoiceStatus.payment_scheduled])
+async def test_settled_no_payment_opens_one_blocking_exception_and_leaves_the_invoice(
+    realdb, erp_reads, status
+):
+    from app.services.payment_gates import PAYMENT_BLOCKING_EXCEPTION_TYPES
+    from app.services.payment_runs import blocked_invoice_ids
+
+    reads, _ = erp_reads
+    await _write_erp(realdb, MOCK_ERP)
+    inv_id = await _seed(realdb, status)
+    doc = await _doc(realdb, inv_id)
+    reads[doc] = ErpInvoiceStatus.settled_no_payment
+
+    result = await sweep.run_status_poll_sweep_once()
+
+    assert result.invoices_applied == 1 and result.invoice_failures == 0
+    # Nothing was paid by us: no transition, no payment, no ERP-status audit row.
+    assert await _status(realdb, inv_id) == status
+    assert await _erp_status_rows(realdb, inv_id) == []
+    async with realdb.sessionmaker(TENANT)() as s:
+        inv = await s.get(Invoice, inv_id)
+        assert inv.amount == Decimal("1234.56")
+        assert (
+            await s.execute(select(Payment).where(Payment.invoice_id == inv_id))
+        ).scalars().all() == []
+    [exc] = await _exceptions(realdb, inv_id)
+    assert exc.exception_type == "payment_reconciliation"
+    assert exc.exception_type in PAYMENT_BLOCKING_EXCEPTION_TYPES
+    assert exc.status == "open"
+    assert exc.raised_by_user_id is None
+    assert exc.description_code == "exception.erp_settled_no_payment"
+    assert exc.erp_report == {
+        "kind": "settled_no_payment",
+        "erp_type": "mock",
+        "erp_document_id": doc,
+        "source": "poll",
+        "invoice_status": status.value,
+    }
+    # The raise is on the append-only trail.
+    assert len(await _audit(realdb, exc.id, "exception.raised")) == 1
+    # A payment run refuses it.
+    async with realdb.sessionmaker(TENANT)() as s:
+        assert await blocked_invoice_ids(s, [inv_id]) == {inv_id}
+
+
+async def test_settled_no_payment_is_not_reraised_on_the_next_tick(realdb, erp_reads):
+    reads, _ = erp_reads
+    await _write_erp(realdb, MOCK_ERP)
+    inv_id = await _seed(realdb, InvoiceStatus.posted_in_erp)
+    reads[await _doc(realdb, inv_id)] = ErpInvoiceStatus.settled_no_payment
+
+    await sweep.run_status_poll_sweep_once()
+    second = await sweep.run_status_poll_sweep_once()
+
+    assert second.invoices_applied == 0 and second.invoices_unchanged == 1
+    [exc] = await _exceptions(realdb, inv_id)
+    assert len(await _audit(realdb, exc.id, "exception.raised")) == 1
+
+
+@pytest.mark.parametrize("closed_as", ["resolved", "dismissed"])
+async def test_settled_no_payment_is_not_reraised_once_closed_until_the_status_changes(
+    realdb, erp_reads, closed_as
+):
+    reads, _ = erp_reads
+    await _write_erp(realdb, MOCK_ERP)
+    inv_id = await _seed(realdb, InvoiceStatus.posted_in_erp)
+    doc = await _doc(realdb, inv_id)
+    reads[doc] = ErpInvoiceStatus.settled_no_payment
+
+    await sweep.run_status_poll_sweep_once()
+    [exc] = await _exceptions(realdb, inv_id)
+    async with realdb.sessionmaker(TENANT)() as s:
+        await s.execute(
+            update(ApException).where(ApException.id == exc.id).values(status=closed_as)
+        )
+        await s.commit()
+
+    # Unchanged: a person's decision stands.
+    unchanged = await sweep.run_status_poll_sweep_once()
+    assert unchanged.invoices_applied == 0
+    assert len(await _exceptions(realdb, inv_id)) == 1
+
+    # The ERP reopens the bill, then settles it with no payment again: a new
+    # report, flagged again.
+    reads[doc] = ErpInvoiceStatus.open
+    await sweep.run_status_poll_sweep_once()
+    reads[doc] = ErpInvoiceStatus.settled_no_payment
+    again = await sweep.run_status_poll_sweep_once()
+    assert again.invoices_applied == 1
+    rows = await _exceptions(realdb, inv_id)
+    assert sorted(r.status for r in rows) == sorted([closed_as, "open"])
+    assert await _status(realdb, inv_id) == InvoiceStatus.posted_in_erp
 
 
 # ---------------------------------------------------------------------------

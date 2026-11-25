@@ -27104,3 +27104,53 @@ locally / add an engines check*: the repo already runs fine on Node 26; the
 drift is in CLDR, which also reaches users through their browser, so a toolchain
 pin would hide the defect rather than fix it. *Loosen the test to accept either
 shape*: the variance is the bug (guard rail 4).
+
+## 532. A polled `settled_no_payment` opens a payment-blocking reconciliation exception, once per change (§303 / §528 follow-up, round 44)
+
+**Problem.** §303 introduced `ErpInvoiceStatus.settled_no_payment` — nothing
+owing in the ERP, no payment visible (a credit applied, a write-off, a
+zero-total bill) — and said a caller must flag it for a person, not record a
+payment. The `erp-status-poll` sweep (§528) is the first caller of
+`get_invoice_status`, and it ignored that status. The invoice stayed at
+`posted_in_erp` / `payment_scheduled` with nothing blocking it, so a payment run
+could pay a bill the ERP already shows settled.
+
+**Decision.** On a read of `settled_no_payment` that differs from the last
+recorded read (`state_data["erp_status_poll"]`, the §528 changed-status rule),
+the sweep opens a `payment_reconciliation` exception — a member of
+`PAYMENT_BLOCKING_EXCEPTION_TYPES`, the type the QuickBooks sync gives the same
+fact when it reads it off a vendor credit (`erp_credit_settlement`, §303 /
+§399) — through `erp_status_sync.open_erp_reconciliation_exception`, the helper
+every ERP-side discrepancy uses. The invoice is not transitioned and no payment
+is recorded: FeohLedger paid nothing. The row carries a new catalogue sentence,
+`exception.erp_settled_no_payment` (in all six web locales and the mobile ARB),
+because `erp_credit_settlement` says "by a vendor credit" and this status also
+covers a write-off. `erp_report` is PII-free machine detail: `kind`
+`settled_no_payment`, the adapter, the document id, `source: poll` and the
+invoice's status. `raised_by_user_id` is NULL (the ERP's report, no employee),
+and `create_exception` writes the `exception.raised` audit row.
+
+* **Once.** While one is open or escalated the helper skips it; an unchanged
+  read applies nothing at all, so a person's resolve or dismiss stands. Only a
+  read that changes away (say `open`) and back raises it again — a new report
+  from the ERP.
+* **In the sweep, not `erp_status_report`.** The generic webhook carries the
+  ERP's status word through `ERP_STATUS_MAP`, which has no word for this status;
+  Merge.dev, whose read does produce it, has its own route and is not polled.
+  Putting the branch in the shared transition would add a webhook contract
+  nobody sends. If a webhook ever gains the word, the branch moves there.
+
+**Rejected.** *Reusing `erp_credit_settlement`*: it tells the reader a vendor
+credit was applied, which is wrong for a write-off. *A named (`{erp}`) twin*:
+the sibling "the ERP shows…" sentences of §303 are unnamed, and the adapter is
+in `erp_report`. *Transitioning to `paid` or `done`*: §303 — a zero balance is
+never a payment, and `paid` needs one behind it. *Raising every tick while the
+status holds*: the exception's open-or-escalated idempotency stops duplicates
+but would re-open a resolved one every 15 minutes.
+
+**Guard.** `tests/test_erp_status_poll_sweep.py`: one blocking
+`payment_reconciliation` with the invoice, amount and payments untouched and
+`payment_runs.blocked_invoice_ids` refusing it; not re-raised on the next tick;
+not re-raised after a resolve or dismiss until the status changes away and
+back. `tests/test_invoice_warning_catalog.py` now counts the sweep (and
+`erp_status_report.py`, which the §528 move left out) as ERP producers.

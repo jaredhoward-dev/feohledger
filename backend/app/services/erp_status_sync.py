@@ -188,9 +188,12 @@ def reported_payment_parts(parts: Sequence[RailPart]) -> tuple[RailPart, ...]:
 #:   settled short of what AP authorized.
 #: * ``voided_after_post`` — the ERP voided a bill FeohLedger had already
 #:   moved past the point a void can be applied.
+#: * ``settled_no_payment`` — a status read shows nothing owing and no payment
+#:   behind it (a credit applied or a write-off in the ERP, §303, §532).
 ERP_REPORT_PAID_NOT_RECORDED = "paid_not_recorded"
 ERP_REPORT_SETTLED_SHORT = "settled_short"
 ERP_REPORT_VOIDED_AFTER_POST = "voided_after_post"
+ERP_REPORT_SETTLED_NO_PAYMENT = "settled_no_payment"
 
 #: How each ERP adapter is named to an AP user. An adapter missing here reads
 #: as "your ERP" — never its raw registry key.

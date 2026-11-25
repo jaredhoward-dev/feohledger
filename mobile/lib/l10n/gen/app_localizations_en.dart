@@ -3827,6 +3827,10 @@ class AppLocalizationsEn extends AppLocalizations {
       'The ERP shows this bill settled, at least in part by a vendor credit applied there. FeohLedger will not pay it until someone confirms what is still owed.';
 
   @override
+  String get exceptionDescriptionErpSettledNoPayment =>
+      'The ERP shows nothing owing on this bill, but no payment against it: a credit was applied or the balance written off there. FeohLedger will not pay it until someone confirms what is still owed.';
+
+  @override
   String get exceptionDescriptionErpPaidWhileScheduled =>
       'The ERP shows this bill paid by a payment FeohLedger did not make, while a FeohLedger payment is scheduled for it. Stop or void one of them before both reach the supplier.';
 

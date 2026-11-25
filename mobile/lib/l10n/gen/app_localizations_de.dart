@@ -3846,6 +3846,10 @@ class AppLocalizationsDe extends AppLocalizations {
       'Laut ERP ist diese Rechnung zumindest teilweise durch eine dort angewendete Lieferantengutschrift beglichen. FeohLedger bezahlt sie erst, wenn jemand bestätigt, was noch offen ist.';
 
   @override
+  String get exceptionDescriptionErpSettledNoPayment =>
+      'Laut ERP ist auf dieser Rechnung nichts mehr offen, aber auch keine Zahlung dazu verbucht: Dort wurde eine Gutschrift angewendet oder der Saldo ausgebucht. FeohLedger bezahlt sie erst, wenn jemand bestätigt, was noch offen ist.';
+
+  @override
   String get exceptionDescriptionErpPaidWhileScheduled =>
       'Laut ERP wurde diese Rechnung durch eine Zahlung beglichen, die nicht von FeohLedger stammt, während in FeohLedger eine Zahlung dafür geplant ist. Stoppen oder stornieren Sie eine der beiden, bevor beide beim Lieferanten ankommen.';
 

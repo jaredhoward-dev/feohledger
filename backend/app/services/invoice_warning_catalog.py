@@ -938,6 +938,12 @@ _ERP_UNNAMED_ONLY: dict[str, str] = {
         "The ERP shows this bill settled, at least in part by a vendor credit applied "
         "there. FeohLedger will not pay it until someone confirms what is still owed."
     ),
+    # The status polling sweep's `settled_no_payment` read (decisions §303, §532).
+    "erp_settled_no_payment": (
+        "The ERP shows nothing owing on this bill, but no payment against it: a credit "
+        "was applied or the balance written off there. FeohLedger will not pay it until "
+        "someone confirms what is still owed."
+    ),
     "erp_paid_while_scheduled": (
         "The ERP shows this bill paid by a payment FeohLedger did not make, while a "
         "FeohLedger payment is scheduled for it. Stop or void one of them before both "
