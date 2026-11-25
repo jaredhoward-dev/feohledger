@@ -114,9 +114,23 @@ the supplier guides and a short glossary on one page, and
   `glossary.ts`, `guides/` or `lifecycle.ts`: that would ship every employee
   guide to suppliers and make the route load the settings slice. The route
   loads only the help slice (the portal slice comes from `/portal`).
-- **Writing one.** Check every step against the portal route it describes and
-  `backend/docs/supplier-portal.md` — suppliers have no AP colleague to ask
-  when a guide is wrong. Name portal controls with `{ui:portal.…}`.
+- **Coverage.** Every `PORTAL_PAGES` page but `/portal/notifications` (two
+  checkboxes, covered by a tip) is some guide's `route`, so a new portal page
+  fails `content.test.ts` until it has a guide. Nine guides today: getting
+  started, submit / resubmit, track to payment, bank details, card payments,
+  invoice from a PO, early-payment offers, W-9 / W-8, invoice conversations.
+- **No search box yet.** `searchHelp` lives in `content.ts`, which the portal
+  may not import (above); the guides still fit one page. Tracked in
+  `docs/followups.md`.
+- **Writing one.** Check every step against the portal route it describes,
+  the endpoint behind it in `backend/app/api/portal.py`, and
+  `backend/docs/supplier-portal.md` (plus the feature's own doc) — suppliers
+  have no AP colleague to ask when a guide is wrong. Name portal controls with
+  `{ui:portal.…}` (or the shared component's own keys, e.g.
+  `{ui:supplierChat.send}`). Add a glossary term only when its translated
+  one-liner reads true for a supplier: `purchase-order` and `form-w9` are
+  written in the buyer's voice ("your order to a supplier"), so the PO and
+  tax-form guides carry no term.
 
 ## HelpTips in the app
 
@@ -166,8 +180,8 @@ controls (`{ui:portal.…}`) needs `'portal'` added to that load —
   directory covers the sidebar; every invoice status is in the lifecycle;
   every diagram is drawn and used; the bundle boundaries; search.
   The **supplier portal help** block holds `PORTAL_GUIDES` to the same
-  reference checks plus the portal-only rules above, and pins that the portal
-  help pages never import the employee guide index.
+  reference checks plus the portal-only rules above (coverage included), and
+  pins that the portal help pages never import the employee guide index.
 - `src/lib/help/inline.test.ts` — the markup parser, the page-help lookup, anchors.
 - `tests-e2e/help/help-centre.spec.ts` — the pages render, search, the
   role-chips, a guide's open-page button, the PageHeader link, a HelpTip by
@@ -175,5 +189,6 @@ controls (`{ui:portal.…}`) needs `'portal'` added to that load —
   disk.
 - `tests-e2e/portal/help.spec.ts` — a supplier reaches `/portal/help` from the
   nav, opens a guide, follows a term link to the portal glossary and the
-  guide's open-page button. `tests-e2e/a11y/axe.spec.ts` scans the landing and
+  guide's open-page button; the purchase-order guide renders its row button's
+  label and opens `/portal/purchase-orders`. `tests-e2e/a11y/axe.spec.ts` scans the landing and
   a guide; `tests-e2e/portal/reflow.spec.ts` checks both at 390px.
