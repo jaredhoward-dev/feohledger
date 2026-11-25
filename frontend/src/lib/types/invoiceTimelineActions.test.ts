@@ -1,58 +1,53 @@
 import { describe, expect, it, vi } from 'vitest';
 
-// The store reaches `$app/*`; only the seam's default slice loader touches it,
-// and every case below passes its own.
+// The store reaches `$app/*`; nothing below reads a message.
 vi.mock('#lib/i18n/store.svelte.ts', () => ({
-	hasMessage: () => false,
-	ensureSlices: () => Promise.resolve()
+	hasMessage: () => false
 }));
 
-const { loadLabelledTimeline } = await import('./invoiceTimelineActions');
+const { activityTimelineView } = await import('./invoiceTimelineActions');
 
-/** A promise plus the handles to settle it from the test. */
-function deferred<T>() {
-	let resolve!: (v: T) => void;
-	let reject!: (e: unknown) => void;
-	const promise = new Promise<T>((res, rej) => {
-		resolve = res;
-		reject = rej;
-	});
-	return { promise, resolve, reject };
-}
+const settled = { fetched: true, errored: false };
 
-// decisions §529: the Activity rows must not reach the view before the label
-// slice does, or they render as raw tokens (`invoice.erp_failed`) and relabel.
-describe('loadLabelledTimeline', () => {
-	it('holds the rows until the label slice has landed', async () => {
-		const rows = deferred<string[]>();
-		const labels = deferred<void>();
-		let settled: string[] | undefined;
-		const p = loadLabelledTimeline(() => rows.promise, () => labels.promise).then((r) => (settled = r));
-
-		rows.resolve(['invoice.erp_failed']);
-		await Promise.resolve();
-		await Promise.resolve();
-		expect(settled).toBeUndefined();
-
-		labels.resolve();
-		await p;
-		expect(settled).toEqual(['invoice.erp_failed']);
+// decisions §529 / §534: the rows are stored the moment their fetch returns
+// (the ERP panel reads them), but the Activity list must not draw one before
+// the label slice lands, or it renders as a raw token (`invoice.erp_failed`)
+// and relabels.
+describe('activityTimelineView', () => {
+	it('draws no row before the label slice has landed, whatever the fetch did', () => {
+		for (const fetch of [
+			{ fetched: false, errored: false, rowCount: 0 },
+			{ fetched: true, errored: false, rowCount: 3 },
+			{ fetched: true, errored: true, rowCount: 0 },
+			{ fetched: true, errored: false, rowCount: 0 }
+		]) {
+			expect(activityTimelineView({ labelsReady: false, ...fetch })).toBe('loading');
+		}
 	});
 
-	it('holds the rows when the labels land first, too', async () => {
-		const rows = deferred<number[]>();
-		let settled: number[] | undefined;
-		const p = loadLabelledTimeline(() => rows.promise, () => Promise.resolve()).then((r) => (settled = r));
-		await Promise.resolve();
-		expect(settled).toBeUndefined();
-		rows.resolve([1]);
-		await p;
-		expect(settled).toEqual([1]);
+	it('draws the rows once the labels are in', () => {
+		expect(activityTimelineView({ labelsReady: true, ...settled, rowCount: 2 })).toBe('rows');
 	});
 
-	it('rejects when the rows fetch does, so the caller keeps its fallback', async () => {
-		await expect(
-			loadLabelledTimeline(() => Promise.reject(new Error('boom')), () => Promise.resolve())
-		).rejects.toThrow('boom');
+	it('keeps rows it already holds up through a refetch or a failed one', () => {
+		expect(
+			activityTimelineView({ labelsReady: true, fetched: false, errored: false, rowCount: 2 })
+		).toBe('rows');
+		expect(
+			activityTimelineView({ labelsReady: true, fetched: true, errored: true, rowCount: 2 })
+		).toBe('rows');
+	});
+
+	it('waits for the first fetch before claiming the list is empty', () => {
+		expect(
+			activityTimelineView({ labelsReady: true, fetched: false, errored: false, rowCount: 0 })
+		).toBe('loading');
+	});
+
+	it('tells a failed load apart from an invoice with no activity', () => {
+		expect(
+			activityTimelineView({ labelsReady: true, fetched: true, errored: true, rowCount: 0 })
+		).toBe('errored');
+		expect(activityTimelineView({ labelsReady: true, ...settled, rowCount: 0 })).toBe('empty');
 	});
 });
