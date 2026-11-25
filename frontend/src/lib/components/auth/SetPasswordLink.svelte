@@ -64,6 +64,8 @@
 	let legalRequired = $state(false);
 	let legalAccepted = $state(false);
 	let legalError = $state('');
+	// The server refused a ticked box: this tab's bundled versions are stale.
+	let legalVersionsChanged = $state(false);
 	let legalBox: LegalAcceptCheckbox | undefined = $state();
 	// `checking` until the token is read; `invalid` when it is unknown, used or
 	// expired; `ready` shows the form; `done` the confirmation.
@@ -191,11 +193,18 @@
 				err.status === 422 &&
 				err.code === 'legal_acceptance_required'
 			) {
-				// The versions in force changed since the page loaded, or the box
-				// was never shown: show it now and say why.
-				legalRequired = true;
-				legalAccepted = false;
-				legalError = apiErrorMessage(err, m('auth.legal.acceptRequired'));
+				if (legalRequired && legalAccepted) {
+					// The box was ticked and still refused: the versions in force
+					// changed since the page loaded, and this tab can only ever send
+					// the ones built into it. Re-asking for the tick is a dead end;
+					// say what changed and offer the reload (it keeps the token).
+					legalVersionsChanged = true;
+				} else {
+					// The box was never shown: show it now and say why.
+					legalRequired = true;
+					legalAccepted = false;
+					legalError = apiErrorMessage(err, m('auth.legal.acceptRequired'));
+				}
 				await tick();
 				legalBox?.focus();
 			} else if (err instanceof ApiError && err.status === 422) {
@@ -250,6 +259,7 @@
 					id="{idPrefix}-legal-accept"
 					bind:checked={legalAccepted}
 					error={legalError}
+					versionsChanged={legalVersionsChanged}
 					onchange={() => (legalError = '')}
 				/>
 			{/if}

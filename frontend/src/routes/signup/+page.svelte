@@ -49,6 +49,9 @@
 	// The required Terms / Privacy accept box (decisions §495).
 	let legalAccepted = $state(false);
 	let legalError = $state('');
+	// The server refused the (necessarily ticked) box: this tab's bundled
+	// versions are stale, and only a reload fetches the current ones.
+	let legalVersionsChanged = $state(false);
 	let legalBox: LegalAcceptCheckbox | undefined = $state();
 	let captchaToken = $state<string | null>(null);
 	let captchaSitekey = $state<string>('');
@@ -485,6 +488,16 @@
 			successHeading?.focus();
 		} catch (err) {
 			discardCaptchaToken();
+			if (err instanceof ApiError && err.code === 'legal_acceptance_required') {
+				// Submit only gets here with the box ticked, so the refusal means
+				// the Terms / Privacy versions changed since the page loaded. Say
+				// so beside the box, with the reload — not a banner asking for a
+				// tick that is already there.
+				legalVersionsChanged = true;
+				await tick();
+				legalBox?.focus();
+				return;
+			}
 			error = (await showRefusal(err)) ?? '';
 		} finally {
 			submitting = false;
@@ -690,6 +703,7 @@
 				id="signup-legal-accept"
 				bind:checked={legalAccepted}
 				error={legalError}
+				versionsChanged={legalVersionsChanged}
 				withDpa
 				onchange={() => (legalError = '')}
 			/>
