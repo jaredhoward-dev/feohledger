@@ -2410,7 +2410,10 @@
 		padding: 20px 24px;
 	}
 
-	.card h2 {
+	/* `:global(.card)`: the intro snippets (`customDomainsIntro`,
+	   `residencyIntro`) render this page's <h2> inside a panel component's
+	   card, which carries the component's scope, not this page's. */
+	:global(.card) h2 {
 		font-size: 1rem;
 		font-weight: 600;
 		margin: 0 0 4px;
