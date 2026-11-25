@@ -5162,6 +5162,7 @@ export const en = {
 	'invoices.modal.review.assignedElsewhereUnnamed': 'Assigned to a colleague — you can still act as an approver.',
 	'invoices.modal.review.assignedHintPost': ' for review.',
 	'invoices.modal.review.assignedHintPre': 'Assigned to ',
+	'invoices.modal.review.checking': 'Checking what you can do here…',
 	'invoices.modal.review.confirmReject': 'Confirm Reject',
 	'invoices.modal.review.reject': 'Reject',
 	'invoices.modal.review.rejectAria': 'Reason for rejection',

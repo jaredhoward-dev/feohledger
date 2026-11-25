@@ -4969,6 +4969,7 @@ export const messages = {
 	'invoices.modal.review.assignedElsewhereUnnamed': 'Atribuída a um colega — você ainda pode agir como aprovador.',
 	'invoices.modal.review.assignedHintPost': ' para revisão.',
 	'invoices.modal.review.assignedHintPre': 'Atribuída a ',
+	'invoices.modal.review.checking': 'Verificando o que você pode fazer aqui…',
 	'invoices.modal.review.confirmReject': 'Confirmar rejeição',
 	'invoices.modal.review.reject': 'Rejeitar',
 	'invoices.modal.review.rejectAria': 'Motivo da rejeição',

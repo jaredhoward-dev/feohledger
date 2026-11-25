@@ -4974,6 +4974,7 @@ export const messages = {
 	'invoices.modal.review.assignedElsewhereUnnamed': 'Assignée à un collègue — vous pouvez tout de même agir en tant qu’approbateur.',
 	'invoices.modal.review.assignedHintPost': ' pour examen.',
 	'invoices.modal.review.assignedHintPre': 'Assigné à ',
+	'invoices.modal.review.checking': 'Vérification de ce que vous pouvez faire ici…',
 	'invoices.modal.review.confirmReject': 'Confirmer le rejet',
 	'invoices.modal.review.reject': 'Rejeter',
 	'invoices.modal.review.rejectAria': 'Motif du rejet',

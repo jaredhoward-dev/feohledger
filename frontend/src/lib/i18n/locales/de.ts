@@ -4975,6 +4975,7 @@ export const messages = {
 	'invoices.modal.review.assignedElsewhereUnnamed': 'Einer Kollegin oder einem Kollegen zugewiesen – Sie können trotzdem als Genehmiger entscheiden.',
 	'invoices.modal.review.assignedHintPost': '.',
 	'invoices.modal.review.assignedHintPre': 'Zur Prüfung zugewiesen an ',
+	'invoices.modal.review.checking': 'Es wird geprüft, was Sie hier tun dürfen …',
 	'invoices.modal.review.confirmReject': 'Ablehnung bestätigen',
 	'invoices.modal.review.reject': 'Ablehnen',
 	'invoices.modal.review.rejectAria': 'Ablehnungsgrund',

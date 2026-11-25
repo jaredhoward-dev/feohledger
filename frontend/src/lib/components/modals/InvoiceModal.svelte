@@ -712,6 +712,23 @@
 	let approveRefusal = $derived(
 		isOffered(verdicts?.approve) ? (verdicts?.approve ?? null) : null
 	);
+	// What each decision button's `aria-describedby` names: the assignee note
+	// (so a screen-reader user hears whose invoice it is before acting), and
+	// for Approve its refusal when disabled.
+	let approveDescribedBy = $derived(
+		[approveRefusal ? 'approve-refusal' : null, assignedTo ? 'review-assigned-elsewhere' : null]
+			.filter(Boolean)
+			.join(' ') || undefined
+	);
+	let rejectDescribedBy = $derived(assignedTo ? 'review-assigned-elsewhere' : undefined);
+	// The verdict for an invoice in review is still on its way: the footer's
+	// review region shows that, rather than the "Assigned to X for review."
+	// line it would swap for the buttons a moment later. Fail closed: nothing
+	// is offered until the answer lands, and a failed read falls back to the
+	// line (the form's LoadError says why).
+	let verdictsLoading = $derived(
+		isReadyForReview && !!invoice.id && verdicts === undefined && !verdictsFailed
+	);
 	// `POST /{id}/complete` (Submit / Send to ERP / Mark Complete). Hidden for
 	// a status it does not advance — not something the reader can act on, like
 	// `role_not_permitted` — and otherwise rendered, disabled with the reason
@@ -2949,7 +2966,11 @@
 						{#if assignedTo}
 							<!-- Non-blocking: any approver the server accepts may act; this
 							     only keeps them from taking a colleague's invoice unawares. -->
-							<p class="review-assigned-hint review-assigned-note" data-testid="review-assigned-elsewhere">
+							<p
+								class="review-assigned-hint review-assigned-note"
+								id="review-assigned-elsewhere"
+								data-testid="review-assigned-elsewhere"
+							>
 								{#if assignedTo.name}
 									{m('invoices.modal.review.assignedElsewherePre')}<strong>{assignedTo.name}</strong>{m('invoices.modal.review.assignedElsewherePost')}
 								{:else}
@@ -2980,7 +3001,7 @@
 										type="button"
 										class="btn-primary review-choice"
 										disabled={reviewing || !isAllowed(verdicts?.approve)}
-										aria-describedby={approveRefusal ? 'approve-refusal' : undefined}
+										aria-describedby={approveDescribedBy}
 										onclick={handleApprove}
 									>
 										<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" aria-hidden="true"><polyline points="20 6 9 17 4 12"/></svg>
@@ -2992,6 +3013,7 @@
 										type="button"
 										class="btn-danger review-choice"
 										disabled={reviewing || !isAllowed(verdicts?.reject)}
+										aria-describedby={rejectDescribedBy}
 										onclick={() => (showRejectForm = true)}
 									>
 										<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
@@ -3008,6 +3030,10 @@
 								</p>
 							{/if}
 						{/if}
+					</div>
+				{:else if verdictsLoading}
+					<div class="review-section">
+						<LoadingState label={m('invoices.modal.review.checking')} testId="review-verdicts-loading" />
 					</div>
 				{:else if isReadyForReview && invoice.assigned_to}
 					<div class="review-section">

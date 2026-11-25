@@ -4905,6 +4905,7 @@ export const messages = {
 	'invoices.modal.review.assignedElsewhereUnnamed': '別の担当者に割り当て済み(承認者としてこのまま処理できます)',
 	'invoices.modal.review.assignedHintPost': '。',
 	'invoices.modal.review.assignedHintPre': 'レビュー担当者: ',
+	'invoices.modal.review.checking': 'ここで実行できる操作を確認しています…',
 	'invoices.modal.review.confirmReject': '却下を確認',
 	'invoices.modal.review.reject': '却下',
 	'invoices.modal.review.rejectAria': '却下の理由',
