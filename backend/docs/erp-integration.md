@@ -2540,8 +2540,9 @@ holder of `payment.void` can name that bill and void it:
   `get_invoice_status` makes; not gated on the §541 status-sync opt-in, since
   it makes no status-sync call) and **Xero** (`_matching_bills`: a live ACCPAY
   bill on our contact with our invoice number; two on one key, a bill on
-  another contact or at a status the filter did not ask for, raise) (decisions
-  §566). Every other adapter answers 409 `erp_lookup_unsupported`; their
+  another contact or at a status the filter did not ask for, raise
+  `XeroBillLookupAmbiguous`, a refused read `XeroRequestError`; both are 502
+  `erp_lookup_failed`) (decisions §566, §569). Every other adapter answers 409 `erp_lookup_unsupported`; their
   lookups live inside `post_invoice` with client state and are wired one at a
   time.
 - **A key that is not unique to one invoice is checked against the tenant.**
@@ -2552,8 +2553,14 @@ holder of `payment.void` can name that bill and void it:
   `erp_bill_void.shared_lookup_keys` refuses the lookup — and the orphan void,
   whose payload is built by the same `lookup_payload` — with 409
   `erp_lookup_unsupported` while another invoice in the tenant carries the
-  same number (trimmed, case-folded) from the same vendor or any vendor linked
-  to the same ERP contact, at any status. The served verdict
+  same number (trimmed, case-folded) from the same vendor or any vendor that
+  could carry the same ERP contact, at any status. The contact is the one the
+  lookup sends (`vendor_erp_links.vendor_erp_ids` in the connected company:
+  the row link when live there, else a kept link) plus the vendor row's own
+  link, matched against every other vendor's row link and every link it keeps
+  under any company (wider than the ERP, so it errs toward refusing). One
+  bounded set of queries for a whole page of candidates, not one per invoice
+  (decisions §569). The served verdict
   (`erp_orphan_lookup_refusal`) reads the same check, so the page never offers
   a lookup the server refuses. What it cannot rule out is a bill someone keyed
   by hand in Xero for the same supplier invoice: the push already adopts such a

@@ -121,8 +121,10 @@ Virtual cards are **not** on a separate page. Card payments appear in the Histor
 Shows invoices in payable statuses (`approved`, `sent_to_erp`, `posted_in_erp`, `payment_scheduled`) that don't have a completed payment yet.
 
 - Sorted by EFFECTIVE due date, soonest first: the invoice's current payment
-  schedule's due date, else its own (`open_ap_due.effective_due_by_invoice`,
-  the date the dashboard's overdue count reads). Each row's `due_date` is that
+  schedule's due date, else its own (`open_ap_due.effective_due_of`, the date
+  the dashboard's overdue count reads; the page reads the current schedule
+  through the correlated `payment_schedules.current_schedule_of_row`, and
+  `/queue/ids` returns ids in the same order, decisions §569). Each row's `due_date` is that
   date, `is_overdue` is judged on it in the same SELECT, and `own_due_date`
   carries the invoice's own, shown as "rescheduled from …" when it differs
   (decisions §565)

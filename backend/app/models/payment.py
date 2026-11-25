@@ -79,6 +79,19 @@ class PaymentRun(Base, EntityMixin, TimestampMixin):
 
 class PaymentSchedule(Base, TimestampMixin):
     __tablename__ = "payment_schedules"
+    # An invoice's schedules in current-schedule order
+    # (`payment_schedules.LATEST_SCHEDULE_ORDER`), so the per-invoice "current
+    # schedule" probe and the `DISTINCT ON (invoice_id)` readers take the index
+    # in order instead of sorting (decisions §569). Mirrors migration 0150;
+    # declared here so fresh tenants built via create_all get it too.
+    __table_args__ = (
+        Index(
+            "ix_payment_schedules_invoice_current",
+            "invoice_id",
+            text("created_at DESC"),
+            text("id DESC"),
+        ),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     correlation_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), index=True)

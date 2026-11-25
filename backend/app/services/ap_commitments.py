@@ -23,7 +23,7 @@ import uuid
 from datetime import date, timedelta
 from decimal import Decimal
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, true
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.invoice import Invoice
@@ -38,7 +38,8 @@ from app.services.open_ap_due import (
     COMMITTED_STATUSES,
     PENDING_STATUSES,
     aging_band,
-    effective_due_by_invoice,
+    current_schedule_due,
+    effective_due_of,
     is_overdue,
     open_ap_due_population,
 )
@@ -213,8 +214,8 @@ async def aging_snapshot_buckets(
 
     Population and band edges are the dashboard's exactly: `OPEN_AP_STATUSES`
     with no due-date filter, each row banded by `open_ap_due.aging_band` on
-    its effective due date (`effective_due_by_invoice`: the current payment
-    schedule's, else the invoice's own; NULL is `current` — unknowable, so not
+    its effective due date (`effective_due_of` over `current_schedule_due`: the
+    current payment schedule's, else the invoice's own; NULL is `current` — unknowable, so not
     overdue), the date the overdue count reads (decisions §565).
     """
     rep = invoice_reporting_amount_sql(
@@ -224,8 +225,8 @@ async def aging_snapshot_buckets(
         persisted_reporting_amount=Invoice.reporting_amount,
         persisted_reporting_currency=Invoice.reporting_currency,
     )
-    timed = effective_due_by_invoice()
-    band = aging_band(timed.c.effective_due, today)
+    current = current_schedule_due()
+    band = aging_band(effective_due_of(current.c.sched_due), today)
     result = await db.execute(
         apply_entity_scope(
             select(
@@ -233,7 +234,8 @@ async def aging_snapshot_buckets(
                 func.coalesce(func.sum(rep.amount), 0),
                 func.coalesce(func.sum(rep.unconverted), 0),
             )
-            .outerjoin(timed, timed.c.invoice_id == Invoice.id)
+            .select_from(Invoice)
+            .outerjoin(current, true())
             .where(Invoice.status.in_(OPEN_AP_STATUSES))
             .group_by(band),
             Invoice,

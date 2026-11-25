@@ -1679,7 +1679,10 @@ def test_two_bills_on_one_key_raise_rather_than_pick_one(xero_fake):
     _fake_bill(xero_fake, number="SUP-1001")
     _fake_bill(xero_fake, number="SUP-1001", status="DRAFT")
 
-    with pytest.raises(RuntimeError):
+    from app.services.erp_adapters.xero import XeroBillLookupAmbiguous
+
+    # Xero answered 200: not an HTTP failure, so not named as one (§569).
+    with pytest.raises(XeroBillLookupAmbiguous):
         _run(_adapter().find_posted_bill(_payload(vendor_erp_id=FAKE_CONTACT)))
 
 
@@ -1758,6 +1761,15 @@ def test_a_lookup_that_cannot_answer_raises_never_none(token, answer):
         with pytest.raises(Exception) as raised:
             _run(_adapter().find_posted_bill(_payload()))
     assert not isinstance(raised.value, AssertionError)
+    from app.services.erp_adapters.xero import XeroBillLookupAmbiguous, XeroRequestError
+
+    # A refused read names its HTTP status; a readable answer that is not one
+    # bill of ours says so instead of passing off a 200 as a failure (§569).
+    if answer.status_code != 200:
+        assert isinstance(raised.value, XeroRequestError)
+    elif answer.content != b"not json":
+        assert isinstance(raised.value, XeroBillLookupAmbiguous)
+        assert "HTTP" not in str(raised.value)
 
 
 @pytest.mark.parametrize("overrides", [{"vendor_erp_id": None}, {"invoice_number": "  "}])

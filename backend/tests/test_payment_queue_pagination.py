@@ -183,3 +183,82 @@ async def test_queue_row_discount_rounds_half_up_matching_the_rollup(realdb):
     assert row["discount_amount"] == "0.53"  # half-UP, not "0.52"
     # And the whole-set savings total attributes the same figure.
     assert Decimal(summary["total_savings"]) >= Decimal("0.53")
+
+
+async def test_ids_resolve_in_the_queue_page_order(realdb):
+    """`/queue/ids` and `/queue` order rows by the same effective due date
+    (current schedule's, else the invoice's own; ties by id), so "select all N"
+    resolves the rows in the order the operator saw them. They reach the
+    current schedule by two routes (the page joins the schedule row it shows;
+    the ids read its due date alone, decisions §569), which is why this is
+    pinned end to end: a rescheduled row, a row whose newest schedule moved it
+    LATER than an older one, a row with no schedule, and tied dates."""
+    from datetime import timedelta
+
+    from app.models.payment import PaymentSchedule
+    from app.utils.dates import utc_today
+
+    org_id = realdb.info(TENANT).org_id
+    mk = realdb.sessionmaker(TENANT)
+    today = utc_today()
+    # (own due offset, [schedule due offsets, oldest first]) — None = no date.
+    shapes = [
+        (40, []),
+        (40, []),  # ties the row above on date; id breaks it
+        (90, [5]),  # rescheduled earlier
+        (3, [60]),  # rescheduled later
+        (10, [1, 70]),  # newest schedule wins over an older, earlier one
+        (None, []),  # untimeable: last
+        (None, [20]),  # timed only by its schedule
+    ]
+    seeded: list[str] = []
+    async with mk() as s:
+        ent = await _default_entity_id(s)
+        for n, (own, schedules) in enumerate(shapes):
+            inv_id = uuid.uuid4()
+            s.add(
+                Invoice(
+                    id=inv_id,
+                    organization_id=org_id,
+                    entity_id=ent,
+                    invoice_number=f"QORD-{n:02d}",
+                    vendor_name="Queue Order",
+                    amount=Decimal("10.00"),
+                    currency="USD",
+                    status=InvoiceStatus.approved,
+                    due_date=None if own is None else today + timedelta(days=own),
+                    correlation_id=uuid.uuid4(),
+                )
+            )
+            await s.flush()
+            for due in schedules:
+                s.add(
+                    PaymentSchedule(
+                        id=uuid.uuid4(),
+                        invoice_id=inv_id,
+                        due_date=today + timedelta(days=due),
+                    )
+                )
+                # Separate transactions so `created_at` orders the schedules.
+                await s.commit()
+            seeded.append(str(inv_id))
+        await s.commit()
+
+    async with realdb.client(key=TENANT, role="admin") as c:
+        page = (await c.get("/api/payments/queue", params={"page_size": 100})).json()
+        ids_resp = (await c.get("/api/payments/queue/ids")).json()
+
+    assert page["total"] <= 100, "the comparison needs the whole queue on one page"
+    selectable = [
+        r["id"] for r in page["items"] if not r["blocked"] and r.get("required_method") is None
+    ]
+    assert ids_resp["ids"] == selectable
+    # And the effective date is what orders the seeded rows.
+    mine = [i for i in ids_resp["ids"] if i in set(seeded)]
+    by_id = {r["id"]: r for r in page["items"]}
+    dues = [by_id[i]["due_date"] for i in mine]
+    timed = [d for d in dues if d is not None]
+    assert timed == sorted(timed)
+    assert dues[-1] is None and mine[-1] == seeded[5]
+    assert by_id[seeded[2]]["due_date"] == (today + timedelta(days=5)).isoformat()
+    assert by_id[seeded[4]]["due_date"] == (today + timedelta(days=70)).isoformat()

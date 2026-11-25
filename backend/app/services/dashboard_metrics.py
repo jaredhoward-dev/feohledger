@@ -26,7 +26,7 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 
-from sqlalchemy import Date, and_, case, cast, func, not_, select
+from sqlalchemy import Date, and_, case, cast, func, not_, select, true
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.exception import Exception as APException
@@ -49,7 +49,8 @@ from app.services.open_ap_due import (
     AGING_BANDS,
     DUE_SOON_DAYS,
     aging_band,
-    effective_due_by_invoice,
+    current_schedule_due,
+    effective_due_of,
     is_due_soon,
     is_overdue,
     open_ap_due_population,
@@ -330,7 +331,8 @@ async def aging(s: DashboardScope) -> tuple[dict, dict]:
     balance has no due_date filter, so aging must not either — an open invoice
     missing a due date used to inflate the balance while vanishing from every
     bucket. A row is banded by its EFFECTIVE due date
-    (`open_ap_due.effective_due_by_invoice`: the current payment schedule's,
+    (`open_ap_due.effective_due_of` over `current_schedule_due`: the current
+    payment schedule's,
     else the invoice's own) through `open_ap_due.aging_band`, the same date
     the overdue count reads, so a rescheduled invoice is past due in a band
     exactly when it is counted overdue (decisions §565). An untimeable row is
@@ -341,8 +343,8 @@ async def aging(s: DashboardScope) -> tuple[dict, dict]:
     aging_dec = _empty_aging_bands()
     aging_reporting_dec = _empty_aging_bands()
     aging_reporting_unconverted = 0
-    timed = effective_due_by_invoice()
-    aging_bucket = aging_band(timed.c.effective_due, s.today)
+    current = current_schedule_due()
+    aging_bucket = aging_band(effective_due_of(current.c.sched_due), s.today)
     aging_rows = await s.db.execute(
         s.inv(
             select(
@@ -351,7 +353,8 @@ async def aging(s: DashboardScope) -> tuple[dict, dict]:
                 func.coalesce(func.sum(s.rep.amount), 0),
                 func.coalesce(func.sum(s.rep.unconverted), 0),
             )
-            .outerjoin(timed, timed.c.invoice_id == Invoice.id)
+            .select_from(Invoice)
+            .outerjoin(current, true())
             .where(Invoice.status.in_(OPEN_AP_STATUSES))
             .group_by(aging_bucket)
         )

@@ -423,9 +423,11 @@ class XeroAdapter(OAuthErpAdapter):
 
         Raises rather than answer "none" on anything it cannot read plainly: a
         payload the push would refuse before sending (no linked supplier, no
-        number), a non-200, more than one bill on the key (which is ours is not
-        knowable), or a bill without an id, on another contact, or at a status
-        the filter did not ask for. The key carries nothing unique to one
+        number), a non-200 (:class:`XeroRequestError`), more than one bill on
+        the key (which is ours is not knowable), or a bill without an id, on
+        another contact, or at a status the filter did not ask for
+        (:class:`XeroBillLookupAmbiguous`: Xero answered 200, so an HTTP status
+        would misname it, decisions §569). The key carries nothing unique to one
         invoice; ``services/erp_bill_void`` keeps it from naming another
         invoice's bill (:attr:`bill_lookup_key_shared`)."""
         if not payload.vendor_erp_id:
@@ -440,7 +442,7 @@ class XeroAdapter(OAuthErpAdapter):
         if not bills:
             return None
         if len(bills) > 1:
-            raise XeroRequestError(resp.status_code)
+            raise XeroBillLookupAmbiguous("more than one live bill carries this key")
         bill = bills[0]
         bill_id = str(bill.get("InvoiceID") or "").strip()
         contact = bill.get("Contact") if isinstance(bill.get("Contact"), dict) else {}
@@ -450,7 +452,9 @@ class XeroAdapter(OAuthErpAdapter):
             or str(contact.get("ContactID") or "") != str(payload.vendor_erp_id)
             or status not in _LIVE_BILL_STATUSES.split(",")
         ):
-            raise XeroRequestError(resp.status_code)
+            raise XeroBillLookupAmbiguous(
+                "the matched bill has no id, another contact, or an unrequested status"
+            )
         return FoundBill(
             document_id=bill_id,
             document_number=bill.get("InvoiceNumber") or None,
@@ -1503,6 +1507,14 @@ class XeroRequestError(RuntimeError):
     def __init__(self, status_code: int):
         self.status_code = status_code
         super().__init__(f"{PROVIDER} request failed: HTTP {status_code}")
+
+
+class XeroBillLookupAmbiguous(RuntimeError):
+    """:meth:`XeroAdapter.find_posted_bill` got a readable answer that does not
+    name exactly one bill of ours (decisions §569). Not an HTTP failure, so not
+    a :class:`XeroRequestError`; the lookup still fails closed on it
+    (``erp_bill_void.find_orphan`` answers ``erp_lookup_failed``). PII-free:
+    the reason is fixed text, never the bill."""
 
 
 #: ``post_payment``'s mark on the Xero payment it writes, in its ``Reference``.
