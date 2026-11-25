@@ -905,6 +905,20 @@ def sync_listing_pages(page_size: int) -> int:
     return -(-SYNC_LISTING_MAX_ROWS // page_size)
 
 
+@dataclass(frozen=True)
+class FoundBill:
+    """A bill :meth:`ErpAdapter.find_posted_bill` found in the ERP for an
+    invoice whose push outcome is unknown (decisions §556). PII-free: the ERP's
+    ids, the total it booked, its currency and where it stands — never the
+    vendor, the lines or a memo."""
+
+    document_id: str
+    document_number: str | None
+    amount: Decimal | None
+    currency: str | None
+    status: ErpInvoiceStatus
+
+
 #: :attr:`ErpAdapter.bill_void_scope` values.
 BILL_VOID_ANY = "any"
 BILL_VOID_DRAFT_ONLY = "draft_only"
@@ -948,6 +962,11 @@ class ErpAdapter:
     #: ``services/erp_bill_void`` reads it from the class, so the exception
     #: queue can say so before anyone presses the button.
     bill_void_scope: str = BILL_VOID_ANY
+    #: True for an adapter whose push's pre-create idempotency lookup is also
+    #: offered on its own, read-only, as :meth:`find_posted_bill`: how a person
+    #: names the bill a timed-out push may have left in the ERP (decisions
+    #: §556). ``services/erp_orphan_bill`` reads it from the class.
+    supports_bill_lookup: bool = False
 
     def __init__(self, config: dict):
         self.config = config
@@ -988,6 +1007,13 @@ class ErpAdapter:
 
     async def void_invoice(self, erp_document_id: str) -> bool:
         """Request cancellation of a posted invoice."""
+        raise NotImplementedError
+
+    async def find_posted_bill(self, payload: InvoicePayload) -> FoundBill | None:
+        """The bill an earlier push of ``payload`` left in the ERP, by the same
+        match the push's own idempotency lookup uses, or None when the ERP has
+        none (decisions §556). Read-only: GETs and queries, never a write. A
+        lookup that cannot finish raises; it is never read as "not posted"."""
         raise NotImplementedError
 
     def call_budget(self) -> CallBudget | None:

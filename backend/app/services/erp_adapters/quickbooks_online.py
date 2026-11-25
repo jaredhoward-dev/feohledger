@@ -87,6 +87,7 @@ from app.services.erp_adapters.base import (
     ErpInvoiceStatus,
     ErpListingIncomplete,
     ErpPostResult,
+    FoundBill,
     GLAccountPayload,
     InvoicePayload,
     ListingGap,
@@ -448,6 +449,8 @@ class QuickBooksOnlineAdapter(OAuthErpAdapter):
     #: ``changed_bills``) and our payments are written back as BillPayments
     #: (``post_payment``) — decisions §295.
     supports_status_sync = True
+    #: Its pre-create lookup is offered on its own (decisions §556).
+    supports_bill_lookup = True
     #: A PO with neither ``DocNumber`` nor ``Id`` used to be filed under the
     #: literal number ``"None"``, every such PO overwriting one row (§328).
     retired_po_numbers = ("None",)
@@ -615,6 +618,23 @@ class QuickBooksOnlineAdapter(OAuthErpAdapter):
             ):
                 return bill
         return None
+
+    async def find_posted_bill(self, payload: InvoicePayload) -> FoundBill | None:
+        """:meth:`_find_existing` on its own, read-only (decisions §556): one
+        Bill query. A payload with no linked vendor cannot match, so it raises
+        rather than answer "none" (the push refused it before sending)."""
+        if not payload.vendor_erp_id:
+            raise ValueError(VENDOR_NOT_LINKED)
+        bill = await self._find_existing(payload)
+        if bill is None:
+            return None
+        return FoundBill(
+            document_id=str(bill.get("Id")),
+            document_number=bill.get("DocNumber") or None,
+            amount=_dec(bill.get("TotalAmt")),
+            currency=iso_currency_or_none((bill.get("CurrencyRef") or {}).get("value")),
+            status=map_bill_status(bill),
+        )
 
     async def post_invoice(self, payload: InvoicePayload) -> ErpPostResult:
         # Whether this attempt has sent the bill create. Until it has, any

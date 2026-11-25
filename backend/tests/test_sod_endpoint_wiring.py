@@ -283,6 +283,10 @@ CASES = [
     # Voiding a flagged bill in the ERP stops a payment out of the ERP — the
     # payment void's duty (decisions §539).
     ("/api/exceptions/{exception_id}/void-erp-bill", "POST", _VOID),
+    # The bill a failed push left in the ERP: naming it (the lookup) and
+    # voiding it are the same duty (decisions §556).
+    ("/api/invoices/{invoice_id}/erp-orphan-bill", "GET", _VOID),
+    ("/api/invoices/{invoice_id}/void-erp-orphan-bill", "POST", _VOID),
     # The NACHA export is the counterpart of `/execute` — uploading the file is
     # the money moving — so it gates on `payment.execute`, not on recording.
     ("/api/payments/runs/{run_id}/nacha", "GET", _EXECUTE),

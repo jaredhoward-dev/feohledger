@@ -233,6 +233,19 @@ async def start_erp_send(
     status_refusal = erp_send_status_refusal(invoice, retry=retry)
     if status_refusal is not None:
         raise HTTPException(status_code=409, detail=status_refusal)
+    # A void of the bill an earlier attempt left in the ERP is calling the ERP
+    # right now, with no lock held (decisions §556): a push now would find that
+    # bill by its idempotency lookup and record it as this invoice's just as it
+    # is voided. Under the lock, so the void's own status check sees the move.
+    from app.services.erp_bill_void import ERP_VOID_IN_PROGRESS, live_pending, refusal_message
+
+    if live_pending(invoice) is not None:
+        from app.api.refusals import coded_refusal
+
+        raise HTTPException(
+            status_code=409,
+            detail=coded_refusal(ERP_VOID_IN_PROGRESS, refusal_message(ERP_VOID_IN_PROGRESS)),
+        )
 
     # Commits before raising, so an exception `/complete`'s `refresh_warnings`
     # just opened survives the refusal that names it (see the gate).
