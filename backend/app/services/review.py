@@ -1123,15 +1123,23 @@ async def recall_refusal(db: AsyncSession, invoice: Invoice, *, actor) -> dict |
     4. the approved document already went out over PEPPOL
        (``invoice_recall_peppol_transmitted``) — a live outbound transmission;
        the network holds it and only a credit note corrects it (§573);
-    5. the invoice is paired inter-company (:func:`_intercompany_recall_refusal`:
-       ``invoice_recall_is_mirror`` / ``invoice_recall_mirror_progressed`` /
-       ``invoice_recall_mirror_unsigned``) — the other side holds a copy of the
-       approved figures and segregation set (§573);
+    5. the pair's mirror has been signed or is being paid
+       (``invoice_recall_mirror_progressed``) — only a credit memo on each side
+       corrects it, so, like 3 and 4, it is named before a claim (§573);
     6. a live payment or virtual card (``invoice_recall_claimed``), read by
        ``erp_export_gate.live_claims`` — the rails' own predicates, so "live"
        reads here as it does for the run builder, the card mint, the ERP push
        and closing. A payment run holds its invoices through exactly these
-       payment rows, so this is also "the invoice is in a payment run".
+       payment rows, so this is also "the invoice is in a payment run". Named
+       before the two pair refusals whose way out is a DELETE
+       (``invoice_recall_is_mirror``: delete this mirror;
+       ``invoice_recall_mirror_unsigned``: delete the mirror, then recall),
+       because ``DELETE /invoices/{id}`` refuses a claimed invoice and the
+       recall would refuse the claim next: the person is told to cancel the run
+       or void the payment / card first (§578);
+    7. the rest of the inter-company pair
+       (:func:`_intercompany_recall_refusal`) — the other side holds a copy of
+       the approved figures and segregation set (§573).
 
     Call it on a row locked for update, as the door does: the run builder, the
     card mint and the ERP push each lock the invoice too, so no claim or push
@@ -1169,12 +1177,12 @@ async def recall_refusal(db: AsyncSession, invoice: Invoice, *, actor) -> dict |
             "approval can't be recalled.",
         )
     intercompany = await _intercompany_recall_refusal(db, invoice)
-    if intercompany is not None:
+    if intercompany is not None and intercompany["code"] == INVOICE_RECALL_MIRROR_PROGRESSED:
         return intercompany
     claim = (await live_claims(db, [invoice.id])).get(invoice.id)
     if claim is not None:
         return coded_refusal(INVOICE_RECALL_CLAIMED, _RECALL_CLAIM_MESSAGES[claim], claim=claim)
-    return None
+    return intercompany
 
 
 async def recall_approval(
