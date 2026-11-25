@@ -32,7 +32,7 @@ import {
  * (`settings.erp.netsuite_status_sync`), and a pass is the sweep's own,
  * triggered here the way an admin triggers it: the ERP panel's "Check
  * payments now" button, drawn for a stored-credential ERP from the status
- * read's verdict (§549), which posts `POST
+ * read's verdict (§551), which posts `POST
  * /api/organization/erp/oauth/status-sync` (not OAuth-only since §547). The
  * pass runs after the 202; its end is the `organization.erp_status_synced`
  * audit row it writes, which the spec waits on (never a timer).
@@ -112,7 +112,7 @@ type PassOutcome = {
 };
 
 /** Open the ERP section and wait for its status read, which carries the
- *  payment-check verdict the panel draws the button from (§549). */
+ *  payment-check verdict the panel draws the button from (§551). */
 async function openErpPanel(page: Page): Promise<{ status_sync_refusal: string | null }> {
 	const statusRead = page.waitForResponse(
 		(r) =>
@@ -375,7 +375,7 @@ test.describe('/erp netsuite without the status-sync opt-in', () => {
 		expect(await sendToErpAndAwaitTerminal(page, inv.id)).toBe('done');
 
 		// The panel offers no check: the status read states the POST's refusal,
-		// and a refused verdict hides the button (§549). The opted-in tests
+		// and a refused verdict hides the button (§551). The opted-in tests
 		// above are the positive control: the same read draws it.
 		expect((await openErpPanel(page)).status_sync_refusal).toBe('status_sync_unsupported');
 		await expect(page.getByTestId('erp-check-payments')).toHaveCount(0);

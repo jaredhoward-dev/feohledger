@@ -130,7 +130,7 @@ class OAuthStatusResponse(BaseModel):
     #: POST itself applies; False when it cannot be read. Stated with or
     #: without an OAuth connection: an ERP reached with stored credentials
     #: whose bills report back (NetSuite, opted in) runs the pass too
-    #: (decisions §547, §549).
+    #: (decisions §547, §551).
     status_sync_available: bool = False
     #: Why not, as the POST's 409 code (``status_sync_off`` /
     #: ``status_sync_unsupported`` / ``status_sync_needs_reconnect``); None when
@@ -270,7 +270,7 @@ async def oauth_status(
         )
     # The on-request pass's verdict is the tenant's, not the connection's: an
     # ERP reached with stored credentials (NetSuite, opted in) has no OAuth
-    # block and still runs it (decisions §547, §549).
+    # block and still runs it (decisions §547, §551).
     sync_refusal, sync_readable = await _status_sync_verdict(org)
     common = {
         "redirect_uri": erp_oauth.callback_url(),

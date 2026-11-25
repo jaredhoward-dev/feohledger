@@ -209,7 +209,7 @@
 	// "Check payments now" (decisions §392): offered only while the server says
 	// an on-request status-sync pass would run (`status_sync_available`): on a
 	// live OAuth connection, or on the saved stored-credential ERP that reports
-	// back (NetSuite opted in, §547, §549). A refusal hides it, as it always has
+	// back (NetSuite opted in, §547, §551). A refusal hides it, as it always has
 	// for OAuth: every code is a configuration state, not one a click resolves.
 	const paymentCheckOffered = $derived(
 		!provider
@@ -318,7 +318,7 @@
 			catalog = loaded;
 			const onFile = storedKey();
 			select(onFile && loaded.providers.some((p) => p.key === onFile) ? onFile : '');
-			// Also the payment-check verdict for a stored-credential ERP (§549).
+			// Also the payment-check verdict for a stored-credential ERP (§551).
 			await loadOAuthStatus();
 		} catch {
 			catalogError = true;
@@ -567,7 +567,7 @@
 			toast(m('org.toast.sectionSaved', { section: m('org.section.erpSaved') }), 'success');
 			// Saving or removing an own app changes which app a connect uses, and
 			// any save can change whether a payment check would run (NetSuite's
-			// opt-in, decisions §549).
+			// opt-in, decisions §551).
 			await loadOAuthStatus();
 			unopenable = false;
 		} catch (err) {

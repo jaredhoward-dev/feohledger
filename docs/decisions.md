@@ -28432,7 +28432,7 @@ catalogue names exactly `WEBHOOK_EVENT_TYPES`, and each type has one payload
 example whose `data` keys are its model's fields; the report's filter picks
 only affected subscriptions and the types they lack.
 
-## 549. "Check payments now" is drawn for a stored-credential ERP by the status read's verdict; a refusal hides it (§547 follow-up, round 46)
+## 551. "Check payments now" is drawn for a stored-credential ERP by the status read's verdict; a refusal hides it (§547 follow-up, round 46)
 
 **Problem.** §547 let an opted-in NetSuite tenant run the on-request pass,
 but the ERP panel drew the button only for a live OAuth connection, and

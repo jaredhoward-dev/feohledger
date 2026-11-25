@@ -863,7 +863,7 @@ describe('statusSyncNowOffered', () => {
 describe('storedErpStatusSyncNowOffered', () => {
 	const netsuite = { key: 'netsuite', auth: 'credentials' } as const;
 	// A stored-credential ERP has no OAuth block: the status says "not
-	// connected" and still carries the tenant's verdict (decisions §549).
+	// connected" and still carries the tenant's verdict (decisions §551).
 	const available = status({ status_sync_available: true });
 
 	it('offers the check on the saved ERP while the server says a pass would run', () => {

@@ -2754,7 +2754,7 @@ async def test_status_states_the_payment_check_verdict_without_an_oauth_connecti
     realdb, monkeypatch
 ):
     """A stored-credential ERP has no OAuth block, and its verdict is still
-    stated (decisions §549), so the settings page draws "check payments now"
+    stated (decisions §551), so the settings page draws "check payments now"
     for an opted-in NetSuite tenant exactly when the POST would run a pass."""
     monkeypatch.setattr(settings, "erp_status_sync_enabled", True)
     await _set_settings(realdb, {"erp": _netsuite_config("on")})

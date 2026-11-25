@@ -627,7 +627,7 @@ differs:
   The ERP settings panel's "Check payments now" button calls it, shown only
   while `GET …/oauth/status` says `status_sync_available` (the same rule, its
   `status_sync_refusal` naming the 409 code otherwise; stated for a
-  stored-credential ERP too, decisions §549).
+  stored-credential ERP too, decisions §551).
 - **Matched by the bill id, in every state.** `Reference` is ACCREC-only in
   Xero, so a bill carries no marker of ours. Its `InvoiceID` is a GUID Xero
   never reuses, so the report sets `match_by_reference` and the sync matches it
@@ -787,7 +787,7 @@ live-claim refusals and §386's recorded-cash rule apply unchanged.
   (`status_sync_available` / `status_sync_refusal`) with or without a
   connection block, and the ERP panel draws "Check payments now" on the saved
   stored-credential ERP while it says available; a refusal hides it, as it
-  does for an OAuth connection (decisions §549).
+  does for an OAuth connection (decisions §551).
 - **Not verified live (#654).** The `vendorPayment` body and `eid:` /
   `DELETE` on it, the `NextTransactionLineLink` join and its `foreignamount`
   sign, `transaction.lastmodifieddate` / `TO_DATE`, and whether applying or
