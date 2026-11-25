@@ -2541,11 +2541,16 @@ async def _delete_refusals(db: AsyncSession, invoice_ids) -> dict[uuid.UUID, dic
     refusals: dict[uuid.UUID, dict] = {}
     for inv_id, claim in (await live_claims(db, ids)).items():
         refusals[inv_id] = _delete_claim_refusal(claim)
+    # Locked, after the invoice rows the doors already hold (the order the
+    # write-back takes too, decisions §581): a discount credit's reservation
+    # or a void re-armed by a write-back that is committing now is waited for
+    # and seen, never read from the snapshot before it and then cascaded away.
     states = (
         await db.execute(
-            select(WorkflowInstance.invoice_id, WorkflowInstance.state_data).where(
-                WorkflowInstance.invoice_id.in_(ids)
-            )
+            select(WorkflowInstance.invoice_id, WorkflowInstance.state_data)
+            .where(WorkflowInstance.invoice_id.in_(ids))
+            .order_by(WorkflowInstance.invoice_id)
+            .with_for_update()
         )
     ).all()
     for inv_id, state in states:

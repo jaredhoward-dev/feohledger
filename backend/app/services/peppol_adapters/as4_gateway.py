@@ -214,8 +214,9 @@ class AS4GatewayAdapter(PeppolAdapter):
 
     async def lookup_transmission(self, business_message_id: str) -> TransmissionLookup:
         """``GET {gateway}/as4/outbound/{business_message_id}`` — the same
-        resource ``send`` posts to, read back by our idempotency key. 404 is
-        ``not_found`` (the gateway never accepted the document); a transport
+        resource ``send`` posts to, read back by our idempotency key. Only a 404
+        whose body says ``{"status": "not_found"}`` is ``not_found`` (the
+        gateway never accepted the document); a bare 404, a transport
         error, a non-404 error status or an unrecognised status is ``unknown``,
         never ``failed`` (decisions §580). The path is this adapter's generic
         gateway shape, like ``/as4/outbound``; a real gateway's status endpoint
@@ -237,7 +238,17 @@ class AS4GatewayAdapter(PeppolAdapter):
                 failure_reason=f"gateway_transport_error:{exc.__class__.__name__}",
             )
         if response.status_code == 404:
-            return TransmissionLookup(outcome="not_found")
+            # Only an affirmative answer that the KEY is unknown is
+            # `not_found`: a gateway without this route answers a bare 404 for
+            # every key, and reading that as "never accepted" would mark a
+            # delivered e-invoice failed and send it again (decisions §581).
+            try:
+                body = response.json() or {}
+            except ValueError:
+                body = {}
+            if isinstance(body, dict) and body.get("status") == "not_found":
+                return TransmissionLookup(outcome="not_found")
+            return TransmissionLookup(outcome="unknown", failure_reason="gateway_error:404")
         if response.status_code >= 400:
             return TransmissionLookup(
                 outcome="unknown", failure_reason=f"gateway_error:{response.status_code}"

@@ -616,3 +616,73 @@ async def test_a_live_claim_is_named_before_a_peppol_transmission(realdb):
         resp = await c.delete(f"/api/invoices/{inv_id}")
     assert resp.status_code == 409, resp.text
     assert resp.json()["detail"]["code"] == "invoice_delete_claimed"
+
+
+# ---------------------------------------------------------------------------
+# The pending maps are read under the instance's row lock (decisions §581): a
+# write committing while the delete runs — a discount credit's reservation, a
+# void a write-back re-arms — is waited for and seen, not read from the
+# snapshot before it and then cascaded away.
+# ---------------------------------------------------------------------------
+
+
+async def _someone_waits_on_a_lock(mk, *, timeout_s: float = 10.0) -> bool:
+    import asyncio
+
+    from sqlalchemy import text
+
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout_s
+    while loop.time() < deadline:
+        async with mk() as s:
+            waiting = (
+                await s.execute(
+                    text(
+                        "SELECT count(*) FROM pg_stat_activity WHERE datname = "
+                        "current_database() AND wait_event_type = 'Lock'"
+                    )
+                )
+            ).scalar_one()
+        if waiting:
+            return True
+        await asyncio.sleep(0.02)
+    return False
+
+
+@pytest.mark.asyncio
+async def test_delete_waits_for_a_pending_write_on_the_instance_and_refuses(realdb):
+    import asyncio
+
+    from app.models.workflow import WorkflowInstance
+
+    mk = realdb.sessionmaker(TENANT)
+    org_id = realdb.info(TENANT).org_id
+    inv_id = await _seed_invoice(mk, org_id, number="DEL-ERP-PEND-RACE")
+    await _with_state(mk, org_id, inv_id, {"approval_level": 1})
+
+    async with mk() as writer:
+        instance = (
+            await writer.execute(
+                select(WorkflowInstance)
+                .where(WorkflowInstance.invoice_id == uuid.UUID(inv_id))
+                .with_for_update()
+            )
+        ).scalar_one()
+        instance.state_data = {
+            **instance.state_data,
+            "erp_discount_credits_pending": {str(uuid.UUID(int=4)): {"credit_id": None}},
+        }
+        await writer.flush()
+        async with realdb.client(key=TENANT, role="admin") as c:
+            delete = asyncio.create_task(c.delete(f"/api/invoices/{inv_id}"))
+            try:
+                assert await _someone_waits_on_a_lock(mk), "the delete did not wait"
+                assert not delete.done()
+                await writer.commit()
+                resp = await asyncio.wait_for(delete, timeout=30)
+            finally:
+                if not delete.done():
+                    delete.cancel()
+    assert resp.status_code == 409, resp.text
+    assert resp.json()["detail"]["code"] == "invoice_delete_erp_reversal_pending"
+    assert await _still_there(mk, inv_id)

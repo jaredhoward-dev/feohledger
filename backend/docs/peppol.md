@@ -262,7 +262,9 @@ transaction:
 
 The `as4_gateway` status path is this adapter's generic gateway shape, like
 `/as4/outbound`; map it to the contracted gateway's status endpoint when one
-is chosen.
+is chosen. Only a 404 whose body says `{"status": "not_found"}` is
+`not_found`: a gateway without the route answers a bare 404 for every key, so a
+bare 404 is `unknown` (exit 3), never a resend (decisions §581).
 
 ## Reading an invoice's transmission state
 

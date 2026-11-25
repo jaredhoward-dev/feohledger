@@ -79,6 +79,9 @@ class _Xero:
         self.next_id = 1
         self.credit_notes: dict[str, dict] = {}
         self.fail_allocation = False
+        # Xero's `where` on CreditNoteNumber is unconfirmed (§577): when set,
+        # the number lookup finds nothing even though the note stands.
+        self.number_lookup_blind = False
 
     # -- state ---------------------------------------------------------------
 
@@ -213,7 +216,7 @@ class _Xero:
     def _credit_notes(self, request, path, q) -> httpx.Response:
         parts = path.split("/")
         if request.method == "GET" and path == "CreditNotes":
-            rows = list(self.credit_notes.values())
+            rows = [] if self.number_lookup_blind else list(self.credit_notes.values())
             for value in re.findall(r'CreditNoteNumber=="([^"]*)"', q.get("where", "")):
                 rows = [r for r in rows if r["CreditNoteNumber"] == value]
             return self._json(200, {"CreditNotes": [dict(r, Allocations=[]) for r in rows]})
@@ -1072,6 +1075,46 @@ def test_voiding_removes_the_allocation_then_voids_the_credit_note_once(xero):
     again = asyncio.run(_adapter().void_discount_credit(_credit()))
     assert again.success and again.erp_document_id is None
     assert len(xero.sent("DELETE", "/Allocations/alloc-1")) == 1
+
+
+def test_a_void_with_a_recorded_id_voids_by_id_when_the_number_lookup_misses(xero):
+    """Decisions §581: the void reads the recorded credit note BY ID. Before,
+    it looked only by number, and a miss there was reported as "nothing of
+    ours" — the payment was then voided with our credit still allocated."""
+    bill = _discounted_bill(xero)
+    booked = asyncio.run(_adapter().post_discount_credit(_credit()))
+    xero.number_lookup_blind = True
+    voided = asyncio.run(_adapter().void_discount_credit(_credit(credit_id=booked.erp_document_id)))
+    assert voided.success and voided.erp_document_id == booked.erp_document_id
+    assert xero.credit_notes[booked.erp_document_id]["Status"] == "VOIDED"
+    assert bill["AmountDue"] == Decimal("5.00")
+
+
+def test_a_void_refuses_a_recorded_id_that_is_not_our_credit_note(xero):
+    _discounted_bill(xero)
+    booked = asyncio.run(_adapter().post_discount_credit(_credit()))
+    xero.credit_notes[booked.erp_document_id]["CreditNoteNumber"] = "CN-somebody-else"
+    result = asyncio.run(_adapter().void_discount_credit(_credit(credit_id=booked.erp_document_id)))
+    assert not result.success and result.erp_document_id == booked.erp_document_id
+    assert "discount_credit_not_ours" in result.message
+    assert xero.credit_notes[booked.erp_document_id]["Status"] != "VOIDED"
+    assert not xero.sent("DELETE", "/Allocations")
+
+
+def test_a_created_credit_note_whose_read_back_misses_keeps_its_id(xero):
+    """Decisions §581: Xero answered our create with this id, so it is ours;
+    the failure carries it for the record a void reverses it by."""
+    _discounted_bill(xero)
+    real_read = XeroAdapter._read_credit_note
+
+    async def renumbered(self, client, headers, credit_id):
+        note = await real_read(self, client, headers, credit_id)
+        return {**note, "CreditNoteNumber": "renumbered"}
+
+    with patch.object(XeroAdapter, "_read_credit_note", renumbered):
+        result = asyncio.run(_adapter().post_discount_credit(_credit()))
+    assert not result.success and "credit_note_unconfirmed" in result.message
+    assert result.erp_document_id == next(iter(xero.credit_notes))
 
 
 def test_a_voided_credit_of_ours_is_not_booked_again(xero):
