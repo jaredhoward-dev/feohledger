@@ -27763,3 +27763,108 @@ replicas flag once; a failed read and a capped batch keep bills pending and the
 next listing asks from the last; a failed listing, a paused budget and a
 refusing budget move nothing; unopenable credentials are skipped without the
 exception text; off by default, registered in `sweep_health` and `main`.
+
+## 542. The ERP bill void announces no approval, voids only on a positive read, and converges a void whose commit was lost (§539 follow-up, round 45)
+
+**Problem.** The round's gate review of §539 found:
+
+1. **The void announced an approval.** `transition_invoice` keyed its outbound
+   webhook and its notification on the target status, so walking
+   `posted_in_erp → approved` sent a fresh `invoice.approved` (new occurrence
+   id) and told the uploader "invoice approved". An integrator that posts
+   approved invoices to its ERP would re-create the bill just voided, on a
+   duplicate- or fraud-flagged invoice. **The payment void
+   (`POST /api/payments/{id}/void`, `payment_scheduled` / `paid → approved`)
+   had the same defect** since round 9, whose occurrence-id fix assumed a
+   void-then-re-approve that never happens: the void itself was the
+   "re-approval".
+2. **It voided on reads that were not positive.** Only `paid` /
+   `partially_paid` were refused; `unknown`, an unimplemented read and
+   `settled_no_payment` still reached `void_invoice`, against §539's "never a
+   blind void".
+3. **A lost commit could not be recovered.** If the ERP voided the bill and our
+   commit failed, a retry read it cancelled and answered `erp_void_rejected`
+   forever.
+4. **A failed void call said "Nothing was changed"**, which may be false.
+5. **NetSuite (and Business Central) offered a button that always fails.**
+   Their `void_invoice` deletes only a pending-approval / draft bill; a bill at
+   `posted_in_erp` is past that.
+6. **The notice went to the wrong people.** `erp_bill_flagged` went to system
+   admin / ap_manager / cfo, telling them to void the bill, which needs
+   `payment.void` (not held by an AP manager; a custom role holding it was
+   missed). Its body could also abort the caller's transaction on a failed
+   statement.
+7. **Row locks span the ERP calls**, unbounded.
+
+**Decision.**
+
+1. **A return to `approved` is not an approval.** `workflow_engine.
+   RETURN_TO_APPROVED_ACTIONS = {ERP_VOID_ACTION, PAYMENT_VOID_ACTION}` is
+   matched on the action before the status, as the recall is: no
+   `invoice.approved`, no "approved" notice. Each emits its own event, added to
+   the catalogue (`WEBHOOK_EVENT_TYPES`, data model + summary, published
+   OpenAPI, admin picker): `invoice.erp_bill_voided` (invoice fields plus the
+   voided bill's `erp_document_id`; "do not post it again") and
+   `payment.voided` (invoice fields). The payment void's action string is
+   unchanged (`invoice.voided_return_to_approved`; adaptive workflows read it),
+   now named by `PAYMENT_VOID_ACTION`.
+2. **Void only on `open` / `draft`.** `paid` / `partially_paid` →
+   `erp_void_bill_paid`; `settled_no_payment` → new `erp_void_bill_settled`
+   (409); `unknown`, not implemented, or a read that raised →
+   `erp_void_failed` (502, nothing was written; its copy now says "could not
+   be reached, or did not say where the bill stands").
+3. **Already gone converges.** A read of `cancelled`, or `unknown` with
+   `bill_report` answering `deleted` (QuickBooks reads a deleted bill as
+   `unknown`; `bill_report`'s `deleted` is every adapter's positive answer, so
+   the normalisation is in the service, not per adapter), finishes the void
+   without calling `void_invoice`: document cleared, `→ approved`, both audit
+   rows with `erp_status_read: "cancelled"` and `already_gone: true`.
+4. **`erp_void_unconfirmed`** (502): the void call raised or timed out. "The
+   ERP did not confirm the void. Check the bill in the ERP before retrying." A
+   retry then converges by 3. `erp_void_failed` stays for failures before any
+   write.
+5. **`ErpAdapter.bill_void_scope`**: `any` (default) or `draft_only`
+   (NetSuite: pending-approval bills only; Business Central: drafts only). The
+   queue verdict reads it from the configured adapter's class
+   (`erp_bill_void.bill_void_scope`, no credential opened) and refuses a
+   draft-only ERP's bill at `posted_in_erp` with new `erp_void_draft_only`;
+   the endpoint refuses the same up front and any read but `draft`. A NetSuite
+   bill at `sent_to_erp` (status sync off) is still offered and decided by the
+   read. A pending-approval NetSuite bill under status sync sits at
+   `posted_in_erp` and is shown refused; it is not payable in NetSuite until
+   approved, so the risk §539 addresses does not arise for it.
+6. **Recipients by effective permission.**
+   `notification_dispatch.resolve_permission_user_ids(org, "payment.void")`
+   loads the org's active users with their roles and filters by
+   `effective_permissions`, as the assignable-reviewer list does for
+   `invoice.approve`. The body runs in `db.begin_nested()`.
+   `emit_exception_raised` beside it runs no SQL on the caller's session (it
+   builds a payload and queues it post-commit), so it needs no savepoint.
+7. **Bounded calls, one transaction.** The read is bounded at 30 s and the
+   void at 45 s (`asyncio.wait_for`, over each adapter's own 15–30 s
+   per-request timeouts); a read timeout is `erp_void_failed`, a void timeout
+   `erp_void_unconfirmed`. The two-transaction design (commit a pending
+   marker, release the locks, call, finish) is not built: the void is a rare
+   manual act on one invoice, the bound caps the lock, and 3 already recovers
+   a lost commit. It is tracked in `docs/followups.md` (c) with its trigger.
+
+The lock order is unchanged (invoice, then flag, then workflow instance); two
+concurrent voids make one ERP call, the second replaying.
+
+**Rejected.** *Keep `invoice.approved` on the payment void for integrators that
+relied on it*: it says something false, and `payment.voided` carries the same
+invoice fields. *Re-read after `void_invoice` returns False to detect "already
+gone"*: the pre-read already established a live bill, so False after it is a
+refusal, not a race worth a third call. *Refuse every NetSuite bill up front*:
+a bill still pending approval at `sent_to_erp` can be deleted.
+
+**Guard.** `tests/test_erp_bill_void_from_flag.py` (refusals parametrized over
+unknown / not-implemented / settled / raising read / unconfirmed void /
+draft-only, no void call before a positive read; convergence from `cancelled`
+and from a `deleted` report; unconfirmed then retry; no `invoice.approved` and
+no approval notice; two concurrent voids, one call; draft-only verdict and
+scope read from the adapter class; notice recipients by `payment.void`; a
+failing notice leaves the flag committed);
+`tests/test_webhook_event_catalogue.py` (both voids emit their own event and
+not `invoice.approved`; every emitter's fields); frontend
+`codedRefusals.test.ts` and the i18n parity tests for the three new codes.

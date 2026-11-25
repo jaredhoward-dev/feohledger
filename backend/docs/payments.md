@@ -2914,7 +2914,7 @@ Decimal `amount` as a string, and the reference — never bank/account values.
 | `payment.pending_compliance` | A child payment held by the sanctions/KYC gate | `payment` |
 | `payment.compliance_released` | `POST /{id}/compliance/release` re-ran compliance-then-adapter for a held payment | `payment` |
 | `payment.compliance_dismissed` | `POST /{id}/compliance/dismiss` gave up on a held payment, flipping it to `failed` | `payment` |
-| `payment.voided` | A completed / in-flight payment voided (`POST /{id}/void`); also writes the `invoice.voided_return_to_approved` invoice row | `payment` |
+| `payment.voided` | A completed / in-flight payment voided (`POST /{id}/void`); also writes the `invoice.voided_return_to_approved` invoice row, which emits the outbound `payment.voided` webhook and no `invoice.approved` / "approved" notice (decisions §542) | `payment` |
 | `payment_run.cfo_approved` | CFO sign-off on an over-threshold draft run | `payment_run` |
 | `payment_run.cancelled` | A draft run cancelled before execution | `payment_run` |
 

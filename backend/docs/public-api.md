@@ -375,8 +375,8 @@ gated on the `organizations` table existing — mirrors 0055).
 
 ### Event catalog
 
-`invoice.approved`, `invoice.approval_recalled`, `payment.settled`,
-`exception.raised` (see `app/models/webhook.py::WEBHOOK_EVENT_TYPES`). The
+`invoice.approved`, `invoice.approval_recalled`, `invoice.erp_bill_voided`,
+`payment.settled`, `payment.voided`, `exception.raised` (see `app/models/webhook.py::WEBHOOK_EVENT_TYPES`). The
 catalog is plain strings, so adding one needs no migration — but it does need a
 `data` model and summary in `app/schemas/webhook_events.py` and an entry in the
 admin page's picker (`frontend/src/lib/types/webhooks.ts`);
@@ -389,6 +389,16 @@ back (`POST /api/invoices/{id}/recall-approval`). The invoice is back at
 `ready_for_review` and is not payable until it is approved again, which emits a
 fresh `invoice.approved`. A receiver that queued a bill or told the supplier it
 would be paid on the approval should undo that here.
+
+**`invoice.erp_bill_voided`** and **`payment.voided`** (decisions §542) are the
+two ways an invoice returns to `approved` without anyone approving it: its bill
+was voided in the ERP from a duplicate / fraud flag (§539), or a payment on it
+was voided (`POST /api/payments/{id}/void`). Neither emits `invoice.approved`:
+a receiver that posts approved invoices to its ERP would post the bill again,
+on a flagged invoice in the first case. `invoice.erp_bill_voided` carries the
+invoice fields plus the voided bill's `erp_document_id`; do not re-post the
+invoice. `payment.voided` carries the invoice fields; a receiver that acted on
+`payment.settled` should undo that.
 
 ### Signing
 
@@ -623,6 +633,11 @@ converges on those statuses (the ERP-sync / payment-webhook / direct-schedule
 paths) emits exactly once, here — once per *transition*, each carrying the
 occurrence id that transition minted, and only once the caller commits
 the transition.
+
+**`invoice.erp_bill_voided` / `payment.voided`** come from the same hook,
+keyed off the transition's action (`workflow_engine.ERP_VOID_ACTION` /
+`PAYMENT_VOID_ACTION`) and matched before the `approved` status, so neither
+also emits `invoice.approved`.
 
 **`invoice.approval_recalled`** comes from the same hook, but keyed off the
 transition's action (`workflow_engine.RECALL_ACTION`, the one action allowed to

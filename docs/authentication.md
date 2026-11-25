@@ -1579,6 +1579,13 @@ exactly as before.
     `test_every_card_closing_route_gates_on_payment_void` (the three doors
     agree). See `backend/docs/virtual-cards.md` § Cancel → The gate is
     `payment.void`.
+  - **Voiding a flagged bill in the ERP is the same duty.**
+    `POST /api/exceptions/{id}/void-erp-bill` (decisions §539) is
+    `require_permission(payment.void)`: voiding the bill is how a payment out
+    of the ERP is stopped. An `ap_manager` works the duplicate / fraud flag but
+    does not void. The `erp_bill_flagged` notice that asks someone to void it
+    goes to holders of `payment.void` by effective permission (a custom role
+    granting it included), not to fixed system roles (decisions §542).
   - **The reads a `user.manage` holder needs to actually use the grant are
     migrated too.** `GET /api/admin/users` (the roster), `GET /api/admin/roles`
     (the picker `role_names` is chosen from) and `GET /api/admin/permissions`

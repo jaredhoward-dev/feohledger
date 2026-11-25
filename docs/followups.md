@@ -1371,6 +1371,29 @@ user-visible halves still open.
 
 ### Surfaced by round 44 (2026-11-25, round PR #771, decisions §527–§535)
 
+### Surfaced by round 45 (2026-11-25, round PR #771, decisions §536–§542)
+
+- [ ] **(c) The flagged-bill ERP void holds row locks across its ERP calls.**
+      `POST /api/exceptions/{id}/void-erp-bill` locks the invoice, the flag
+      and the workflow instance FOR UPDATE, then reads the bill and voids it
+      in the ERP inside that transaction (`services/erp_bill_void`). Both
+      calls are now bounded (30 s read, 45 s void, plus each adapter's own
+      per-request timeout; decisions §542), so the worst case is ~75 s of
+      locks on one invoice and its flag — long enough to stall an ERP status
+      webhook, the reconciliation sweep or a payment run touching that
+      invoice, and to hold one pool connection. Not split now because the void
+      is a rare manual act on one flagged invoice, the bound caps it, and the
+      lost-commit case already converges (a retry reads the bill cancelled and
+      finishes). **Durable fix:** the two-transaction shape — commit an
+      `erp_bill_void_pending` marker (`state_data`, with the actor and
+      exception) under the locks, release them, call the ERP, then re-lock and
+      finish (or record the unconfirmed outcome); every writer that walks the
+      invoice from `sent_to_erp` / `posted_in_erp` refuses while the marker
+      stands, and a sweep resolves stale markers by reading the bill.
+      **Trigger:** a lock-wait or statement timeout on an invoice row traced to
+      this endpoint, an ERP whose void routinely takes more than a few seconds,
+      or making the void callable in bulk / from an agent.
+
 ### Surfaced by round 12 (2026-11-15, round PR #716, decisions §410–§421)
 
 
