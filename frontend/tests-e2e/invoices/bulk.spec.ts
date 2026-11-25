@@ -18,6 +18,12 @@ test.describe('/invoices bulk bar (acme admin)', () => {
 
 	test('bulk bar appears after selecting a row', async ({ page }) => {
 		await expect(page.locator('.bulk-bar')).toHaveCount(0);
+		// The bar's live region exists, empty, before the bar does: a region
+		// inserted with its text is often not announced, so the first
+		// selection would be silent (WCAG 4.1.3).
+		const status = page.getByTestId('bulk-bar-status');
+		await expect(status).toHaveAttribute('role', 'status');
+		await expect(status).toHaveText('');
 		// Pick the first row whose checkbox is enabled (i.e. not system-
 		// managed). The seed always has at least one such row.
 		const enabledCheckbox = page
@@ -27,6 +33,7 @@ test.describe('/invoices bulk bar (acme admin)', () => {
 
 		await expect(page.locator('.bulk-bar')).toBeVisible();
 		await expect(page.locator('.bulk-count')).toContainText('1 selected');
+		await expect(status).toHaveText('1 selected');
 	});
 
 	test('Clear deselects everything and hides the bar', async ({ page }) => {

@@ -469,6 +469,18 @@ appears when one or more rows are selected:
 - `countLabel` overrides the count text when the page's noun takes a gender
   (`invoices.bulk.selected`); the `lead` snippet sits between the count and
   Clear, for the "select all N matching" button or its in-force note.
+- **The bar's one live region is mounted from first paint.** The visible bar
+  exists only while something is selected, so a live region inside it would
+  be inserted together with the first selection's text, and that is often not
+  announced: the first selection was silent. `BulkBar` therefore always
+  renders a visually hidden `role="status"` span (`data-testid="bulk-bar-status"`)
+  outside its `{#if count > 0}`: empty with nothing selected, "N selected"
+  (the `countLabel`) after. A page's own status sentence goes in through the
+  `note` prop and is spoken after the count; the page shows its visible copy
+  of it without a live role. Never put a `role="status"` / `aria-live` inside
+  the bar's snippets: it repeats the bar's region and is inserted with the bar.
+  `a11y/liveRegionAudit.test.ts` pins both; `tests-e2e/invoices/bulk.spec.ts`
+  and `tests-e2e/contracts/action-verdicts.spec.ts` check the region in a browser.
 - Delete is always armed-confirm (one click arms; outside-click or
   second click un-arms or commits). `BulkDeleteButton` does this.
   Pass `confirmLabel` (the armed label) from the catalogue too — its
@@ -1111,10 +1123,10 @@ pages ("select all N matching"), which only the server can judge.
 `offersBulk(tally)` is true when some row allows the action or some is unknown;
 an action it refuses is **not listed** in the bar's select (never a disabled
 option), and a selection no action fits says so in place of the select. The
-bar states up front how many the server will skip (`refused`), in **one
-persistent `role="status"` live region** the select's `aria-describedby`
-points at (a status node created at the moment its text appears is often not
-announced). While `unknown > 0` that count is a floor, so it reads "at least N
+bar states up front how many the server will skip (`refused`), in a visible
+note the select's `aria-describedby` points at, and passes the same sentence
+to `BulkBar`'s `note` prop so the bar's one persistent live region speaks it
+after the count (see Bulk selection above). While `unknown > 0` that count is a floor, so it reads "at least N
 will be skipped" (`contracts.bulk.willSkipAtLeast`), never an exact number.
 /contracts is the reference (`routes/contracts/+page.svelte`, pinned in
 `tests-e2e/contracts/action-verdicts.spec.ts`).
