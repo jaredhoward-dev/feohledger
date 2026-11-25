@@ -28710,3 +28710,113 @@ blind.
 **Tests.** `backend/tests/test_erp_dispatch_check.py::test_a_netsuite_bill_is_read_with_its_stored_credentials`
 fails without the fix (the `NetSuiteConfigError` → `erp_bill_unverified` hold)
 and passes with it.
+
+## 554. A lapse that arrives before its authorization is applied when the authorization lands; a further clearing on a settled card is added once, flagged when it overcharges, refused when it lowers (§544 / §549 follow-up, round 47)
+
+**Problem 1 — out-of-order lapse.** The card webhook applied a reversal or
+expiry only to a `charged` card (§544). Delivered before its authorization, the
+lapse was inert on an `active` card, and the late authorization then left the
+card `charged` with its hold already released: a void was refused as
+`card_already_charged` and the invoice was stuck until reconciled by hand
+(fail-closed, but stuck).
+
+**Problem 2 — clearings after settlement.** The settlement branch completed a
+card once. A transaction can clear more than once — Lithic: "Once a transaction
+has been partially cleared, there can be any permutation of Clearing, Return,
+Authorization Reversal, and Authorization Expiry messages on this same
+transaction", e.g. "$8 is cleared, $1 is reversed, and another $1 is cleared"
+(<https://docs.lithic.com/docs/transaction-flow>, checked 2026-11-25) — and a
+further clearing on a `completed` card matched no branch, so spend after the
+first settlement was never written onto the card or the run's payment.
+
+**Decision.**
+
+* *Memory, durable.* A new tenant table `card_transaction_events` (migration
+  0148: tenant fan-out, idempotent, no backfill, `ON DELETE CASCADE` from
+  `virtual_cards`; model `CardTransactionEvent`; writer
+  `services/card_transaction_memory.py`), unique per card on
+  `(kind, event_key)`, written with `ON CONFLICT DO NOTHING` under the card row
+  lock. Not an existing field: `first_authorized_at` / `charged_at` are per
+  card, not per transaction, and the audit rows ship to SQS in `lambda` mode.
+  Not a column on `virtual_cards`: a card may see more than one transaction
+  (a declined retry, a multi-use provider) and more than one clearing.
+* *Transaction id* (`_card_transaction_id`): Lithic's transaction `token`
+  (the same on every update of it); Nium's `authCode` ("authorization code of
+  the transaction"), else `rhaTransactionId`
+  (<https://docs.nium.com/docs/developers/notifications-and-webhooks/issuing-and-card-events/transaction-reversal>,
+  checked 2026-11-25); the mock's `transaction_id`.
+* *An early lapse* (reversal / expiry on `created` / `sent` / `active`) is
+  remembered under that id; the card is unchanged and no audit row is written
+  yet. *The authorization of the same transaction* is then applied as lapsed:
+  the card stays (or returns to) `active` with no figure, the run leg stays
+  `in_flight`, nothing is re-dispatched, and one `card.authorization_lapsed` row
+  carries `out_of_order: true`. **`first_authorized_at` is stamped**, because
+  the provider did authorize: a Lithic `SINGLE_USE` card closes "upon first
+  successful authorization" whatever happens to the hold, which is what §549's
+  `card_authorized_before` refusal exists for. A lapse never followed by an
+  authorization stamps nothing (no authorization happened). A remembered
+  partial reversal (Nium / mock figure below the authorization's) leaves the
+  authorization standing, as in order (§544). A decline is not remembered.
+* *Each clearing is recorded* under its own identity (`_clearing_key`): the
+  newest Lithic financial event's `token` (`CLEARING` / `RETURN` /
+  `RETURN_REVERSAL` in `events`), else the transaction token plus its cumulative
+  figure (a different total is a different clearing); the delivery id for Nium
+  and the mock. The first settlement records its clearing too, so its replay on
+  the now-`completed` card is a no-op even past the Redis dedupe.
+* *A further clearing on a `completed` card* (`_record_further_clearing`):
+  Lithic reports the transaction's cumulative settled figure (`amount`), so it
+  adds `reported − amount_charged`; the mock reports each clearing's own
+  figure. An increase is added to `amount_charged` (exact Decimal),
+  `record_card_spend` writes the total onto the run payment's `settled_amount`,
+  a still-`pending` rebate is re-based on the total at its own rate (a
+  confirmed / paid rebate is the processor's statement and stands), a
+  `card.clearing_added` row is written, and the payment sync is re-dispatched
+  once after the commit.
+* *Overcharge.* After any settlement (first or further),
+  `payment_settlement_record.flag_card_over_settlement` judges the card total
+  against the run payment's amount (else the invoice's) with
+  `verify_settlement`; over tolerance opens one payment-blocking
+  `payment_reconciliation` exception with the catalogue's
+  `settlement_amount_over` finding, deduped by `erp_report.kind`
+  `card_over_settled` (§535). The figure is still recorded — the money moved —
+  and over-settlement reads `covered` by design, so the flag is what tells a
+  person. Reusing the existing finding needed no new locale strings.
+* *A decrease is refused.* A further clearing that does not raise the total (a
+  Lithic `RETURN` lowering the cumulative figure, a negative mock clearing) is a
+  refund, a different flow, as a reversal after settlement is (§544): the card,
+  payment and rebate stand and `card.clearing_refused` (`not_an_increase`)
+  records it. Applying it would lower `settled_amount` and could turn a `paid`
+  invoice's leg `short` behind the payment sync's back.
+* *Nium is not applied.* Its documented card webhooks describe one
+  `CARD_SETTLEMENT_DEBIT_WEBHOOK` per authorization and no incremental capture;
+  with no clearing id of its own, a second one cannot be told from a
+  redelivery under a new `webhookId`, and adding it would double-count. A
+  further Nium settlement writes `card.clearing_refused`
+  (`provider_single_settlement`) and changes nothing.
+
+**No event-map change.** No new stage was needed: a further clearing is a
+`settlement` stage on a `completed` card.
+
+**Not verified.** That Lithic sends a `card_transaction.updated` per clearing
+(the docs say a webhook is sent "at each step in the transaction lifecycle"),
+and that its delivery carries an `event_id`: without one, `_lithic_event_id`
+keys an update on `token:STATUS`, so a second `SETTLED` delivery is deduped as
+a replay in Redis before this branch runs. That key is the provider-contract
+lane's this round; once the delivery id is read, this branch applies the
+clearing with no further change. Also unverified: that Nium's reversal repeats
+its authorization's `authCode`.
+
+**Guard.** `tests/test_card_authorization_lapse.py`: per provider, a reversal /
+expiry before its authorization leaves the card `active`, unstamped and
+unaudited, and the late authorization is lapsed (`out_of_order: true`,
+`first_authorized_at` set, `card_authorized_before`, leg `in_flight`, no
+dispatch); a lapse alone stamps nothing; another transaction's lapse does not
+lapse this one; an early partial reversal leaves the authorization charged; a
+repeated early lapse is one row. `tests/test_card_money_path_regression.py`: a
+Lithic incremental capture adds the difference to the card and the run payment
+(rebate re-based, one `card.clearing_added`, two dispatches, its redelivery a
+no-op); a Lithic clearing with no `events` keyed by its total; clearings past
+the payment amount open one `card_over_settled` flag; a decrease and a further
+Nium settlement are refused with `card.clearing_refused`.
+`tests/test_migration_0148_card_transaction_events.py`: create, unique key,
+cascade, idempotent, reversible, control plane untouched.

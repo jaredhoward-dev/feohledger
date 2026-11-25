@@ -735,8 +735,10 @@ float.
 | `card.cancel_failed` | vendor made un-payable, but the provider did not confirm the close — the card is **still live** | `last_four`, `vendor_id`, `trigger`, `outcome`, `status` |
 | `card.cancel_deferred_to_void` | vendor made un-payable, card is behind a live payment — left for the payment void | `last_four`, `vendor_id`, `trigger`, `payment_id` |
 | `card.charged` | authorization webhook applies a charge | `last_four`, `from`, `to`, `amount_charged` (string Decimal) |
-| `card.authorization_lapsed` | a reversal / expiry webhook releases a `charged` card's hold (decisions §544) | `last_four`, `from` (`charged`), `to` (`active`), `lapse` (`reversal` \| `expiry`), `released_amount` (string Decimal or null) |
+| `card.authorization_lapsed` | a reversal / expiry webhook releases a `charged` card's hold (decisions §544), or an authorization arrives after its own lapse (§554) | `last_four`, `from` (`charged`, or the unspent status out of order), `to` (`active`), `lapse` (`reversal` \| `expiry`), `released_amount` (string Decimal or null), `out_of_order` (`true`, out of order only) |
 | `card.reversal_after_settlement` | a reversal / expiry webhook arrives for a `completed` card — left untouched (refund / chargeback territory) | `last_four`, `status`, `lapse` |
+| `card.clearing_added` | a further clearing raised a settled card's total (decisions §554) | `last_four`, `cleared_amount`, `amount_charged`, `currency`, `rebate_amount` (string Decimals or null) |
+| `card.clearing_refused` | a further clearing on a settled card was not applied (decisions §554) | `last_four`, `reason` (`not_an_increase` \| `provider_single_settlement` \| `no_amount`), `cleared_amount`, `amount_charged`, `currency` |
 | `card.settled_after_cancel` | a settlement webhook arrives for a `cancelled` card — the card is left cancelled and a payment-blocking `payment_reconciliation` exception is opened on its invoice (decisions §549) | `last_four`, `status`, `settled_amount` (string Decimal or null), `currency`, `invoice_id` |
 | `card.settled` | settlement webhook completes + accrues the rebate | `last_four`, `from`, `to`, `rebate_amount`, `rebate_rate`, `rebate_base` (string Decimals), `rebate_base_source` (`settled` \| `charged` \| `unknown` — which figure the rebate priced off, see § Rebate base), `rebate_created` (bool — `false` if the one-per-card unique index skipped a duplicate) |
 | `card_rebate.confirmed` | `POST /rebates/{id}/confirm` (`pending` → `confirmed`) | `amount` (string Decimal), `from`, `to` |
@@ -1147,6 +1149,55 @@ authorization and never cleared, makes `card_settlement_block` refuse it as
 A settlement is accepted on a `charged` card **or an unspent one**
 (`created` / `sent` / `active`): a clearing can arrive after its authorization
 expired (a force post), and money moved. `card.settled`'s `from` records which.
+
+**A lapse delivered before its authorization (decisions §554).** Out of
+order, a reversal or expiry finds an unspent card and no hold to release. It
+is remembered in `card_transaction_events` (kind `lapse`, migration 0148)
+under the provider's transaction id (`_card_transaction_id`: Lithic's
+transaction `token`, Nium's `authCode` else `rhaTransactionId`, the mock's
+`transaction_id`); nothing on the card changes and no audit row is written
+yet. When the authorization of that same transaction arrives it is applied as
+already lapsed: the card stays (or returns to) `active` with no figure, the
+run leg stays `in_flight`, and one `card.authorization_lapsed` row is written
+with `out_of_order: true`. The provider **did** authorize, so
+`first_authorized_at` is stamped and a re-run refuses the card as
+`card_authorized_before` (§549); a lapse that is never followed by an
+authorization stamps nothing. A remembered partial reversal (a figure below
+the authorization's, Nium / mock only) leaves the late authorization standing,
+as it does in order. A lapse with no transaction id is only logged.
+
+**Further clearings on a settled card (decisions §554).** A transaction can
+clear more than once — Lithic: "there can be any permutation of Clearing,
+Return, Authorization Reversal, and Authorization Expiry messages on this same
+transaction" (<https://docs.lithic.com/docs/transaction-flow>, checked
+2026-11-25). Every applied clearing is recorded in `card_transaction_events`
+(kind `clearing`) under its own identity (`_clearing_key`: the newest Lithic
+financial event's `token` in `events`, else the transaction token and its
+cumulative figure; the delivery id for Nium and the mock), so each is applied
+once even past the Redis dedupe. On a `completed` card
+(`_record_further_clearing`):
+
+| Clearing | Result |
+|---|---|
+| Lithic, cumulative figure above `amount_charged` | the difference is added; `record_card_spend` writes the total onto the run payment; a `pending` rebate is re-based on the total at its rate; `card.clearing_added` (`cleared_amount`, `amount_charged`, `currency`, `rebate_amount`, string Decimals); the payment sync is re-dispatched once |
+| mock, positive figure | the same, the figure being this clearing's own |
+| a figure that does not raise the total (a Lithic `RETURN`, a negative mock clearing) | **refused**: card, payment and rebate stand; `card.clearing_refused` (`reason` `not_an_increase`) for the refund flow, as a reversal after settlement is |
+| Nium | **refused** (`provider_single_settlement`): Nium's documented card webhooks describe one `CARD_SETTLEMENT_DEBIT_WEBHOOK` per authorization and no incremental capture, so a second one cannot be told from a redelivery under a new id |
+| a replay of an applied clearing | nothing |
+
+Any settlement (the first included) whose card total exceeds what the card
+pays — the run payment's amount, else the invoice's, judged by
+`verify_settlement` — opens one payment-blocking `payment_reconciliation`
+exception (`exception.settlement_amount_over`, deduped by `erp_report.kind`
+`card_over_settled`; `payment_settlement_record.flag_card_over_settlement`).
+The money moved, so the figure is recorded; the flag is how a person learns of
+the overcharge, since over-settlement reads `covered`. **Not verified:** that
+Lithic sends a `card_transaction.updated` per clearing (its docs say a webhook
+is sent "at each step in the transaction lifecycle"), and that its delivery
+carries an `event_id`: without one, `_lithic_event_id` keys an update on
+`token:STATUS`, so a second `SETTLED` delivery is deduped as a replay before it
+reaches this branch (the event-id location is another lane's change this
+round).
 
 **A settlement on a `cancelled` card (decisions §549)** is the force post that
 arrives after AP voided the payment — reachable since §544, because a lapsed
