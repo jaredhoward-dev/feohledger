@@ -217,3 +217,16 @@ export interface ResidencyAlignment {
 	deployed_region: string | null;
 	reason: string | null;
 }
+
+/**
+ * Organization → Chat notifications (Slack / Teams). The incoming-webhook URL
+ * is WRITE-ONLY end to end: `newWebhook` is only the draft being typed, never
+ * a mirror of the stored value. See backend/docs/notifications.md.
+ */
+export interface ChatFields {
+	enabled: boolean;
+	provider: string;
+	/** Every supported event, materialized: a missing key would mean "unset". */
+	events: Record<string, boolean>;
+	newWebhook: string;
+}

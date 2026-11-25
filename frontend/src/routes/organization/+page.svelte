@@ -29,11 +29,7 @@
 		updateChatNotifications
 	} from '#lib/api/chatNotifications.ts';
 	import { getEmailIntake, rotateEmailIntakeToken } from '#lib/api/emailIntake.ts';
-	import {
-		CHAT_EVENT_LABELS,
-		CHAT_PROVIDER_LABELS,
-		type ChatNotificationStatus
-	} from '#lib/types/chatNotifications.ts';
+	import type { ChatNotificationStatus } from '#lib/types/chatNotifications.ts';
 	import { getSsoSettings, updateSsoSettings } from '#lib/api/ssoSettings.ts';
 	import { ssoRefusalText } from '#lib/api/ssoRefusal.ts';
 	import type { SsoSettingsStatus } from '#lib/types/ssoSettings.ts';
@@ -50,6 +46,7 @@
 	import MatchRulesPanel from '#lib/components/organization/MatchRulesPanel.svelte';
 	import AgentAutonomyPanel from '#lib/components/organization/AgentAutonomyPanel.svelte';
 	import CompanyProfilePanel from '#lib/components/organization/CompanyProfilePanel.svelte';
+	import ChatNotificationsPanel from '#lib/components/organization/ChatNotificationsPanel.svelte';
 	import CustomDomainsPanel from '#lib/components/organization/CustomDomainsPanel.svelte';
 	import ResidencyPanel from '#lib/components/organization/ResidencyPanel.svelte';
 	import SsoPanel from '#lib/components/organization/SsoPanel.svelte';
@@ -68,6 +65,7 @@
 		extractionProviderLabel,
 		type BrandingFields,
 		type CardsFields,
+		type ChatFields,
 		type CompanyFields,
 		type ExtractionFields,
 		type NachaFields,
@@ -1363,42 +1361,24 @@
 	// draft the admin is currently typing. Don't add one.
 	// See backend/docs/notifications.md § Rotating the webhook URL.
 	let chat = $state<ChatNotificationStatus | null>(null);
-	let chatEnabled = $state(false);
-	let chatProvider = $state('mock');
-	let chatEvents = $state<Record<string, boolean>>({});
+	let chatFields = $state<ChatFields>({ enabled: false, provider: 'mock', events: {}, newWebhook: '' });
 	let loadingChat = $state(true);
 	let chatError = $state('');
 	let savingChat = $state(false);
-	let newChatWebhook = $state('');
 	let savingChatWebhook = $state(false);
 	let confirmRemoveChatWebhook = $state(false);
 
 	function applyChat(data: ChatNotificationStatus) {
 		chat = data;
-		chatEnabled = data.enabled;
-		chatProvider = data.provider ?? 'mock';
+		chatFields.enabled = data.enabled;
+		chatFields.provider = data.provider ?? 'mock';
 		// A missing per-event key means "on" (the backend's opt-out default), so
 		// materialize the full map here rather than letting an unchecked box
 		// mean "unset".
-		chatEvents = Object.fromEntries(
+		chatFields.events = Object.fromEntries(
 			(data.supported_events ?? []).map((e) => [e, data.events?.[e] ?? true])
 		);
 	}
-
-	function chatProviderLabel(token: string): string {
-		return CHAT_PROVIDER_LABELS[token] ?? token;
-	}
-
-	function chatEventLabel(token: string): string {
-		return CHAT_EVENT_LABELS[token] ?? token;
-	}
-
-	// Chat on, a real provider selected, no webhook stored → the adapter fails
-	// closed and silently posts nothing. Surface that rather than let the panel
-	// read as configured.
-	const chatWebhookMissing = $derived(
-		!!chat && chat.enabled && chat.provider !== 'mock' && !chat.webhook_configured
-	);
 
 	$effect(() => {
 		// Its own effect, the same shape as the email-intake one below and for the
@@ -1439,9 +1419,9 @@
 			// `webhook_configured`, which this save deliberately does not touch.
 			applyChat(
 				await updateChatNotifications({
-					enabled: chatEnabled,
-					provider: chatProvider,
-					events: chatEvents
+					enabled: chatFields.enabled,
+					provider: chatFields.provider,
+					events: chatFields.events
 				})
 			);
 			toast(m('org.chat.toast.saved'), 'success');
@@ -1453,7 +1433,7 @@
 	}
 
 	async function saveChatWebhook() {
-		const url = newChatWebhook.trim();
+		const url = chatFields.newWebhook.trim();
 		if (!url) {
 			toast(m('org.chat.webhook.toast.empty'), 'error');
 			return;
@@ -1463,7 +1443,7 @@
 			applyChat(await rotateChatWebhook(url));
 			// Drop the credential from component state the moment it is stored —
 			// it is never re-fetchable, so keeping it around buys nothing.
-			newChatWebhook = '';
+			chatFields.newWebhook = '';
 			toast(m('org.chat.webhook.toast.saved'), 'success');
 		} catch (err) {
 			toast(errorMessage(err, m('org.chat.webhook.toast.saveFailed')), 'error');
@@ -1874,130 +1854,21 @@
 				{/if}
 
 				{#if section === 'chat'}
-					<section class="card">
-						<h2>{m('org.section.chat')}</h2>
-						<p class="card-hint">{m('org.chat.hint')}</p>
-
-						{#if !userLoaded || loadingChat}
-							<LoadingState label={m('org.chat.loading')} />
-						{:else if readOnly}
-							<!-- GET is admin-only, so nothing is fetched for a non-admin and
-							     there is nothing to show. Say that, exactly as the Email
-							     Intake panel does, instead of rendering a 403 the reader
-							     cannot act on. -->
-							<p class="card-hint" data-testid="chat-admin-only">
-								{m('org.chat.adminOnly')}
-							</p>
-						{:else if chatError}
-							<LoadError message={chatError} onretry={loadChat} testId="chat-load-error" />
-						{:else if chat}
-							<div class="form-grid">
-								<label class="switch-row">
-									<input type="checkbox" bind:checked={chatEnabled} />
-									<span>{m('org.chat.enabled')}</span>
-								</label>
-								<label>
-									{m('org.chat.provider')}
-									<select bind:value={chatProvider}>
-										{#each chat.supported_providers as p (p)}
-											<option value={p}>{chatProviderLabel(p)}</option>
-										{/each}
-									</select>
-								</label>
-							</div>
-
-							<fieldset class="chat-events">
-								<legend>{m('org.chat.events')}</legend>
-								<p class="card-hint">{m('org.chat.eventsHint')}</p>
-								{#each chat.supported_events as ev (ev)}
-									<label class="switch-row">
-										<input
-											type="checkbox"
-											checked={chatEvents[ev] ?? true}
-											onchange={(e) =>
-												(chatEvents = {
-													...chatEvents,
-													[ev]: (e.currentTarget as HTMLInputElement).checked
-												})}
-										/>
-										<span>{chatEventLabel(ev)}</span>
-									</label>
-								{/each}
-							</fieldset>
-
-							<div class="section-footer">
-								<button class="btn-save-section" disabled={savingChat} onclick={saveChat}>
-									{savingChat ? m('org.common.saving') : m('org.chat.save')}
-								</button>
-							</div>
-
-							<h3 class="chat-subhead">{m('org.chat.webhook.title')}</h3>
-							<p class="card-hint">{m('org.chat.webhook.hint')}</p>
-
-							{#if chatWebhookMissing}
-								<p class="chat-warning" role="alert">
-									{m('org.chat.webhook.missingWarning', {
-										provider: chatProviderLabel(chat.provider ?? '')
-									})}
-								</p>
-							{/if}
-
-							<div class="chat-webhook-status">
-								{#if chat.webhook_configured}
-									<span class="chat-webhook-set">
-										{chat.webhook_host
-											? m('org.chat.webhook.configured', { host: chat.webhook_host })
-											: m('org.chat.webhook.configuredUnknownHost')}
-									</span>
-									<span class="chat-webhook-remove">
-										<button
-											type="button"
-											class="btn-remove-domain"
-											class:armed={confirmRemoveChatWebhook}
-											disabled={savingChatWebhook}
-											aria-label={savingChatWebhook
-												? undefined
-												: confirmRemoveChatWebhook
-													? m('org.chat.webhook.confirmRemoveAria')
-													: m('org.chat.webhook.removeAria')}
-											onclick={removeChatWebhook}
-										>
-											{confirmRemoveChatWebhook
-												? m('org.chat.webhook.confirmRemove')
-												: m('org.chat.webhook.remove')}
-										</button>
-									</span>
-								{:else}
-									<span class="card-hint">{m('org.chat.webhook.notConfigured')}</span>
-								{/if}
-							</div>
-
-							<form
-								class="domain-add"
-								onsubmit={(e) => {
-									e.preventDefault();
-									saveChatWebhook();
-								}}
-							>
-								<input
-									type="text"
-									bind:value={newChatWebhook}
-									placeholder={m('org.chat.webhook.placeholder')}
-									aria-label={m('org.chat.webhook.inputAria')}
-									autocomplete="off"
-									spellcheck="false"
-								/>
-								<button type="submit" class="btn-save-section" disabled={savingChatWebhook}>
-									{savingChatWebhook
-										? m('org.chat.webhook.saving')
-										: chat.webhook_configured
-											? m('org.chat.webhook.replace')
-											: m('org.chat.webhook.set')}
-								</button>
-							</form>
-							<p class="card-hint">{m('org.chat.webhook.rotateHint')}</p>
-						{/if}
-					</section>
+					<ChatNotificationsPanel
+						bind:fields={chatFields}
+						status={chat}
+						{readOnly}
+						{userLoaded}
+						loading={loadingChat}
+						loadError={chatError}
+						onretry={loadChat}
+						saving={savingChat}
+						onsave={saveChat}
+						savingWebhook={savingChatWebhook}
+						confirmRemoveWebhook={confirmRemoveChatWebhook}
+						onsetwebhook={saveChatWebhook}
+						onremovewebhook={removeChatWebhook}
+					/>
 				{/if}
 
 				{#if section === 'email-intake'}
