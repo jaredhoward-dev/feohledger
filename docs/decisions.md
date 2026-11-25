@@ -28432,151 +28432,6 @@ catalogue names exactly `WEBHOOK_EVENT_TYPES`, and each type has one payload
 example whose `data` keys are its model's fields; the report's filter picks
 only affected subscriptions and the types they lack.
 
-## 551. "Check payments now" is drawn for a stored-credential ERP by the status read's verdict; a refusal hides it (§547 follow-up, round 46)
-
-**Problem.** §547 let an opted-in NetSuite tenant run the on-request pass,
-but the ERP panel drew the button only for a live OAuth connection, and
-`GET /api/organization/erp/oauth/status` answered a tenant with no connection
-block before reading the verdict, so `status_sync_available` was always false
-for it. A NetSuite admin reached the pass only through the API.
-
-**Decision.** The status read computes `status_sync_now_refusal` once and
-states it in both branches, so the verdict is the tenant's, not the
-connection's (an OAuth ERP without a block reads `status_sync_unsupported`,
-which the panel never showed, since it requires a live connection). The panel
-draws **Check payments now** for a non-OAuth ERP when
-`storedErpStatusSyncNowOffered` holds: the selected ERP is the one the saved
-configuration names (an unsaved dropdown choice is not what the pass reads)
-and the server says available. The status is re-read after every save, not
-only an OAuth one, so turning NetSuite's opt-in on draws the button. The
-POST, its RBAC (admin; a non-admin sees the admin-only hint and no read),
-codes, audit and limit are unchanged.
-
-**A refusal hides the button rather than disabling it beside a
-`RefusalNote`.** The OAuth panel already hides it on every refusal, and the
-two codes a stored-credential ERP can get, `status_sync_off` (the
-deployment switch) and `status_sync_unsupported` (an ERP that does not
-report back, or NetSuite without its opt-in), are configuration states no
-click resolves. A disabled button with "does not report its bills' payments
-back" on every Sage Intacct or Business Central panel would be noise, and the
-code does not distinguish "NetSuite, opted out" from "cannot", so a sentence
-pointing at the opt-in would have to restate the rule in the browser.
-
-**The e2e spec's rate limit.** The on-request pass is limited to four an
-hour per tenant, and `netsuite-status-sync.spec.ts` runs two. CI's `erp-e2e`
-job, like every e2e job, runs with `FEOH_RATE_LIMIT_ENABLED=false`, which
-`frontend/tests-e2e/README.md` requires locally too, so a retry or re-run is
-never answered 429; the spec now says so, and names that switch if it does
-meet a 429. Raising the limit, or adding a test-only limiter reset, was not
-needed. The spec starts each pass with the panel's button.
-
-Tests: `backend/tests/test_erp_oauth.py` (the verdict with no connection
-block: available opted in, `status_sync_unsupported` opted out,
-`status_sync_off` with the switch off), `frontend/src/lib/types/erpConnection.test.ts`
-(`storedErpStatusSyncNowOffered`), `frontend/tests-e2e/erp/netsuite-status-sync.spec.ts`.
-
-## 550. The ERP bill void's whole ERP step is bounded inside its staleness window, and a void it cannot record is recorded as orphaned; the on-request status-sync audit names the resolved ERP (§545 / §547 follow-up, round 46)
-
-**Problem.**
-
-1. **§545 overstated its bound.** It set `PENDING_STALE_AFTER_S` = 300 s as
-   "well past step 2's 105 s bound", but only the status read (30 s), the
-   deleted-bill report (30 s) and the void (45 s) were bounded. Opening the
-   adapter was not: `provider_config(org, "erp")` unseals the stored credential
-   through KMS in a worker thread, and the KMS client ran on boto's defaults (a
-   60 s connect, a 60 s read, five legacy-mode attempts), so one stalled unseal
-   could take minutes. Past 300 s the marker stops holding the flag, a person
-   can dismiss it and a run can take the invoice to `payment_scheduled`; the
-   stuck attempt then reads the bill open and voids it in the ERP.
-2. **That void went unrecorded.** `finish_void` correctly refused to write
-   when its marker had been taken over or the invoice had moved on, but it
-   wrote nothing at all, so a bill could be void in the ERP while FeohLedger
-   paid the invoice, with no row anywhere saying so.
-3. **`status_sync_provider` mislabelled after a switch of ERP.** It preferred
-   `settings.erp.oauth.provider` to `settings.erp.type`; §547 rejected trusting
-   that block because it survives a switch (§270), so a NetSuite tenant that
-   once connected QuickBooks had its on-request passes audited as QuickBooks.
-
-**Decision.**
-
-1. **Step 2 is bounded as a whole.** `call_erp` runs under one
-   `asyncio.wait_for` of `CALL_ERP_TIMEOUT_S` = 150 s, half the staleness
-   window (a module-level assertion keeps it so), covering the unseal and the
-   adapter's construction as well as the three calls. It tracks one phase bit,
-   set just before `void_invoice` is awaited: a timeout before it is
-   `erp_void_failed` (nothing was sent), after it `erp_void_unconfirmed` (the
-   ERP may have acted; a retry converges, §542). The per-call bounds stay and
-   still decide a slow ERP call. **A thread cannot be cancelled**: an unseal
-   already running in `asyncio.to_thread` finishes in its worker after the
-   timeout, but the coroutine that awaited it is cancelled, so nothing reads its
-   result and no read or void follows it. The step's own timeouts are what
-   protect the marker, not the thread's.
-2. **The KMS client is bounded at its one construction site**
-   (`credential_crypto._kms_client`): a 5 s connect, a 10 s read, three
-   attempts in all in botocore's `standard` retry mode. Every caller of that
-   client is a request or a sweep unsealing or sealing one tenant's provider
-   credential, where KMS answers in milliseconds and each caller already maps
-   `CredentialCryptoError` to its own refusal; a call that has not answered in
-   those bounds is failing, and failing faster changes no outcome but the wait.
-   Worst case is about 45 s plus backoff, well inside the 150 s step.
-3. **A void this attempt sent but cannot record is recorded as orphaned.**
-   When `finish_void` finds the marker no longer this attempt's or the invoice
-   no longer holding the bill at a voidable status, and this attempt sent the
-   void (`already_gone` false), it writes an append-only
-   `exception.erp_bill_void_orphaned` row on the flag (bill, actor, attempt id,
-   `void_result`, the invoice's status now, whether the marker was taken over)
-   before refusing as before. The endpoint does the same for an
-   `erp_void_unconfirmed` refusal whose attempt has lost its invoice
-   (`void_result: "unconfirmed"`). Nothing on the invoice is rewritten: what
-   happened to it since is a person's decision. When the invoice no longer
-   holds the bill and is payable here (`PAYABLE_STATUSES`), a
-   **`payment_reconciliation`** row opens (kind `void_orphaned`, deduped by
-   kind through `open_erp_reconciliation_exception`, §535). That type, not
-   `erp_reconciliation`, because it is the payment-blocking type for "a
-   disagreement that would let FeohLedger pay a bill the ERP has already ...
-   removed" (`erp_status_sync.PAYMENT_RECONCILIATION_EXCEPTION_TYPE`), and a
-   payment against a bill we voided is exactly that; the non-blocking type
-   would let the run pay while a person reads it. Its sentence is the existing
-   `erp_voided_after_post` (the ERP reports the bill void but FeohLedger sent
-   it on for payment; check whether a payment is on its way), so no new
-   catalogue strings. An invoice that still holds the same bill with its marker
-   taken over by a newer attempt gets only the audit row: that attempt reads the
-   bill gone and converges, and the open flag holds the invoice meanwhile. The
-   audit action is labelled on `/audit` in all six locales.
-4. **The on-request status-sync audit names the resolved adapter**:
-   `status_sync_provider` returns `dispatcher.resolve_adapter_key(settings.erp)`,
-   the key `status_sync_now_refusal` selects the tenant by, and `None` with no
-   ERP configured.
-
-**Correction to §545.** "Well past step 2's 105 s bound" was not true while the
-unseal was unbounded; with (1) and (2) step 2 is bounded at 150 s, which is
-what the 300 s staleness rule now rests on.
-
-**Rejected.** *Raising `PENDING_STALE_AFTER_S`*: it only moves the race, and
-lengthens how long a crashed attempt holds a false flag open. *Unsealing in
-step 1 under the locks*: it puts the KMS call back inside the row locks §545
-took it out of. *Reverting the invoice or the payment on an orphaned void*:
-by then a person or a run has acted on the invoice, and undoing either
-automatically is the kind of money move this module never makes; the blocking
-row puts it in front of a person instead.
-
-**Also.** The audit roster test (`auditActions.roster.test.ts`) harvested
-any constant whose name merely contained `ACTION`, so `cards.py`'s
-`_LITHIC_TRANSACTION_EVENT` (Lithic's event type) read as an unlabelled audit
-action; it now takes `ACTION` / `ACTIONS` as a whole word of the name.
-
-**Guard.** `tests/test_erp_bill_void_from_flag.py`: the step times out as a
-whole on a stalled unseal and a stalled read (`erp_void_failed`, no void) and
-on a stalled void (`erp_void_unconfirmed`); a void sent after the marker was
-taken over writes the orphan row and no reconciliation row; one sent after the
-invoice moved to `payment_scheduled` writes it and opens one blocking
-`payment_reconciliation` row (`void_orphaned`), as does an unconfirmed void
-there; a bill found already gone is never orphaned; the normal path and every
-refusal write no orphan row; the marker is SQL NULL (`IS NULL`) after a
-completed void and after a refusal. `tests/test_provider_credentials.py`: the
-KMS client's timeouts and retries. `tests/test_erp_status_sync.py`: a NetSuite
-tenant with a leftover QuickBooks OAuth block is audited as `netsuite`.
-
 ## 549. A clearing on a cancelled card is flagged, a once-authorized card is never reused, and card events are read from an explicit per-provider map (§544 follow-up, round 46)
 
 **Problem 1 — a settlement on a cancelled card vanished.** Since §544 a lapsed
@@ -28688,3 +28543,148 @@ in the closed vocabulary, its precedence, and that it is retry-safe.
 `tests/test_payment_void_card_retry.py` (unchanged) still voids a lapsed card.
 `tests/test_migration_0147_card_first_authorized_at.py`: add, backfill, no
 invention, idempotent, reversible, control plane untouched.
+
+## 550. The ERP bill void's whole ERP step is bounded inside its staleness window, and a void it cannot record is recorded as orphaned; the on-request status-sync audit names the resolved ERP (§545 / §547 follow-up, round 46)
+
+**Problem.**
+
+1. **§545 overstated its bound.** It set `PENDING_STALE_AFTER_S` = 300 s as
+   "well past step 2's 105 s bound", but only the status read (30 s), the
+   deleted-bill report (30 s) and the void (45 s) were bounded. Opening the
+   adapter was not: `provider_config(org, "erp")` unseals the stored credential
+   through KMS in a worker thread, and the KMS client ran on boto's defaults (a
+   60 s connect, a 60 s read, five legacy-mode attempts), so one stalled unseal
+   could take minutes. Past 300 s the marker stops holding the flag, a person
+   can dismiss it and a run can take the invoice to `payment_scheduled`; the
+   stuck attempt then reads the bill open and voids it in the ERP.
+2. **That void went unrecorded.** `finish_void` correctly refused to write
+   when its marker had been taken over or the invoice had moved on, but it
+   wrote nothing at all, so a bill could be void in the ERP while FeohLedger
+   paid the invoice, with no row anywhere saying so.
+3. **`status_sync_provider` mislabelled after a switch of ERP.** It preferred
+   `settings.erp.oauth.provider` to `settings.erp.type`; §547 rejected trusting
+   that block because it survives a switch (§270), so a NetSuite tenant that
+   once connected QuickBooks had its on-request passes audited as QuickBooks.
+
+**Decision.**
+
+1. **Step 2 is bounded as a whole.** `call_erp` runs under one
+   `asyncio.wait_for` of `CALL_ERP_TIMEOUT_S` = 150 s, half the staleness
+   window (a module-level assertion keeps it so), covering the unseal and the
+   adapter's construction as well as the three calls. It tracks one phase bit,
+   set just before `void_invoice` is awaited: a timeout before it is
+   `erp_void_failed` (nothing was sent), after it `erp_void_unconfirmed` (the
+   ERP may have acted; a retry converges, §542). The per-call bounds stay and
+   still decide a slow ERP call. **A thread cannot be cancelled**: an unseal
+   already running in `asyncio.to_thread` finishes in its worker after the
+   timeout, but the coroutine that awaited it is cancelled, so nothing reads its
+   result and no read or void follows it. The step's own timeouts are what
+   protect the marker, not the thread's.
+2. **The KMS client is bounded at its one construction site**
+   (`credential_crypto._kms_client`): a 5 s connect, a 10 s read, three
+   attempts in all in botocore's `standard` retry mode. Every caller of that
+   client is a request or a sweep unsealing or sealing one tenant's provider
+   credential, where KMS answers in milliseconds and each caller already maps
+   `CredentialCryptoError` to its own refusal; a call that has not answered in
+   those bounds is failing, and failing faster changes no outcome but the wait.
+   Worst case is about 45 s plus backoff, well inside the 150 s step.
+3. **A void this attempt sent but cannot record is recorded as orphaned.**
+   When `finish_void` finds the marker no longer this attempt's or the invoice
+   no longer holding the bill at a voidable status, and this attempt sent the
+   void (`already_gone` false), it writes an append-only
+   `exception.erp_bill_void_orphaned` row on the flag (bill, actor, attempt id,
+   `void_result`, the invoice's status now, whether the marker was taken over)
+   before refusing as before. The endpoint does the same for an
+   `erp_void_unconfirmed` refusal whose attempt has lost its invoice
+   (`void_result: "unconfirmed"`). Nothing on the invoice is rewritten: what
+   happened to it since is a person's decision. When the invoice no longer
+   holds the bill and is payable here (`PAYABLE_STATUSES`), a
+   **`payment_reconciliation`** row opens (kind `void_orphaned`, deduped by
+   kind through `open_erp_reconciliation_exception`, §535). That type, not
+   `erp_reconciliation`, because it is the payment-blocking type for "a
+   disagreement that would let FeohLedger pay a bill the ERP has already ...
+   removed" (`erp_status_sync.PAYMENT_RECONCILIATION_EXCEPTION_TYPE`), and a
+   payment against a bill we voided is exactly that; the non-blocking type
+   would let the run pay while a person reads it. Its sentence is the existing
+   `erp_voided_after_post` (the ERP reports the bill void but FeohLedger sent
+   it on for payment; check whether a payment is on its way), so no new
+   catalogue strings. An invoice that still holds the same bill with its marker
+   taken over by a newer attempt gets only the audit row: that attempt reads the
+   bill gone and converges, and the open flag holds the invoice meanwhile. The
+   audit action is labelled on `/audit` in all six locales.
+4. **The on-request status-sync audit names the resolved adapter**:
+   `status_sync_provider` returns `dispatcher.resolve_adapter_key(settings.erp)`,
+   the key `status_sync_now_refusal` selects the tenant by, and `None` with no
+   ERP configured.
+
+**Correction to §545.** "Well past step 2's 105 s bound" was not true while the
+unseal was unbounded; with (1) and (2) step 2 is bounded at 150 s, which is
+what the 300 s staleness rule now rests on.
+
+**Rejected.** *Raising `PENDING_STALE_AFTER_S`*: it only moves the race, and
+lengthens how long a crashed attempt holds a false flag open. *Unsealing in
+step 1 under the locks*: it puts the KMS call back inside the row locks §545
+took it out of. *Reverting the invoice or the payment on an orphaned void*:
+by then a person or a run has acted on the invoice, and undoing either
+automatically is the kind of money move this module never makes; the blocking
+row puts it in front of a person instead.
+
+**Also.** The audit roster test (`auditActions.roster.test.ts`) harvested
+any constant whose name merely contained `ACTION`, so `cards.py`'s
+`_LITHIC_TRANSACTION_EVENT` (Lithic's event type) read as an unlabelled audit
+action; it now takes `ACTION` / `ACTIONS` as a whole word of the name.
+
+**Guard.** `tests/test_erp_bill_void_from_flag.py`: the step times out as a
+whole on a stalled unseal and a stalled read (`erp_void_failed`, no void) and
+on a stalled void (`erp_void_unconfirmed`); a void sent after the marker was
+taken over writes the orphan row and no reconciliation row; one sent after the
+invoice moved to `payment_scheduled` writes it and opens one blocking
+`payment_reconciliation` row (`void_orphaned`), as does an unconfirmed void
+there; a bill found already gone is never orphaned; the normal path and every
+refusal write no orphan row; the marker is SQL NULL (`IS NULL`) after a
+completed void and after a refusal. `tests/test_provider_credentials.py`: the
+KMS client's timeouts and retries. `tests/test_erp_status_sync.py`: a NetSuite
+tenant with a leftover QuickBooks OAuth block is audited as `netsuite`.
+
+## 551. "Check payments now" is drawn for a stored-credential ERP by the status read's verdict; a refusal hides it (§547 follow-up, round 46)
+
+**Problem.** §547 let an opted-in NetSuite tenant run the on-request pass,
+but the ERP panel drew the button only for a live OAuth connection, and
+`GET /api/organization/erp/oauth/status` answered a tenant with no connection
+block before reading the verdict, so `status_sync_available` was always false
+for it. A NetSuite admin reached the pass only through the API.
+
+**Decision.** The status read computes `status_sync_now_refusal` once and
+states it in both branches, so the verdict is the tenant's, not the
+connection's (an OAuth ERP without a block reads `status_sync_unsupported`,
+which the panel never showed, since it requires a live connection). The panel
+draws **Check payments now** for a non-OAuth ERP when
+`storedErpStatusSyncNowOffered` holds: the selected ERP is the one the saved
+configuration names (an unsaved dropdown choice is not what the pass reads)
+and the server says available. The status is re-read after every save, not
+only an OAuth one, so turning NetSuite's opt-in on draws the button. The
+POST, its RBAC (admin; a non-admin sees the admin-only hint and no read),
+codes, audit and limit are unchanged.
+
+**A refusal hides the button rather than disabling it beside a
+`RefusalNote`.** The OAuth panel already hides it on every refusal, and the
+two codes a stored-credential ERP can get, `status_sync_off` (the
+deployment switch) and `status_sync_unsupported` (an ERP that does not
+report back, or NetSuite without its opt-in), are configuration states no
+click resolves. A disabled button with "does not report its bills' payments
+back" on every Sage Intacct or Business Central panel would be noise, and the
+code does not distinguish "NetSuite, opted out" from "cannot", so a sentence
+pointing at the opt-in would have to restate the rule in the browser.
+
+**The e2e spec's rate limit.** The on-request pass is limited to four an
+hour per tenant, and `netsuite-status-sync.spec.ts` runs two. CI's `erp-e2e`
+job, like every e2e job, runs with `FEOH_RATE_LIMIT_ENABLED=false`, which
+`frontend/tests-e2e/README.md` requires locally too, so a retry or re-run is
+never answered 429; the spec now says so, and names that switch if it does
+meet a 429. Raising the limit, or adding a test-only limiter reset, was not
+needed. The spec starts each pass with the panel's button.
+
+Tests: `backend/tests/test_erp_oauth.py` (the verdict with no connection
+block: available opted in, `status_sync_unsupported` opted out,
+`status_sync_off` with the switch off), `frontend/src/lib/types/erpConnection.test.ts`
+(`storedErpStatusSyncNowOffered`), `frontend/tests-e2e/erp/netsuite-status-sync.spec.ts`.
