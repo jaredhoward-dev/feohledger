@@ -26,6 +26,7 @@ import {
 
 test.describe('matching_rules tolerance precedence (vendor > commodity > org)', () => {
 	const created: { invoiceIds: string[]; poIds: string[] } = { invoiceIds: [], poIds: [] };
+	const OTHER_GL_MARK = 'MRPREC';
 	let originalMatching: MatchingBlock = {};
 	let vendorId: string;
 
@@ -47,6 +48,8 @@ test.describe('matching_rules tolerance precedence (vendor > commodity > org)', 
 		await signInAndWait(page);
 		await setMatching(page, originalMatching);
 		await ctx.close();
+		// After the rules are restored, so no rule still names the account.
+		tenantPsql(`DELETE FROM gl_accounts WHERE code LIKE '${OTHER_GL_MARK}-%'`);
 	});
 
 	test('vendor rule wins over commodity + org for the same invoice', async ({ page }) => {
@@ -101,11 +104,14 @@ test.describe('matching_rules tolerance precedence (vendor > commodity > org)', 
 	test('falls back to org default when neither vendor nor commodity matches', async ({ page }) => {
 		const gl = chartGlCode();
 		// A rule on ANOTHER account of the chart: the writer refuses a GL code
-		// the tenant does not have, so the non-matching rule is a real one.
-		const otherGl = tenantPsql(
-			`SELECT code FROM gl_accounts WHERE is_active AND entity_id IS NULL AND code <> '${gl}' ORDER BY code LIMIT 1`
-		).trim();
-		expect(otherGl, 'the worker tenant needs a second shared GL account').toBeTruthy();
+		// the tenant does not have, so this spec adds its own shared account
+		// (removed in afterAll) rather than assume the seed holds a second one.
+		const otherGl = `${OTHER_GL_MARK}-${Date.now().toString(36)}`;
+		const made = await page.request.post(`${API_BASE}/api/gl-accounts`, {
+			headers: { ...tenantHeaders(await authToken(page)), 'Content-Type': 'application/json' },
+			data: { code: otherGl, name: `${otherGl} name` }
+		});
+		expect(made.ok(), await made.text()).toBe(true);
 		await setMatching(page, {
 			tolerance_pct: 5.0,
 			commodity_rules: { [otherGl]: { tolerance_pct: 1.0 } }
