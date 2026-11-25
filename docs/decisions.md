@@ -29236,3 +29236,95 @@ not what is typed into the form. `docs/sub-processors.md` § 21 says the same.
   The §498 rule still holds: a mobile build older than the bump can only sign
   out until it is updated, so this ships with or after a mobile release that
   carries it.
+
+## 562. A refused card settlement holds the card as possibly spent and reaches a person; a further clearing that changes a paid leg leaves a payment row; a Lithic webhook secret must carry its prefix (§557 correction, round 47)
+
+**§557's premise was wrong.** §557 refused a settlement with no usable figure
+(absent, zero or negative, unparseable, another currency) and opened no flag
+because "the card is still `charged` (spent), so it cannot be voided and re-paid
+on another rail". The refused branch is guarded by `_SETTLEABLE_CARD_STATUSES`,
+which includes `created` / `sent` / `active`: a lapse returns a card to `active`
+(§544), and a force post can clear it afterwards. Worked example: Nium approves
+1000 USD → a reversal advice returns the card to `active` → the settlement
+arrives with `authCurrency` EUR and is refused → the card still reads `active`
+→ AP cancels the "lapsed" card, voids the leg, and the next run pays the
+invoice by ACH while the card charge stands. The vendor is paid twice. §557's
+text is left as written; this entry corrects it.
+
+**Decision.** A refused settlement, in the webhook's own transaction:
+
+* records a durable `settlement_refused` row in `card_transaction_events`
+  (card-scoped, keyed by the delivery id; `card_transaction_memory.record_settlement_refused`
+  / `settlement_refused`, added beside the existing functions, whose signatures
+  are unchanged). Not the audit log: in `lambda` audit mode it ships to SQS and
+  may not be in the tenant database. The column is `VARCHAR(20)`; the kind is
+  18 characters, so no migration;
+* opens one payment-blocking `payment_reconciliation` exception of kind
+  `card_settlement_refused` (deduped by kind, §535; message
+  `exception.card_settlement_refused` in the warning catalogue, six web locales
+  and the mobile ARBs).
+
+While the fact exists the card is treated as possibly spent: `POST
+/api/cards/{id}/cancel` answers 409 `card_cancel_settlement_refused` (coded;
+the route is unwired in both clients, §96, so the English fallback is the
+only surface and no locale string is added); the void's card leg returns
+`card_already_charged`, so the card keeps its invoice's live-card slot and the
+void reports it `not_closed_final`; and `card_settlement_block` refuses a run's
+reuse as `card_settlement_refused`, which is deliberately not retry-safe. The
+fact never expires: a person reconciling with the provider either sees a later
+usable settlement complete the card or deals with the card at the provider.
+
+**On a `charged` card the flag is blocking too.** Its leg is in flight, so no
+run could pay the invoice today and a non-blocking flag would be enough for
+that moment. But a later lapse returns the card to `active` and the flag is the
+only thing that reaches a person, so one kind, one type, blocking in both cases.
+*Rejected: a second, non-blocking type for the `charged` case* — two flags for
+one fact, and the safe one would have to be re-raised on the lapse.
+
+**Audit-only refusals now reach a person.** A further clearing on a settled
+card refused as `provider_single_settlement` (Nium) or `no_amount` opens a
+blocking `card_clearing_refused` reconciliation flag (deduped by kind), beside
+the `card.clearing_refused` row. `not_an_increase` (a Lithic `RETURN`, a
+negative mock clearing) stays audit-only: it is money coming back, the refund
+flow's. Because Lithic reports a cumulative figure and each clearing adds
+`reported − amount_charged`, a refused return is netted into the next capture
+(clear 100, return 30, capture 50 → the card records 120) and the
+over-settlement flag measures that net.
+
+**A further clearing that changes a completed leg writes a payment row.**
+`_record_further_clearing` writes `payment.settled_amount_changed` (entity the
+payment; `from`, `to`, `currency`, `via`, `virtual_card_id`; string Decimals) in
+the same transaction whenever `record_card_spend` changes `settled_amount`.
+The re-dispatched payment sync writes a `paid` leg back to the ERP again; the
+write-back's per-payment idempotency holds (QuickBooks finds its own
+BillPayment by the `PrivateNote` marker and returns it, so a changed amount
+posts no second BillPayment); the difference is the over-settlement flag's.
+
+**A Lithic card webhook secret must start with `whsec_`.** Lithic signs with a
+Standard-Webhooks secret and `verify_standard_webhook` fails closed on any
+other value, so a pasted API key saved cleanly and then answered every real
+delivery with a silent 204. `PUT /api/organization/credentials/cards` refuses a
+`webhook_signing_secret` without the prefix when the cards block's provider is
+`lithic`, with a coded 422 `card_webhook_secret_format` (`params.provider`),
+before the lock and the audit row, never echoing the value; the organization
+page states it in six locales. Nium's secret is a free-form `x-partner-key` and
+the mock's a hex key, so neither is checked. The prefix constant is read from
+`webhook_security`, the verifier's own.
+
+**Not done.** The vendor-revocation sweep (`vendor_card_revocation`) still
+cancels a card a settlement was refused on when its vendor is blocked: closing
+it at the provider stops further spend and the open flag still blocks the
+invoice. Xero and NetSuite write-back idempotency (by `Reference` /
+`externalId`) is documented in their adapters but was not re-pinned here.
+
+**Tests.** `backend/tests/test_card_settlement_refused.py` (lapsed card +
+refused settlement on Nium and Lithic: card `active`, fact recorded, one
+blocking flag, run gate excludes the invoice, cancel 409, void leg reports
+charged; run reuse refused; a `charged` card is flagged and still refused a
+cancel after a later reversal; one flag per kind across deliveries; an
+unaffected card still cancels); `test_card_money_path_regression.py` (the
+`payment.settled_amount_changed` row on an incremental capture; the
+`card_clearing_refused` flag on a Nium further settlement and none on a
+return); `test_qbo_status_sync_adapter.py` (a re-sync with a changed amount
+posts no second BillPayment); `test_provider_credentials.py` (the `whsec_`
+refusal and the per-provider acceptance).
