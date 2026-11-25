@@ -5,15 +5,17 @@ names the root cause, the evidence, blast radius, and a recommended fix
 approach — this is a staging area for real problems, not a place to let them
 go stale. See root `CLAUDE.md` guard rail 6 (no dangling deferred findings).
 
-**Eight entries are open**: the run builder reading
-a missing invoice currency as USD (found 2026-10-21), the app rendering nothing when browser
+**Seven entries are open**: the app rendering nothing when browser
 storage is blocked (found 2026-10-20),
 the expense-report Attach dead end found while
 writing the help centre, the `all`-mode approval-chain segregation deadlock,
 an out-of-office delegation that cannot stand in on an `all`-mode level (found
 2026-11-24),
 the legal-contents smooth-scroll race and the e2e cleanup race directly below,
-and the `payments/` local-e2e flake near the bottom. The `/complete` amount
+and the `payments/` local-e2e flake near the bottom. The run builder reading
+a missing invoice currency as USD, found 2026-10-21, was fixed on 2026-11-18
+(decisions §457) but left open here until 2026-11-25; it sits struck in place.
+The `/complete` amount
 floor approving an invoice whose PO was never matched, found and struck on
 2026-11-15, sits struck above the run-builder entry. Merge.dev's vendor listing
 calling an endpoint Merge does not publish, found and struck on 2026-10-26, sits
@@ -36,10 +38,11 @@ this note has now warned about twice. Two defects were **fixed on 2026-09-17**:
 the `/organization` 320px reflow defect (issue #432), along with six more routes
 that failed the same criterion and had no entry at all because nothing measured
 them; and the local-e2e `alembic` drift, which now has a pre-run guard that
-refuses to start against a stale database. Twenty-two of the thirty `##`
+refuses to start against a stale database. Twenty-four of the thirty-one `##`
 entries are now `~~struck-through~~` resolved stubs. (This line said "the other
 fifteen" while the file held fifteen struck in total, the two above included,
-and later "seventeen of the twenty-four" while nineteen were struck.)
+later "seventeen of the twenty-four" while nineteen were struck, and then
+"twenty-two of the thirty" while twenty-three of thirty-one were.)
 They are kept because the *diagnosis* is the
 expensive part and is worth not re-deriving. Add a new entry at the top when a
 defect is diagnosed but can't be fixed in the same session.
@@ -212,7 +215,23 @@ the floor's purpose for PO-less spend and is the recommended default. Test
 beside `tests/test_invoice_complete_auto_approve.py`: a below-floor invoice
 citing an unknown PO is not approved and carries `po_mismatch`.
 
-## The run builder reads a missing invoice currency as USD
+## ~~The run builder reads a missing invoice currency as USD~~ — FIXED 2026-11-18
+
+**Fixed** in round 16 (decisions §453, §457), by the first fix this entry
+recommends: a missing currency is refused, never counted as a value.
+`payment_runs.run_refusal_reasons` refuses an invoice whose
+`payable_currency_code` is `None` (NULL, blank, whitespace-only or malformed)
+as `currency_unknown`, so `create_payment_run_for_invoices` answers 409
+`currency_unknown: … <invoice numbers>` before any total or CFO comparison, and
+the mixed-currency 422 leaves the blank out rather than counting it as a second
+currency. `POST /api/payments/runs` and the copilot's `/draft-run` (which skips
+it under its own `currency_unknown` code) share that builder; dispatch,
+`POST /api/payments`, corridor quotes and the card mint refuse it too. Pinned
+by `backend/tests/test_payment_run_currency.py::test_payment_run_refuses_an_invoice_with_no_currency`
+(NULL, `""` and spaces; alone and batched with a USD invoice, nothing booked).
+The entry stayed open for a week after the fix because §457 did not strike it;
+re-verified against the code on 2026-11-25. The `or "USD"` defaults still in
+`app/` default the org's *reporting* currency setting, not an invoice's.
 
 **Found 2026-10-21**, in the money-path review of the ERP push gate (decisions
 §309); diagnosed from the code, not reproduced. `services/payment_runs.create_payment_run_for_invoices`
