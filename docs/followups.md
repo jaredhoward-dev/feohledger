@@ -1330,21 +1330,6 @@ scope (§260) — do not fold them into any of these.
       group the closure can poll empty. **Trigger:** the first deployment that
       runs `FEOH_AUDIT_MODE=lambda` and wants self-service closure.
 
-### Surfaced by the Blackbaud FE NXT API audit (#651, 2026-10-26)
-
-- [ ] **(c) A push refused by the SKY call budget is not re-sent when the
-      allowance resets.** `erp_call_budget_exhausted` (`tenant_budget` /
-      `subscription_quota`) fails the invoice before any call, with the reason
-      and `retry_after`. Someone has to retry it after 00:00 UTC, one invoice
-      or a bulk retry at a time. The original follow-up asked to *defer*
-      rather than fail. **Durable fix:** a sweep that, after the reset,
-      re-dispatches invoices whose last `invoice.erp_failed` refusal is
-      `erp_call_budget_exhausted` and whose state is unchanged since. It goes
-      through `erp_send.start_erp_send` (plan and export gates), in
-      `retry_after` order, and stops at the org's share again. **Trigger:**
-      the first tenant that hits its share in production, or a support request
-      to retry a batch by hand.
-
 ### Surfaced by the UI action-verdict pass (2026-10-21, issue #575 § One rule, one place, decisions §305)
 
 - [ ] **(c) The invoice modal still hides Approve / Reject from a reviewer the
