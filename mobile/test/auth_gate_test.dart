@@ -51,8 +51,13 @@ Map<String, dynamic> _dashboardBody() => {
 
 /// Answers every request the clerk-role home tabs make (dashboard, invoices,
 /// contracts) plus the auth profile load.
-MockClient _homeClient({bool Function()? legalRequired}) =>
-    MockClient((req) async {
+///
+/// A handler, not a client: a test that wraps it answers some paths itself and
+/// delegates the rest by calling this directly. Re-sending the request through
+/// a second `MockClient` instead fails with "Can't finalize a finalized
+/// Request" — the outer client already finalized it.
+MockClientHandler _homeHandler({bool Function()? legalRequired}) =>
+    (req) async {
       final path = req.url.path;
       Map<String, dynamic> me({required bool required}) => {
             'id': 'u1',
@@ -76,7 +81,10 @@ MockClient _homeClient({bool Function()? legalRequired}) =>
         return _json({'items': <Map<String, dynamic>>[]});
       }
       return _json({});
-    });
+    };
+
+MockClient _homeClient({bool Function()? legalRequired}) =>
+    MockClient(_homeHandler(legalRequired: legalRequired));
 
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
@@ -382,13 +390,13 @@ void main() {
         'tenant_slug': 'acme',
       });
       var required = false;
-      final home = _homeClient(legalRequired: () => required);
+      final home = _homeHandler(legalRequired: () => required);
       ApiClient().debugConfigure(
         client: MockClient((req) async {
           if (required && req.url.path == '/api/dashboard') {
             return legalRefusal();
           }
-          return home.send(req).then(http.Response.fromStream);
+          return home(req);
         }),
       );
 
@@ -421,7 +429,7 @@ void main() {
       var required = true;
       var refusedRegistrations = 0;
       var acceptedRegistrations = 0;
-      final home = _homeClient(legalRequired: () => required);
+      final home = _homeHandler(legalRequired: () => required);
       ApiClient().debugConfigure(
         client: MockClient((req) async {
           if (req.url.path == '/api/notifications/device-token') {
@@ -432,7 +440,7 @@ void main() {
             acceptedRegistrations++;
             return _json({});
           }
-          return home.send(req).then(http.Response.fromStream);
+          return home(req);
         }),
       );
 

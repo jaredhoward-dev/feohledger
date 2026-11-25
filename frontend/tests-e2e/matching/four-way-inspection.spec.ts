@@ -6,7 +6,10 @@ import {
 	createPo,
 	exceptionsFor,
 	issueText,
-	recompute
+	readMatching,
+	recompute,
+	setMatching,
+	type MatchingBlock
 } from './setup';
 
 /**
@@ -182,49 +185,30 @@ test.describe('4-way Quality Inspection gate', () => {
 
 test.describe('require_inspection rule (4-way gate when no inspection exists)', () => {
 	const created: { invoiceIds: string[]; poIds: string[] } = { invoiceIds: [], poIds: [] };
-	let originalSettings: Record<string, unknown> | null = null;
+	let originalMatching: MatchingBlock = {};
 
 	test.beforeAll(async ({ browser, tenantSlug }) => {
-		// Capture the org settings so afterAll can restore them — the matching
-		// config is org-wide and must not leak into sibling specs.
+		// Capture the org's matching rules so afterAll can restore them — the
+		// matching config is org-wide and must not leak into sibling specs.
 		const ctx = await browser.newContext({ baseURL: tenantBase(tenantSlug) });
 		const page = await ctx.newPage();
 		const { signInAndWait } = await import('../fixtures/helpers');
 		await signInAndWait(page);
-		const headers = tenantHeaders(await authToken(page));
-		const resp = await page.request.get(`${API_BASE}/api/organization`, { headers });
-		originalSettings = ((await resp.json()) as { settings: Record<string, unknown> }).settings ?? {};
+		originalMatching = await readMatching(page);
 		await ctx.close();
 	});
 
 	test.afterAll(async ({ browser, tenantSlug }) => {
 		cleanup(created);
-		// Restore the org's matching settings to whatever they were.
+		// Restore the org's matching rules to whatever they were, through the
+		// same audited writer the tests use.
 		const ctx = await browser.newContext({ baseURL: tenantBase(tenantSlug) });
 		const page = await ctx.newPage();
 		const { signInAndWait } = await import('../fixtures/helpers');
 		await signInAndWait(page);
-		const headers = { ...tenantHeaders(await authToken(page)), 'Content-Type': 'application/json' };
-		const restore = { ...(originalSettings ?? {}) };
-		delete (restore as Record<string, unknown>).matching;
-		await page.request.patch(`${API_BASE}/api/organization`, {
-			headers,
-			data: { settings: { matching: null } }
-		});
+		await setMatching(page, originalMatching);
 		await ctx.close();
 	});
-
-	async function setMatching(
-		page: import('@playwright/test').Page,
-		matching: Record<string, unknown> | null
-	) {
-		const headers = { ...tenantHeaders(await authToken(page)), 'Content-Type': 'application/json' };
-		const resp = await page.request.patch(`${API_BASE}/api/organization`, {
-			headers,
-			data: { settings: { matching } }
-		});
-		expect(resp.ok()).toBe(true);
-	}
 
 	test('org-wide require_inspection on + no inspection → inspection_required + quality_hold warning', async ({
 		page

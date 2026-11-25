@@ -625,17 +625,24 @@
 		color: var(--text);
 	}
 
+	/* WCAG 1.4.10 (reflow at 320px): a <fieldset>'s default `min-inline-size`
+	   is its min-content width, so one wide control inside it widens the
+	   fieldset past the card and scrolls the whole document sideways. Both
+	   fieldsets here — `.group` is one, and the rule form's inner one — give
+	   that up, and the controls below shrink to the column instead. */
 	.group {
 		border: 1px solid var(--border);
 		border-radius: 6px;
 		padding: 12px 14px;
 		margin: 0 0 16px;
+		min-width: 0;
 	}
 
 	.group fieldset {
 		border: 0;
 		padding: 0;
 		margin: 0;
+		min-width: 0;
 	}
 
 	legend {
@@ -657,12 +664,20 @@
 		gap: 4px;
 		font-size: 0.85rem;
 		color: var(--text);
+		/* A flex item's default min-width is its content's; this lets a label
+		   in `.row` shrink to the column rather than hold it open. */
+		min-width: 0;
+		max-width: 100%;
 	}
 
+	/* 12rem where there is room, never wider than the column: a <select> is
+	   as wide as its longest option (a long GL account name), which a bare
+	   `min-width: 12rem` neither caps nor stops from overflowing at 320px. */
 	input[type='text'],
 	select {
 		min-height: 32px;
-		min-width: 12rem;
+		min-width: min(12rem, 100%);
+		max-width: 100%;
 		padding: 4px 8px;
 		border: 1px solid var(--border);
 		border-radius: 4px;
@@ -673,6 +688,7 @@
 
 	.scope-choice {
 		display: flex;
+		flex-wrap: wrap;
 		gap: 16px;
 		margin: 8px 0;
 	}
@@ -741,6 +757,7 @@
 
 	.form-actions {
 		display: flex;
+		flex-wrap: wrap;
 		gap: 8px;
 		margin-top: 8px;
 	}

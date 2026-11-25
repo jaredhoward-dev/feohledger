@@ -83,6 +83,7 @@ const PANELS = [
 	['data-sync', 'Data Sync'],
 	['payments', 'Payments (ACH / Wire / RTP)'],
 	['cards', 'Virtual Cards'],
+	['match-rules', 'PO match rules'],
 	['security', 'Security'],
 	['sso', 'Single Sign-On'],
 	['scim', 'SCIM provisioning'],
