@@ -57,6 +57,7 @@
 	import MatchRulesPanel from '#lib/components/organization/MatchRulesPanel.svelte';
 	import AgentAutonomyPanel from '#lib/components/organization/AgentAutonomyPanel.svelte';
 	import CompanyProfilePanel from '#lib/components/organization/CompanyProfilePanel.svelte';
+	import FraudRulesPanel from '#lib/components/organization/FraudRulesPanel.svelte';
 	import ExtractionPanel from '#lib/components/organization/ExtractionPanel.svelte';
 	import BrandingPanel from '#lib/components/organization/BrandingPanel.svelte';
 	import CardsPanel from '#lib/components/organization/CardsPanel.svelte';
@@ -72,6 +73,7 @@
 		type CardsFields,
 		type CompanyFields,
 		type ExtractionFields,
+		type FraudRules,
 		type InvoiceDefaultsFields
 	} from '#lib/components/organization/panelState.ts';
 	import { withoutOwnedFraudKeys } from '#lib/types/orgControls.ts';
@@ -106,24 +108,6 @@
 		number_prefix: string;
 		default_gl_account: string;
 		default_cost_center: string;
-	}
-
-	interface FraudRules {
-		round_amount_enabled: boolean;
-		future_date_enabled: boolean;
-		bank_change_enabled: boolean;
-		stat_anomaly_enabled: boolean;
-		rush_payment_enabled: boolean;
-		new_vendor_large_enabled: boolean;
-		personal_email_enabled: boolean;
-		llm_anomaly_enabled: boolean;
-		round_amount_min: string;
-		rush_payment_max_days: number;
-		new_vendor_max_age_days: number;
-		new_vendor_large_amount: string;
-		stat_anomaly_sigma: number;
-		stat_anomaly_min_history: number;
-		personal_email_domains: string[];
 	}
 
 	interface OrgSettings {
@@ -2823,196 +2807,14 @@
 				{/if}
 
 				{#if section === 'fraud'}
-					{#if readOnly || fraud}
-						<section class="card">
-							<h2>{m('org.section.fraud')}</h2>
-							<p class="card-hint">
-								{m('org.fraud.hint')}
-								<HelpTip term="exception" />
-							</p>
-							{#if readOnly}
-								<p class="card-hint" data-testid="fraud-admin-only">
-									{m('org.readOnly.sectionAdminOnly')}
-								</p>
-							{:else if fraud}
-								<div class="fraud-grid">
-									<label class="switch-row">
-										<input type="checkbox" bind:checked={fraud.round_amount_enabled} />
-										<span>
-											<strong>{m('org.fraud.roundAmount')}</strong>
-											<span class="rule-hint">
-												{m('org.fraud.roundAmountHint', { min: fraud.round_amount_min })}
-											</span>
-										</span>
-									</label>
-									<div class="threshold-row">
-										<label>
-											<span>{m('org.fraud.minAmount')}</span>
-											<input
-												type="number"
-												min="0"
-												step="100"
-												bind:value={fraud.round_amount_min}
-												disabled={!fraud.round_amount_enabled}
-											/>
-										</label>
-									</div>
-
-									<label class="switch-row">
-										<input type="checkbox" bind:checked={fraud.future_date_enabled} />
-										<span>
-											<strong>{m('org.fraud.futureDate')}</strong>
-											<span class="rule-hint">
-												{m('org.fraud.futureDateHint')}
-											</span>
-										</span>
-									</label>
-
-									<label class="switch-row">
-										<input type="checkbox" bind:checked={fraud.rush_payment_enabled} />
-										<span>
-											<strong>{m('org.fraud.rushPayment')}</strong>
-											<span class="rule-hint">
-												{m('org.fraud.rushPaymentHint')}
-											</span>
-										</span>
-									</label>
-									<div class="threshold-row">
-										<label>
-											<span>{m('org.fraud.maxDays')}</span>
-											<input
-												type="number"
-												min="0"
-												max="30"
-												bind:value={fraud.rush_payment_max_days}
-												disabled={!fraud.rush_payment_enabled}
-											/>
-										</label>
-									</div>
-
-									<label class="switch-row">
-										<input type="checkbox" bind:checked={fraud.new_vendor_large_enabled} />
-										<span>
-											<strong>{m('org.fraud.newVendorLarge')}</strong>
-											<span class="rule-hint">
-												{m('org.fraud.newVendorLargeHint', { amount: fraud.new_vendor_large_amount, days: fraud.new_vendor_max_age_days })}
-											</span>
-										</span>
-									</label>
-									<div class="threshold-row">
-										<label>
-											<span>{m('org.fraud.vendorAge')}</span>
-											<input
-												type="number"
-												min="1"
-												bind:value={fraud.new_vendor_max_age_days}
-												disabled={!fraud.new_vendor_large_enabled}
-											/>
-										</label>
-										<label>
-											<span>{m('org.fraud.largeThreshold')}</span>
-											<input
-												type="number"
-												min="0"
-												step="500"
-												bind:value={fraud.new_vendor_large_amount}
-												disabled={!fraud.new_vendor_large_enabled}
-											/>
-										</label>
-									</div>
-
-									<label class="switch-row">
-										<input type="checkbox" bind:checked={fraud.bank_change_enabled} />
-										<span>
-											<strong>{m('org.fraud.bankChange')}</strong>
-											<span class="rule-hint">
-												{m('org.fraud.bankChangeHint')}
-											</span>
-										</span>
-									</label>
-
-									<label class="switch-row">
-										<input type="checkbox" bind:checked={fraud.personal_email_enabled} />
-										<span>
-											<strong>{m('org.fraud.personalEmail')}</strong>
-											<span class="rule-hint">
-												{m('org.fraud.personalEmailHint')}
-											</span>
-										</span>
-									</label>
-									<div class="threshold-row">
-										<label class="full">
-											<span>{m('org.fraud.personalEmailDomains')}</span>
-											<textarea
-												rows="4"
-												bind:value={personalEmailDomainsText}
-												disabled={!fraud.personal_email_enabled}
-											></textarea>
-										</label>
-									</div>
-
-									<label class="switch-row">
-										<input type="checkbox" bind:checked={fraud.stat_anomaly_enabled} />
-										<span>
-											<strong>{m('org.fraud.statAnomaly')}</strong>
-											<span class="rule-hint">
-												{m('org.fraud.statAnomalyHint')}
-											</span>
-										</span>
-									</label>
-									<div class="threshold-row">
-										<label>
-											<span>{m('org.fraud.sigma')}</span>
-											<input
-												type="number"
-												min="0.5"
-												step="0.1"
-												bind:value={fraud.stat_anomaly_sigma}
-												disabled={!fraud.stat_anomaly_enabled}
-											/>
-										</label>
-										<label>
-											<span>{m('org.fraud.minPriorInvoices')}</span>
-											<input
-												type="number"
-												min="2"
-												bind:value={fraud.stat_anomaly_min_history}
-												disabled={!fraud.stat_anomaly_enabled}
-											/>
-										</label>
-									</div>
-
-									<label class="switch-row">
-										<input type="checkbox" bind:checked={fraud.llm_anomaly_enabled} />
-										<span>
-											<strong>{m('org.fraud.llmAnomaly')}</strong>
-											<span class="rule-hint">
-												{m('org.fraud.llmAnomalyHint')}
-											</span>
-										</span>
-									</label>
-								</div>
-
-								<div class="section-footer">
-									<button
-										type="button"
-										class="btn-link"
-										onclick={resetFraudToDefaults}
-										disabled={savingFraud}
-									>
-										{m('org.fraud.resetDefaults')}
-									</button>
-									<button
-										class="btn-save-section"
-										disabled={savingFraud}
-										onclick={saveFraud}
-									>
-										{savingFraud ? m('org.common.saving') : m('org.fraud.save')}
-									</button>
-								</div>
-							{/if}
-						</section>
-					{/if}
+					<FraudRulesPanel
+						bind:rules={fraud}
+						bind:personalEmailDomainsText
+						{readOnly}
+						saving={savingFraud}
+						onsave={saveFraud}
+						onreset={resetFraudToDefaults}
+					/>
 				{/if}
 
 				{#if section === 'data-sync'}
@@ -3590,106 +3392,8 @@
 		flex-shrink: 0;
 	}
 
-	/* --- Fraud detection panel --- */
-
-	.fraud-grid {
-		display: flex;
-		flex-direction: column;
-		gap: 14px;
-	}
-
-	.fraud-grid label.switch-row {
-		align-items: flex-start;
-	}
-
-	.fraud-grid .rule-hint {
-		display: block;
-		margin-top: 2px;
-		font-size: 0.8rem;
-		color: var(--text-muted);
-		font-weight: 400;
-	}
-
-	.threshold-row {
-		display: grid;
-		grid-template-columns: repeat(2, minmax(180px, 1fr));
-		gap: 12px;
-		margin-left: 26px; /* align under the switch label */
-		margin-bottom: 4px;
-	}
-
-	.threshold-row label {
-		display: flex;
-		flex-direction: column;
-		gap: 4px;
-	}
-
-	.threshold-row label.full {
-		grid-column: 1 / -1;
-	}
-
-	.threshold-row label span {
-		font-size: 0.72rem;
-		font-weight: 500;
-		color: var(--text-muted);
-		text-transform: uppercase;
-		letter-spacing: 0.04em;
-	}
-
-	/* Text-entry recipe. No checkbox sits under this selector today, but it
-	   outranks the global control base in `app.css`, so the carve-out keeps a
-	   later one from losing its tick (`background:` resets the drawn mark). */
-	.threshold-row input:not([type='checkbox']):not([type='radio']),
-	.threshold-row textarea {
-		background: var(--bg);
-		border: 1px solid var(--border);
-		border-radius: 4px;
-		padding: 8px 10px;
-		font-size: 0.88rem;
-		color: var(--text);
-		font-family: inherit;
-	}
-
-	.threshold-row textarea {
-		resize: vertical;
-		font-family: 'SF Mono', 'Cascadia Code', monospace;
-		font-size: 0.82rem;
-	}
-
-	.threshold-row input:not([type='checkbox']):not([type='radio']):focus,
-	.threshold-row textarea:focus {
-		outline: none;
-		border-color: var(--accent);
-		box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 15%, transparent);
-	}
-
-	.threshold-row input:disabled,
-	.threshold-row textarea:disabled {
-		opacity: 0.5;
-		cursor: not-allowed;
-	}
-
-	.btn-link {
-		background: none;
-		border: none;
-		color: var(--text-muted);
-		font-size: 0.85rem;
-		cursor: pointer;
-		font-family: inherit;
-		padding: 0;
-		margin-right: auto;
-	}
-
-	.btn-link:hover:not(:disabled) {
-		color: var(--accent);
-	}
-
 	@media (max-width: 600px) {
 		.form-grid {
-			grid-template-columns: 1fr;
-		}
-
-		.threshold-row {
 			grid-template-columns: 1fr;
 		}
 

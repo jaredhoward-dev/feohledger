@@ -133,3 +133,22 @@ export const extractionProviderLabel = (provider: string): string =>
 	provider === 'ollama'
 		? m('org.extraction.providerOllama')
 		: (EXTRACTION_PROVIDERS.find((p) => p.value === provider)?.name ?? provider);
+
+/** Organization → Fraud detection: the composed rule set (`settings.fraud_rules` over the defaults). */
+export interface FraudRules {
+	round_amount_enabled: boolean;
+	future_date_enabled: boolean;
+	bank_change_enabled: boolean;
+	stat_anomaly_enabled: boolean;
+	rush_payment_enabled: boolean;
+	new_vendor_large_enabled: boolean;
+	personal_email_enabled: boolean;
+	llm_anomaly_enabled: boolean;
+	round_amount_min: string;
+	rush_payment_max_days: number;
+	new_vendor_max_age_days: number;
+	new_vendor_large_amount: string;
+	stat_anomaly_sigma: number;
+	stat_anomaly_min_history: number;
+	personal_email_domains: string[];
+}
