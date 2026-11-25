@@ -1463,6 +1463,15 @@ class XeroAdapter(OAuthErpAdapter):
         except httpx.HTTPError:
             return ErpPostResult(success=False, message=f"{PROVIDER} post failed: network_error")
 
+    async def find_discount_credit(self, payload: DiscountCreditPayload) -> str | None:
+        """Our live credit note for the payment, found by its number."""
+        headers = await self._headers()
+        async with self.oauth_client(timeout=30) as client:
+            for credit in await self._our_credit_notes(client, headers, payload.payment_id):
+                if str(credit.get("Status") or "").upper() not in _GONE_STATUSES:
+                    return str(credit.get("CreditNoteID"))
+        return None
+
     async def void_discount_credit(self, payload: DiscountCreditPayload) -> ErpPostResult:
         """Remove our credit note's allocations, then void it. Found by its
         number, as :meth:`post_discount_credit` finds it; none live is a

@@ -647,6 +647,19 @@ published schemas were read instead):
   `CreditNoteNumber` on an ACCPAYCREDIT, filtering `where` on it, and refusing
   to void an allocated credit note.
 
+**A credit that may stand unapplied is recorded, not re-booked** (decisions
+§577). A credit failure that may have written leaves
+`state_data.erp_discount_credits_pending[<payment id>]` (the credit's ERP id
+when known, and the payload's ids and amount); the balance-open flag's
+`erp_report` then carries `discount_credit_pending: true` and
+`discount_credit_document_id`, meaning a retry will apply it and nobody should
+book another. The status-sync sweep (`resume_pending_credits`, after
+`resume_pending_voids`) re-posts with `credit_id`, and QuickBooks applies that
+credit by id rather than relying on `requestid` replay. A void records our
+credit's id in `state_data.erp_discount_credit_voids_pending` before deleting
+anything, so a retry after the application was deleted still deletes the
+credit; the void-failed flag names it as `discount_credit_document_id`.
+
 The code is exercised against `tools/fake-erp` and the adapter doubles only,
 not yet a real company; a read-back that is not what we wrote fails closed
 (`vendor_credit_unconfirmed` / `credit_note_unconfirmed`).
