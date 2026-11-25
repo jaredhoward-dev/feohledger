@@ -11,6 +11,7 @@
 	import PageHeader from '#lib/components/ui/PageHeader.svelte';
 	import SettingsRail from '#lib/components/ui/SettingsRail.svelte';
 	import ThemePicker from '#lib/components/ui/ThemePicker.svelte';
+	import DelegationPanel from '#lib/components/profile/DelegationPanel.svelte';
 	import { SUPPORTED_LOCALES, LOCALE_LABELS, type Locale } from '#lib/i18n/locale.ts';
 	import { currentLocale, setLocale, m } from '#lib/i18n/store.svelte.ts';
 	import LoadingState from '#lib/components/ui/LoadingState.svelte';
@@ -34,10 +35,10 @@
 	}
 
 	// ── Section navigation ────────────────────────────────────────────────
-	// Eight panels, all genuinely one subject ("my account"), so the rail is
+	// Nine panels, all genuinely one subject ("my account"), so the rail is
 	// FLAT — no group headings, which is what `ui/SettingsRail.svelte` renders
 	// when a group carries no label. `/organization` groups its fifteen because
-	// they are fifteen unrelated concerns; eight coherent ones do not need it.
+	// they are fifteen unrelated concerns; nine coherent ones do not need it.
 	//
 	// The reason to give this page a rail at all is not the section count but
 	// the three reads below: preferences, passkeys and signed-in devices each
@@ -56,6 +57,7 @@
 		{ slug: 'mfa', labelKey: 'profile.mfa.heading' },
 		{ slug: 'passkeys', labelKey: 'profile.passkeys.heading' },
 		{ slug: 'sessions', labelKey: 'profile.sessions.heading' },
+		{ slug: 'delegation', labelKey: 'profile.delegation.heading' },
 		{ slug: 'notifications', labelKey: 'profile.notifications.heading' },
 		{ slug: 'language', labelKey: 'profile.language.heading' },
 		{ slug: 'appearance', labelKey: 'profile.appearance.heading' }
@@ -1091,6 +1093,10 @@
 						<div class="status disabled">{m('profile.sessions.none')}</div>
 					{/if}
 				</section>
+			{/if}
+
+			{#if section === 'delegation'}
+				<DelegationPanel />
 			{/if}
 
 			{#if section === 'notifications'}

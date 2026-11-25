@@ -1,7 +1,7 @@
 /**
  * Localizing the backend's coded auth refusals — a refused factor-change
- * step-up (employee or supplier portal), and a passkey ceremony with no usable
- * credential.
+ * step-up (employee or supplier portal), a passkey ceremony with no usable
+ * credential, and a refused out-of-office delegation.
  *
  * The backend sends `detail = {code, message, params}` for these
  * (`backend/app/api/refusals.py::coded_refusal`), and `api.ts` /
@@ -41,7 +41,14 @@ const KEYS: Record<string, MessageKey> = {
 	sensitive_step_up_required: 'authRefusal.sensitiveStepUpRequired',
 	sensitive_step_up_failed: 'authRefusal.sensitiveStepUpFailed',
 	sensitive_step_up_no_factor: 'authRefusal.sensitiveStepUpNoFactor',
-	sensitive_step_up_unavailable: 'authRefusal.sensitiveStepUpUnavailable'
+	sensitive_step_up_unavailable: 'authRefusal.sensitiveStepUpUnavailable',
+	// Out-of-office delegation (`POST /api/auth/delegation`, decisions §511).
+	delegation_invalid_id: 'authRefusal.delegationInvalidId',
+	delegation_self: 'authRefusal.delegationSelf',
+	delegation_until_invalid: 'authRefusal.delegationUntilInvalid',
+	delegation_until_past: 'authRefusal.delegationUntilPast',
+	delegation_delegate_not_found: 'authRefusal.delegationDelegateNotFound',
+	delegation_delegate_cannot_approve: 'authRefusal.delegationDelegateCannotApprove'
 };
 
 /** The codes this build can state in the reader's language. */

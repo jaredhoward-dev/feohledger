@@ -348,6 +348,36 @@ export const messages = {
 	'privacyDsar.unmaskedNotice':
 		'Les coordonnées bancaires de cet export ne sont pas masquées. Traitez-le en conséquence.',
 
+	// Profile → Out of office (delegation) card; the authRefusal.delegation* keys are the
+	// POST /api/auth/delegation coded refusals (api/authRefusals.ts).
+	'profile.delegation.heading': "Absence",
+	'profile.delegation.hint': "Pendant votre absence, les factures qui vous sont attribuées pour approbation sont envoyées à un collègue. La délégation commence dès l'enregistrement et se termine après le dernier jour choisi.",
+	'profile.delegation.limits': "Votre délégué approuve en son propre nom : dans la limite de ses propres plafonds d'approbation, et jamais une facture qu'il a téléversée, dont il a réceptionné les marchandises ou qu'il a contrôlée. Vous pouvez toujours approuver ces factures vous aussi.",
+	'profile.delegation.statusOn': "Activée : les factures à approuver vont à {name} jusqu'au {date} inclus.",
+	'profile.delegation.statusOff': "Désactivée : les factures à approuver vous sont attribuées.",
+	'profile.delegation.statusEnded': "Désactivée : votre délégation à {name} a pris fin le {date}.",
+	'profile.delegation.delegate': "Délégué",
+	'profile.delegation.choose': "Choisir un collègue",
+	'profile.delegation.lastDay': "Dernier jour d'absence",
+	'profile.delegation.lastDayHint': "Se termine au début du jour suivant, dans votre fuseau horaire.",
+	'profile.delegation.noCandidates': "Aucun collègue habilité à approuver des factures n'est disponible pour la délégation.",
+	'profile.delegation.turnOn': "Activer",
+	'profile.delegation.update': "Mettre à jour",
+	'profile.delegation.end': "Terminer maintenant",
+	'profile.delegation.saved': "L'absence est activée.",
+	'profile.delegation.cleared': "L'absence est désactivée.",
+	'profile.delegation.loadFailed': "Impossible de charger votre paramètre d'absence.",
+	'profile.delegation.saveFailed': "Impossible d'enregistrer votre paramètre d'absence.",
+	'profile.delegation.endFailed': "Impossible de désactiver l'absence.",
+	'profile.delegation.delegateRequired': "Choisissez un délégué.",
+	'profile.delegation.lastDayRequired': "Choisissez votre dernier jour d'absence, aujourd'hui ou plus tard.",
+	'authRefusal.delegationInvalidId': "Ce délégué est introuvable. Choisissez un collègue dans la liste.",
+	'authRefusal.delegationSelf': "Vous ne pouvez pas vous déléguer vos propres approbations.",
+	'authRefusal.delegationUntilInvalid': "Choisissez un dernier jour d'absence valide.",
+	'authRefusal.delegationUntilPast': "Votre dernier jour d'absence est déjà passé. Choisissez aujourd'hui ou un jour ultérieur.",
+	'authRefusal.delegationDelegateNotFound': "Ce collègue n'est plus un utilisateur actif de votre organisation. Choisissez quelqu'un d'autre.",
+	'authRefusal.delegationDelegateCannotApprove': "Ce collègue ne peut pas approuver de factures : les approbations qui lui seraient envoyées ne pourraient jamais être traitées. Choisissez quelqu'un d'habilité.",
+
 	'profile.sessions.heading': 'Appareils connectés',
 	'profile.sessions.hint':
 		'Tous les navigateurs et applications actuellement connectés à votre compte. Si vous n’en reconnaissez pas un — ou si vous vous êtes connecté sur un appareil que vous n’avez plus — déconnectez-le ici. Il cesse de fonctionner immédiatement.',

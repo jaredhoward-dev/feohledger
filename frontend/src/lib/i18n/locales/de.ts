@@ -345,6 +345,36 @@ export const messages = {
 	'privacyDsar.unmaskedNotice':
 		'Die Bankdaten in diesem Export sind unmaskiert. Behandeln Sie ihn entsprechend.',
 
+	// Profile → Out of office (delegation) card; the authRefusal.delegation* keys are the
+	// POST /api/auth/delegation coded refusals (api/authRefusals.ts).
+	'profile.delegation.heading': "Abwesenheit",
+	'profile.delegation.hint': "Während Sie abwesend sind, gehen Rechnungen, die Ihnen zur Freigabe zugewiesen werden, stattdessen an eine Kollegin oder einen Kollegen. Die Vertretung beginnt mit dem Speichern und endet nach dem gewählten letzten Abwesenheitstag.",
+	'profile.delegation.limits': "Ihre Vertretung gibt in eigenem Namen frei: im Rahmen ihrer eigenen Freigabegrenzen und nie eine Rechnung, die sie selbst hochgeladen, deren Ware sie angenommen oder die sie geprüft hat. Sie selbst können diese Rechnungen weiterhin freigeben.",
+	'profile.delegation.statusOn': "Aktiv: Rechnungen zu Ihrer Freigabe gehen bis einschließlich {date} an {name}.",
+	'profile.delegation.statusOff': "Aus: Rechnungen zu Ihrer Freigabe kommen zu Ihnen.",
+	'profile.delegation.statusEnded': "Aus: Ihre Vertretung durch {name} endete am {date}.",
+	'profile.delegation.delegate': "Vertretung",
+	'profile.delegation.choose': "Kollegin oder Kollegen wählen",
+	'profile.delegation.lastDay': "Letzter Abwesenheitstag",
+	'profile.delegation.lastDayHint': "Endet zu Beginn des Folgetags, in Ihrer Zeitzone.",
+	'profile.delegation.noCandidates': "Es gibt keine Kollegin und keinen Kollegen, die Rechnungen freigeben und Sie vertreten können.",
+	'profile.delegation.turnOn': "Aktivieren",
+	'profile.delegation.update': "Aktualisieren",
+	'profile.delegation.end': "Jetzt beenden",
+	'profile.delegation.saved': "Abwesenheit ist aktiv.",
+	'profile.delegation.cleared': "Abwesenheit ist aus.",
+	'profile.delegation.loadFailed': "Ihre Abwesenheitseinstellung konnte nicht geladen werden.",
+	'profile.delegation.saveFailed': "Ihre Abwesenheitseinstellung konnte nicht gespeichert werden.",
+	'profile.delegation.endFailed': "Die Abwesenheit konnte nicht beendet werden.",
+	'profile.delegation.delegateRequired': "Wählen Sie eine Vertretung.",
+	'profile.delegation.lastDayRequired': "Wählen Sie Ihren letzten Abwesenheitstag, heute oder später.",
+	'authRefusal.delegationInvalidId': "Diese Vertretung wurde nicht gefunden. Wählen Sie eine Person aus der Liste.",
+	'authRefusal.delegationSelf': "Sie können Ihre Freigaben nicht an sich selbst übertragen.",
+	'authRefusal.delegationUntilInvalid': "Wählen Sie einen gültigen letzten Abwesenheitstag.",
+	'authRefusal.delegationUntilPast': "Ihr letzter Abwesenheitstag liegt bereits in der Vergangenheit. Wählen Sie heute oder einen späteren Tag.",
+	'authRefusal.delegationDelegateNotFound': "Diese Person ist kein aktiver Benutzer Ihrer Organisation mehr. Wählen Sie jemand anderen.",
+	'authRefusal.delegationDelegateCannotApprove': "Diese Person darf keine Rechnungen freigeben, daher könnten an sie gesendete Freigaben nie bearbeitet werden. Wählen Sie jemanden, der freigeben darf.",
+
 	'profile.sessions.heading': 'Angemeldete Geräte',
 	'profile.sessions.hint':
 		'Alle Browser und Apps, die derzeit bei Ihrem Konto angemeldet sind. Wenn Sie eines nicht erkennen — oder sich auf einem Gerät angemeldet haben, das Sie nicht mehr besitzen — melden Sie es hier ab. Es verliert sofort seine Gültigkeit.',

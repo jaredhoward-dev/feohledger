@@ -342,6 +342,36 @@ export const messages = {
 	'privacyDsar.unmaskedNotice':
 		'このエクスポートの口座情報はマスクされていません。取り扱いに注意してください。',
 
+	// Profile → Out of office (delegation) card; the authRefusal.delegation* keys are the
+	// POST /api/auth/delegation coded refusals (api/authRefusals.ts).
+	'profile.delegation.heading': "不在設定",
+	'profile.delegation.hint': "不在の間、承認のために割り当てられた請求書は同僚に送られます。保存するとすぐに開始し、選択した最終日の後に終了します。",
+	'profile.delegation.limits': "代理人は本人として承認します。代理人自身の承認上限の範囲内で行い、自分がアップロードした請求書、自分が商品を受領した請求書、自分が検品した請求書は承認できません。あなたもこれらの請求書を引き続き承認できます。",
+	'profile.delegation.statusOn': "オン：承認待ちの請求書は {date} まで {name} に送られます。",
+	'profile.delegation.statusOff': "オフ：承認待ちの請求書はあなたに届きます。",
+	'profile.delegation.statusEnded': "オフ：{name} への代理設定は {date} に終了しました。",
+	'profile.delegation.delegate': "代理人",
+	'profile.delegation.choose': "同僚を選択",
+	'profile.delegation.lastDay': "不在の最終日",
+	'profile.delegation.lastDayHint': "お使いのタイムゾーンで翌日の開始時に終了します。",
+	'profile.delegation.noCandidates': "請求書を承認できる同僚がいないため、代理人を設定できません。",
+	'profile.delegation.turnOn': "オンにする",
+	'profile.delegation.update': "更新",
+	'profile.delegation.end': "今すぐ終了",
+	'profile.delegation.saved': "不在設定をオンにしました。",
+	'profile.delegation.cleared': "不在設定をオフにしました。",
+	'profile.delegation.loadFailed': "不在設定を読み込めませんでした。",
+	'profile.delegation.saveFailed': "不在設定を保存できませんでした。",
+	'profile.delegation.endFailed': "不在設定をオフにできませんでした。",
+	'profile.delegation.delegateRequired': "代理人を選択してください。",
+	'profile.delegation.lastDayRequired': "不在の最終日を今日以降で選択してください。",
+	'authRefusal.delegationInvalidId': "その代理人が見つかりません。一覧から同僚を選択してください。",
+	'authRefusal.delegationSelf': "自分自身に承認を委任することはできません。",
+	'authRefusal.delegationUntilInvalid': "有効な不在の最終日を選択してください。",
+	'authRefusal.delegationUntilPast': "不在の最終日はすでに過ぎています。今日以降の日を選択してください。",
+	'authRefusal.delegationDelegateNotFound': "その同僚は組織の有効なユーザーではなくなりました。別の人を選択してください。",
+	'authRefusal.delegationDelegateCannotApprove': "その同僚は請求書を承認できないため、送られた承認を処理できません。承認できる人を選択してください。",
+
 	'profile.sessions.heading': 'サインイン中の端末',
 	'profile.sessions.hint':
 		'現在このアカウントにサインインしているブラウザーとアプリの一覧です。見覚えのないものがある場合、または手元にない端末でサインインした場合は、ここからサインアウトしてください。ただちに無効になります。',
