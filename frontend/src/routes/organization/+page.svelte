@@ -5,8 +5,6 @@
 	import { toast } from '#lib/components/ui/Toast.svelte';
 	import PageHeader from '#lib/components/ui/PageHeader.svelte';
 	import SecretReveal from '#lib/components/ui/SecretReveal.svelte';
-	import SecretField from '#lib/components/ui/SecretField.svelte';
-	import CredentialResetPrompt from '#lib/components/organization/CredentialResetPrompt.svelte';
 	import { CREDENTIAL_BLOCK_UNOPENABLE } from '#lib/api/codedRefusals.ts';
 	import {
 		getProviderCredentials,
@@ -37,14 +35,9 @@
 		type ChatNotificationStatus
 	} from '#lib/types/chatNotifications.ts';
 	import { getSsoSettings, updateSsoSettings } from '#lib/api/ssoSettings.ts';
-	import { ssoFieldLabels, ssoRefusalText } from '#lib/api/ssoRefusal.ts';
-	import {
-		SSO_PROVIDER_LABELS,
-		type SsoProtocol,
-		type SsoSettingsStatus
-	} from '#lib/types/ssoSettings.ts';
+	import { ssoRefusalText } from '#lib/api/ssoRefusal.ts';
+	import type { SsoSettingsStatus } from '#lib/types/ssoSettings.ts';
 	import { formatList } from '#lib/utils/list.ts';
-	import PlanUpgradeNotice from '#lib/components/ui/PlanUpgradeNotice.svelte';
 	import LoadError from '#lib/components/ui/LoadError.svelte';
 	import { errorMessage } from '#lib/utils/apiError.ts';
 	import { setupStepDone, setupStepHref, type SetupStepId } from '#lib/utils/onboarding.ts';
@@ -57,6 +50,7 @@
 	import MatchRulesPanel from '#lib/components/organization/MatchRulesPanel.svelte';
 	import AgentAutonomyPanel from '#lib/components/organization/AgentAutonomyPanel.svelte';
 	import CompanyProfilePanel from '#lib/components/organization/CompanyProfilePanel.svelte';
+	import SsoPanel from '#lib/components/organization/SsoPanel.svelte';
 	import PaymentsPanel from '#lib/components/organization/PaymentsPanel.svelte';
 	import FraudRulesPanel from '#lib/components/organization/FraudRulesPanel.svelte';
 	import ExtractionPanel from '#lib/components/organization/ExtractionPanel.svelte';
@@ -76,6 +70,7 @@
 		type ExtractionFields,
 		type NachaFields,
 		type PaymentsFields,
+		type SsoFields,
 		type FraudRules,
 		type InvoiceDefaultsFields
 	} from '#lib/components/organization/panelState.ts';
@@ -83,9 +78,7 @@
 	import type { StoredErpConfig } from '#lib/types/erpConnection.ts';
 	import {
 		FEATURE_ERP_INTEGRATIONS,
-		FEATURE_ERP_MERGE,
-		FEATURE_SSO,
-		FEATURE_SSO_ENFORCEMENT
+		FEATURE_ERP_MERGE
 	} from '#lib/types/planFeatures.ts';
 	import {
 		NACHA_FIELD_LABEL_KEYS,
@@ -314,8 +307,6 @@
 	// control that would be refused for the upgrade prompt. What a save would
 	// turn OFF is never gated, so a downgraded tenant can still switch SSO or
 	// "require SSO" off.
-	const ssoEntitled = $derived(auth.hasFeature(FEATURE_SSO));
-	const ssoEnforcementEntitled = $derived(auth.hasFeature(FEATURE_SSO_ENFORCEMENT));
 	const erpEntitled = $derived(auth.hasFeature(FEATURE_ERP_INTEGRATIONS));
 	const erpMergeEntitled = $derived(auth.hasFeature(FEATURE_ERP_MERGE));
 
@@ -1553,55 +1544,42 @@
 	let ssoLoadError = $state('');
 	let ssoSaveError = $state('');
 	let savingSso = $state(false);
-	let ssoEnabled = $state(false);
-	let ssoOnly = $state(false);
-	let ssoProtocol = $state<SsoProtocol>('oidc');
-	let ssoProvider = $state('oidc');
-	let ssoDomains = $state('');
-	let ssoDiscoveryUrl = $state('');
-	let ssoClientId = $state('');
-	let ssoNewClientSecret = $state('');
-	let ssoClearClientSecret = $state(false);
-	let ssoIdpEntityId = $state('');
-	let ssoIdpSsoUrl = $state('');
-	let ssoIdpCert = $state('');
-	let ssoIdpSloUrl = $state('');
-	let ssoSpEntityId = $state('');
-
-	const SSO_PROVIDERS = Object.keys(SSO_PROVIDER_LABELS);
-
-	function ssoProviderLabel(token: string): string {
-		return token === 'oidc' || token === 'saml'
-			? m('orgSso.provider.generic')
-			: (SSO_PROVIDER_LABELS[token] ?? token);
-	}
+	let ssoFields = $state<SsoFields>({
+		enabled: false,
+		only: false,
+		protocol: 'oidc',
+		provider: 'oidc',
+		domains: '',
+		discoveryUrl: '',
+		clientId: '',
+		newClientSecret: '',
+		clearClientSecret: false,
+		idpEntityId: '',
+		idpSsoUrl: '',
+		idpCert: '',
+		idpSloUrl: '',
+		spEntityId: ''
+	});
 
 	function applySso(data: SsoSettingsStatus) {
 		sso = data;
-		ssoEnabled = data.enabled;
-		ssoOnly = data.sso_only;
-		ssoProtocol = data.protocol;
-		ssoProvider = data.provider ?? data.protocol;
+		ssoFields.enabled = data.enabled;
+		ssoFields.only = data.sso_only;
+		ssoFields.protocol = data.protocol;
+		ssoFields.provider = data.provider ?? data.protocol;
 		// A list of machine identifiers re-split on save, so a literal comma
 		// separator — not `formatList` (see `utils/list.ts`).
-		ssoDomains = data.allowed_email_domains.join(', ');
-		ssoDiscoveryUrl = data.discovery_url ?? '';
-		ssoClientId = data.client_id ?? '';
-		ssoNewClientSecret = '';
-		ssoClearClientSecret = false;
-		ssoIdpEntityId = data.idp_entity_id ?? '';
-		ssoIdpSsoUrl = data.idp_sso_url ?? '';
-		ssoIdpCert = data.idp_x509_cert ?? '';
-		ssoIdpSloUrl = data.idp_slo_url ?? '';
-		ssoSpEntityId = data.sp_entity_id ?? '';
+		ssoFields.domains = data.allowed_email_domains.join(', ');
+		ssoFields.discoveryUrl = data.discovery_url ?? '';
+		ssoFields.clientId = data.client_id ?? '';
+		ssoFields.newClientSecret = '';
+		ssoFields.clearClientSecret = false;
+		ssoFields.idpEntityId = data.idp_entity_id ?? '';
+		ssoFields.idpSsoUrl = data.idp_sso_url ?? '';
+		ssoFields.idpCert = data.idp_x509_cert ?? '';
+		ssoFields.idpSloUrl = data.idp_slo_url ?? '';
+		ssoFields.spEntityId = data.sp_entity_id ?? '';
 	}
-
-	// The server's own list of what the selected protocol still lacks, named by
-	// the labels this panel shows. Recomputed from the SAVED state, so it
-	// describes what sign-in sees now, not the unsaved form.
-	const ssoMissingLabels = $derived(
-		sso && sso.idp_config_missing.length ? ssoFieldLabels(sso.idp_config_missing, m) : null
-	);
 
 	$effect(() => {
 		// Same role gate as the chat panel: the GET is admin-only, so a clerk is
@@ -1636,27 +1614,27 @@
 		savingSso = true;
 		ssoSaveError = '';
 		try {
-			const secret = ssoNewClientSecret.trim();
+			const secret = ssoFields.newClientSecret.trim();
 			applySso(
 				await updateSsoSettings({
-					enabled: ssoEnabled,
-					sso_only: ssoOnly,
-					protocol: ssoProtocol,
-					provider: nullable(ssoProvider),
-					allowed_email_domains: ssoDomains
+					enabled: ssoFields.enabled,
+					sso_only: ssoFields.only,
+					protocol: ssoFields.protocol,
+					provider: nullable(ssoFields.provider),
+					allowed_email_domains: ssoFields.domains
 						.split(/[\s,]+/)
 						.map((d) => d.trim())
 						.filter(Boolean),
-					discovery_url: nullable(ssoDiscoveryUrl),
-					client_id: nullable(ssoClientId),
+					discovery_url: nullable(ssoFields.discoveryUrl),
+					client_id: nullable(ssoFields.clientId),
 					...(secret ? { client_secret: secret } : {}),
-					...(ssoClearClientSecret && !secret ? { clear_client_secret: true } : {}),
-					idp_entity_id: nullable(ssoIdpEntityId),
-					idp_sso_url: nullable(ssoIdpSsoUrl),
-					idp_x509_cert: nullable(ssoIdpCert),
+					...(ssoFields.clearClientSecret && !secret ? { clear_client_secret: true } : {}),
+					idp_entity_id: nullable(ssoFields.idpEntityId),
+					idp_sso_url: nullable(ssoFields.idpSsoUrl),
+					idp_x509_cert: nullable(ssoFields.idpCert),
 					idp_x509_cert_multi: sso.idp_x509_cert_multi,
-					sp_entity_id: nullable(ssoSpEntityId),
-					idp_slo_url: nullable(ssoIdpSloUrl)
+					sp_entity_id: nullable(ssoFields.spEntityId),
+					idp_slo_url: nullable(ssoFields.idpSloUrl)
 				})
 			);
 			toast(m('orgSso.toast.saved'), 'success');
@@ -2357,224 +2335,18 @@
 				{/if}
 
 				{#if section === 'sso'}
-					<section class="card" data-testid="sso-panel">
-						<h2>{m('orgSso.title')}</h2>
-						<p class="card-hint">{m('orgSso.hint')}</p>
-
-						{#if !userLoaded || loadingSso}
-							<LoadingState label={m('orgSso.loading')} />
-						{:else if readOnly}
-							<p class="card-hint" data-testid="sso-admin-only">
-								{m('org.readOnly.sectionAdminOnly')}
-							</p>
-						{:else if ssoLoadError}
-							<LoadError message={ssoLoadError} onretry={loadSso} testId="sso-load-error" />
-						{:else if sso}
-							{#if sso.password_sign_in_closed}
-								<p class="sso-status" data-testid="sso-status-closed">
-									{m('orgSso.status.passwordClosed')}
-								</p>
-							{:else if sso.enabled && sso.idp_config_missing.length}
-								<p class="chat-warning" role="alert" data-testid="sso-status-incomplete">
-									{ssoMissingLabels
-										? m('orgSso.status.incomplete', { fields: formatList(ssoMissingLabels) })
-										: m('orgSso.status.incompleteUnknown')}
-								</p>
-							{/if}
-
-							{#if !ssoEntitled}
-								<PlanUpgradeNotice feature={FEATURE_SSO} testId="sso-plan-upgrade" />
-							{/if}
-
-							<div class="form-grid">
-								<label class="switch-row full-width">
-									<!-- Off is always allowed; ON needs the plan. -->
-									<input
-										type="checkbox"
-										bind:checked={ssoEnabled}
-										disabled={!ssoEntitled && !ssoEnabled}
-										data-testid="sso-enabled-toggle"
-									/>
-									<span>{m('orgSso.enabled')}</span>
-								</label>
-								<label>
-									<span>{m('orgSso.field.protocol')}</span>
-									<select bind:value={ssoProtocol}>
-										<option value="oidc">{m('orgSso.protocol.oidc')}</option>
-										<option value="saml">{m('orgSso.protocol.saml')}</option>
-									</select>
-								</label>
-								<label>
-									<span>{m('orgSso.field.provider')}</span>
-									<select bind:value={ssoProvider}>
-										{#each SSO_PROVIDERS as p (p)}
-											<option value={p}>{ssoProviderLabel(p)}</option>
-										{/each}
-									</select>
-								</label>
-
-								{#if ssoProtocol === 'oidc'}
-									<label class="full-width">
-										<span>{m('orgSso.field.discoveryUrl')}</span>
-										<input
-											type="url"
-											bind:value={ssoDiscoveryUrl}
-											placeholder={'https://example.okta.com/.well-known/openid-configuration'}
-											autocomplete="off"
-											spellcheck="false"
-										/>
-									</label>
-									<label>
-										<span>{m('orgSso.field.clientId')}</span>
-										<input
-											type="text"
-											bind:value={ssoClientId}
-											autocomplete="off"
-											spellcheck="false"
-										/>
-									</label>
-									<div>
-										<label>
-											<span>{m('orgSso.field.clientSecret')}</span>
-											<input
-												type="password"
-												bind:value={ssoNewClientSecret}
-												placeholder={sso.client_secret_configured
-													? m('orgSso.secret.keepPlaceholder')
-													: ''}
-												autocomplete="new-password"
-												spellcheck="false"
-												aria-describedby="sso-secret-hint"
-												data-testid="sso-client-secret"
-											/>
-										</label>
-										<p class="field-hint" id="sso-secret-hint">
-											{sso.client_secret_configured
-												? m('orgSso.secret.configured')
-												: m('orgSso.secret.notConfigured')}
-										</p>
-										{#if sso.client_secret_configured}
-											<label class="switch-row">
-												<input type="checkbox" bind:checked={ssoClearClientSecret} />
-												<span>{m('orgSso.secret.clear')}</span>
-											</label>
-										{/if}
-									</div>
-								{:else}
-									<label class="full-width">
-										<span>{m('orgSso.field.idpEntityId')}</span>
-										<input
-											type="text"
-											bind:value={ssoIdpEntityId}
-											autocomplete="off"
-											spellcheck="false"
-										/>
-									</label>
-									<label class="full-width">
-										<span>{m('orgSso.field.idpSsoUrl')}</span>
-										<input
-											type="url"
-											bind:value={ssoIdpSsoUrl}
-											autocomplete="off"
-											spellcheck="false"
-										/>
-									</label>
-									<label class="full-width">
-										<span>{m('orgSso.field.idpCert')}</span>
-										<textarea
-											bind:value={ssoIdpCert}
-											rows="4"
-											spellcheck="false"
-											placeholder={'-----BEGIN CERTIFICATE-----'}
-										></textarea>
-									</label>
-									<label>
-										<span>{m('orgSso.field.idpSloUrl')}</span>
-										<input
-											type="url"
-											bind:value={ssoIdpSloUrl}
-											autocomplete="off"
-											spellcheck="false"
-										/>
-									</label>
-									<label>
-										<span>{m('orgSso.field.spEntityId')}</span>
-										<input
-											type="text"
-											bind:value={ssoSpEntityId}
-											placeholder={sso.saml_sp_entity_id}
-											autocomplete="off"
-											spellcheck="false"
-										/>
-									</label>
-								{/if}
-
-								<div class="full-width">
-									<label>
-										<span>{m('orgSso.field.allowedDomains')}</span>
-										<input
-											type="text"
-											bind:value={ssoDomains}
-											placeholder={'example.com, example.co.uk'}
-											autocomplete="off"
-											spellcheck="false"
-											aria-describedby="sso-domains-hint"
-										/>
-									</label>
-									<p class="field-hint" id="sso-domains-hint">{m('orgSso.domainsHint')}</p>
-								</div>
-							</div>
-
-							<h3 class="chat-subhead">{m('orgSso.register.title')}</h3>
-							<p class="card-hint">{m('orgSso.register.hint')}</p>
-							<dl class="sso-register">
-								{#if ssoProtocol === 'oidc'}
-									<dt>{m('orgSso.register.redirectUri')}</dt>
-									<dd><code>{sso.oidc_redirect_uri}</code></dd>
-								{:else}
-									<dt>{m('orgSso.register.acsUrl')}</dt>
-									<dd><code>{sso.saml_acs_url}</code></dd>
-									<dt>{m('orgSso.register.spEntityId')}</dt>
-									<dd><code>{sso.saml_sp_entity_id}</code></dd>
-								{/if}
-							</dl>
-
-							<div class="sso-only-row">
-								<label class="switch-row">
-									<input
-										type="checkbox"
-										bind:checked={ssoOnly}
-										disabled={!ssoEnforcementEntitled && !ssoOnly}
-										aria-describedby="sso-only-hint"
-										data-testid="sso-only-toggle"
-									/>
-									<span>{m('orgSso.ssoOnly')}</span>
-								</label>
-								<p class="field-hint" id="sso-only-hint">{m('orgSso.ssoOnlyHint')}</p>
-								{#if ssoEntitled && !ssoEnforcementEntitled}
-									<PlanUpgradeNotice
-										feature={FEATURE_SSO_ENFORCEMENT}
-										testId="sso-only-plan-upgrade"
-									/>
-								{/if}
-							</div>
-
-							{#if ssoSaveError}
-								<p class="chat-error" role="alert" data-testid="sso-save-error">{ssoSaveError}</p>
-							{/if}
-
-							<div class="section-footer">
-								<button
-									class="btn-save-section"
-									disabled={savingSso}
-									onclick={saveSso}
-									data-testid="sso-save"
-								>
-									{savingSso ? m('org.common.saving') : m('orgSso.save')}
-								</button>
-							</div>
-						{/if}
-					</section>
+					<SsoPanel
+						bind:fields={ssoFields}
+						status={sso}
+						{readOnly}
+						{userLoaded}
+						loading={loadingSso}
+						loadError={ssoLoadError}
+						onretry={loadSso}
+						saveError={ssoSaveError}
+						saving={savingSso}
+						onsave={saveSso}
+					/>
 				{/if}
 
 				{#if section === 'scim'}
@@ -2917,8 +2689,7 @@
 	/* An in-panel save refusal (a domain add, an SSO save). A panel's failed
 	   LOAD is `ui/LoadError` instead, which carries the Retry this line had no
 	   room for. */
-	.domain-error,
-	.chat-error {
+	.domain-error {
 		color: var(--danger);
 		font-size: 0.88rem;
 		margin: 4px 0 12px;
@@ -2935,44 +2706,6 @@
 		font-size: 0.82rem;
 		background: var(--warning-tint);
 		color: var(--warning-on-tint);
-	}
-
-	/* SSO-only in force: a state, not a problem — the success tint recipe. */
-	.sso-status {
-		margin: 4px 0 12px;
-		padding: 10px 12px;
-		border-radius: 6px;
-		font-size: 0.82rem;
-		background: var(--success-tint);
-		color: var(--success-on-tint);
-	}
-
-	/* What the admin pastes into the IdP. Long URLs wrap rather than push the
-	   card past a 320px viewport (WCAG 1.4.10). */
-	.sso-register {
-		display: grid;
-		grid-template-columns: max-content 1fr;
-		gap: 6px 14px;
-		margin: 0 0 16px;
-		font-size: 0.85rem;
-	}
-
-	.sso-register dt {
-		color: var(--text-muted);
-	}
-
-	.sso-register dd {
-		margin: 0;
-		min-width: 0;
-	}
-
-	.sso-register code {
-		font-family: var(--font-mono);
-		overflow-wrap: anywhere;
-	}
-
-	.sso-only-row {
-		margin: 4px 0 8px;
 	}
 
 	.chat-subhead {
@@ -3135,10 +2868,5 @@
 		.form-grid {
 			grid-template-columns: 1fr;
 		}
-
-		.sso-register {
-			grid-template-columns: 1fr;
-		}
-
 	}
 </style>

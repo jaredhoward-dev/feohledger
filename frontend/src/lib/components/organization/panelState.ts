@@ -1,5 +1,6 @@
 import { m } from '#lib/i18n/store.svelte.ts';
 import type { PaymentExecutionMode } from '#lib/types/paymentExecution.ts';
+import type { SsoProtocol } from '#lib/types/ssoSettings.ts';
 
 /**
  * Field state of the `/organization` panels the page renders through a
@@ -183,4 +184,28 @@ export interface NachaFields {
 	offsetRouting: string;
 	offsetAccount: string;
 	offsetAccountType: string;
+}
+
+/**
+ * Organization → Single sign-on (`settings.sso`, one writer:
+ * `PUT /api/organization/sso`). The OIDC client secret is write-only, so
+ * there is no mirror of the stored value — only `newClientSecret`, sent when
+ * non-blank, and `clearClientSecret`, the explicit remove.
+ */
+export interface SsoFields {
+	enabled: boolean;
+	only: boolean;
+	protocol: SsoProtocol;
+	provider: string;
+	/** Machine identifiers, comma-joined for editing and re-split on save. */
+	domains: string;
+	discoveryUrl: string;
+	clientId: string;
+	newClientSecret: string;
+	clearClientSecret: boolean;
+	idpEntityId: string;
+	idpSsoUrl: string;
+	idpCert: string;
+	idpSloUrl: string;
+	spEntityId: string;
 }
