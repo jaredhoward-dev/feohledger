@@ -27392,71 +27392,84 @@ leaves the run nothing to pay; with a live card it is refused behind a
 blocking row; an `approved` invoice with no document is never read. The three
 in-flight hold tests assert the new code.
 
-## 540. A dropped Merge.dev webhook is backstopped by a read-back sweep of the bills we pushed, through the webhook's own reconciler (§408 / §525 / §527 follow-up, round 45)
+## 536. NetSuite's bills sync back: a keyset poll, matched by our marker, written back at the exact amount (§295 / §386 follow-up, round 45)
 
-**Problem.** The Merge webhook (`POST /api/erp/webhook/merge_dev/{slug}`)
-answers a delivery it cannot verify with the same silent 204 as a forgery: when
-the tenant's credentials cannot be opened, or the source's unseal budget is
-spent for a tenant whose data key is cold (§408, §525, §527). Merge never
-redelivers a 204, and a pushed Merge invoice is already `done` (§504), so a bill
-voided or deleted behind Merge was never flagged. §528 backstopped the generic
-route only.
+**Context.** §295 status sync-back covered QuickBooks and, since §386, Xero.
+Every other ERP closed a push at `done`, so a bill paid there never reached
+FeohLedger (`docs/followups.md`, "A bill paid in an ERP other than QuickBooks
+or Xero"). The round extended it to one more adapter.
 
-**Decision.** A sweep, `services/merge_readback_sweep` (`merge-readback`,
-`FEOH_MERGE_READBACK_SWEEP_ENABLED`, off by default; interval 15 min, batch 50
-reads per tenant, first-pass lookback 48 h). Per Merge tenant it lists
-`MergeDevAdapter.changed_bills(since)`, keeps the bills an invoice was pushed as
-(`erp_status_sync._bills_we_posted`, `by_reference=True`, the webhook's own
-pre-read filter), reads each back with `bill_report` and applies it with
-`erp_status_sync.apply_bill_report` — the reconciler the webhook, QuickBooks
-and Xero use. No forked logic: a bill means the same whichever channel carried
-it. Rows are marked `source: reconciliation_sweep` (`event_id` None), as the
-QuickBooks / Xero sweep's are.
+**Why NetSuite, not Business Central.** NetSuite was closer: its adapter
+already reads what settled a bill (`_paid_or_settled`, §303, cash versus
+credit from `NextTransactionLineLink`), its bills carry our marker (the push's
+`externalId` is the correlation id) and its records take an `externalId` that
+NetSuite keeps unique per type, which is the write-back's idempotency key for
+free. Business Central's API v2.0 pays a bill only through a vendor payment
+journal that must then be posted, and its `purchaseInvoice` states no open
+amount we could check a write-back against. fake-erp already modelled
+NetSuite's records and SuiteQL, so the new calls extend it.
 
-* **Cursor.** `Organization.settings["erp_merge_readback"] = {through,
-  pending}`: `through` is the moment the last listing started, `pending` that
-  listing's matched bills not yet applied. Not `settings.erp.oauth` (where the
-  QuickBooks / Xero mark `status_sync_through` lives): a Merge tenant has no
-  OAuth block. Not inside `settings.erp`: that block is the adapter config and
-  the input to the connection's realm. A missing cursor (first pass, or one an
-  org-settings writer dropped) reads the lookback window, and re-applying is
-  harmless.
-* **Moves only past what was applied.** Pending bills are read in order, at most
-  the batch a tick, before any new listing. A read that fails, a read the call
-  budget refuses (`ErpCallBudgetExhausted`) or a paused budget
-  (`call_budget().usage()`, None for Merge today) ends the pass with that bill
-  and the rest still pending. A failed listing moves nothing.
-* **Replica-safe by compare-and-swap.** The cursor is written under the org row
-  lock (the settings-writer rule) only if it still equals what the pass read; a
-  second replica finds it moved and writes nothing. The apply is idempotent on
-  its own (`apply_bill_report` judges under the invoice row lock; flags dedupe
-  while live, by kind, §535), so two replicas applying one listing flag once.
-* **404.** Not read as gone: only Merge's `Invoice.removed` says that (§399),
-  and the change feed carries no event. `VOID` and `remote_was_deleted` are
-  Merge's positive answers and are flagged.
-* **Credentials.** A tenant whose block cannot be opened is logged as an error
-  without the exception text and skipped; the others carry on.
+**Decision.** `NetSuiteAdapter.supports_status_sync = True`; with
+`FEOH_ERP_STATUS_SYNC_ENABLED` on, a confirmed NetSuite push lands at
+`posted_in_erp` and §296 / §309 / §386 apply unchanged. Detail:
+`backend/docs/erp-integration.md` § NetSuite status sync-back.
 
-**Rejected.** *Polling each pushed bill's status, as §528 does*: a Merge push
-closes at `done`, so the candidate set is every bill ever pushed, unbounded.
-*A full read-back fallback when the feed is too long* (QuickBooks' answer to a
-CDC gap): the same unbounded set. *Advancing the cursor at listing time and
-dropping a failed read*: a bill whose read failed would never be read again
-until it changed. *A per-delivery dedup key shared with the webhook*: Merge's
-key includes the linked account and hook event from the body, which the feed
-does not carry; the reconciler's own idempotency is enough, with one accepted
-residue — a flag a person resolves between the webhook's apply and the sweep's
-read of the same change is opened again once, as with the QuickBooks / Xero
-webhook and sweep. *Making Merge a status-sync adapter*: §504 stands; this
-sweep writes nothing back.
+- **Read.** A bill is matched by its marker (`bills_match_by_reference`
+  False). Open = `total` − every applied transaction, and it must agree with
+  NetSuite's status; anything else (Pending Approval, Rejected, mixed signs,
+  an unreadable link) is `unknown`, so the dispatch check holds. Cash is a
+  `VendPymt`; ours carries `externalId feohledger-payment-<id>`; any other
+  applied type is credit (§303). `paid_amount` is the exact cash a person
+  applied, only for a bill paid wholly by them in cash, in the currency
+  NetSuite's `currency.symbol` states (the bill's `refName` is a name, never
+  taken for a code). The rail is not read (not stated: 1099-reportable).
+- **Changes.** No REST change feed, so a SuiteQL keyset poll on
+  `lastmodifieddate` of bills and of transactions applied to bills, the
+  window widened by a day for the account's unknown time zone. A failed read
+  fails the pass (mark unmoved), a truncated one is a full reconciliation.
+- **Write-back.** A `vendorPayment` at the exact Decimal that reached the
+  supplier, never above what is open, refused before any write on no account,
+  a gone / voided / unapproved bill or a currency that differs or is unstated.
+  Idempotent by `eid:` lookup before the create, NetSuite's externalId
+  uniqueness against a race, and a second lookup when a create is refused. No
+  `disc` is sent: a discount stays open and is flagged, as for QuickBooks and
+  Xero. `void_payment` deletes ours (REST has no void).
+- **Sweep tenant selection** (this lane owns `erp_status_sync`). A
+  credentials-based ERP has no `settings.erp.oauth` block, so the sweep now
+  selects by the OAuth provider OR `settings.erp.type`, then keeps a tenant
+  only when `dispatcher.resolve_adapter_key` names a status-sync adapter. Its
+  mark lives in `settings.erp_status_sync = {realm, through}`, written under
+  the org row lock only while the stored configuration still names that
+  realm, and read only for it, so pointing the configuration at another
+  account starts with a full reconciliation. `erp-status-poll` already skips
+  any adapter with `supports_status_sync`, so it stops polling NetSuite
+  tenants with no change there (`pollable_adapter`).
 
-**Guard.** `tests/test_merge_readback_sweep.py` (real Postgres; Merge's feed and
-reads stubbed): a missed void and a deleted bill are flagged; unchanged and
-unpushed bills change nothing (the latter is not read); two ticks and two
-replicas flag once; a failed read and a capped batch keep bills pending and the
-next listing asks from the last; a failed listing, a paused budget and a
-refusing budget move nothing; unopenable credentials are skipped without the
-exception text; off by default, registered in `sweep_health` and `main`.
+**Rejected.** Reading `amountremaining` from the bill: not a field we could
+verify on the REST vendorBill, while `total` and the applied links are what
+the adapter already reads. Treating a write-back someone deleted in NetSuite
+as Xero does (`bill_payment_voided`): REST lists no deleted records, so a
+deleted write-back is not findable and a retry would post again. Accepted
+residual, narrow (a write-back is retried only until it first succeeds).
+
+**Not verified (#654).** The vendor docs could not be fetched this round
+(Oracle's REST API Browser and help pages returned no usable page,
+2026-11-25), so these are this adapter's reading, encoded in fake-erp, not
+Oracle's confirmed shapes: the `vendorPayment` body (`apply.items[]` with
+`doc` / `apply` / `amount`), `GET vendorPayment/eid:` and `DELETE` on it, the
+`NextTransactionLineLink` → `transaction` join and the sign of
+`foreignamount`, `transaction.lastmodifieddate` with `TO_DATE`, and whether
+applying or deleting a payment moves a bill's `lastmodifieddate`. Each fails
+closed: an unexpected answer is an `unknown` bill, a failed pass, or a refused
+write-back, never a payment recorded or posted. Status sync stays off by
+default; turn it on for a NetSuite tenant only after a sandbox pass.
+
+**Not done.** No NetSuite webhook, the admin's on-request pass stays
+OAuth-only, and no Playwright spec under `tests-e2e/erp/` drives the
+write-back yet.
+
+Tests: `backend/tests/test_netsuite_status_sync_adapter.py`,
+`test_erp_status_sync.py` § NetSuite sweep.
 
 ## 537. A run's card leg counts what its card was charged; uncharged, it is in flight (§535 follow-up, round 45)
 
@@ -27600,85 +27613,6 @@ document id and leaves the NULL and stamp rows alone.
 `tests/test_erp_payment_writeback.py`: voiding a payment on a mock bill records
 no ERP void.
 
-## 536. NetSuite's bills sync back: a keyset poll, matched by our marker, written back at the exact amount (§295 / §386 follow-up, round 45)
-
-**Context.** §295 status sync-back covered QuickBooks and, since §386, Xero.
-Every other ERP closed a push at `done`, so a bill paid there never reached
-FeohLedger (`docs/followups.md`, "A bill paid in an ERP other than QuickBooks
-or Xero"). The round extended it to one more adapter.
-
-**Why NetSuite, not Business Central.** NetSuite was closer: its adapter
-already reads what settled a bill (`_paid_or_settled`, §303, cash versus
-credit from `NextTransactionLineLink`), its bills carry our marker (the push's
-`externalId` is the correlation id) and its records take an `externalId` that
-NetSuite keeps unique per type, which is the write-back's idempotency key for
-free. Business Central's API v2.0 pays a bill only through a vendor payment
-journal that must then be posted, and its `purchaseInvoice` states no open
-amount we could check a write-back against. fake-erp already modelled
-NetSuite's records and SuiteQL, so the new calls extend it.
-
-**Decision.** `NetSuiteAdapter.supports_status_sync = True`; with
-`FEOH_ERP_STATUS_SYNC_ENABLED` on, a confirmed NetSuite push lands at
-`posted_in_erp` and §296 / §309 / §386 apply unchanged. Detail:
-`backend/docs/erp-integration.md` § NetSuite status sync-back.
-
-- **Read.** A bill is matched by its marker (`bills_match_by_reference`
-  False). Open = `total` − every applied transaction, and it must agree with
-  NetSuite's status; anything else (Pending Approval, Rejected, mixed signs,
-  an unreadable link) is `unknown`, so the dispatch check holds. Cash is a
-  `VendPymt`; ours carries `externalId feohledger-payment-<id>`; any other
-  applied type is credit (§303). `paid_amount` is the exact cash a person
-  applied, only for a bill paid wholly by them in cash, in the currency
-  NetSuite's `currency.symbol` states (the bill's `refName` is a name, never
-  taken for a code). The rail is not read (not stated: 1099-reportable).
-- **Changes.** No REST change feed, so a SuiteQL keyset poll on
-  `lastmodifieddate` of bills and of transactions applied to bills, the
-  window widened by a day for the account's unknown time zone. A failed read
-  fails the pass (mark unmoved), a truncated one is a full reconciliation.
-- **Write-back.** A `vendorPayment` at the exact Decimal that reached the
-  supplier, never above what is open, refused before any write on no account,
-  a gone / voided / unapproved bill or a currency that differs or is unstated.
-  Idempotent by `eid:` lookup before the create, NetSuite's externalId
-  uniqueness against a race, and a second lookup when a create is refused. No
-  `disc` is sent: a discount stays open and is flagged, as for QuickBooks and
-  Xero. `void_payment` deletes ours (REST has no void).
-- **Sweep tenant selection** (this lane owns `erp_status_sync`). A
-  credentials-based ERP has no `settings.erp.oauth` block, so the sweep now
-  selects by the OAuth provider OR `settings.erp.type`, then keeps a tenant
-  only when `dispatcher.resolve_adapter_key` names a status-sync adapter. Its
-  mark lives in `settings.erp_status_sync = {realm, through}`, written under
-  the org row lock only while the stored configuration still names that
-  realm, and read only for it, so pointing the configuration at another
-  account starts with a full reconciliation. `erp-status-poll` already skips
-  any adapter with `supports_status_sync`, so it stops polling NetSuite
-  tenants with no change there (`pollable_adapter`).
-
-**Rejected.** Reading `amountremaining` from the bill: not a field we could
-verify on the REST vendorBill, while `total` and the applied links are what
-the adapter already reads. Treating a write-back someone deleted in NetSuite
-as Xero does (`bill_payment_voided`): REST lists no deleted records, so a
-deleted write-back is not findable and a retry would post again. Accepted
-residual, narrow (a write-back is retried only until it first succeeds).
-
-**Not verified (#654).** The vendor docs could not be fetched this round
-(Oracle's REST API Browser and help pages returned no usable page,
-2026-11-25), so these are this adapter's reading, encoded in fake-erp, not
-Oracle's confirmed shapes: the `vendorPayment` body (`apply.items[]` with
-`doc` / `apply` / `amount`), `GET vendorPayment/eid:` and `DELETE` on it, the
-`NextTransactionLineLink` → `transaction` join and the sign of
-`foreignamount`, `transaction.lastmodifieddate` with `TO_DATE`, and whether
-applying or deleting a payment moves a bill's `lastmodifieddate`. Each fails
-closed: an unexpected answer is an `unknown` bill, a failed pass, or a refused
-write-back, never a payment recorded or posted. Status sync stays off by
-default; turn it on for a NetSuite tenant only after a sandbox pass.
-
-**Not done.** No NetSuite webhook, the admin's on-request pass stays
-OAuth-only, and no Playwright spec under `tests-e2e/erp/` drives the
-write-back yet.
-
-Tests: `backend/tests/test_netsuite_status_sync_adapter.py`,
-`test_erp_status_sync.py` § NetSuite sweep.
-
 ## 539. A duplicate or fraud flag on a bill already in the ERP offers the ERP void, gated like a payment void (§286 / §309 follow-up, round 45)
 
 **Context.** §286 refuses the ERP push while a `duplicate` / `fraud_flag`
@@ -27763,3 +27697,69 @@ notice fires only for a posted bill and names no vendor);
 `tests/test_notification_templates.py`; frontend
 `notificationHref.test.ts`, `codedRefusals.test.ts`, the audit roster;
 `tests-e2e/exceptions/void-erp-bill.spec.ts`.
+
+## 540. A dropped Merge.dev webhook is backstopped by a read-back sweep of the bills we pushed, through the webhook's own reconciler (§408 / §525 / §527 follow-up, round 45)
+
+**Problem.** The Merge webhook (`POST /api/erp/webhook/merge_dev/{slug}`)
+answers a delivery it cannot verify with the same silent 204 as a forgery: when
+the tenant's credentials cannot be opened, or the source's unseal budget is
+spent for a tenant whose data key is cold (§408, §525, §527). Merge never
+redelivers a 204, and a pushed Merge invoice is already `done` (§504), so a bill
+voided or deleted behind Merge was never flagged. §528 backstopped the generic
+route only.
+
+**Decision.** A sweep, `services/merge_readback_sweep` (`merge-readback`,
+`FEOH_MERGE_READBACK_SWEEP_ENABLED`, off by default; interval 15 min, batch 50
+reads per tenant, first-pass lookback 48 h). Per Merge tenant it lists
+`MergeDevAdapter.changed_bills(since)`, keeps the bills an invoice was pushed as
+(`erp_status_sync._bills_we_posted`, `by_reference=True`, the webhook's own
+pre-read filter), reads each back with `bill_report` and applies it with
+`erp_status_sync.apply_bill_report` — the reconciler the webhook, QuickBooks
+and Xero use. No forked logic: a bill means the same whichever channel carried
+it. Rows are marked `source: reconciliation_sweep` (`event_id` None), as the
+QuickBooks / Xero sweep's are.
+
+* **Cursor.** `Organization.settings["erp_merge_readback"] = {through,
+  pending}`: `through` is the moment the last listing started, `pending` that
+  listing's matched bills not yet applied. Not `settings.erp.oauth` (where the
+  QuickBooks / Xero mark `status_sync_through` lives): a Merge tenant has no
+  OAuth block. Not inside `settings.erp`: that block is the adapter config and
+  the input to the connection's realm. A missing cursor (first pass, or one an
+  org-settings writer dropped) reads the lookback window, and re-applying is
+  harmless.
+* **Moves only past what was applied.** Pending bills are read in order, at most
+  the batch a tick, before any new listing. A read that fails, a read the call
+  budget refuses (`ErpCallBudgetExhausted`) or a paused budget
+  (`call_budget().usage()`, None for Merge today) ends the pass with that bill
+  and the rest still pending. A failed listing moves nothing.
+* **Replica-safe by compare-and-swap.** The cursor is written under the org row
+  lock (the settings-writer rule) only if it still equals what the pass read; a
+  second replica finds it moved and writes nothing. The apply is idempotent on
+  its own (`apply_bill_report` judges under the invoice row lock; flags dedupe
+  while live, by kind, §535), so two replicas applying one listing flag once.
+* **404.** Not read as gone: only Merge's `Invoice.removed` says that (§399),
+  and the change feed carries no event. `VOID` and `remote_was_deleted` are
+  Merge's positive answers and are flagged.
+* **Credentials.** A tenant whose block cannot be opened is logged as an error
+  without the exception text and skipped; the others carry on.
+
+**Rejected.** *Polling each pushed bill's status, as §528 does*: a Merge push
+closes at `done`, so the candidate set is every bill ever pushed, unbounded.
+*A full read-back fallback when the feed is too long* (QuickBooks' answer to a
+CDC gap): the same unbounded set. *Advancing the cursor at listing time and
+dropping a failed read*: a bill whose read failed would never be read again
+until it changed. *A per-delivery dedup key shared with the webhook*: Merge's
+key includes the linked account and hook event from the body, which the feed
+does not carry; the reconciler's own idempotency is enough, with one accepted
+residue — a flag a person resolves between the webhook's apply and the sweep's
+read of the same change is opened again once, as with the QuickBooks / Xero
+webhook and sweep. *Making Merge a status-sync adapter*: §504 stands; this
+sweep writes nothing back.
+
+**Guard.** `tests/test_merge_readback_sweep.py` (real Postgres; Merge's feed and
+reads stubbed): a missed void and a deleted bill are flagged; unchanged and
+unpushed bills change nothing (the latter is not read); two ticks and two
+replicas flag once; a failed read and a capped batch keep bills pending and the
+next listing asks from the last; a failed listing, a paused budget and a
+refusing budget move nothing; unopenable credentials are skipped without the
+exception text; off by default, registered in `sweep_health` and `main`.
