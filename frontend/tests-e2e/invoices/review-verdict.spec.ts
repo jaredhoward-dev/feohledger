@@ -91,6 +91,41 @@ test.describe('invoice modal — review decisions follow the server verdict', ()
 		expect((await approved).status()).toBe(200);
 	});
 
+	test('an approver the invoice is not assigned to sees the buttons and a note naming the assignee', async ({
+		page
+	}) => {
+		// Assignment is routing, not authority (decisions §564): the server
+		// accepts any approver who passes its gates, so the modal no longer
+		// hides Approve / Reject from a reader who is not the assignee. It
+		// names the colleague instead, so nobody takes their invoice unawares.
+		const number = `${PREFIX}-ELSE-${Date.now()}`;
+		const id = await createInReview(page, number);
+		tenantPsql(
+			`UPDATE invoices SET uploaded_by_id = NULL, assigned_to_id = gen_random_uuid(), assigned_to = 'E2E Colleague' WHERE id='${id}'`
+		);
+
+		const verdict = page.waitForResponse(
+			(r) => r.url().endsWith(`/api/invoices/${id}/review-actions`) && r.status() === 200
+		);
+		await page.goto(`/invoices?id=${id}`);
+		await verdict;
+		const modal = page.locator('div.modal[role="dialog"]');
+		await expect(modal.locator('header h2')).toContainText(number);
+
+		await expect(modal.getByTestId('review-assigned-elsewhere')).toHaveText(
+			'Assigned to E2E Colleague — you can still act as an approver.'
+		);
+		const approve = modal.getByRole('button', { name: 'Approve', exact: true });
+		await expect(approve).toBeEnabled();
+		await expect(modal.getByRole('button', { name: 'Reject', exact: true })).toBeEnabled();
+
+		const approved = page.waitForResponse(
+			(r) => r.url().endsWith(`/api/invoices/${id}/approve`) && r.request().method() === 'POST'
+		);
+		await approve.click();
+		expect((await approved).status()).toBe(200);
+	});
+
 	test('Approve, Reject and Save are on screen when the dialog opens on a short viewport', async ({
 		page
 	}) => {
