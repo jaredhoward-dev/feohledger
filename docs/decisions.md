@@ -30374,3 +30374,67 @@ recorded id, a pre-write refusal leaving no marker);
 refused on both doors, allowed once cancelled); `tests/test_invoice_recall_approval.py`
 (a mirror held by a payment or a card cannot be deleted out of the way, and the
 recall still says progressed); web `codedRefusals.test.ts`.
+
+## 578. Round 49 gate fixes: a revoke and a new child link serialize, PEPPOL send reserves before it transmits, a claim is named before a delete-the-mirror recall refusal, the discount-credit account is checked at save (§573 / §574 / §575 follow-up, round 49)
+
+**Partner revoke vs attach / provision.** §574's revoke counts children under
+the partner's row lock, but attach and provision did not take that lock, so a
+revoke counting zero could commit beside a concurrent attach and leave a child
+owned by a workspace without the capability. Attach now locks the partner's
+row and the child's in **one statement ordered by id**, and provision locks the
+partner's row before creating the tenant (held through provisioning: the child
+is born parented or not at all); both re-check `is_partner` under the lock and
+refuse coded `partner_capability_required`. Rejected: "parent before child" as
+two statements — two partners attaching each other at once would lock in
+opposite orders and deadlock; an id order cannot. No other path locks two org
+rows (closure, settings writers and child branding lock one).
+
+**PEPPOL send: reserve → commit → call → record.** §573 had `POST /peppol-send`
+hold `FOR UPDATE` on the invoice for the whole send, SMP lookup and AS4 call
+included, so payment sync, run building and approvals waited on an Access
+Point's timeout. Now: unlocked pre-checks (status, an existing live
+transmission answered `already_sent` without a lookup) → SMP lookup
+(`peppol_send.resolve_receiver`) with no lock → the row lock, status re-read,
+validation and the `sending` reservation, **committed** (releasing the lock) →
+the transmit → the outcome and audit row in a second commit. The recall still
+serializes with it: a recall holding the lock first leaves the invoice
+`ready_for_review`, and the send refuses `invoice_not_approved`; a recall after
+the reservation sees the committed `sending` row and refuses
+`invoice_recall_peppol_transmitted`. A transmit that raises (adapters return
+failures as results, so this is unexpected) leaves the row `sending`: its
+outcome is unknown and counts as sent, as an unknown ERP push does.
+
+**Recall refusal order.** An approved mirror already in a staged run was told
+`invoice_recall_is_mirror` ("delete this mirror"), and `DELETE /invoices/{id}`
+then refused it for the live payment. The live claim (`invoice_recall_claimed`)
+is now named before the two pair refusals whose way out is a delete
+(`invoice_recall_is_mirror`, `invoice_recall_mirror_unsigned`), so the person
+cancels the run or voids the payment / card first. `invoice_recall_mirror_progressed`
+stays ahead of the claim: only a credit memo on each side corrects it, so
+cancelling a run first would be wasted work. Rejected: a mirror-specific
+variant naming both steps — a new code in every locale for an order the
+existing two codes already express.
+
+**Partner linking off.** `POST /api/organization/partner-link-code` with no
+signing key answers a coded 503 `partner_linking_disabled` instead of bare
+English.
+
+**Discount-credit account at save.** §575 required an account while the opt-in
+is on, but accepted one the write-back could not resolve. `PATCH
+/api/organization` now also refuses (422) a `discount_credit_account` that is
+not an org-wide (shared) GL account with an `erp_account_id` linked to the
+connection being saved (`erp_payment_writeback.discount_account_refusal`, the
+same `resolve_erp_account_ids` rule `_resolve_account` uses, read for the
+shared chart). An entity-only account would resolve for that entity's invoices
+alone. The 422 bodies stay plain English, as §575's are. Coding them needs
+entries in the web and mobile catalogues, so that is left to the client lane.
+
+**Tests.** `test_partner_link_provisioning.py` (a revoke holding the lock
+makes a queued attach refuse; an attach holding it makes a queued revoke
+refuse; the coded 503; the old route a plain 404), `test_partner_provision.py`
+(a revoke landing before the lock refuses provision before anything is
+created), `test_peppol_route.py` (a recall during the transmit finishes
+without waiting and is refused; a recall holding the lock makes the queued
+send refuse with nothing reserved or sent), `test_invoice_recall_approval.py`
+(the new precedence rows; a claimed mirror's recall and delete agree),
+`test_erp_payment_writeback.py` (the PATCH 422s and the 200).

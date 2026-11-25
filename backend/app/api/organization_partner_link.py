@@ -16,12 +16,17 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
 
 from app.api.deps import ROLE_ADMIN, require_roles
+from app.api.refusals import coded_refusal
 from app.config import settings
 from app.models.organization import Organization
 from app.models.user import User
 from app.services.audit_dispatch import dispatch_auth_audit
 from app.services.partner_link_token import build_link_code
 from app.tenant import get_tenant
+
+#: The coded 503 when no signing key is configured: the feature is off on this
+#: deployment, an operator setting, never something the admin did wrong.
+PARTNER_LINKING_DISABLED = "partner_linking_disabled"
 
 router = APIRouter(prefix="/organization", tags=["organization"])
 
@@ -65,7 +70,7 @@ async def mint_partner_link_code(
         # No key → fail closed: the feature is not configured.
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Partner linking is not enabled.",
+            detail=coded_refusal(PARTNER_LINKING_DISABLED, "Partner linking is not enabled."),
         )
 
     await dispatch_auth_audit(

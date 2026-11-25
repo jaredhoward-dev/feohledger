@@ -24,12 +24,17 @@ parent/child link in a `finally` — order-independent.
 
 from __future__ import annotations
 
-import pytest
-from sqlalchemy import select, update
+import asyncio
+from unittest.mock import patch
 
+import pytest
+from sqlalchemy import select, text, update
+
+from app.api import partner as partner_api
 from app.config import settings
 from app.models.organization import Organization
 from app.models.workflow import AuditLog
+from app.services import partner_capability
 from app.services.partner_link_token import build_link_code
 from tests.partner_capability_helpers import granted_partner
 
@@ -108,6 +113,10 @@ async def test_mint_link_code_fails_closed_without_key(realdb, monkeypatch):
     async with realdb.client(key="b", role="admin") as c:
         resp = await c.post("/api/organization/partner-link-code")
     assert resp.status_code == 503
+    # Coded, so the Organization settings card states it in the admin's locale
+    # (the client catalogue registers `partner_linking_disabled`).
+    assert resp.json()["detail"]["code"] == "partner_linking_disabled"
+    assert resp.json()["detail"]["message"] == "Partner linking is not enabled."
 
 
 @pytest.mark.asyncio
@@ -126,10 +135,14 @@ async def test_mint_link_code_needs_no_partner_capability_and_is_audited(realdb,
 
 @pytest.mark.asyncio
 async def test_old_partner_link_code_route_is_gone(realdb, partner_key):
-    """The mint moved; the old path is not a second, ungated door."""
+    """Deliberate: the mint moved to ``POST /api/organization/partner-link-code``
+    (decisions §574) and the old path must not survive as a second door under
+    different rules. No ``/api/partner`` route matches it in any method, so it is
+    a plain 404 — a 403 here would mean the old route is back behind the
+    capability gate, a 200 that it is back ungated."""
     async with realdb.client(key="b", role="admin") as c:
         resp = await c.post("/api/partner/link-code")
-    assert resp.status_code in (404, 405)
+    assert resp.status_code == 404
 
 
 @pytest.mark.asyncio
@@ -311,6 +324,122 @@ async def test_detach_admin_only(realdb, partner_key):
             resp = await c.delete(f"/api/partner/children/{realdb.info('b').org_id}")
         assert resp.status_code == 403
         # Still linked — the denied call changed nothing.
+        assert await _parent_of(realdb, "b") == realdb.info("a").org_id
+    finally:
+        await _set_parent(realdb, child_key="b", parent_key=None)
+
+
+# ---------------------------------------------------------------------------
+# Attach vs operator revoke — serialized on the partner's row (decisions §578)
+# ---------------------------------------------------------------------------
+
+
+async def _wait_for_control_lock_waiter(realdb, *, timeout: float = 15.0) -> bool:
+    """True once Postgres reports another backend in the control-plane database
+    waiting on a lock — the server's own wait state, never a slept guess."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while loop.time() < deadline:
+        async with realdb.control_sessionmaker()() as s:
+            waiting = (
+                await s.execute(
+                    text(
+                        "SELECT count(*) FROM pg_stat_activity "
+                        "WHERE datname = current_database() "
+                        "AND pid <> pg_backend_pid() AND wait_event_type = 'Lock'"
+                    )
+                )
+            ).scalar_one()
+        if waiting:
+            return True
+        await asyncio.sleep(0.05)
+    return False
+
+
+async def _mint(realdb, key: str) -> str:
+    async with realdb.client(key=key, role="admin") as c:
+        return (await c.post("/api/organization/partner-link-code")).json()["link_code"]
+
+
+async def _attach(realdb, code: str):
+    async with realdb.client(key="a", role="admin") as c:
+        return await c.post("/api/partner/children", json={"link_code": code})
+
+
+@pytest.mark.asyncio
+async def test_revoke_holding_the_partner_lock_makes_a_queued_attach_refuse(realdb, partner_key):
+    """The revoke counts zero children under A's row lock; an attach arriving
+    then must wait for that lock and, once the revoke commits, refuse — never
+    leave B parented by a workspace without the capability."""
+    await _set_parent(realdb, child_key="b", parent_key=None)
+    code = await _mint(realdb, "b")
+    lock_held, release = asyncio.Event(), asyncio.Event()
+    real_audit = partner_capability.record_auth_audit_or_raise
+
+    async def _gated_audit(**kwargs):
+        lock_held.set()  # the count is done and A's row is locked
+        await release.wait()
+        return await real_audit(**kwargs)
+
+    async def _revoke():
+        async with realdb.control_sessionmaker()() as s:
+            return await partner_capability.set_partner_capability(
+                s, realdb.info("a").slug, enabled=False
+            )
+
+    try:
+        with patch.object(partner_capability, "record_auth_audit_or_raise", new=_gated_audit):
+            revoke_task = asyncio.create_task(_revoke())
+            await asyncio.wait_for(lock_held.wait(), timeout=15)
+            attach_task = asyncio.create_task(_attach(realdb, code))
+            queued = await _wait_for_control_lock_waiter(realdb)
+            release.set()
+            revoked, attach = await asyncio.gather(revoke_task, attach_task)
+        assert queued, "the attach never queued behind the revoke's lock on A's row"
+        assert revoked.changed and revoked.is_partner is False
+        assert attach.status_code == 403
+        assert attach.json()["detail"]["code"] == "partner_capability_required"
+        assert await _parent_of(realdb, "b") is None
+    finally:
+        await _set_parent(realdb, child_key="b", parent_key=None)
+
+
+@pytest.mark.asyncio
+async def test_attach_holding_the_partner_lock_makes_a_queued_revoke_refuse(realdb, partner_key):
+    """The other order: an attach holding A's row lock links B; the revoke
+    waits for it, then counts the new child and refuses."""
+    await _set_parent(realdb, child_key="b", parent_key=None)
+    code = await _mint(realdb, "b")
+    lock_held, release = asyncio.Event(), asyncio.Event()
+    real_lock = partner_api._lock_partner_and_child
+
+    async def _gated_lock(*args, **kwargs):
+        rows = await real_lock(*args, **kwargs)
+        lock_held.set()
+        await release.wait()
+        return rows
+
+    async def _revoke():
+        async with realdb.control_sessionmaker()() as s:
+            try:
+                return await partner_capability.set_partner_capability(
+                    s, realdb.info("a").slug, enabled=False
+                )
+            except partner_capability.PartnerHasChildren as exc:
+                return exc
+
+    try:
+        with patch.object(partner_api, "_lock_partner_and_child", new=_gated_lock):
+            attach_task = asyncio.create_task(_attach(realdb, code))
+            await asyncio.wait_for(lock_held.wait(), timeout=15)
+            revoke_task = asyncio.create_task(_revoke())
+            queued = await _wait_for_control_lock_waiter(realdb)
+            release.set()
+            attach, revoked = await asyncio.gather(attach_task, revoke_task)
+        assert queued, "the revoke never queued behind the attach's lock on A's row"
+        assert attach.status_code == 201
+        assert isinstance(revoked, partner_capability.PartnerHasChildren)
+        assert revoked.count == 1
         assert await _parent_of(realdb, "b") == realdb.info("a").org_id
     finally:
         await _set_parent(realdb, child_key="b", parent_key=None)

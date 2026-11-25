@@ -913,12 +913,58 @@ async def peppol_send(
     from app.models.entity import Entity
     from app.services.e_invoice import EInvoiceValidationError
     from app.services.peppol_adapters import ParticipantId, PeppolSendError
-    from app.services.peppol_send import send_invoice_over_peppol
+    from app.services.peppol_send import (
+        live_outbound_transmission,
+        resolve_receiver,
+        send_invoice_over_peppol,
+    )
 
-    # Row-locked: the approval recall (`review.recall_refusal`) refuses once a
-    # transmission exists and locks this row too, so a send and a recall
-    # serialize — the send re-reads the status the recall left, and the recall
-    # sees the transmission the send wrote (decisions §573).
+    # Unlocked pre-checks, before any network: an unapproved invoice is refused
+    # and an already-sent one answered `already_sent` without an SMP lookup.
+    # Column reads, not the ORM row, so the locked read below is not served
+    # stale from the identity map. Both are re-checked under the lock.
+    current_status = (
+        await db.execute(select(Invoice.status).where(Invoice.id == invoice_id))
+    ).scalar_one_or_none()
+    if current_status is None:
+        raise HTTPException(status_code=404, detail="Invoice not found")
+    if current_status not in _PEPPOL_SENDABLE_STATUSES:
+        raise HTTPException(status_code=422, detail="invoice_not_approved")
+    existing = await live_outbound_transmission(db, invoice_id)
+    if existing is not None:
+        return _peppol_send_response(existing, already_sent=True)
+    # End the read transaction: nothing is held open across the SMP lookup.
+    await db.commit()
+
+    # Everything that needs no network next: a malformed participant id or a
+    # missing sender is a 400 before any lookup.
+    peppol_config = (org.settings or {}).get("peppol") or {}
+    sender_scheme = body.sender_scheme or peppol_config.get("sender_scheme")
+    sender_value = body.sender_value or peppol_config.get("sender_value")
+    if not sender_scheme or not sender_value:
+        raise HTTPException(status_code=400, detail="sender participant id is not configured")
+
+    try:
+        sender_id = ParticipantId(scheme=str(sender_scheme), value=str(sender_value))
+        # Round-trip through parse to validate the scheme format (PII-free error).
+        ParticipantId.parse(sender_id.format())
+        receiver_id = ParticipantId.parse(f"{body.receiver_scheme}:{body.receiver_value}")
+    except ValueError as exc:
+        # str(exc) names the field only — never the value (PII-free).
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    # Reserve → commit → call → record (decisions §578). The SMP lookup is a
+    # network call, so it runs BEFORE the invoice row is locked; then, under the
+    # lock, the status is checked and `send_invoice_over_peppol` reserves the
+    # `sending` row and commits it, releasing the lock before the AS4 transmit.
+    # The approval recall (`review.recall_refusal`) locks this row too and
+    # refuses on any transmission not `failed`, so a send and a recall
+    # serialize without holding a lock across the network: the send re-reads
+    # the status a recall left, and a recall sees the committed reservation.
+    try:
+        adapter = await resolve_receiver(peppol_config, receiver_id)
+    except PeppolSendError as exc:
+        raise HTTPException(status_code=422, detail=exc.code) from exc
     invoice = await get_invoice_for_update(db, invoice_id)
 
     # PEPPOL transmission is a compliance-significant outbound to a counterparty
@@ -950,21 +996,6 @@ async def peppol_send(
 
     buyer = _buyer_identity_from_org(org, entity_name=entity_name)
 
-    peppol_config = (org.settings or {}).get("peppol") or {}
-    sender_scheme = body.sender_scheme or peppol_config.get("sender_scheme")
-    sender_value = body.sender_value or peppol_config.get("sender_value")
-    if not sender_scheme or not sender_value:
-        raise HTTPException(status_code=400, detail="sender participant id is not configured")
-
-    try:
-        sender_id = ParticipantId(scheme=str(sender_scheme), value=str(sender_value))
-        # Round-trip through parse to validate the scheme format (PII-free error).
-        ParticipantId.parse(sender_id.format())
-        receiver_id = ParticipantId.parse(f"{body.receiver_scheme}:{body.receiver_value}")
-    except ValueError as exc:
-        # str(exc) names the field only — never the value (PII-free).
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-
     try:
         transmission, already_sent = await send_invoice_over_peppol(
             db,
@@ -977,6 +1008,7 @@ async def peppol_send(
             entity_id=invoice.entity_id,
             actor_id=user.id,
             peppol_config=peppol_config,
+            adapter=adapter,
         )
     except EInvoiceValidationError as exc:
         # Structured + PII-free. The BIS Billing 3.0 conformance pass reports
@@ -987,6 +1019,10 @@ async def peppol_send(
     except PeppolSendError as exc:
         raise HTTPException(status_code=422, detail=exc.code) from exc
 
+    return _peppol_send_response(transmission, already_sent=already_sent)
+
+
+def _peppol_send_response(transmission, *, already_sent: bool) -> PeppolSendResponse:
     return PeppolSendResponse(
         transmission_id=transmission.id,
         status=transmission.status,

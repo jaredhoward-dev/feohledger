@@ -15,6 +15,10 @@ what a tenant may do, with no record, is the outcome to avoid).
 A revoke is refused while the org still parents a child: the children would be
 left administered by nobody (their partner could no longer reach
 ``/api/partner`` to detach them). The partner's admin detaches them first.
+The count is taken under the org's row lock, which ``attach_child`` and
+``provision_child`` also take (and re-check ``is_partner`` under) before they
+link a child, so a revoke and a new link serialize: one of them refuses
+(decisions §578).
 """
 
 from __future__ import annotations

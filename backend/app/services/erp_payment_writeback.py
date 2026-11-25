@@ -188,6 +188,45 @@ async def _resolve_account(
     return ids.get(code)
 
 
+async def discount_account_refusal(
+    db: AsyncSession, organization_id: uuid.UUID, erp_config: dict | None
+) -> str | None:
+    """Why a ``settings.erp`` block about to be saved with the discount credit
+    on names an account the write-back could not resolve, or None.
+
+    Read with :func:`_resolve_account`'s rule on the org-wide (shared) chart:
+    the account must exist there and carry an ERP id linked to the connection
+    being saved (``connection_realm`` / ``legacy_links_trusted``). An
+    entity-only account resolves for that entity's invoices alone, and one
+    never synced, or synced from another ERP company, for none — a save that
+    names one would turn on a credit every write-back then refuses
+    (decisions §578). Off, or no account named, is
+    ``catalog.discount_credit_refusal``'s call, not this one's.
+    """
+    from app.services.gl_chart import resolve_erp_account_ids
+
+    if not discount_credit_on(erp_config):
+        return None
+    code = str((erp_config or {}).get(DISCOUNT_ACCOUNT_KEY) or "").strip()
+    if not code:
+        return None
+    realm = connection_realm(erp_config)
+    ids = await resolve_erp_account_ids(
+        db,
+        organization_id,
+        None,
+        [code],
+        realm=realm,
+        trust_legacy=legacy_links_trusted(erp_config, realm),
+    )
+    if ids.get(code):
+        return None
+    return (
+        f"erp.{DISCOUNT_ACCOUNT_KEY} must be an organization-wide GL account linked to "
+        "the connected ERP. Sync the chart of accounts, then pick it again."
+    )
+
+
 async def build_discount_credit_payload(
     db: AsyncSession,
     *,

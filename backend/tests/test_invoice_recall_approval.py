@@ -500,6 +500,24 @@ _REFUSALS = {
         "invoice_recall_peppol_transmitted",
         {},
     ),
+    # A claim is named before the pair refusals whose way out is a DELETE: the
+    # delete refuses a claimed invoice, so the run / payment goes first (§578).
+    "mirror_in_a_payment_run": (
+        {"mirror": "self", "claim": "payment"},
+        "invoice_recall_claimed",
+        {"claim": "payment"},
+    ),
+    "mirror_unsigned_and_origin_in_a_run": (
+        {"mirror": "unsigned", "claim": "payment"},
+        "invoice_recall_claimed",
+        {"claim": "payment"},
+    ),
+    # …but a progressed mirror, which only a credit memo corrects, stays first.
+    "mirror_progressed_and_origin_in_a_run": (
+        {"mirror": "approved", "claim": "payment"},
+        "invoice_recall_mirror_progressed",
+        {"mirror_status": "approved"},
+    ),
     # Both: the ERP is named first — nothing in FeohLedger clears it.
     "erp_and_payment": (
         {"erp_document_id": "BILL-3", "claim": "payment"},
@@ -1016,3 +1034,16 @@ async def test_the_engine_walks_the_recall_edges_only_for_the_recall(realdb):
         await transition_invoice(s, inv, InvoiceStatus.ready_for_review, action_name=RECALL_ACTION)
         assert inv.status == InvoiceStatus.ready_for_review
         await s.rollback()
+
+
+async def test_a_mirror_in_a_payment_run_is_told_to_clear_the_run_first(realdb):
+    """§578: the mirror refusal's way out is deleting the mirror, which the
+    delete door refuses while a payment holds it — so the recall names the run
+    first, and the delete agrees it is the blocker."""
+    invoice_id = await _invoice(realdb, mirror="self", claim="payment")
+    resp = await _recall(realdb, "ap_manager", invoice_id)
+    assert resp.status_code == 409, resp.text
+    assert resp.json()["detail"]["code"] == "invoice_recall_claimed"
+    async with realdb.client(key=TENANT, role="ap_manager") as c:
+        deleted = await c.delete(f"/api/invoices/{invoice_id}")
+    assert deleted.status_code == 409, deleted.text

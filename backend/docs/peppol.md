@@ -150,7 +150,7 @@ CREATE UNIQUE INDEX uq_peppol_one_live_per_invoice_direction
 
 At most one **non-failed** (`sending`/`sent`/`delivered`) transmission per
 `(invoice_id, direction)`. The send service inserts the row in `sending` state
-and **flushes before the networked transmit**, so two concurrent POSTs cannot
+and **commits it before the networked transmit**, so two concurrent POSTs cannot
 both reach the gateway — the loser hits `IntegrityError`, rolls back, and gets
 the committed live row returned (`already_sent=True`). A prior **failed** send
 is excluded from the index, so a legitimate retry is allowed and creates a
@@ -203,13 +203,22 @@ non-empty `supported_doc_types`.
 | tax-invalid / not BIS 3.0 conformant | 422 (PII-free structured `[{loc, type, msg}]` list — see `e-invoicing.md` § The 422 body) |
 | role not permitted | 403 |
 
-The route takes the invoice **row lock** (`get_invoice_for_update`) before
-reading its status, so a send and an approval recall serialize: once a live
-(not `failed`) outbound transmission exists, the recall is refused with 409
-`invoice_recall_peppol_transmitted` — the receiver holds the approved
-document, and a transmitted e-invoice is corrected by a credit note and a new
-document, never by reopening the one sent (`services/review.recall_refusal`,
-decisions §573). A `sending` row counts: its outcome is unknown.
+**Reserve → commit → call → record** (decisions §578). The SMP lookup
+(`peppol_send.resolve_receiver`) runs first, with no lock held. The route then
+takes the invoice **row lock** (`get_invoice_for_update`), re-reads its status,
+and the send service reserves the `sending` row and **commits** it, releasing
+the lock before the AS4 transmit; the outcome is recorded in a second commit.
+No lock spans a network call, so payment sync, run building and approvals never
+wait on an Access Point's timeout. A send and an approval recall still
+serialize: a recall holding the lock first leaves the invoice
+`ready_for_review` and the send then refuses `invoice_not_approved`; a recall
+after the reservation sees a live (not `failed`) outbound transmission and is
+refused with 409 `invoice_recall_peppol_transmitted` — the receiver holds the
+approved document, and a transmitted e-invoice is corrected by a credit note and
+a new document, never by reopening the one sent (`services/review.recall_refusal`,
+decisions §573). A `sending` row counts: its outcome is unknown — including a
+transmit that raised instead of returning a result, which leaves its row
+`sending`.
 
 A send writes a `invoice.peppol_sent` (or `invoice.peppol_send_failed`) audit
 row through `dispatch_audit` (`details` records provider, `receiver_scheme`,
