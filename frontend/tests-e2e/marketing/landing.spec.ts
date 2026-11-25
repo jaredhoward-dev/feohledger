@@ -352,7 +352,7 @@ test.describe('landing — signing in from the main domain (#635 finding 4)', ()
 
 		await expect(page.getByRole('heading', { level: 1, name: 'Sign in to your workspace' })).toBeVisible();
 		await expect(page).toHaveURL(/\/find-workspace$/);
-		const field = page.getByLabel('Workspace address');
+		const field = page.getByLabel('Workspace address', { exact: true });
 		// The platform host is shown beside the field, from the template.
 		await expect(page.locator('#workspace-suffix')).toHaveText('.feoh.example');
 
@@ -365,7 +365,7 @@ test.describe('landing — signing in from the main domain (#635 finding 4)', ()
 	test('an address that cannot be a workspace is refused in place, with the reason', async ({ page }) => {
 		await stubPublicConfig(page);
 		await page.goto('/find-workspace');
-		const field = page.getByLabel('Workspace address');
+		const field = page.getByLabel('Workspace address', { exact: true });
 		await field.fill('acme_corp');
 		await page.getByRole('button', { name: 'Continue' }).click();
 
@@ -381,7 +381,7 @@ test.describe('landing — signing in from the main domain (#635 finding 4)', ()
 		// from that host, so that is what its users type.
 		await stubPublicConfig(page);
 		await page.goto('/find-workspace');
-		const field = page.getByLabel('Workspace address');
+		const field = page.getByLabel('Workspace address', { exact: true });
 		await field.fill('ap.acmecorp.com');
 		await page.getByRole('button', { name: 'Continue' }).click();
 
