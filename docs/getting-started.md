@@ -101,7 +101,12 @@ pnpm simulate:card -- --tenant acme --card <card id or mock_card_… token> --se
 The card's `id` is in `GET /api/cards` (or `virtual_cards.id` in the tenant
 database). `--settle` sends the settlement after the authorization; without it the card
 is only authorized and the invoice stays `payment_scheduled` (an authorization is not money
-moved). Add `--amount 90.00` for a short charge.
+moved). Add `--amount 90.00` for a short charge. To undo an authorization instead, as the
+issuer would, send `--reverse` (or `--expire`): the card returns to unspent (decisions §544):
+
+```bash
+pnpm simulate:card -- --tenant acme --card <card id or mock_card_… token> --reverse
+```
 Details: [backend/docs/virtual-cards.md](../backend/docs/virtual-cards.md)
 § Charging a mock card locally.
 
