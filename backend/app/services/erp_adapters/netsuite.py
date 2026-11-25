@@ -48,6 +48,7 @@ from app.services.erp_adapters.base import (
     ErpInvoiceStatus,
     ErpListingIncomplete,
     ErpPostResult,
+    FoundBill,
     GLAccountPayload,
     InvoicePayload,
     ListingGap,
@@ -404,6 +405,11 @@ class NetSuiteAdapter(ErpAdapter):
     #: ``void_invoice`` deletes a bill only while it is pending approval; REST
     #: has no void for an approved one (decisions §542).
     bill_void_scope = BILL_VOID_DRAFT_ONLY
+    #: The push's ``eid:`` idempotency lookup is offered on its own
+    #: (:meth:`find_posted_bill`, decisions §566). Its key, the externalId, is
+    #: the invoice's correlation id (unique per invoice), and it reads no
+    #: status-sync call, so it does not wait on the §541 opt-in.
+    supports_bill_lookup = True
 
     def status_sync_on(self) -> bool:
         """Status sync is a per-tenant opt-in for NetSuite (decisions §541):
@@ -769,6 +775,36 @@ class NetSuiteAdapter(ErpAdapter):
             return 502, None
         return 200, record
 
+    async def find_posted_bill(self, payload: InvoicePayload) -> FoundBill | None:
+        """The push's own match, read-only (decisions §556, §566): the
+        vendorBill at ``eid:<correlation id>`` (:meth:`_find_by_external_id`),
+        then its currency's ISO code and, for a bill Paid In Full, what was
+        applied to it (both SuiteQL reads :meth:`get_invoice_status` makes).
+
+        The correlation id is unique per invoice (``invoices.correlation_id``)
+        and NetSuite keeps an externalId unique per record type, so the bill
+        found is this invoice's push or nothing. A lookup that cannot be made,
+        a 200 that is not plainly our bill, or a config NetSuite cannot be
+        called with raises; only ``NONEXISTENT_ID`` is "none". A currency or
+        payment read that fails leaves the currency None / the status
+        ``unknown`` on a bill that WAS found, never a miss."""
+        if not str(payload.correlation_id or "").strip():
+            raise ValueError("netsuite bill lookup: no correlation id")
+        await self._check_config()
+        lookup_status, record = await self._find_by_external_id(payload.correlation_id)
+        if lookup_status != 200:
+            raise NetSuiteStatusReadError(lookup_status)
+        if record is None:
+            return None
+        bill_id = str(record["id"])
+        return FoundBill(
+            document_id=bill_id,
+            document_number=str(record.get("tranId") or "") or None,
+            amount=_netsuite_decimal(record.get("total")),
+            currency=await self._currency_code(_ref_id(record.get("currency"))),
+            status=await self._status_of(bill_id, record),
+        )
+
     async def _currency_id(self, code: str) -> tuple[bool, str | None]:
         """``(read, internal id)`` of the active NetSuite currency whose ISO
         code is ``code`` (``_CURRENCY_QUERY``). ``(True, None)``: NetSuite has
@@ -1100,9 +1136,13 @@ class NetSuiteAdapter(ErpAdapter):
         record = await self._read_bill(erp_document_id)
         if record is None:
             return ErpInvoiceStatus.unknown
+        return await self._status_of(erp_document_id, record)
+
+    async def _status_of(self, bill_id: str, record: dict) -> ErpInvoiceStatus:
+        """:meth:`get_invoice_status` on a bill already read."""
         status = _netsuite_bill_status(record)
         if status == "paidinfull":
-            return await self._paid_or_settled(erp_document_id, record)
+            return await self._paid_or_settled(bill_id, record)
         status_map = {
             "open": ErpInvoiceStatus.open,
             "pendingapproval": ErpInvoiceStatus.draft,

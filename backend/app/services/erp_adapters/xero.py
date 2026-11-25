@@ -90,6 +90,7 @@ from app.services.erp_adapters.base import (
     ErpListingIncomplete,
     ErpPostResult,
     ErpScopeMissing,
+    FoundBill,
     GLAccountPayload,
     InvoicePayload,
     ListingGap,
@@ -202,6 +203,9 @@ XERO_OAUTH = register_oauth_provider(
 )
 
 _BILL_STATUSES = {"AUTHORISED", "DRAFT"}
+#: The statuses the push's idempotency lookup (and so the orphan-bill lookup)
+#: reads a bill at: everything but DELETED / VOIDED.
+_LIVE_BILL_STATUSES = "DRAFT,SUBMITTED,AUTHORISED,PAID"
 
 _STATUS_MAP = {
     "DRAFT": ErpInvoiceStatus.draft,
@@ -327,6 +331,12 @@ class XeroAdapter(OAuthErpAdapter):
     #: The vendor page can find any contact by name or tax number and link it
     #: by hand (``search_vendors`` / ``get_vendor``, decisions §415).
     supports_vendor_search = True
+    #: The push's idempotency lookup is offered on its own
+    #: (:meth:`find_posted_bill`, decisions §566). Its key is the supplier and
+    #: invoice number, nothing unique to one invoice, so the lookup is refused
+    #: while another invoice in the tenant shares that key.
+    supports_bill_lookup = True
+    bill_lookup_key_shared = True
 
     @classmethod
     async def list_external_tenants(
@@ -373,9 +383,9 @@ class XeroAdapter(OAuthErpAdapter):
 
     # -- post ---------------------------------------------------------------
 
-    async def _find_existing_bill(self, client, headers, payload: InvoicePayload):
-        """Pre-create idempotency lookup: a live ACCPAY bill from this supplier
-        carrying this invoice number. Returns ``(response, bill | None)``.
+    async def _matching_bills(self, client, headers, payload: InvoicePayload):
+        """Every live ACCPAY bill from this supplier carrying this invoice
+        number. Returns ``(response, bills)``; ``bills`` is empty on a non-200.
 
         ``Reference`` is ACCREC-only in Xero, so there is no bill field to carry
         our correlation id; the supplier + supplier invoice number is the key
@@ -386,19 +396,68 @@ class XeroAdapter(OAuthErpAdapter):
             params={
                 "InvoiceNumbers": payload.invoice_number,
                 "ContactIDs": payload.vendor_erp_id,
-                "Statuses": "DRAFT,SUBMITTED,AUTHORISED,PAID",
+                "Statuses": _LIVE_BILL_STATUSES,
                 "where": 'Type=="ACCPAY"',
             },
             headers=headers,
         )
         if resp.status_code != 200:
-            return resp, None
-        for bill in _json(resp).get("Invoices") or []:
-            if bill.get("Type", "ACCPAY") == "ACCPAY" and (
-                bill.get("InvoiceNumber") == payload.invoice_number
-            ):
-                return resp, bill
-        return resp, None
+            return resp, []
+        return resp, [
+            bill
+            for bill in _json(resp).get("Invoices") or []
+            if isinstance(bill, dict)
+            and bill.get("Type", "ACCPAY") == "ACCPAY"
+            and bill.get("InvoiceNumber") == payload.invoice_number
+        ]
+
+    async def _find_existing_bill(self, client, headers, payload: InvoicePayload):
+        """Pre-create idempotency lookup: the first of :meth:`_matching_bills`.
+        Returns ``(response, bill | None)``."""
+        resp, bills = await self._matching_bills(client, headers, payload)
+        return resp, (bills[0] if bills else None)
+
+    async def find_posted_bill(self, payload: InvoicePayload) -> FoundBill | None:
+        """The push's own match (:meth:`_matching_bills`), read-only, as a
+        :class:`FoundBill` (decisions §556, §566). One GET.
+
+        Raises rather than answer "none" on anything it cannot read plainly: a
+        payload the push would refuse before sending (no linked supplier, no
+        number), a non-200, more than one bill on the key (which is ours is not
+        knowable), or a bill without an id, on another contact, or at a status
+        the filter did not ask for. The key carries nothing unique to one
+        invoice; ``services/erp_bill_void`` keeps it from naming another
+        invoice's bill (:attr:`bill_lookup_key_shared`)."""
+        if not payload.vendor_erp_id:
+            raise ValueError(VENDOR_NOT_LINKED)
+        if not (payload.invoice_number or "").strip():
+            raise ValueError("xero bill lookup: no invoice number")
+        headers = await self._headers()
+        async with self.oauth_client(timeout=30) as client:
+            resp, bills = await self._matching_bills(client, headers, payload)
+        if resp.status_code != 200:
+            raise XeroRequestError(resp.status_code)
+        if not bills:
+            return None
+        if len(bills) > 1:
+            raise XeroRequestError(resp.status_code)
+        bill = bills[0]
+        bill_id = str(bill.get("InvoiceID") or "").strip()
+        contact = bill.get("Contact") if isinstance(bill.get("Contact"), dict) else {}
+        status = str(bill.get("Status") or "").upper()
+        if (
+            not bill_id
+            or str(contact.get("ContactID") or "") != str(payload.vendor_erp_id)
+            or status not in _LIVE_BILL_STATUSES.split(",")
+        ):
+            raise XeroRequestError(resp.status_code)
+        return FoundBill(
+            document_id=bill_id,
+            document_number=bill.get("InvoiceNumber") or None,
+            amount=_decimal(bill.get("Total")),
+            currency=iso_currency_or_none(bill.get("CurrencyCode")),
+            status=map_bill_status(bill),
+        )
 
     async def _account_tax_types(self, client, headers, account_ids: set[str]) -> dict[str, str]:
         """Each account's default ``TaxType`` from the customer's own chart."""
