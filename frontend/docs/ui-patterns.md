@@ -476,10 +476,16 @@ per-currency money breakdown, so the pay-bar's subtotals + mixed-currency
 guard stay honest without holding every row); while in matching mode the
 prune effect is skipped and the money totals come from that backend
 breakdown, not the loaded page — mirrors `/invoices`' `selectedAllMatching`.
+Because the prune stands aside, a matching-mode selection must end when the
+filter it was made under changes (`/vendors` keys it on search + status;
+guard: `tests-e2e/vendors/bulk.spec.ts`), or the bar keeps counting, and a
+bulk action keeps acting on, rows the table no longer shows.
 
 Shipped on `/invoices`, `/expenses`, `/vendors` (bulk verify/reject via
 `POST /api/vendors/bulk/status`, bulk re-screen via `.../bulk/screen`, CSV
-export via `.../bulk/export`; gated to `vendor.manage`) and `/contracts`
+export via `.../bulk/export`; each action on its own endpoint's gate:
+verify/reject `vendor.manage`, re-screen admin | ap_manager, export admin |
+ap_manager | cfo, and the checkbox column only when one of them is held) and `/contracts`
 (bulk activate/terminate/cancel via `POST /api/contracts/bulk/status`,
 routed through the same `_transition` helper the single-row lifecycle
 buttons use; CSV export) and the `/payments` **Queue** tab (payment-run

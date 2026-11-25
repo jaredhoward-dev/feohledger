@@ -230,6 +230,16 @@
 	let sortOrder = $state<SortOrder>(initialSort.order);
 
 	// --- Bulk selection ---
+	// Each bulk action shows on the gate its own endpoint uses, not one gate
+	// for the bar. `/bulk/status` is `require_permission(vendor.manage)`,
+	// `/bulk/screen` `require_roles(admin, ap_manager)` and `/bulk/export`
+	// `require_roles(admin, ap_manager, cfo)`. Gating the whole bar on
+	// vendor.manage hid Export from the CFO the export endpoint admits (who
+	// still got row checkboxes that did nothing), and offered Screen to a
+	// custom vendor.manage role it 403s.
+	const canBulkScreen = $derived(auth.isManager);
+	const canBulkExport = $derived(auth.isManager || auth.isCfo);
+	const canBulk = $derived(canManageVendors || canBulkScreen || canBulkExport);
 	let selected = $state<Set<string>>(new Set());
 	// True once "Select all N matching" has resolved the whole filtered set
 	// (not just the loaded page) into `selected` — mirrors the identical
@@ -793,14 +803,16 @@
 		filtered={!noActiveFilters}
 		emptyFiltered={m('vendors.empty')}
 		empty={m('vendors.empty.fresh')}
-		colspan={10}
+		colspan={canBulk ? 10 : 9}
 		fixed
 	>
 		{#snippet header()}
 			<tr>
-				<th class="checkbox-col">
-					<input type="checkbox" aria-label={m('vendors.selectAllAria')} checked={allSelected} onchange={toggleSelectAll} />
-				</th>
+				{#if canBulk}
+					<th class="checkbox-col">
+						<input type="checkbox" aria-label={m('vendors.selectAllAria')} checked={allSelected} onchange={toggleSelectAll} />
+					</th>
+				{/if}
 				<SortableHeader class="col-vendor" field="name" label={m('vendors.col.vendor')} active={sortField === 'name'} order={sortOrder} onsort={handleSort} onclear={handleClearSort} />
 				<SortableHeader class="col-code" field="code" label={m('vendors.col.code')} active={sortField === 'code'} order={sortOrder} onsort={handleSort} onclear={handleClearSort} />
 				<th scope="col" class="col-email">{m('vendors.col.email')}</th>
@@ -823,15 +835,17 @@
 							if (isRowOpenClick(e)) detailVendor = v;
 						}}
 					>
-						<td class="checkbox-col">
-							<input
-								type="checkbox"
-								checked={selected.has(v.id)}
-								onclick={(e) => e.stopPropagation()}
-								onchange={() => toggleSelect(v.id)}
-								aria-label={m('vendors.selectRowAria', { vendor: v.name })}
-							/>
-						</td>
+						{#if canBulk}
+							<td class="checkbox-col">
+								<input
+									type="checkbox"
+									checked={selected.has(v.id)}
+									onclick={(e) => e.stopPropagation()}
+									onchange={() => toggleSelect(v.id)}
+									aria-label={m('vendors.selectRowAria', { vendor: v.name })}
+								/>
+							</td>
+						{/if}
 						<td class="vendor-name">
 							<RowLink onclick={() => (detailVendor = v)} ariaLabel={m('vendors.row.openAria', { vendor: v.name })}>
 								{v.name}
@@ -938,7 +952,7 @@
 	/>
 	{/if}
 
-	{#if canManageVendors}
+	{#if canBulk}
 		<BulkBar count={selected.size} onclear={clearSelection}>
 			{#snippet actions()}
 				{#if allSelected && !selectedAllMatching && total > vendors.length}
@@ -950,23 +964,31 @@
 				{:else if selectedAllMatching}
 					<span class="bulk-all-matching-note">{m('common.allMatchingSelected')}</span>
 				{/if}
-				<RowAction variant="success" disabled={bulkBusy} onclick={bulkVerify}>{m('vendors.row.verify')}</RowAction>
-				<RowAction
-					variant="danger"
-					armed={bulkRejectArmed}
-					disabled={bulkBusy}
-					onclick={() => {
-						if (bulkRejectArmed) {
-							armed = null;
-							bulkReject();
-						} else armed = { action: 'bulkReject' };
-					}}
-				>
-					{bulkRejectArmed ? m('vendors.row.confirmReject') : m('vendors.row.reject')}
-				</RowAction>
-				<div class="bulk-divider"></div>
-				<RowAction disabled={bulkBusy} onclick={bulkScreen}>{m('vendors.bulk.screen')}</RowAction>
-				<RowAction disabled={bulkBusy} onclick={bulkExport}>{m('vendors.bulk.exportCsv')}</RowAction>
+				{#if canManageVendors}
+					<RowAction variant="success" disabled={bulkBusy} onclick={bulkVerify}>{m('vendors.row.verify')}</RowAction>
+					<RowAction
+						variant="danger"
+						armed={bulkRejectArmed}
+						disabled={bulkBusy}
+						onclick={() => {
+							if (bulkRejectArmed) {
+								armed = null;
+								bulkReject();
+							} else armed = { action: 'bulkReject' };
+						}}
+					>
+						{bulkRejectArmed ? m('vendors.row.confirmReject') : m('vendors.row.reject')}
+					</RowAction>
+					{#if canBulkScreen || canBulkExport}
+						<div class="bulk-divider"></div>
+					{/if}
+				{/if}
+				{#if canBulkScreen}
+					<RowAction disabled={bulkBusy} onclick={bulkScreen}>{m('vendors.bulk.screen')}</RowAction>
+				{/if}
+				{#if canBulkExport}
+					<RowAction disabled={bulkBusy} onclick={bulkExport}>{m('vendors.bulk.exportCsv')}</RowAction>
+				{/if}
 			{/snippet}
 		</BulkBar>
 	{/if}
