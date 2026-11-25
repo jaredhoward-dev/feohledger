@@ -22,8 +22,13 @@
 	 * Terms or Privacy Policy is refused (`legal_acceptance_required`) however
 	 * often the box is ticked. Only a reload fetches the current documents and
 	 * versions, so the message says so and offers the reload beside the box.
+	 *
+	 * `documents="privacy"` is the supplier portal's box (`docs/decisions.md`
+	 * §499): a Supplier User is not a party to the Terms, so the box names only
+	 * the Privacy Policy and says it was read, not agreed to.
 	 */
 	import LinkedMessage from '#lib/components/ui/LinkedMessage.svelte';
+	import type { MessageKey } from '#lib/i18n/messages.ts';
 	import { m } from '#lib/i18n/store.svelte.ts';
 	import { legalTitle } from '#lib/legal/pages.ts';
 
@@ -32,6 +37,7 @@
 		id,
 		error = '',
 		withDpa = false,
+		documents = 'terms_privacy',
 		versionsChanged = false,
 		onchange
 	}: {
@@ -40,6 +46,10 @@
 		/** Shown beside the box, and announced, when a submit found it unticked. */
 		error?: string;
 		withDpa?: boolean;
+		/** Which documents the box names: our Terms and Privacy Policy (an
+		 *  employee account), or the Privacy Policy alone (a supplier-portal
+		 *  account, §499). */
+		documents?: 'terms_privacy' | 'privacy';
 		/** The server refused a TICKED box: the documents changed since the page
 		 *  loaded. Shown in place of `error`, with a reload action. */
 		versionsChanged?: boolean;
@@ -48,6 +58,24 @@
 
 	let input: HTMLInputElement | undefined = $state();
 	let described = $derived(Boolean(error) || versionsChanged);
+	let privacyOnly = $derived(documents === 'privacy');
+	let labelKey: MessageKey = $derived(
+		privacyOnly
+			? 'auth.legal.privacyAckLabel'
+			: withDpa
+				? 'auth.signup.legalConsent'
+				: 'auth.legal.acceptLabel'
+	);
+	let privacyLink = { href: '/legal/privacy', label: legalTitle('/legal/privacy') };
+	let links = $derived(
+		privacyOnly
+			? { privacy: privacyLink }
+			: {
+					terms: { href: '/legal/terms', label: legalTitle('/legal/terms') },
+					privacy: privacyLink,
+					...(withDpa ? { dpa: { href: '/legal/dpa', label: legalTitle('/legal/dpa') } } : {})
+				}
+	);
 
 	/** Move focus to the box (a submit that found it unticked). */
 	export function focus() {
@@ -67,19 +95,12 @@
 		aria-describedby={described ? `${id}-error` : undefined}
 	/>
 	<label for={id}>
-		<LinkedMessage
-			text={m(withDpa ? 'auth.signup.legalConsent' : 'auth.legal.acceptLabel')}
-			links={{
-				terms: { href: '/legal/terms', label: legalTitle('/legal/terms') },
-				privacy: { href: '/legal/privacy', label: legalTitle('/legal/privacy') },
-				...(withDpa ? { dpa: { href: '/legal/dpa', label: legalTitle('/legal/dpa') } } : {})
-			}}
-		/>
+		<LinkedMessage text={m(labelKey)} {links} />
 	</label>
 </div>
 {#if versionsChanged}
 	<div id="{id}-error" class="hint bad versions-changed" role="alert">
-		<span>{m('auth.legal.versionsChanged')}</span>
+		<span>{m(privacyOnly ? 'auth.legal.privacyVersionsChanged' : 'auth.legal.versionsChanged')}</span>
 		<button type="button" class="reload" onclick={() => location.reload()}>
 			{m('auth.legal.reload')}
 		</button>

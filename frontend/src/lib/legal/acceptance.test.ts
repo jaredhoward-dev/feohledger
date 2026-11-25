@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { ACCEPTED_LEGAL_VERSIONS } from './acceptance.ts';
+import { ACCEPTED_LEGAL_VERSIONS, ACKNOWLEDGED_PORTAL_VERSIONS } from './acceptance.ts';
 import { PRIVACY_VERSION, TERMS_VERSION } from './legalVersions.generated.ts';
 import { LAST_UPDATED } from './operator.ts';
 
@@ -10,6 +10,13 @@ describe('accepted legal versions (decisions §495)', () => {
 			accepted_terms_version: TERMS_VERSION,
 			accepted_privacy_version: PRIVACY_VERSION
 		});
+	});
+
+	it('sends the supplier portal the Privacy Policy version alone (decisions §499)', () => {
+		// A Supplier User is not a party to the Terms: no Terms version is sent,
+		// so none can be recorded against a supplier.
+		expect(ACKNOWLEDGED_PORTAL_VERSIONS).toEqual({ accepted_privacy_version: PRIVACY_VERSION });
+		expect(ACKNOWLEDGED_PORTAL_VERSIONS).not.toHaveProperty('accepted_terms_version');
 	});
 
 	it('never names a version newer than the published set', () => {

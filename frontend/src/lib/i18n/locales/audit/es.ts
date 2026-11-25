@@ -257,6 +257,7 @@ export const messages = {
 	'audit.action.portal.mfa.step_up.failure': "Reverificación en el portal de proveedores fallida",
 	'audit.action.portal.mfa.verify.failure': "Verificación MFA del portal de proveedores fallida",
 	'audit.action.portal.mfa.verify.success': "Verificación MFA del portal de proveedores superada",
+	'audit.action.portal.legal.accepted': "Lectura de la política de privacidad confirmada en el portal de proveedores",
 	'audit.action.portal.password.changed': "Contraseña del portal de proveedores cambiada",
 	'audit.action.portal.password_reset.requested': "Restablecimiento de contraseña del portal solicitado",
 	'audit.action.portal.session.revoked': "Sesión del portal de proveedores revocada",

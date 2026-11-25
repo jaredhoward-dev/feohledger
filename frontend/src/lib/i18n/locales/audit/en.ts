@@ -260,6 +260,7 @@ export const enAudit = {
 	'audit.action.portal.mfa.step_up.failure': "Supplier portal re-verification failed",
 	'audit.action.portal.mfa.verify.failure': "Supplier portal MFA check failed",
 	'audit.action.portal.mfa.verify.success': "Supplier portal MFA check passed",
+	'audit.action.portal.legal.accepted': "Supplier portal Privacy Policy acknowledged",
 	'audit.action.portal.password.changed': "Supplier portal password changed",
 	'audit.action.portal.password_reset.requested': "Supplier portal password reset requested",
 	'audit.action.portal.session.revoked': "Supplier portal session revoked",

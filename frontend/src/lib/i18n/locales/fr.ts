@@ -3553,6 +3553,9 @@ export const messages = {
 	'auth.legal.acceptRequired': 'Cochez la case pour accepter les conditions d\'utilisation et la politique de confidentialité.',
 	'auth.legal.versionsChanged': 'Les conditions d\'utilisation ou la politique de confidentialité ont changé depuis le chargement de cette page. Rechargez la page pour lire et accepter les versions en vigueur.',
 	'auth.legal.reload': 'Recharger la page',
+	'auth.legal.privacyAckLabel': 'J\'ai lu la {privacy}.',
+	'auth.legal.privacyAckRequired': 'Cochez la case pour confirmer que vous avez lu la politique de confidentialité.',
+	'auth.legal.privacyVersionsChanged': 'La politique de confidentialité a changé depuis le chargement de cette page. Rechargez la page pour lire la version en vigueur.',
 	'auth.signup.footerPre': 'Vous avez déjà un espace de travail ? Rendez-vous sur ',
 	'auth.signup.footerPost': ' pour vous connecter.',
 	// Auth shell brand panel (lib/components/auth/AuthShell.svelte) — signup's

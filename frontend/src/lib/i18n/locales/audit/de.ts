@@ -257,6 +257,7 @@ export const messages = {
 	'audit.action.portal.mfa.step_up.failure': "Erneute Bestätigung im Lieferantenportal fehlgeschlagen",
 	'audit.action.portal.mfa.verify.failure': "Lieferantenportal-MFA-Prüfung fehlgeschlagen",
 	'audit.action.portal.mfa.verify.success': "Lieferantenportal-MFA-Prüfung bestanden",
+	'audit.action.portal.legal.accepted': "Datenschutzerklärung im Lieferantenportal zur Kenntnis genommen",
 	'audit.action.portal.password.changed': "Lieferantenportal-Passwort geändert",
 	'audit.action.portal.password_reset.requested': "Lieferantenportal-Passwortzurücksetzung angefordert",
 	'audit.action.portal.session.revoked': "Lieferantenportal-Sitzung widerrufen",

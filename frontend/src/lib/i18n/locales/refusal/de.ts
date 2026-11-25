@@ -143,6 +143,7 @@ export const messages = {
 	'refusal.signupUnavailable': "Das Erstellen von Arbeitsbereichen ist vorübergehend nicht möglich. Versuchen Sie es später erneut.",
 	'refusal.signupProvisioningFailed': "Beim Erstellen Ihres Arbeitsbereichs ist ein Fehler aufgetreten. Wenden Sie sich an den Support.",
 	'refusal.legalAcceptanceRequired': "Bitte akzeptieren Sie die aktuellen Nutzungsbedingungen und die Datenschutzerklärung, um fortzufahren.",
+	'refusal.privacyAcknowledgementRequired': "Bitte bestätigen Sie, dass Sie die aktuelle Datenschutzerklärung gelesen haben, um fortzufahren.",
 	// The shared limiter's 429 (`services/rate_limit.py`, `rate_limited`): the wait,
 	// rounded up to the largest whole unit, never which limit tripped.
 	'refusal.rateLimitedSeconds': "Zu viele Versuche. Warten Sie {n, plural, one {# Sekunde} other {# Sekunden}} und versuchen Sie es dann erneut.",
