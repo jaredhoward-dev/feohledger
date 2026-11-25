@@ -288,10 +288,14 @@ best-effort email to `vendor.email`, modeled on
   The conversation is an inline panel on the portal invoice list, which reads
   `?chat=` on mount and on same-route navigation and opens that invoice's
   thread (fetching the row via `GET /api/portal/invoices/{id}` when it is not
-  on the loaded page; an id the supplier does not own reads as not found).
+  on the loaded page). Only a `404` (or an id that is not a UUID) reads as
+  "not in your account"; any other failure of that read says the conversation
+  could not be opened, with a Retry. Once open, focus moves to the composer (or
+  to the thread's own Retry when the thread read failed).
   Signed out, the portal layout's auth wall sends the supplier to
   `/portal/login?next=…` and the sign-in returns them there
-  (`safePortalNextPath`: portal pages only). The link used to be
+  (`safePortalNextPath`: portal pages only) — through the forced password
+  change too, which carries `?next=` on (`withPortalNext`) and follows it. The link used to be
   `/portal/invoices/{id}/chat`, which no portal route renders, so every one
   404ed; `tests/test_supplier_chat_portal_link.py` pins the path to a real
   SvelteKit page and the parameter to the one it reads, and
