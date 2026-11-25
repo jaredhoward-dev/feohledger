@@ -124,6 +124,43 @@ test.describe('/organization — line-total check and exception-agent autonomy',
 		['line-total-check', 'line-total', LINE_TOTAL],
 		['exception-agents', 'agent-autonomy', AUTONOMY]
 	] as const) {
+		test(`a failed ${section} read shows the error with Retry, and Retry loads it`, async ({
+			page
+		}) => {
+			// Only the first GET fails, so Retry reaches the real endpoint.
+			let failed = false;
+			await page.route(
+				(url) => url.pathname === path,
+				async (route) => {
+					if (route.request().method() === 'GET' && !failed) {
+						failed = true;
+						await route.fulfill({
+							status: 500,
+							contentType: 'application/json',
+							body: JSON.stringify({ detail: 'boom' })
+						});
+						return;
+					}
+					await route.continue();
+				}
+			);
+			await page.goto(`/organization?section=${section}`);
+
+			const panel = page.getByTestId(`${testId}-panel`);
+			const error = panel.getByTestId(`${testId}-load-error`);
+			await expect(error).toBeVisible();
+			await expect(panel.getByTestId(`${testId}-save`)).toHaveCount(0);
+
+			await error.getByRole('button', { name: 'Retry' }).click();
+			await expect(error).toHaveCount(0);
+			await expect(panel.getByTestId(`${testId}-save`)).toBeDisabled();
+		});
+	}
+
+	for (const [section, testId, path] of [
+		['line-total-check', 'line-total', LINE_TOTAL],
+		['exception-agents', 'agent-autonomy', AUTONOMY]
+	] as const) {
 		test(`a non-admin sees the ${section} notice and the page asks the server nothing`, async ({
 			page,
 			tenantClerk

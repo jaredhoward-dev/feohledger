@@ -448,6 +448,14 @@ a definition as JSON). All wrap the shared `ui/Modal.svelte` and call the
   type-the-slug confirmation enables the destructive button, `ui/StepUpPrompt` collects a second
   factor when the server asks, and success clears the token and navigates to
   `/login?reason=workspace_closed`. Admin-only hint for everyone else.
+- `OrgSettingPanel.svelte` — the frame of a single-setting Organization panel (the Line-total
+  check and Exception agents panels): the titled `.card`, its intro line, the admin-only notice and
+  the async states around the form the caller passes as `children` — `ui/LoadingState` while
+  `loading`, `ui/LoadError` with `onretry` when `loadFailed`. Props: `title`, `intro`, `testId`
+  (prefix of `{testId}-panel`, `-admin-only`, `-loading`, `-load-error`), `readOnly`, `loading`,
+  `loadFailed`, `loadFailedMessage`, `onretry`, and an optional `footer` snippet for the save row,
+  whose button is the global `.btn-primary`. The multi-step connection panels (ERP, Commerce) keep
+  their own frames.
 - `ErpConnectionPanel.svelte` — the Organization → ERP panel, rendered entirely from the backend ERP
   catalogue (`GET /api/organization/erp/providers`). Props: `stored` (`settings.erp` as
   `GET /api/organization` serves it — configuration only), `readOnly`, `userLoaded`, `entitled` (the

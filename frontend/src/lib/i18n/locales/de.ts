@@ -89,7 +89,7 @@ export const messages = {
 	'shell.legalAccept.continue': 'Akzeptieren und fortfahren',
 	'shell.legalAccept.continuing': 'Wird gespeichert…',
 	'shell.legalAccept.failed': 'Ihre Zustimmung wurde nicht gespeichert. Versuchen Sie es erneut.',
-	'shell.privacyAck.heading': 'Bestätigen Sie, dass Sie unsere Datenschutzerklärung gelesen haben',
+	'shell.privacyAck.heading': 'Bestätigen Sie, dass Sie die Datenschutzerklärung der Plattform gelesen haben',
 	'shell.privacyAck.body': 'Bevor Sie fortfahren, lesen Sie die aktuelle Datenschutzerklärung. Sie erklärt, wie die Plattform mit den hier eingegebenen Angaben umgeht. Wenn Sie das nicht möchten, melden Sie sich ab.',
 	'shell.privacyAck.continue': 'Bestätigen und fortfahren',
 	'shell.privacyAck.failed': 'Ihre Bestätigung wurde nicht gespeichert. Versuchen Sie es erneut.',

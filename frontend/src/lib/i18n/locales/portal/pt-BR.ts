@@ -26,6 +26,7 @@ export const messages = {
 	'portal.nav.notifications': 'Notificações',
 	'portal.shell.logOut': 'Sair',
 	'portal.shell.footerSupport': 'Suporte',
+	'portal.privacyAck.support': 'Dúvidas? Fale com o suporte',
 	'portal.shell.footerLegal': 'Jurídico',
 	'portal.shell.footerPlatformLegal': 'Privacidade e termos',
 

@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 
 import 'package:material_ui/material_ui.dart';
@@ -41,10 +42,18 @@ MockClient _happyClient({
   String email = 'demo@acme.com',
   List<String> roles = const ['admin'],
   String tenantUrlTemplate = 'https://{slug}.feohledger.com',
+  _PublicConfigHook? publicConfig,
 }) {
   return MockClient((req) async {
     final path = req.url.path;
     if (req.method == 'GET' && path == '/api/public-config') {
+      if (publicConfig != null) {
+        publicConfig.calls += 1;
+        await publicConfig.gate?.future;
+        if (publicConfig.status != 200) {
+          return _json({'detail': 'boom'}, publicConfig.status);
+        }
+      }
       return _json({
         'hcaptcha_sitekey': '',
         'tenant_url_template': tenantUrlTemplate,
@@ -64,12 +73,23 @@ MockClient _happyClient({
   });
 }
 
+/// How `GET /api/public-config` answers in a test that needs to control it:
+/// held until [gate] completes, refused with [status], and counted.
+class _PublicConfigHook {
+  final Completer<void>? gate;
+  final int status;
+  int calls = 0;
+
+  _PublicConfigHook({this.gate, this.status = 200});
+}
+
 /// Drive a real login so the screen renders behind an authenticated user.
 Future<void> _loginAs({
   String fullName = 'Demo User',
   String email = 'demo@acme.com',
   List<String> roles = const ['admin'],
   String tenantUrlTemplate = 'https://{slug}.feohledger.com',
+  _PublicConfigHook? publicConfig,
 }) async {
   ApiClient().debugConfigure(
     client: _happyClient(
@@ -77,6 +97,7 @@ Future<void> _loginAs({
       email: email,
       roles: roles,
       tenantUrlTemplate: tenantUrlTemplate,
+      publicConfig: publicConfig,
     ),
   );
   final result = await AuthStore.instance.login(email, 'demo', 'acme');
@@ -489,6 +510,69 @@ void main() {
       await tester.pumpAndSettle();
 
       expect(find.byType(SnackBar), findsOneWidget);
+    });
+
+    testWidgets('a failed public-config read opens nothing and says so',
+        (tester) async {
+      final config = _PublicConfigHook(status: 500);
+      await _loginAs(publicConfig: config);
+      final opened = <Uri>[];
+      await tester.pumpWidget(wrap(opener: (uri) async {
+        opened.add(uri);
+        return true;
+      }));
+      await tester.pump();
+      await showHelpRow(tester);
+
+      await tester.tap(find.byKey(const Key('settings-help')));
+      await tester.pumpAndSettle();
+
+      expect(config.calls, 1);
+      expect(opened, isEmpty);
+      expect(
+        find.text(
+          "Couldn't open the help centre. Sign in to your workspace on the "
+          'web and open Help there.',
+        ),
+        findsOneWidget,
+      );
+      // Settled: the row is back to its link icon, ready for another try.
+      expect(find.byKey(const Key('settings-help-busy')), findsNothing);
+      expect(find.byIcon(Icons.open_in_new), findsOneWidget);
+    });
+
+    testWidgets('a second tap while the first resolves is ignored, and the '
+        'row shows progress meanwhile', (tester) async {
+      final gate = Completer<void>();
+      final config = _PublicConfigHook(gate: gate);
+      await _loginAs(publicConfig: config);
+      final opened = <Uri>[];
+      await tester.pumpWidget(wrap(opener: (uri) async {
+        opened.add(uri);
+        return true;
+      }));
+      await tester.pump();
+      await showHelpRow(tester);
+
+      await tester.tap(find.byKey(const Key('settings-help')));
+      await tester.pump();
+      expect(find.byKey(const Key('settings-help-busy')), findsOneWidget);
+      expect(find.byIcon(Icons.open_in_new), findsNothing);
+      expect(
+        find.bySemanticsLabel('Help, Loading…'),
+        findsOneWidget,
+      );
+
+      await tester.tap(find.byKey(const Key('settings-help')));
+      await tester.pump();
+
+      gate.complete();
+      await tester.pumpAndSettle();
+
+      expect(config.calls, 1);
+      expect(opened, [Uri.parse('https://acme.feohledger.com/help')]);
+      expect(find.byKey(const Key('settings-help-busy')), findsNothing);
+      expect(find.byType(SnackBar), findsNothing);
     });
   });
 }

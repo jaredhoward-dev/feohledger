@@ -32,7 +32,7 @@
 	 * stale-versions refusal (`privacy_acknowledgement_required`) are the
 	 * Privacy Policy acknowledgement's; `mark` replaces the FeohLedger mark with
 	 * the tenant's white-label one, which the portal shell shows everywhere
-	 * else.
+	 * else, and `footer` carries the tenant's support link when it has one.
 	 */
 	import { onMount, tick, type Snippet } from 'svelte';
 	import BrandMark from '#lib/components/ui/BrandMark.svelte';
@@ -49,9 +49,11 @@
 		documents?: 'terms_privacy' | 'privacy';
 		/** The brand mark above the heading; FeohLedger's when omitted. */
 		mark?: Snippet;
+		/** Under the actions: the portal's link to the tenant's own support. */
+		footer?: Snippet;
 	}
 
-	let { onaccept, onlogout, documents = 'terms_privacy', mark }: Props = $props();
+	let { onaccept, onlogout, documents = 'terms_privacy', mark, footer }: Props = $props();
 
 	let privacyOnly = $derived(documents === 'privacy');
 	// The coded 422 a TICKED box meets when the versions moved under this tab.
@@ -153,6 +155,9 @@
 				{m('shell.logOut')}
 			</button>
 		</div>
+		{#if footer}
+			{@render footer()}
+		{/if}
 	</form>
 </main>
 

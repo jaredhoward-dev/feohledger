@@ -30,6 +30,11 @@ class _SettingsScreenState extends State<SettingsScreen> {
   bool _bioAvailable = false;
   bool _bioEnabled = false;
 
+  /// A Help tap is resolving its URL (`GET /public-config`) or handing it to
+  /// the browser. Further taps are ignored until it settles, so a second tap
+  /// never starts a second fetch or opens the browser twice.
+  bool _openingHelp = false;
+
   @override
   void initState() {
     super.initState();
@@ -53,9 +58,14 @@ class _SettingsScreenState extends State<SettingsScreen> {
   /// holds no copy of the help content. Anything that leaves no safe https
   /// URL, or a browser that refuses it, ends in one snackbar saying where
   /// else to find Help.
+  ///
+  /// While it resolves, the row's trailing icon is a progress ring and the
+  /// row ignores taps ([_openingHelp]).
   Future<void> _openHelp() async {
+    if (_openingHelp) return;
     final messenger = ScaffoldMessenger.maybeOf(context);
     final failure = AppLocalizations.of(context).settingsHelpUnavailable;
+    setState(() => _openingHelp = true);
     bool opened = false;
     try {
       final template = await PublicConfigApi.tenantUrlTemplate();
@@ -66,6 +76,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
       }
     } catch (_) {
       opened = false;
+    } finally {
+      if (mounted) setState(() => _openingHelp = false);
     }
     if (!opened) {
       messenger?.showSnackBar(SnackBar(content: Text(failure)));
@@ -252,7 +264,10 @@ class _SettingsScreenState extends State<SettingsScreen> {
           const Divider(height: 32),
           Semantics(
             link: true,
-            label: '${l.settingsHelp}, ${l.settingsHelpHint}',
+            // While the URL resolves the row says so, in place of the hint.
+            label: _openingHelp
+                ? '${l.settingsHelp}, ${l.commonLoading}'
+                : '${l.settingsHelp}, ${l.settingsHelpHint}',
             excludeSemantics: true,
             onTap: _openHelp,
             child: ListTile(
@@ -260,7 +275,17 @@ class _SettingsScreenState extends State<SettingsScreen> {
               leading: const Icon(Icons.help_outline),
               title: Text(l.settingsHelp),
               subtitle: Text(l.settingsHelpHint),
-              trailing: const Icon(Icons.open_in_new),
+              trailing: _openingHelp
+                  ? const SizedBox(
+                      key: Key('settings-help-busy'),
+                      width: 24,
+                      height: 24,
+                      child: Padding(
+                        padding: EdgeInsets.all(2),
+                        child: CircularProgressIndicator(strokeWidth: 2),
+                      ),
+                    )
+                  : const Icon(Icons.open_in_new),
               onTap: _openHelp,
             ),
           ),

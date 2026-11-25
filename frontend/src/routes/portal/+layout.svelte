@@ -145,6 +145,24 @@
 				/>
 			{:else if portalBrand.mark.kind === 'platform'}
 				<BrandMark size={36} />
+			{:else}
+				<!-- A product name with no logo: the name itself is the mark, so the
+				     step says whose portal this is (the heading names the platform's
+				     policy, not the tenant's). Not a heading: the <h1> follows. -->
+				<p class="step-product" data-testid="legal-step-product">{portalBrand.productName}</p>
+			{/if}
+		{/snippet}
+		{#snippet footer()}
+			{#if portalBrand.supportUrl}
+				<!-- A supplier unsure what they are agreeing to has no AP colleague
+				     to ask; the tenant's own support URL, as in the shell footer. -->
+				<a
+					class="step-support"
+					href={portalBrand.supportUrl}
+					target="_blank"
+					rel="noopener noreferrer"
+					data-testid="legal-step-support">{m('portal.privacyAck.support')}</a
+				>
 			{/if}
 		{/snippet}
 	</LegalAcceptStep>
@@ -261,6 +279,23 @@
 		max-width: 160px;
 		object-fit: contain;
 		align-self: flex-start;
+	}
+
+	.step-product {
+		margin: 0;
+		font-size: 1rem;
+		font-weight: 600;
+		color: var(--text);
+		overflow-wrap: anywhere;
+	}
+
+	/* 24px tall: a standalone link is a target (WCAG 2.5.8). */
+	.step-support {
+		align-self: flex-start;
+		display: inline-flex;
+		align-items: center;
+		min-height: 24px;
+		font-size: 0.85rem;
 	}
 
 	.portal-shell {
