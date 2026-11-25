@@ -982,7 +982,13 @@ class MergeDevAdapter(ErpAdapter):
         :data:`SYNC_LISTING_MAX_ROWS` rows. Bills only — the reports themselves
         are read by :meth:`bill_report`. Not swept yet: the status-sync sweep
         reads only adapters with ``supports_status_sync``, which Merge does
-        not have (decisions §504)."""
+        not have (decisions §504).
+
+        ``since`` must be timezone-aware: ``astimezone`` would read a naive one
+        as the host's local time and shift the window by its UTC offset, so a
+        naive ``since`` is a :class:`ValueError`, not a guess."""
+        if since.tzinfo is None or since.utcoffset() is None:
+            raise ValueError("changed_bills needs a timezone-aware `since`")
         stamp = since.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
         common = {"modified_after": stamp, "include_deleted_data": "true", "page_size": "100"}
         invoices = await self._list_complete("invoices", {**common, "type": "ACCOUNTS_PAYABLE"})
