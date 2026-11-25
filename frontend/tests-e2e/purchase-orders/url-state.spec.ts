@@ -111,14 +111,19 @@ test.describe('/purchase-orders — URL state', () => {
 		await expect(page.getByRole('button', { name: 'View purchase order E2E-URL-PO-1' })).toBeHidden();
 
 		listRequests.length = 0;
+		// Clicked from script, as layout-stability.spec.ts does: an anchor
+		// appended to <body> lands at the left edge under the fixed 220px
+		// sidebar, so a pointer click there hits the sidebar and Playwright
+		// waits for it to become clickable until the test times out. The
+		// script click is still a same-origin anchor click, which SvelteKit's
+		// document listener turns into a client-side navigation.
 		await page.evaluate(() => {
 			const a = document.createElement('a');
 			a.href = '/purchase-orders';
-			a.id = 'e2e-same-route';
-			a.textContent = 'same route';
 			document.body.appendChild(a);
+			a.click();
+			a.remove();
 		});
-		await page.locator('#e2e-same-route').click();
 		await expect(page).toHaveURL(/\/purchase-orders$/);
 		await expect(closedChip).toHaveAttribute('aria-pressed', 'false');
 		await expect(page.getByPlaceholder('Search PO number...')).toHaveValue('');
