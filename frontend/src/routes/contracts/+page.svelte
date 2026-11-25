@@ -127,6 +127,11 @@
 	const bulkSkipCount = $derived(
 		effectiveBulkAction ? bulkTallies[effectiveBulkAction].refused : 0
 	);
+	// Selected ids beyond the loaded pages ("select all N matching"): the
+	// server decides them, so the skip count above is only a floor.
+	const bulkSkipUnknown = $derived(
+		effectiveBulkAction ? bulkTallies[effectiveBulkAction].unknown : 0
+	);
 
 	$effect(() => {
 		if (selectedAllMatching) return;
@@ -593,7 +598,7 @@
 						value={effectiveBulkAction}
 						onchange={(e) => (bulkAction = e.currentTarget.value as ContractBulkAction)}
 						aria-label={m('contracts.bulk.newStatusAria')}
-						aria-describedby={bulkSkipCount > 0 ? 'contracts-bulk-skip-note' : undefined}
+						aria-describedby="contracts-bulk-skip-note"
 						disabled={bulkBusy}
 						data-testid="contracts-bulk-action"
 					>
@@ -602,14 +607,14 @@
 						{/each}
 					</select>
 					<button class="btn-primary" disabled={bulkBusy} onclick={bulkStatusChange}>{m('contracts.bulk.changeStatus')}</button>
-					{#if bulkSkipCount > 0}
-						<span id="contracts-bulk-skip-note" class="bulk-skip-note" role="status" data-testid="contracts-bulk-skip-note">
-							{m('contracts.bulk.willSkip', { skipped: bulkSkipCount })}
-						</span>
-					{/if}
-				{:else}
-					<span class="bulk-skip-note" role="status" data-testid="contracts-bulk-no-action">{m('contracts.bulk.noTransitions')}</span>
 				{/if}
+				<!-- ONE live region, rendered for as long as the bar is, whose
+				     text changes: a `role="status"` node created at the moment
+				     its message appears is often not announced. Empty, it is
+				     visually collapsed but stays in the accessibility tree. The
+				     skip count is a minimum ("at least") while some selected ids
+				     are beyond the loaded pages — their verdicts are unknown. -->
+				<span id="contracts-bulk-skip-note" class="bulk-skip-note" role="status" data-testid="contracts-bulk-skip-note">{#if !effectiveBulkAction}<span data-testid="contracts-bulk-no-action">{m('contracts.bulk.noTransitions')}</span>{:else if bulkSkipCount > 0}{m(bulkSkipUnknown > 0 ? 'contracts.bulk.willSkipAtLeast' : 'contracts.bulk.willSkip', { skipped: bulkSkipCount })}{/if}</span>
 				<div class="bulk-divider"></div>
 				<button class="btn-secondary" disabled={bulkBusy} onclick={bulkExport}>{m('contracts.bulk.exportCsv')}</button>
 			{/snippet}
@@ -667,6 +672,17 @@
 	.bulk-skip-note {
 		font-size: 0.8rem;
 		color: var(--text-muted);
+	}
+	/* The live region is always present; while it says nothing it takes no
+	   room, but stays in the accessibility tree (no `display: none`) so the
+	   text it later gains is announced. */
+	.bulk-skip-note:empty {
+		position: absolute;
+		width: 1px;
+		height: 1px;
+		overflow: hidden;
+		clip-path: inset(50%);
+		white-space: nowrap;
 	}
 	.bulk-all-matching-note {
 		font-size: 0.82rem;

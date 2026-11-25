@@ -16,6 +16,9 @@ Grouped into subfolders by role. Import with the full path, e.g.
 - `RichText.svelte` — renders help prose's inline markup (`{ui:key}`, `[[term]]`, `[[guide:…]]`, `[[page:…]]`, bold, emphasis) as elements; never `{@html}`. UI labels carry the UI's `lang` inside English prose.
 - `HelpNav.svelte` / `HelpCrumbs.svelte` — the help shell's disclosure contents list and the subpage breadcrumb.
 - `InvoiceLifecycle.svelte` — the invoice-lifecycle walkthrough: a tab list of stages (arrow keys / Home / End) over `lib/help/lifecycle.ts`, with real `StatusBadge`s.
+- `GuideToc.svelte` — a guide's "On this page" list (`sections`, `englishLang`), rendered only past one section; in-page anchors, so no `audience`. The employee guide page restyles its `.toc` into a sticky rail on a wide column. Shared by `/help/guides/[id]` and `/portal/help/[id]`.
+- `GuideTerms.svelte` — a guide's "Terms" `<dl>`: each glossary id's name (linked through `termHref(id, audience)`) and one-liner. Takes `terms` and `audience` (`'employee'` default / `'supplier'`); renders nothing for an empty list. Shared by both guide pages.
+- `GuideRelated.svelte` — a guide's "Related guides" list (title linked through `guideHref(id, audience)`, then summary). Takes the resolved `guides` — each page resolves ids against its own index, so a supplier's page never loads the employee one — plus `englishLang` and `audience`. Shared by both guide pages.
 - `EnglishNotice.svelte` — the translated "guides are in English for now" notice; renders only under a non-English locale.
 - `diagrams/Diagram.svelte` — dispatches a guide's `diagram` block to its inline-SVG illustration (tokens for colour, catalogue for every word).
 
