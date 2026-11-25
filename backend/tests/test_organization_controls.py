@@ -40,6 +40,17 @@ def test_line_total_check_defaults_on():
     assert line_total_check_enabled(off) is False
 
 
+@pytest.mark.parametrize("stored", [0, None, "", 0.0, False])
+def test_line_total_check_reads_any_falsy_value_off_as_the_engine_does(stored):
+    """`invoice_warnings` skips the check on any falsy stored value, so the
+    endpoint must report it off — never `enabled: true` over a disabled check."""
+    from app.services.invoice_warnings import _fraud_config
+
+    org_settings = {"fraud_rules": {"line_total_mismatch_enabled": stored}}
+    assert bool(_fraud_config(org_settings)["line_total_mismatch_enabled"]) is False
+    assert line_total_check_enabled(org_settings) is False
+
+
 def test_guard_carries_stored_values_across_a_block_replacement():
     stored = {
         "fraud_rules": {"line_total_mismatch_enabled": False, "round_amount_enabled": True},
@@ -82,6 +93,51 @@ def test_guard_passes_an_unchanged_value_and_leaves_unset_keys_unset():
 def test_guard_refuses_a_change_and_names_the_owning_endpoint(incoming, path):
     with pytest.raises(HTTPException) as exc:
         guard_owned_keys(incoming, {})
+    assert exc.value.status_code == 422
+    assert path in exc.value.detail
+
+
+@pytest.mark.parametrize("block", ["fraud_rules", "exception_agents"])
+@pytest.mark.parametrize("value", [None, "x", [], 0])
+def test_guard_refuses_a_non_object_block(block, value):
+    """A present non-object block would replace the whole block, owned key
+    included, unaudited — and a string crashes `_fraud_config` /
+    `resolve_autonomy_level` on every later read."""
+    stored = {
+        "fraud_rules": {"line_total_mismatch_enabled": False},
+        "exception_agents": {"autonomy_level": "balanced"},
+    }
+    with pytest.raises(HTTPException) as exc:
+        guard_owned_keys({block: value}, stored)
+    assert exc.value.status_code == 422
+    assert "/api/organization/" in exc.value.detail
+
+
+@pytest.mark.parametrize(
+    ("incoming", "stored", "path"),
+    [
+        # `0 == False`, but 0 is not the bool the rule stores.
+        (
+            {"fraud_rules": {"line_total_mismatch_enabled": 0}},
+            {"fraud_rules": {"line_total_mismatch_enabled": False}},
+            LINE_TOTAL,
+        ),
+        ({"fraud_rules": {"line_total_mismatch_enabled": 1}}, {}, LINE_TOTAL),
+        ({"fraud_rules": {"line_total_mismatch_enabled": None}}, {}, LINE_TOTAL),
+        ({"fraud_rules": {"line_total_mismatch_enabled": "true"}}, {}, LINE_TOTAL),
+        # An unknown level reads `conservative`, but is not one.
+        (
+            {"exception_agents": {"autonomy_level": "supervised"}},
+            {"exception_agents": {"autonomy_level": "supervised"}},
+            AUTONOMY,
+        ),
+        ({"exception_agents": {"autonomy_level": None}}, {}, AUTONOMY),
+        ({"exception_agents": {"autonomy_level": ["balanced"]}}, {}, AUTONOMY),
+    ],
+)
+def test_guard_refuses_a_non_canonical_value(incoming, stored, path):
+    with pytest.raises(HTTPException) as exc:
+        guard_owned_keys(incoming, stored)
     assert exc.value.status_code == 422
     assert path in exc.value.detail
 
@@ -243,3 +299,67 @@ async def test_generic_patch_carries_and_refuses(realdb):
         "line_total_mismatch_enabled": False,
     }
     assert stored["exception_agents"] == {"autonomy_level": "balanced"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"settings": {"fraud_rules": None}},
+        {"settings": {"exception_agents": None}},
+        {"settings": {"fraud_rules": "x"}},
+        {"settings": {"fraud_rules": {"line_total_mismatch_enabled": 0}}},
+        {"settings": {"exception_agents": {"autonomy_level": "supervised"}}},
+    ],
+)
+async def test_generic_patch_refuses_a_non_object_block_or_non_canonical_value(realdb, body):
+    seeded = {
+        "fraud_rules": {"line_total_mismatch_enabled": False},
+        "exception_agents": {"autonomy_level": "balanced"},
+    }
+    await _seed(realdb, seeded)
+    async with realdb.client(key="a", role="admin") as c:
+        resp = await c.patch("/api/organization", json=body)
+        assert resp.status_code == 422, resp.text
+    stored = await _settings(realdb)
+    assert stored["fraud_rules"] == seeded["fraud_rules"]
+    assert stored["exception_agents"] == seeded["exception_agents"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stored_value", [0, None])
+async def test_a_stored_falsy_value_reads_off_and_put_true_rewrites_it(realdb, stored_value):
+    """A non-bool falsy value has the engine's check OFF: the endpoint says so,
+    and turning it on writes `True` with an audit row instead of a no-op."""
+    await _seed(realdb, {"fraud_rules": {"line_total_mismatch_enabled": stored_value}})
+    async with realdb.client(key="a", role="admin") as c:
+        assert (await c.get(LINE_TOTAL)).json() == {"enabled": False}
+        resp = await c.put(LINE_TOTAL, json={"enabled": True})
+        assert resp.status_code == 200, resp.text
+        assert resp.json() == {"enabled": True}
+    assert (await _settings(realdb))["fraud_rules"]["line_total_mismatch_enabled"] is True
+    rows = await _rows(realdb, "organization.fraud_rule_updated")
+    assert len(rows) == 1
+    assert rows[0].details["old"] is False
+    assert rows[0].details["new"] is True
+    assert rows[0].details["stored"] == stored_value
+
+
+@pytest.mark.asyncio
+async def test_put_false_over_a_stored_zero_normalises_it_with_an_audit_row(realdb):
+    """Same effective value, non-canonical storage: rewritten to the bool, and
+    the row records what was stored."""
+    await _seed(realdb, {"fraud_rules": {"line_total_mismatch_enabled": 0}})
+    async with realdb.client(key="a", role="admin") as c:
+        resp = await c.put(LINE_TOTAL, json={"enabled": False})
+        assert resp.status_code == 200, resp.text
+        assert resp.json() == {"enabled": False}
+    assert (await _settings(realdb))["fraud_rules"]["line_total_mismatch_enabled"] is False
+    rows = await _rows(realdb, "organization.fraud_rule_updated")
+    assert len(rows) == 1
+    assert rows[0].details == {
+        "setting": "fraud_rules.line_total_mismatch_enabled",
+        "old": False,
+        "new": False,
+        "stored": 0,
+    }
