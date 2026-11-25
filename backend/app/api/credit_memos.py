@@ -22,8 +22,10 @@ from app.api.pagination import PaginationParams, pagination_params
 from app.api.refusals import coded_refusal
 from app.api.sorting import SortParams, resolve_order_by, sort_params
 from app.models.credit_memo import CREDIT_MEMO_STATUSES, CreditMemo
+from app.models.discount import OFFER_SCOPE_INVOICE, OFFER_STATUS_ACCEPTED, DiscountOffer
 from app.models.invoice import Invoice, InvoiceStatus
 from app.models.organization import Organization
+from app.models.payment import LIVE_PAYMENT_TERMINAL_STATUSES, Payment
 from app.models.user import User
 from app.models.vendor import Vendor
 from app.schemas.credit_memo import (
@@ -38,6 +40,7 @@ from app.schemas.credit_memo import (
     EligibleInvoiceResponse,
 )
 from app.schemas.money import json_money_string
+from app.services import discount_offers as offers_svc
 from app.services.audit_access import build_field_diff
 from app.services.audit_dispatch import dispatch_audit
 from app.services.currency_conversion import (
@@ -96,6 +99,104 @@ _INVOICE_CURRENCY_UNKNOWN_DETAIL = coded_refusal(
     "The invoice records no currency, so a credit cannot be matched against its "
     "balance. Set the invoice's currency first, then apply the credit.",
 )
+
+
+#: `POST /api/credit-memos` with `discount_offer_id` that cannot be the
+#: discount on that invoice (decisions §520). One code, the sentence says
+#: which rule; the link is an API affordance with no screen, so the English
+#: message is what a caller reads.
+CREDIT_MEMO_DISCOUNT_OFFER_INVALID = "credit_memo_discount_offer_invalid"
+
+
+def _discount_offer_invalid(message: str) -> HTTPException:
+    return HTTPException(
+        status_code=409, detail=coded_refusal(CREDIT_MEMO_DISCOUNT_OFFER_INVALID, message)
+    )
+
+
+async def _assert_discount_offer_linkable(
+    db: AsyncSession,
+    *,
+    offer_id: uuid.UUID,
+    invoice: Invoice,
+    amount: Decimal,
+    currency: str,
+) -> None:
+    """Refuse a `discount_offer_id` that this memo cannot honestly be (§520).
+
+    The memo must be exactly the discount: the offer is invoice-scoped, on THIS
+    invoice, ``accepted`` with a tier, in the memo's currency, still priced on
+    the invoice's amount, and the memo's amount is its savings to the cent.
+    Anything looser would let a link carry the very guess it replaces. The
+    offer row is locked, and no other non-void memo may already take it or any
+    discount on this invoice (the partial unique index
+    ``uq_credit_memos_discount_offer_live`` backs the per-offer half under a
+    race), nor any live payment booked with it — the run already takes that
+    discount, so a memo for it as well would deduct it twice.
+
+    The deadline is deliberately NOT checked: a credit the supplier issued for
+    the discount is a fact about what they agreed, whenever it is recorded.
+    """
+    offer = (
+        await db.execute(
+            select(DiscountOffer).where(DiscountOffer.id == offer_id).with_for_update()
+        )
+    ).scalar_one_or_none()
+    if offer is None or offer.invoice_id != invoice.id:
+        # Same answer for "no such offer" and "another invoice's offer".
+        raise HTTPException(status_code=404, detail="Discount offer not found on this invoice")
+    if offer.scope != OFFER_SCOPE_INVOICE:
+        raise _discount_offer_invalid(
+            "Only an invoice-scoped discount offer can be taken as a credit memo"
+        )
+    if offer.status != OFFER_STATUS_ACCEPTED or not offer.accepted_tier:
+        raise _discount_offer_invalid(
+            f"The discount offer is '{offer.status}'; only an accepted offer can be "
+            "taken as a credit memo"
+        )
+    if (offer.currency or "").upper() != currency.upper():
+        raise _discount_offer_invalid("The discount offer's currency is not the credit memo's")
+    cents = Decimal("0.01")
+    base = Decimal(offer.base_amount).quantize(cents)
+    if invoice.amount is None or base != Decimal(invoice.amount).quantize(cents):
+        raise _discount_offer_invalid(
+            "The discount offer was priced on an amount the invoice no longer has"
+        )
+    savings = offers_svc.discount_savings(base, offer.accepted_tier)
+    if amount != savings:
+        raise _discount_offer_invalid(
+            f"A credit memo that takes this discount must be exactly its savings ({savings})"
+        )
+    # One invoice takes one discount: another live linked memo on this invoice
+    # (for this offer or a re-sent one) refuses, as `applicable_discounts`
+    # reads any linked memo as the invoice's discount taken. The invoice row
+    # is already locked by the caller, so two creates serialize here.
+    taken = (
+        await db.execute(
+            select(CreditMemo.id).where(
+                or_(
+                    CreditMemo.discount_offer_id == offer.id,
+                    CreditMemo.invoice_id == invoice.id,
+                ),
+                CreditMemo.discount_offer_id.is_not(None),
+                CreditMemo.status != "void",
+            )
+        )
+    ).first()
+    if taken is not None:
+        raise _discount_offer_invalid(
+            "Another credit memo already takes a discount on this invoice"
+        )
+    booked = (
+        await db.execute(
+            select(Payment.id).where(
+                Payment.discount_offer_id == offer.id,
+                Payment.status.not_in(LIVE_PAYMENT_TERMINAL_STATUSES),
+            )
+        )
+    ).first()
+    if booked is not None:
+        raise _discount_offer_invalid("A payment already takes this discount")
 
 
 def _invoice_settled_detail(status: str) -> dict:
@@ -499,6 +600,7 @@ def _to_response(
         status=memo.status,
         applied_at=memo.applied_at.isoformat() if memo.applied_at else None,
         applied_by=memo.applied_by,
+        discount_offer_id=str(memo.discount_offer_id) if memo.discount_offer_id else None,
         created_at=memo.created_at.isoformat() if memo.created_at else "",
     )
 
@@ -834,6 +936,20 @@ async def create_credit_memo(
                 status_code=409, detail=_exceeds_balance_detail(remaining, invoice.currency)
             )
         invoice_number = invoice.invoice_number
+        if body.discount_offer_id is not None:
+            await _assert_discount_offer_linkable(
+                db,
+                offer_id=body.discount_offer_id,
+                invoice=invoice,
+                amount=body.amount,
+                currency=currency,
+            )
+    elif body.discount_offer_id is not None:
+        # The link is the discount ON an invoice; an open memo has none, and
+        # applying it later goes through `/apply`, which knows nothing of offers.
+        raise _discount_offer_invalid(
+            "A credit memo that takes a discount must name the offer's invoice (invoice_id)"
+        )
 
     # Last rung, for an UNLINKED memo only (a linked one resolved above or was
     # refused): the org's own reporting currency (which itself falls back to
@@ -849,6 +965,7 @@ async def create_credit_memo(
         currency=currency,
         issued_date=body.issued_date,
         reason=body.reason,
+        discount_offer_id=body.discount_offer_id,
         status="applied" if invoice_uuid else "open",
         applied_at=datetime.now(UTC) if invoice_uuid else None,
         applied_by=user.full_name if invoice_uuid else None,
@@ -873,6 +990,7 @@ async def create_credit_memo(
             "amount": str(memo.amount),  # string-Decimal, never float
             "currency": memo.currency,
             "status": memo.status,
+            "discount_offer_id": str(memo.discount_offer_id) if memo.discount_offer_id else None,
         },
     )
     await db.commit()

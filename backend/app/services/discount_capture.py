@@ -82,7 +82,7 @@ async def applicable_discounts(
 ) -> dict[uuid.UUID, AppliedDiscount]:
     """Which of ``invoices`` an ACCEPTED early-pay discount applies to if paid
     on ``pay_date`` — and for how much. Two queries for the whole batch at
-    most (the offers, then the applied memos of only the invoices carrying one).
+    most (the offers, then the invoices whose applied memo already took one).
 
     An offer applies only when every one of these holds, and otherwise the
     invoice is paid in full (never refused — the supplier is owed the whole
@@ -104,18 +104,15 @@ async def applicable_discounts(
       struck; the invoice is paid in full and the mismatch logged;
     * the deduction leaves something to pay: ``savings < net_amounts[id]``
       (the invoice net of applied credit memos);
-    * the discount has not ALREADY been taken through a credit memo. Before
-      this function existed, recording an applied credit memo for the savings
-      was the documented way to pay the discounted figure (and the in-app help
-      said so), and such a memo is already inside ``net_amounts``. An applied
-      memo on the invoice, in its currency, for exactly the savings is read as
-      that deduction — whenever it was recorded — and the offer is not deducted
-      a second time; the settlement still captures it through the amount-match
-      leg (:func:`capture_offers_for_settled_payment`). Nothing links a memo to
-      an offer, so this is an amount coincidence, and it is resolved toward
-      paying the supplier in full: a return credit that happens to equal the
-      savings costs the buyer one discount, where guessing the other way would
-      short-pay the supplier by it.
+    * the discount has not ALREADY been taken through a credit memo: no
+      applied memo on the invoice names a discount offer
+      (``credit_memos.discount_offer_id``, decisions §520). Such a memo is
+      already inside ``net_amounts``, so deducting the offer again would
+      short-pay the supplier by it; the settlement captures the offer through
+      that memo instead (:func:`capture_offers_for_settled_payment`). A memo
+      that names no offer is an ordinary credit whatever its amount — a return
+      credit that happens to equal the savings does not cost the buyer the
+      discount (it used to: §250 matched on the amount).
 
     Several accepted offers on one invoice (a re-sent offer, both accepted):
     the earliest accepted is the one taken — one payment realizes one discount,
@@ -142,23 +139,36 @@ async def applicable_discounts(
     by_invoice: dict[uuid.UUID, list[DiscountOffer]] = {}
     for offer in offers:
         by_invoice.setdefault(offer.invoice_id, []).append(offer)
-    # Applied memos on the invoices that carry an offer — the manual-deduction
-    # check below. Skipped entirely (no query) when no invoice has an offer.
-    memos_by_invoice: dict[uuid.UUID, list[tuple[Decimal, str]]] = {}
+    # Invoices that already took a discount through an applied credit memo
+    # linked to an offer (decisions §520). Skipped entirely (no query) when no
+    # invoice has an accepted offer.
+    taken_by_memo: set[uuid.UUID] = set()
     if by_invoice:
-        memo_rows = await db.execute(
-            select(CreditMemo.invoice_id, CreditMemo.amount, CreditMemo.currency).where(
-                CreditMemo.invoice_id.in_(list(by_invoice)),
-                CreditMemo.status == "applied",
+        taken_by_memo = set(
+            (
+                await db.execute(
+                    select(CreditMemo.invoice_id).where(
+                        CreditMemo.invoice_id.in_(list(by_invoice)),
+                        CreditMemo.status == "applied",
+                        CreditMemo.discount_offer_id.is_not(None),
+                    )
+                )
             )
+            .scalars()
+            .all()
         )
-        for invoice_id, memo_amount, memo_currency in memo_rows.all():
-            memos_by_invoice.setdefault(invoice_id, []).append(
-                (Decimal(memo_amount).quantize(_CENTS), (memo_currency or "").upper())
-            )
 
     out: dict[uuid.UUID, AppliedDiscount] = {}
     for inv in rows:
+        if inv.id in taken_by_memo:
+            # One invoice, one discount: the memo took it, whichever offer it
+            # names, so no other accepted offer comes off on top.
+            logger.info(
+                "invoice %s already took its discount through a linked credit memo; "
+                "not deducting it again",
+                inv.id,
+            )
+            continue
         for offer in by_invoice.get(inv.id, ()):
             if not offer.accepted_tier:
                 continue
@@ -179,13 +189,6 @@ async def applicable_discounts(
             savings = offers_svc.discount_savings(base, offer.accepted_tier)
             if savings <= 0 or savings >= net_amounts.get(inv.id, Decimal("0")):
                 continue
-            if (savings, inv.currency.upper()) in memos_by_invoice.get(inv.id, ()):
-                logger.info(
-                    "discount offer %s already deducted through an applied credit memo; "
-                    "not deducting it again",
-                    offer.id,
-                )
-                break
             out[inv.id] = AppliedDiscount(offer_id=offer.id, amount=savings, deadline=deadline)
             break
     return out
@@ -207,16 +210,14 @@ async def capture_offer_for_settled_payment(
     (a retried webhook, a reconciliation re-run) is left untouched, and the row
     is locked so two settlement paths cannot both capture it.
 
-    A payment with no discount booked falls back to the amount match below
-    (:func:`capture_offers_for_settled_payment`), which is how a payment made
-    before discounts were deducted automatically — paid at the discounted
-    figure through a credit memo — is still recognized.
+    A payment with no discount booked falls back to the credit memo that took
+    the discount (:func:`capture_offers_for_settled_payment`): the payment was
+    netted of that memo, so settling it realizes the offer the memo names.
     """
     if payment.discount_offer_id is None:
         return await capture_offers_for_settled_payment(
             db,
             invoice_id=payment.invoice_id,
-            payment_amount=payment.amount,
             invoice_currency=invoice_currency,
             now=now,
             payment_id=payment.id,
@@ -243,118 +244,80 @@ async def capture_offers_for_settled_payment(
     db: AsyncSession,
     *,
     invoice_id: uuid.UUID,
-    payment_amount: Decimal,
     invoice_currency: str,
     now: datetime,
     payment_id: uuid.UUID | None = None,
 ) -> list[DiscountOffer]:
-    """Capture any ``accepted`` invoice-scoped ``DiscountOffer`` on
-    ``invoice_id`` whose accepted tier's discounted payoff exactly matches
-    ``payment_amount``.
+    """Capture the ``accepted`` invoice-scoped offer an applied credit memo on
+    ``invoice_id`` took (``credit_memos.discount_offer_id``), for that memo's
+    amount — the deduction the supplier actually gave.
 
     The FALLBACK leg of :func:`capture_offer_for_settled_payment`, for a
     payment that booked no discount of its own. ``payment_id`` is stamped on
-    the capture when given, so even a matched capture is reversed exactly.
+    the capture when given, so a void reverses exactly this capture.
 
-    Only invoice-scoped offers are considered (``scope == "invoice"``) — a
-    vendor-scoped bulk offer's ``base_amount`` is the summed open balance
-    across several invoices, so no single invoice's payment can be proven to
-    BE that offer's settlement; guessing would misattribute savings, so those
-    are left ``accepted`` for a future reconciliation pass rather than
-    auto-captured here.
+    **Only a link counts, never an amount** (decisions §520). This leg used to
+    capture any accepted offer whose discounted payoff equalled the payment
+    amount, so a payment netted of a return credit that happened to equal the
+    savings recorded the offer as captured — realized savings on the CFO
+    dashboard for a discount nobody took. A payment with no linked memo
+    captures nothing; the offer stays ``accepted``.
 
-    **Currency is checked before amount.** `POST /api/discounts/offers` lets
-    the caller set an explicit ``currency`` independent of the invoice
-    (falling back to ``invoice.currency`` only when omitted — see
-    ``api/discounts.py::create_offer``), so an offer's currency can diverge
-    from its own invoice's (data-entry mistake, or a currency-mismatched
-    negotiation). ``Payment.amount`` is always denominated in the invoice's
-    own currency. Without this check, a numeric coincidence between
-    ``payment_amount`` and a differently-denominated offer's discounted
-    payoff would be treated as proof of a discounted settlement and
-    permanently mark it ``captured`` — the same misreporting-to-the-CFO risk
-    the amount-exactness rule below guards against, just via a currency
-    mismatch instead of a rounding one. Comparison is case-insensitive
-    (``.upper()`` both sides) to match the uppercasing `discounts.py`
-    already applies when it resolves an offer's currency.
+    Only invoice-scoped offers are considered — a vendor-scoped bulk offer
+    spans several invoices, so no single invoice's settlement is it; the memo
+    create path refuses to link one anyway.
 
-    The match is an EXACT cent comparison — ``payment_amount`` against
-    ``offer.base_amount - discount_savings(base_amount, accepted_tier)``,
-    both cent-quantized the same way — not a tolerance band. A payment for
-    the full (undiscounted) amount, or for any other amount, leaves the
-    offer ``accepted`` rather than being guessed at; a false "captured"
-    would misreport realized savings to the CFO dashboard just as badly as
-    the missing-caller bug this closes.
+    **Currency is checked.** An offer's ``currency`` can diverge from its
+    invoice's (``POST /api/discounts/offers`` takes an explicit one), and
+    linking refuses that, but a capture across currencies would misreport the
+    savings, so it is re-checked here rather than trusted.
 
-    Idempotent: only offers currently ``accepted`` are queried, so calling
-    this again for the same settlement (a retry, a reconciliation re-run)
-    finds nothing left to capture — never double-counts, never raises on an
-    already-``captured`` offer. The ``mark_captured`` ``ValueError`` is also
-    caught defensively in case a concurrent settlement path captured the same
-    offer between the query and the mutation.
+    Idempotent: only offers currently ``accepted`` are read, and they are
+    locked, so a retry or a concurrent settlement path finds nothing left to
+    capture. One settlement realizes at most one discount: should two memos
+    on one invoice each name an offer, the earliest accepted offer is captured
+    and the scan stops.
 
-    **One settlement realizes at most one discount.** Nothing stops more than
-    one ``accepted`` offer existing on the same invoice (a supplier re-sends an
-    offer and both get accepted), and two with the same tier share one
-    discounted payoff. The vendor was short-paid that discount ONCE, so the
-    first matching offer — earliest ``accepted_at``, ``id`` as the tiebreak —
-    is captured and the scan stops. Capturing every match used to book the
-    savings once per offer, so ``GET /api/discounts/dashboard`` reported a
-    $40 saving off a $20 deduction.
-
-    Returns the offers captured — empty in the common no-discount case, one
-    element when a discounted payoff was recognized. A list rather than an
-    optional so the caller's audit loop needs no special case.
+    Returns the offers captured — empty in the common no-discount case.
     """
-    result = await db.execute(
-        select(DiscountOffer)
-        .where(
-            DiscountOffer.invoice_id == invoice_id,
-            DiscountOffer.scope == OFFER_SCOPE_INVOICE,
-            DiscountOffer.status == OFFER_STATUS_ACCEPTED,
+    rows = (
+        await db.execute(
+            select(DiscountOffer, CreditMemo.amount)
+            .join(CreditMemo, CreditMemo.discount_offer_id == DiscountOffer.id)
+            .where(
+                CreditMemo.invoice_id == invoice_id,
+                CreditMemo.status == "applied",
+                DiscountOffer.invoice_id == invoice_id,
+                DiscountOffer.scope == OFFER_SCOPE_INVOICE,
+                DiscountOffer.status == OFFER_STATUS_ACCEPTED,
+            )
+            .order_by(DiscountOffer.accepted_at.asc().nulls_last(), DiscountOffer.id.asc())
+            .with_for_update(of=DiscountOffer)
         )
-        .order_by(DiscountOffer.accepted_at.asc().nulls_last(), DiscountOffer.id.asc())
-    )
-    offers = result.scalars().all()
-    if not offers:
-        return []
+    ).all()
 
-    paid = Decimal(payment_amount).quantize(_CENTS)
     invoice_ccy = (invoice_currency or "").upper()
-    captured: list[DiscountOffer] = []
-    for offer in offers:
-        if not offer.accepted_tier:
-            continue
+    for offer, memo_amount in rows:
         if (offer.currency or "").upper() != invoice_ccy:
-            # Currency mismatch between the offer and its own invoice — never
-            # attribute a numeric coincidence across currencies to a real
-            # discounted settlement. See the docstring above.
             logger.warning(
                 "discount offer %s currency (%s) does not match its invoice's "
-                "currency (%s); skipping capture match",
+                "currency (%s); not capturing it",
                 offer.id,
                 offer.currency,
                 invoice_currency,
             )
             continue
-        savings = offers_svc.discount_savings(offer.base_amount, offer.accepted_tier)
-        discounted_payoff = (offer.base_amount - savings).quantize(_CENTS)
-        if paid != discounted_payoff:
-            continue
         try:
-            offers_svc.mark_captured(offer, captured_amount=savings, now=now, payment_id=payment_id)
-        except ValueError:
-            # Lost a race with another settlement/reconciliation path that
-            # captured this same offer first — already handled, no-op.
-            logger.info(
-                "discount offer %s already captured; skipping duplicate capture",
-                offer.id,
+            offers_svc.mark_captured(
+                offer, captured_amount=memo_amount, now=now, payment_id=payment_id
             )
+        except ValueError:
+            # Lost a race with another settlement path that captured it first.
+            logger.info("discount offer %s already captured; skipping duplicate capture", offer.id)
             continue
-        captured.append(offer)
-        # One payment, one discount — see the docstring.
-        break
-    return captured
+        # One payment, one discount.
+        return [offer]
+    return []
 
 
 async def reverse_captures_for_voided_payment(
@@ -366,7 +329,7 @@ async def reverse_captures_for_voided_payment(
 ) -> list[tuple[DiscountOffer, Decimal]]:
     """Un-capture the discount a now-voided payment had realized.
 
-    The inverse of :func:`capture_offers_for_settled_payment`, called from
+    The inverse of :func:`capture_offer_for_settled_payment`, called from
     ``POST /api/payments/{id}/void``. A void returns the invoice to
     ``approved`` — nothing was paid, so nothing was saved — but the offer used
     to stay ``captured`` with its ``captured_amount``: the discounting

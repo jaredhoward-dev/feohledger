@@ -6,18 +6,15 @@ genuinely accepted and the invoice paid at the discounted amount.
 `services/discount_capture.capture_offers_for_settled_payment` is the new
 caller, wired into `app/api/payments.py::_execute_single_payment` (both the
 adapter-completed leg and the virtual-card leg) and the async webhook-driven
-completion path. It recognizes a settled `Payment` whose amount EXACTLY
-equals an `accepted` invoice-scoped offer's discounted payoff
-(`base_amount - discount_savings(...)`), AND whose currency matches the
-offer's own `currency` (checked first — an invoice-scoped offer's currency
-can diverge from its invoice's, see `test_currency_mismatched_offer_...`
-below), and calls `mark_captured`.
+completion path. For a payment that booked no discount of its own it
+captures the `accepted` invoice-scoped offer that an applied credit memo on
+the invoice NAMES (`credit_memos.discount_offer_id`, decisions §520), for the
+memo's amount, provided the offer's currency is the invoice's — never one
+whose discounted payoff merely equals the payment amount (§250's amount match,
+which read a return credit equal to the savings as the discount).
 
-The realistic way AP actually pays the discounted amount today is via the
-existing credit-memo netting `create_payment_run_for_invoices` already does
-(see `test_payment_run_credit_memo_netting.py`) — recording a credit memo for
-the discount amount nets `Payment.amount` down to exactly the discounted
-payoff. This suite drives that same path end to end through
+This suite takes the discount as a linked credit memo — the memo nets
+`Payment.amount` down to the discounted payoff — and drives it end to end through
 `POST /api/payments/runs` + `.../execute` (mock adapter, synchronous
 `completed`) and asserts the offer is captured — plus controls proving a
 full-amount settlement and a currency-mismatched offer do NOT falsely
@@ -75,9 +72,9 @@ async def _seed_vendor_and_approved_invoice(
 
 
 async def test_settlement_at_discounted_payoff_captures_the_offer(realdb):
-    """The money-path proof: an accepted 2% offer on a $1000 invoice, paid at
-    its $980 discounted payoff (via an applied $20 credit memo netting the
-    payment run down to it), is recognized and captured on execute — and the
+    """The money-path proof: an accepted 2% offer on a $1000 invoice, taken as
+    an applied $20 credit memo LINKED to it (so the run pays $980 and does not
+    deduct the offer again), is recognized and captured on execute — and the
     dynamic-discounting dashboard reflects the real captured savings."""
     info = realdb.info("a")
     mk = realdb.sessionmaker("a")
@@ -102,10 +99,8 @@ async def test_settlement_at_discounted_payoff_captures_the_offer(realdb):
         assert accept_resp.status_code == 200, accept_resp.text
         assert accept_resp.json()["status"] == "accepted"
 
-        # $1000.00 base * 2% = $20.00 — net it off via a credit memo so the
-        # payment run's existing credit-memo-netting math lands the actual
-        # `Payment.amount` on the discounted payoff, exactly like a real AP
-        # workflow that negotiated the discount into the amount actually paid.
+        # $1000.00 base * 2% = $20.00 — taken as a credit memo that names
+        # the offer, so the run nets it once and books no discount of its own.
         memo_resp = await c.post(
             "/api/credit-memos",
             json={
@@ -113,9 +108,11 @@ async def test_settlement_at_discounted_payoff_captures_the_offer(realdb):
                 "vendor_id": (await c.get(f"/api/invoices/{invoice_id}")).json()["vendor_id"],
                 "amount": "20.00",
                 "invoice_id": invoice_id,
+                "discount_offer_id": offer_id,
             },
         )
         assert memo_resp.status_code == 201, memo_resp.text
+        assert memo_resp.json()["discount_offer_id"] == offer_id
 
         run_resp = await c.post(
             "/api/payments/runs",
@@ -263,14 +260,29 @@ async def test_currency_mismatched_offer_does_not_falsely_capture(realdb):
         accept_resp = await c.post(f"/api/discounts/offers/{offer_id}/accept", json={})
         assert accept_resp.status_code == 200, accept_resp.text
 
-        # Same $20 credit-memo netting as the happy-path test — nets the USD
-        # payment down to 980.00, numerically identical to the (EUR-labeled)
-        # offer's discounted payoff, but denominated in a different currency.
+        vendor_id = (await c.get(f"/api/invoices/{invoice_id}")).json()["vendor_id"]
+        # A USD memo cannot take a EUR offer: the link is refused outright.
+        linked = await c.post(
+            "/api/credit-memos",
+            json={
+                "memo_number": "CM-DISC-CAP-4L",
+                "vendor_id": vendor_id,
+                "amount": "20.00",
+                "invoice_id": invoice_id,
+                "discount_offer_id": offer_id,
+            },
+        )
+        assert linked.status_code == 409, linked.text
+        assert linked.json()["detail"]["code"] == "credit_memo_discount_offer_invalid"
+
+        # An unlinked $20 credit nets the USD payment down to 980.00,
+        # numerically identical to the (EUR-labeled) offer's discounted
+        # payoff, but it is an ordinary credit in a different currency.
         memo_resp = await c.post(
             "/api/credit-memos",
             json={
                 "memo_number": "CM-DISC-CAP-4",
-                "vendor_id": (await c.get(f"/api/invoices/{invoice_id}")).json()["vendor_id"],
+                "vendor_id": vendor_id,
                 "amount": "20.00",
                 "invoice_id": invoice_id,
             },
@@ -294,7 +306,7 @@ async def test_currency_mismatched_offer_does_not_falsely_capture(realdb):
         offer = (
             await s.execute(select(DiscountOffer).where(DiscountOffer.id == uuid.UUID(offer_id)))
         ).scalar_one()
-        assert offer.status == "accepted"  # untouched — currency mismatch refused the match
+        assert offer.status == "accepted"  # untouched — no memo names it
         assert offer.captured_amount is None
         assert offer.captured_at is None
 
@@ -326,6 +338,17 @@ async def test_capture_is_idempotent_on_repeat_settlement(realdb):
         offer_id = offer_resp.json()["id"]
         accept_resp = await c.post(f"/api/discounts/offers/{offer_id}/accept", json={})
         assert accept_resp.status_code == 200, accept_resp.text
+        memo_resp = await c.post(
+            "/api/credit-memos",
+            json={
+                "memo_number": "CM-DISC-CAP-3",
+                "vendor_id": (await c.get(f"/api/invoices/{invoice_id}")).json()["vendor_id"],
+                "amount": "20.00",
+                "invoice_id": invoice_id,
+                "discount_offer_id": offer_id,
+            },
+        )
+        assert memo_resp.status_code == 201, memo_resp.text
 
     now = datetime.now(UTC)
 
@@ -334,7 +357,6 @@ async def test_capture_is_idempotent_on_repeat_settlement(realdb):
         first = await capture_offers_for_settled_payment(
             s,
             invoice_id=uuid.UUID(invoice_id),
-            payment_amount=Decimal("980.00"),
             invoice_currency="USD",
             now=now,
         )
@@ -343,13 +365,12 @@ async def test_capture_is_idempotent_on_repeat_settlement(realdb):
     assert first[0].captured_amount == Decimal("20.00")
     first_captured_at = first[0].captured_at
 
-    # Repeat call — same invoice, same discounted amount, later timestamp —
+    # Repeat call — same invoice, later timestamp —
     # must be a clean no-op: nothing captured, nothing changed.
     async with mk() as s:
         second = await capture_offers_for_settled_payment(
             s,
             invoice_id=uuid.UUID(invoice_id),
-            payment_amount=Decimal("980.00"),
             invoice_currency="USD",
             now=datetime.now(UTC),
         )
@@ -386,10 +407,10 @@ async def _accepted_offer(c, invoice_id: str, *, percent: str = "2.00") -> str:
     return offer_id
 
 
-async def _pay_at_discounted_payoff(realdb, invoice_id: str, *, memo: str) -> str:
-    """Net a $1000 invoice to $980 via a $20 credit memo, then run + execute
-    it (creator and executor differ — run segregation). Returns the completed
-    payment's id."""
+async def _pay_at_discounted_payoff(realdb, invoice_id: str, *, memo: str, offer_id: str) -> str:
+    """Net a $1000 invoice to $980 via a $20 credit memo that takes
+    ``offer_id``, then run + execute it (creator and executor differ — run
+    segregation). Returns the completed payment's id."""
     async with realdb.client(key="a", role="ap_manager") as c:
         vendor_id = (await c.get(f"/api/invoices/{invoice_id}")).json()["vendor_id"]
         memo_resp = await c.post(
@@ -399,6 +420,7 @@ async def _pay_at_discounted_payoff(realdb, invoice_id: str, *, memo: str) -> st
                 "vendor_id": vendor_id,
                 "amount": "20.00",
                 "invoice_id": invoice_id,
+                "discount_offer_id": offer_id,
             },
         )
         assert memo_resp.status_code == 201, memo_resp.text
@@ -423,10 +445,10 @@ async def _pay_at_discounted_payoff(realdb, invoice_id: str, *, memo: str) -> st
 
 async def test_one_settlement_never_captures_two_offers(realdb):
     """Two `accepted` offers with the same tier on one invoice — a supplier's
-    re-sent offer, both accepted — share one discounted payoff. ONE payment at
-    that payoff realizes ONE discount: the vendor was short-paid $20 once.
-    Capturing both booked $40 of savings off a $20 deduction, and the
-    dashboard's `captured_amount` reported money that was never saved."""
+    re-sent offer, both accepted. ONE payment realizes ONE discount: the vendor
+    was short-paid $20 once. Capturing both booked $40 of savings off a $20
+    deduction, and the dashboard's `captured_amount` reported money that was
+    never saved."""
     mk = realdb.sessionmaker("a")
     _, invoice_id = await _seed_vendor_and_approved_invoice(
         mk, realdb.info("a").org_id, number="DISC-CAP-DUP", amount=Decimal("1000.00")
@@ -435,7 +457,7 @@ async def test_one_settlement_never_captures_two_offers(realdb):
         first = await _accepted_offer(c, invoice_id)
         second = await _accepted_offer(c, invoice_id)
 
-    await _pay_at_discounted_payoff(realdb, invoice_id, memo="CM-DISC-DUP")
+    await _pay_at_discounted_payoff(realdb, invoice_id, memo="CM-DISC-DUP", offer_id=first)
 
     async with mk() as s:
         a = await s.get(DiscountOffer, uuid.UUID(first))
@@ -473,7 +495,9 @@ async def test_voiding_the_settling_payment_reverses_the_capture(realdb):
     async with realdb.client(key="a", role="ap_manager") as c:
         offer_id = await _accepted_offer(c, invoice_id)
 
-    payment_id = await _pay_at_discounted_payoff(realdb, invoice_id, memo="CM-DISC-VOID")
+    payment_id = await _pay_at_discounted_payoff(
+        realdb, invoice_id, memo="CM-DISC-VOID", offer_id=offer_id
+    )
     async with mk() as s:
         assert (await s.get(DiscountOffer, uuid.UUID(offer_id))).status == "captured"
 
@@ -519,7 +543,7 @@ async def test_voiding_a_payment_that_never_settled_leaves_captures_alone(realdb
     )
     async with realdb.client(key="a", role="ap_manager") as c:
         offer_id = await _accepted_offer(c, invoice_id)
-    await _pay_at_discounted_payoff(realdb, invoice_id, memo="CM-DISC-VOID2")
+    await _pay_at_discounted_payoff(realdb, invoice_id, memo="CM-DISC-VOID2", offer_id=offer_id)
 
     async with mk() as s:
         reversed_ = await reverse_captures_for_voided_payment(
