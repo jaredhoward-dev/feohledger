@@ -57,52 +57,12 @@ test.describe('/invoices invoice detail modal', () => {
 		const modal = page.locator('div.modal[role="dialog"]');
 		await expect(modal).toBeVisible();
 
-		// The .activity-section renders only when audit entries exist
-		// for the invoice (loadAuditLog populates it). Seed creates at
-		// least one audit row per invoice (creation event).
+		// The .activity-section is always mounted (rows, or its loading /
+		// failed / empty state), so its title is the stable contract.
 		await expect(modal.locator('.activity-section .activity-title')).toHaveText(
 			'Activity',
 			{ timeout: 10_000 }
 		);
-	});
-
-	test('Activity rows render labelled the first time, never as raw action tokens', async ({
-		page
-	}) => {
-		// decisions §529: the rows used to arrive before the lazy `audit` label
-		// slice, so a token like `invoice.erp_failed` showed for a moment and then
-		// relabelled. Record every `.activity-action` text the DOM ever holds from
-		// before the modal opens, so a transient raw token is caught even though it
-		// would be gone by the time a plain assertion looks.
-		await page.evaluate(() => {
-			const seen: string[] = [];
-			(window as unknown as { __activityTexts: string[] }).__activityTexts = seen;
-			const record = () => {
-				for (const el of document.querySelectorAll('.activity-action'))
-					seen.push(el.textContent ?? '');
-			};
-			new MutationObserver(record).observe(document.body, {
-				subtree: true,
-				childList: true,
-				characterData: true
-			});
-		});
-
-		await page.locator('table tbody tr').first().getByRole('button', { name: 'Edit' }).click();
-		const modal = page.locator('div.modal[role="dialog"]');
-		await expect(modal).toBeVisible();
-
-		const section = modal.locator('.activity-section');
-		await expect(section).toHaveAttribute('data-ready', 'true', { timeout: 10_000 });
-		await expect(section.locator('.activity-action').first()).toBeVisible();
-
-		const rawToken = /\b(?:invoice|exception|audit)\.[a-z_]+\b/;
-		await expect(section.locator('.activity-action').filter({ hasText: rawToken })).toHaveCount(0);
-		const seen = await page.evaluate(
-			() => (window as unknown as { __activityTexts: string[] }).__activityTexts
-		);
-		expect(seen.length).toBeGreaterThan(0);
-		expect(seen.filter((t) => rawToken.test(t))).toEqual([]);
 	});
 
 	test('modal close button dismisses', async ({ page }) => {
@@ -248,6 +208,99 @@ test.describe('/invoices invoice detail modal', () => {
 				data: JSON.stringify({ description: original })
 			});
 		}
+	});
+});
+
+/**
+ * decisions §529 / §534: the Activity list never draws a row with its raw
+ * action token. The rows arrive from `GET /api/invoices/{id}/audit-log`, their
+ * labels from the lazy `audit` catalogue slice, and the two race. The test
+ * forces the losing order: it holds the slice's module until the audit-log
+ * response is in, so a list that drew rows as soon as they arrived would show
+ * `invoice.created` here. The invoice is created through the API so its
+ * timeline deterministically holds `invoice.created`, which the modal's own
+ * invoice-voice overrides (`INVOICE_TIMELINE_LABEL_KEYS`) do not cover: its
+ * only label is the slice's.
+ */
+test.describe('/invoices detail modal — Activity labels', () => {
+	const MARKER = `E2E-ACTLABEL-${Date.now()}`;
+	// A key only the `audit` slice's modules carry (`locales/audit/*.ts`), so
+	// it picks that chunk out under `vite dev` (`…/locales/audit/en.ts`) and
+	// in the hashed production bundle alike.
+	const AUDIT_SLICE_MARKER = 'audit.action.invoice.created_from_po';
+	let invoiceId = '';
+
+	test.beforeEach(async ({ page }) => {
+		const res = await page.request.post(`${API_BASE}/api/invoices`, {
+			headers: await authedTenantHeaders(page),
+			data: { vendor: 'E2E Activity Label Vendor', invoice_number: MARKER, amount: '12.00', currency: 'USD' }
+		});
+		expect(res.status()).toBe(201);
+		invoiceId = ((await res.json()) as { id: string }).id;
+	});
+
+	test.afterEach(() => deleteInvoicesWhere(`invoice_number = '${MARKER}'`));
+
+	test('rows wait for the label slice even when the audit log lands first', async ({ page }) => {
+		// Record every `.activity-action` text the DOM ever holds, from before
+		// the app boots, so a transient raw token is caught even though it would
+		// be relabelled by the time a plain assertion looks.
+		await page.addInitScript(() => {
+			const seen: string[] = [];
+			(window as unknown as { __activityTexts: string[] }).__activityTexts = seen;
+			new MutationObserver(() => {
+				for (const el of document.querySelectorAll('.activity-action'))
+					seen.push(el.textContent ?? '');
+			}).observe(document, { subtree: true, childList: true, characterData: true });
+		});
+
+		let releaseSlice!: () => void;
+		const sliceReleased = new Promise<void>((resolve) => (releaseSlice = resolve));
+		let sliceHeld = false;
+		await page.route(/\.(?:m?js|ts)(?:\?.*)?$/, async (route) => {
+			const response = await route.fetch();
+			const body = await response.text();
+			if (body.includes(AUDIT_SLICE_MARKER)) {
+				sliceHeld = true;
+				await sliceReleased;
+			}
+			await route.fulfill({ response, body });
+		});
+
+		try {
+			const auditLog = page.waitForResponse(
+				(r) =>
+					r.request().method() === 'GET' &&
+					new URL(r.url()).pathname === `/api/invoices/${invoiceId}/audit-log`
+			);
+			await page.goto(`/invoices?id=${invoiceId}`);
+			const modal = page.locator('div.modal[role="dialog"]');
+			await expect(modal.locator('header h2')).toContainText(MARKER);
+			expect((await auditLog).status()).toBe(200);
+			await expect.poll(() => sliceHeld).toBe(true);
+
+			// Rows in hand, labels held back: the list states it is loading and
+			// draws nothing, and is not yet ready.
+			const section = modal.getByTestId('invoice-activity');
+			await expect(section.getByTestId('invoice-activity-loading')).toBeVisible();
+			await expect(section).toHaveAttribute('data-ready', 'false');
+			await expect(section.locator('.activity-action')).toHaveCount(0);
+
+			releaseSlice();
+			await expect(section).toHaveAttribute('data-ready', 'true');
+			await expect(
+				section.locator('.activity-action', { hasText: 'Invoice created' }).first()
+			).toBeVisible();
+		} finally {
+			releaseSlice();
+		}
+
+		const rawToken = /\b(?:invoice|exception|audit)\.[a-z_]+\b/;
+		const seen = await page.evaluate(
+			() => (window as unknown as { __activityTexts: string[] }).__activityTexts
+		);
+		expect(seen.length).toBeGreaterThan(0);
+		expect(seen.filter((t) => rawToken.test(t))).toEqual([]);
 	});
 });
 
