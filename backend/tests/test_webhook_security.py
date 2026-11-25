@@ -964,6 +964,50 @@ async def test_erp_webhook_a_key_that_cannot_be_opened_spends_the_budget_too(
 
 
 @pytest.mark.asyncio
+async def test_erp_webhook_a_spent_budget_still_lets_a_cache_served_tenant_verify(
+    fake_redis, erp_unseal_budget, monkeypatch
+):
+    """Parity with the Merge route (decisions §527): once the source has spent
+    its budget, a tenant whose data key the DEK cache holds is opened and
+    verified (no KMS call to bound), a cold one is refused unopened, and the
+    warm one is refused too once its cache entry is past the TTL."""
+    import time
+
+    from app.services import credential_crypto, provider_credentials
+
+    body = _erp_body(correlation_id="not-a-uuid")  # verified, then a silent 204
+    for _ in range(2):
+        await _erp_from("198.51.100.7", _org_with_erp_secret("real"), _sign("x", body), body)
+
+    warm, cold = _org_with_erp_secret("real"), _org_with_erp_secret("real")
+    for org in (warm, cold):
+        org.sealed_envelopes = {
+            "erp": credential_crypto.Envelope(
+                ciphertext=b"", wrapped_key=uuid.uuid4().bytes, key_provider="kms", key_id="k"
+            )
+        }
+    credential_crypto.clear_dek_cache()
+    key = credential_crypto._dek_cache_key(
+        warm.sealed_envelopes["erp"].wrapped_key, provider_credentials._context(warm.id, "erp")
+    )
+    now = time.monotonic()
+    credential_crypto._dek_cache[key] = (now + 60.0, b"\x00" * 32)
+    try:
+        result, opened = await _erp_from("198.51.100.7", warm, _sign("real", body), body)
+        assert result is None
+        opened.assert_awaited_once()
+        result, opened = await _erp_from("198.51.100.7", cold, _sign("real", body), body)
+        assert result is None
+        opened.assert_not_awaited()
+
+        monkeypatch.setattr(credential_crypto.time, "monotonic", lambda: now + 61.0)
+        result, opened = await _erp_from("198.51.100.7", warm, _sign("real", body), body)
+        opened.assert_not_awaited()
+    finally:
+        credential_crypto.clear_dek_cache()
+
+
+@pytest.mark.asyncio
 async def test_erp_webhook_credentials_that_cannot_be_opened_are_a_silent_204(fake_redis):
     """Not a 503: the signature cannot be checked without the key, and a 503
     before it verifies would answer a configured slug differently (§408)."""

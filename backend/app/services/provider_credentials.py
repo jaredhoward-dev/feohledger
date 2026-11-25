@@ -551,6 +551,30 @@ async def stored_secret_paths(org, block: str, *, db: AsyncSession) -> frozenset
     return frozenset(fields or ())
 
 
+async def stored_block_opens_from_cache(org, block: str, *, db: AsyncSession) -> bool:
+    """Would opening ``org``'s sealed ``block`` now cost no KMS call? No decrypt.
+
+    Reads the row's wrapped key and asks
+    :func:`credential_crypto.opens_from_cache`, which neither opens nor warms
+    anything. The per-tenant ERP webhooks ask it when the source's unseal
+    budget is spent: an opening the DEK cache would serve is not what the
+    budget bounds, so it goes ahead (decisions §527). False with no row.
+    """
+    row = (
+        await db.execute(
+            select(ProviderCredential.wrapped_key, ProviderCredential.key_provider).where(
+                ProviderCredential.organization_id == org.id, ProviderCredential.block == block
+            )
+        )
+    ).one_or_none()
+    if row is None:
+        return False
+    envelope = credential_crypto.Envelope(
+        ciphertext=b"", wrapped_key=bytes(row.wrapped_key), key_provider=row.key_provider, key_id=""
+    )
+    return credential_crypto.opens_from_cache(envelope, _context(org.id, block))
+
+
 async def credential_status(db: AsyncSession, org_id: uuid.UUID) -> dict[str, list[str]]:
     """Which secret paths are set, per block — names only, no decrypt."""
     rows = (
