@@ -729,6 +729,7 @@ export const messages = {
 	'exceptions.description.erpCreditSettlement': "ERP ではこの請求書が、少なくとも一部は ERP 側で適用された仕入先の貸方票で消し込まれています。未払い額を誰かが確認するまで、FeohLedger はこれを支払いません。",
 	'exceptions.description.erpSettledNoPayment': "ERP ではこの請求書に未払い残高はありませんが、支払いの記録もありません（ERP 側で貸方票が適用されたか、残高が償却されています）。未払い額を誰かが確認するまで、FeohLedger はこれを支払いません。",
 	'exceptions.description.erpPaidWhileScheduled': "ERP ではこの請求書が FeohLedger 以外の支払いで支払済みになっていますが、FeohLedger でも支払いが予定されています。両方が仕入先に届く前に、どちらかを停止または無効にしてください。",
+	'exceptions.description.erpPaidWhilePaymentInFlight': "ERP ではこの請求書が支払済みになっていますが、FeohLedger の支払いはまだ完了していません。何かを無効にする前に、その記録が FeohLedger の支払いなのか、2 件目の支払いなのかを確認してください。",
 	'exceptions.description.erpPaidTwice': "FeohLedger がこの請求書を支払いましたが、ERP では FeohLedger 以外の支払いでも支払済みになっています。仕入先に二重に支払われた可能性があります。どちらかの支払いを回収してください。",
 	'exceptions.description.erpPartlyPaidOutside': "ERP ではこの請求書の一部が FeohLedger の外で支払いまたは貸方処理されています。FeohLedger で全額を支払うと過払いになります。支払う前に未払い額を照合してください。",
 	'exceptions.description.erpRecordedPaymentWithdrawn': "ERP がこの請求書を支払済みと報告し、FeohLedger はその支払いを記録しましたが、ERP では支払済みと表示されなくなりました（支払いが ERP 側で削除または無効化されました）。まだ未払いかどうかを確認してください。",

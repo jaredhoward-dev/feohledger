@@ -261,6 +261,8 @@ export const INVOICE_WARNING_MESSAGE_KEYS = {
 	'exception.erp_settled_no_payment': 'exceptions.description.erpSettledNoPayment',
 	// The ERP shows this bill paid by a payment FeohLedger did not make, while a FeohLedger payment is scheduled for it. Stop or void one of them before both reach the supplier.
 	'exception.erp_paid_while_scheduled': 'exceptions.description.erpPaidWhileScheduled',
+	// The ERP shows this bill paid while FeohLedger's payment for it has not completed. Confirm whether that entry is FeohLedger's payment or a second one before voiding anything.
+	'exception.erp_paid_while_payment_in_flight': 'exceptions.description.erpPaidWhilePaymentInFlight',
 	// FeohLedger paid this invoice, and the ERP shows the bill also paid by a payment FeohLedger did not make — the supplier may have been paid twice. Recover one of the payments.
 	'exception.erp_paid_twice': 'exceptions.description.erpPaidTwice',
 	// The ERP shows part of this bill paid or credited outside FeohLedger; a FeohLedger payment for the full amount would overpay it. Reconcile what is still owed before paying.
@@ -462,6 +464,7 @@ export const INVOICE_WARNING_PARAM_KINDS = {
 	'exception.erp_credit_settlement': {},
 	'exception.erp_settled_no_payment': {},
 	'exception.erp_paid_while_scheduled': {},
+	'exception.erp_paid_while_payment_in_flight': {},
 	'exception.erp_paid_twice': {},
 	'exception.erp_partly_paid_outside': {},
 	'exception.erp_recorded_payment_withdrawn': {},

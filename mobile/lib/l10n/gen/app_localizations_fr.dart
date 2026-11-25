@@ -3869,6 +3869,10 @@ class AppLocalizationsFr extends AppLocalizations {
       'Selon l\'ERP, cette facture a été payée par un paiement que FeohLedger n\'a pas effectué, alors qu\'un paiement FeohLedger est planifié pour elle. Arrêtez ou annulez l\'un des deux avant qu\'ils n\'atteignent tous deux le fournisseur.';
 
   @override
+  String get exceptionDescriptionErpPaidWhilePaymentInFlight =>
+      'Selon l\'ERP, cette facture est payée alors que le paiement FeohLedger correspondant n\'est pas encore terminé. Vérifiez si cette écriture est le paiement FeohLedger ou un second paiement avant d\'annuler quoi que ce soit.';
+
+  @override
   String get exceptionDescriptionErpPaidTwice =>
       'FeohLedger a payé cette facture, et selon l\'ERP elle a aussi été payée par un paiement que FeohLedger n\'a pas effectué : le fournisseur a peut-être été payé deux fois. Récupérez l\'un des paiements.';
 

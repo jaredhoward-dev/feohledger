@@ -5671,6 +5671,12 @@ abstract class AppLocalizations {
   /// **'The ERP shows this bill paid by a payment FeohLedger did not make, while a FeohLedger payment is scheduled for it. Stop or void one of them before both reach the supplier.'**
   String get exceptionDescriptionErpPaidWhileScheduled;
 
+  /// No description provided for @exceptionDescriptionErpPaidWhilePaymentInFlight.
+  ///
+  /// In en, this message translates to:
+  /// **'The ERP shows this bill paid while FeohLedger\'s payment for it has not completed. Confirm whether that entry is FeohLedger\'s payment or a second one before voiding anything.'**
+  String get exceptionDescriptionErpPaidWhilePaymentInFlight;
+
   /// No description provided for @exceptionDescriptionErpPaidTwice.
   ///
   /// In en, this message translates to:

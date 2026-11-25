@@ -3668,6 +3668,10 @@ class AppLocalizationsJa extends AppLocalizations {
       'ERP ではこの請求書が FeohLedger 以外の支払いで支払済みになっていますが、FeohLedger でも支払いが予定されています。両方が仕入先に届く前に、どちらかを停止または無効にしてください。';
 
   @override
+  String get exceptionDescriptionErpPaidWhilePaymentInFlight =>
+      'ERP ではこの請求書が支払済みになっていますが、FeohLedger の支払いはまだ完了していません。何かを無効にする前に、その記録が FeohLedger の支払いなのか、2 件目の支払いなのかを確認してください。';
+
+  @override
   String get exceptionDescriptionErpPaidTwice =>
       'FeohLedger がこの請求書を支払いましたが、ERP では FeohLedger 以外の支払いでも支払済みになっています。仕入先に二重に支払われた可能性があります。どちらかの支払いを回収してください。';
 

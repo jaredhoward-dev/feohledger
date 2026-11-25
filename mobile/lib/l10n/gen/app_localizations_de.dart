@@ -3854,6 +3854,10 @@ class AppLocalizationsDe extends AppLocalizations {
       'Laut ERP wurde diese Rechnung durch eine Zahlung beglichen, die nicht von FeohLedger stammt, während in FeohLedger eine Zahlung dafür geplant ist. Stoppen oder stornieren Sie eine der beiden, bevor beide beim Lieferanten ankommen.';
 
   @override
+  String get exceptionDescriptionErpPaidWhilePaymentInFlight =>
+      'Laut ERP ist diese Rechnung bezahlt, während die Zahlung von FeohLedger dafür noch nicht abgeschlossen ist. Prüfen Sie, ob dieser Eintrag die Zahlung von FeohLedger oder eine zweite Zahlung ist, bevor Sie etwas stornieren.';
+
+  @override
   String get exceptionDescriptionErpPaidTwice =>
       'FeohLedger hat diese Rechnung bezahlt, und laut ERP wurde sie zusätzlich durch eine Zahlung beglichen, die nicht von FeohLedger stammt – der Lieferant wurde möglicherweise doppelt bezahlt. Holen Sie eine der Zahlungen zurück.';
 

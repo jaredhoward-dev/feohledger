@@ -3860,6 +3860,10 @@ class AppLocalizationsEs extends AppLocalizations {
       'Según el ERP, esta factura se pagó con un pago que FeohLedger no hizo, mientras hay un pago de FeohLedger programado para ella. Detenga o anule uno de los dos antes de que ambos lleguen al proveedor.';
 
   @override
+  String get exceptionDescriptionErpPaidWhilePaymentInFlight =>
+      'Según el ERP, esta factura está pagada mientras el pago de FeohLedger para ella aún no se ha completado. Confirme si ese registro es el pago de FeohLedger o un segundo pago antes de anular nada.';
+
+  @override
   String get exceptionDescriptionErpPaidTwice =>
       'FeohLedger pagó esta factura y, según el ERP, también se pagó con un pago que FeohLedger no hizo: es posible que el proveedor haya cobrado dos veces. Recupere uno de los pagos.';
 

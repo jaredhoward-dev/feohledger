@@ -3859,6 +3859,10 @@ class AppLocalizationsPt extends AppLocalizations {
       'Segundo o ERP, esta fatura foi paga por um pagamento que o FeohLedger não fez, enquanto há um pagamento do FeohLedger agendado para ela. Interrompa ou estorne um deles antes que os dois cheguem ao fornecedor.';
 
   @override
+  String get exceptionDescriptionErpPaidWhilePaymentInFlight =>
+      'Segundo o ERP, esta fatura está paga, mas o pagamento do FeohLedger para ela ainda não foi concluído. Confirme se esse lançamento é o pagamento do FeohLedger ou um segundo pagamento antes de estornar qualquer coisa.';
+
+  @override
   String get exceptionDescriptionErpPaidTwice =>
       'O FeohLedger pagou esta fatura e, segundo o ERP, ela também foi paga por um pagamento que o FeohLedger não fez — o fornecedor pode ter sido pago duas vezes. Recupere um dos pagamentos.';
 
@@ -8960,6 +8964,10 @@ class AppLocalizationsPtBr extends AppLocalizationsPt {
   @override
   String get exceptionDescriptionErpPaidWhileScheduled =>
       'Segundo o ERP, esta fatura foi paga por um pagamento que o FeohLedger não fez, enquanto há um pagamento do FeohLedger agendado para ela. Interrompa ou estorne um deles antes que os dois cheguem ao fornecedor.';
+
+  @override
+  String get exceptionDescriptionErpPaidWhilePaymentInFlight =>
+      'Segundo o ERP, esta fatura está paga, mas o pagamento do FeohLedger para ela ainda não foi concluído. Confirme se esse lançamento é o pagamento do FeohLedger ou um segundo pagamento antes de estornar qualquer coisa.';
 
   @override
   String get exceptionDescriptionErpPaidTwice =>

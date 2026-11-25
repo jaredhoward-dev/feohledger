@@ -299,6 +299,7 @@ const Map<String, Map<String, String>> invoiceWarningParamKinds = {
   'exception.erp_credit_settlement': {},
   'exception.erp_settled_no_payment': {},
   'exception.erp_paid_while_scheduled': {},
+  'exception.erp_paid_while_payment_in_flight': {},
   'exception.erp_paid_twice': {},
   'exception.erp_partly_paid_outside': {},
   'exception.erp_recorded_payment_withdrawn': {},
@@ -1181,6 +1182,9 @@ String? _localizeWarningCode(
     // The ERP shows this bill paid by a payment FeohLedger did not make, while a FeohLedger payment is scheduled for it. Stop or void one of them before both reach the supplier.
     case 'exception.erp_paid_while_scheduled':
       return l.exceptionDescriptionErpPaidWhileScheduled;
+    // The ERP shows this bill paid while FeohLedger's payment for it has not completed. Confirm whether that entry is FeohLedger's payment or a second one before voiding anything.
+    case 'exception.erp_paid_while_payment_in_flight':
+      return l.exceptionDescriptionErpPaidWhilePaymentInFlight;
     // FeohLedger paid this invoice, and the ERP shows the bill also paid by a payment FeohLedger did not make — the supplier may have been paid twice. Recover one of the payments.
     case 'exception.erp_paid_twice':
       return l.exceptionDescriptionErpPaidTwice;

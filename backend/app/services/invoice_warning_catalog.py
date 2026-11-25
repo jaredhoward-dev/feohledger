@@ -949,6 +949,15 @@ _ERP_UNNAMED_ONLY: dict[str, str] = {
         "FeohLedger payment is scheduled for it. Stop or void one of them before both "
         "reach the supplier."
     ),
+    # The generic route and the status polling sweep (decisions §533, §535):
+    # unlike the QuickBooks sync they cannot tell whether the ERP's payment
+    # came from outside, and the usual cause is a bookkeeper recording our own
+    # in-flight payment there — so they never tell anyone to void one.
+    "erp_paid_while_payment_in_flight": (
+        "The ERP shows this bill paid while FeohLedger's payment for it has not "
+        "completed. Confirm whether that entry is FeohLedger's payment or a second one before "
+        "voiding anything."
+    ),
     "erp_paid_twice": (
         "FeohLedger paid this invoice, and the ERP shows the bill also paid by a payment "
         "FeohLedger did not make — the supplier may have been paid twice. Recover one of "
