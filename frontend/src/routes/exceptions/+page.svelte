@@ -698,6 +698,14 @@
 	const erpShowSplit = $derived(spansSeveralRails(erpParts));
 	// The split is the record over any rail picked: the picker becomes a fact.
 	const erpSplitStands = $derived(erpShowSplit && resolveTarget?.erp_payment_split_stands === true);
+	/** The "record the ERP's payment" panel sits ABOVE the note in the resolve
+	 *  dialog; when it shows, the dialog opens at its start (the focus trap's
+	 *  default) rather than skipping a keyboard reader past it to the note. */
+	const erpPanelShown = $derived(
+		!!resolveTarget &&
+			isErpPaidReport(resolveTarget.erp_report) &&
+			isOffered(resolveTarget.record_erp_payment_refusal)
+	);
 	// The note under the split reads the server's three-state verdict
 	// (`splitNoteKey`, in `ErpPaymentSplit`); the picker stays unless it stands.
 
@@ -1380,7 +1388,7 @@
 				{refusalNote(resolveTarget)}
 			</p>
 		{/if}
-		{#if isErpPaidReport(resolveTarget.erp_report) && isOffered(resolveTarget.record_erp_payment_refusal)}
+		{#if erpPanelShown}
 			<!-- The payment the ERP reported, pre-filled, recorded in one step.
 			     Resolving this exception and recording the payment happen in one
 			     transaction server-side, so neither can land without the other. -->
@@ -1479,7 +1487,7 @@
 					bind:value={resolutionText}
 					placeholder={m('exceptions.resolveModal.notePlaceholder')}
 					maxlength="500"
-					autofocus
+					data-autofocus={erpPanelShown ? undefined : true}
 				/>
 			</label>
 			{#if decisionRefused}
@@ -1554,7 +1562,7 @@
 				bind:value={resolutionText}
 				placeholder={m('exceptions.bulkModal.notePlaceholder')}
 				maxlength="500"
-				autofocus
+				data-autofocus
 			/>
 		</label>
 		<div class="modal-footer">
