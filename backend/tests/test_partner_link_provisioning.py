@@ -31,6 +31,16 @@ from app.config import settings
 from app.models.organization import Organization
 from app.models.workflow import AuditLog
 from app.services.partner_link_token import build_link_code
+from tests.partner_capability_helpers import granted_partner
+
+
+@pytest.fixture(autouse=True)
+async def _a_is_partner(realdb):
+    """Tenant "a" is the partner in this module: the operator granted it the
+    capability every `/api/partner` route requires (decisions §574)."""
+    async with granted_partner(realdb, "a"):
+        yield
+
 
 _KEY = "integration-partner-link-key"
 
@@ -74,21 +84,21 @@ async def _audit_rows(realdb, tenant_key: str, action: str) -> list:
 @pytest.mark.asyncio
 async def test_mint_link_code_admin_only(realdb, partner_key):
     async with realdb.client(key="b", role="admin") as c:
-        ok = await c.post("/api/partner/link-code")
+        ok = await c.post("/api/organization/partner-link-code")
     assert ok.status_code == 200
     body = ok.json()
     assert body["link_code"]
     assert body["expires_in_minutes"] == 30
 
     async with realdb.client(key="b", role="ap_manager") as c:
-        denied = await c.post("/api/partner/link-code")
+        denied = await c.post("/api/organization/partner-link-code")
     assert denied.status_code == 403
 
 
 @pytest.mark.asyncio
 async def test_mint_link_code_requires_auth(realdb, partner_key):
     async with realdb.client(key="b", role=None) as c:
-        resp = await c.post("/api/partner/link-code")
+        resp = await c.post("/api/organization/partner-link-code")
     assert resp.status_code == 401
 
 
@@ -96,8 +106,42 @@ async def test_mint_link_code_requires_auth(realdb, partner_key):
 async def test_mint_link_code_fails_closed_without_key(realdb, monkeypatch):
     monkeypatch.setattr(settings, "partner_link_signing_key", "")
     async with realdb.client(key="b", role="admin") as c:
-        resp = await c.post("/api/partner/link-code")
+        resp = await c.post("/api/organization/partner-link-code")
     assert resp.status_code == 503
+
+
+@pytest.mark.asyncio
+async def test_mint_link_code_needs_no_partner_capability_and_is_audited(realdb, partner_key):
+    """Decisions §574: consenting to BE adopted is not a partner act. B was never
+    granted the capability, its admin still mints from Organization settings,
+    and the issue is audited on B's own trail as before."""
+    before = len(await _audit_rows(realdb, "b", "partner.link_code_issued"))
+    async with realdb.client(key="b", role="admin") as c:
+        resp = await c.post("/api/organization/partner-link-code")
+    assert resp.status_code == 200
+    rows = await _audit_rows(realdb, "b", "partner.link_code_issued")
+    assert len(rows) == before + 1
+    assert any(r.details == {"ttl_minutes": 30} for r in rows)
+
+
+@pytest.mark.asyncio
+async def test_old_partner_link_code_route_is_gone(realdb, partner_key):
+    """The mint moved; the old path is not a second, ungated door."""
+    async with realdb.client(key="b", role="admin") as c:
+        resp = await c.post("/api/partner/link-code")
+    assert resp.status_code in (404, 405)
+
+
+@pytest.mark.asyncio
+async def test_non_partner_cannot_redeem_a_code(realdb, partner_key):
+    """A's admin consents (mints); B — not a partner — cannot adopt A with it."""
+    async with realdb.client(key="a", role="admin") as c:
+        code = (await c.post("/api/organization/partner-link-code")).json()["link_code"]
+    async with realdb.client(key="b", role="admin") as c:
+        resp = await c.post("/api/partner/children", json={"link_code": code})
+    assert resp.status_code == 403
+    assert resp.json()["detail"]["code"] == "partner_capability_required"
+    assert await _parent_of(realdb, "a") is None
 
 
 # ---------------------------------------------------------------------------
@@ -112,7 +156,7 @@ async def test_attach_with_consenting_code_links_and_audits(realdb, partner_key)
     try:
         # Child B consents by minting a code.
         async with realdb.client(key="b", role="admin") as c:
-            mint = await c.post("/api/partner/link-code")
+            mint = await c.post("/api/organization/partner-link-code")
         code = mint.json()["link_code"]
 
         # Partner A redeems it.
@@ -180,7 +224,7 @@ async def test_attach_with_forged_cross_key_code_is_rejected(realdb, partner_key
 @pytest.mark.asyncio
 async def test_attach_admin_only(realdb, partner_key):
     async with realdb.client(key="b", role="admin") as c:
-        code = (await c.post("/api/partner/link-code")).json()["link_code"]
+        code = (await c.post("/api/organization/partner-link-code")).json()["link_code"]
     async with realdb.client(key="a", role="ap_manager") as c:
         resp = await c.post("/api/partner/children", json={"link_code": code})
     assert resp.status_code == 403
@@ -197,7 +241,7 @@ async def test_attach_code_is_single_use(realdb, partner_key):
     await _set_parent(realdb, child_key="b", parent_key=None)
     try:
         async with realdb.client(key="b", role="admin") as c:
-            code = (await c.post("/api/partner/link-code")).json()["link_code"]
+            code = (await c.post("/api/organization/partner-link-code")).json()["link_code"]
         async with realdb.client(key="a", role="admin") as c:
             first = await c.post("/api/partner/children", json={"link_code": code})
             # Detach so the re-parent guard isn't what trips the replay.
@@ -220,7 +264,7 @@ async def test_reparent_guard_blocks_takeover_but_same_partner_is_idempotent(rea
     try:
         # Same-partner re-attach: idempotent 201 (returns the summary), no error.
         async with realdb.client(key="b", role="admin") as c:
-            code = (await c.post("/api/partner/link-code")).json()["link_code"]
+            code = (await c.post("/api/organization/partner-link-code")).json()["link_code"]
         async with realdb.client(key="a", role="admin") as c:
             same = await c.post("/api/partner/children", json={"link_code": code})
         assert same.status_code == 201

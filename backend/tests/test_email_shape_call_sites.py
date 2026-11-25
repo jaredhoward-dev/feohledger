@@ -40,6 +40,7 @@ from app.models.organization import Organization
 from app.models.signup import EmailVerification
 from app.models.user import User, UserRole
 from app.services.legal_acceptance import CURRENT_LEGAL_VERSIONS
+from tests.partner_capability_helpers import granted_partner
 
 pytestmark = pytest.mark.asyncio
 
@@ -177,7 +178,9 @@ async def test_partner_provision_refuses_a_malformed_admin_email(realdb, address
     a half-provisioned child would leave an orphan database behind."""
     slug = _unique_slug("pshape")
     try:
-        async with realdb.client(key="a", role="admin") as c:
+        # "a" holds the partner capability the route requires (decisions §574),
+        # so the refusal measured is the email check's, not the capability's.
+        async with granted_partner(realdb, "a"), realdb.client(key="a", role="admin") as c:
             resp = await c.post(
                 "/api/partner/children/provision",
                 json={"name": "Shape Child", "slug": slug, "admin_email": address},
