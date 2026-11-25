@@ -119,6 +119,7 @@ export const messages = {
 	'portal.invoices.tableAria': '請求書一覧',
 	'portal.invoices.chatLoadFailed': '会話を読み込めませんでした。',
 	'portal.invoices.chatNotFound': 'お客様のアカウントにその請求書が見つかりませんでした。',
+	'portal.invoices.chatLinkFailed': '現在、その会話を開けませんでした。',
 
 	// ポータルの支払い (routes/portal/payments/+page.svelte)
 	'portal.payments.title': '支払い',

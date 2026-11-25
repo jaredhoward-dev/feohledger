@@ -6,6 +6,7 @@
 		PORTAL_PAGE_SIZE,
 		type PortalInvoiceListItem,
 	} from '#lib/portalApi.ts';
+	import { ApiError } from '#lib/api.ts';
 	import { portalAuth } from '#lib/stores/portalAuth.svelte.ts';
 	import LoadMoreFooter from '#lib/components/ui/LoadMoreFooter.svelte';
 	import { page } from '$app/state';
@@ -376,12 +377,18 @@
 	const CHAT_LINK_PARAM = 'chat';
 	const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 	let linkedChatId: string | null = null;
+	// What went wrong opening the linked conversation. Only a 404 (or an id
+	// that cannot be one) means "not in your account"; any other failure is a
+	// failed read, said as such with a Retry — telling a supplier their
+	// invoice does not exist because the server blipped would be false.
+	let chatLinkError = $state<{ notFound: boolean } | null>(null);
 
 	async function openLinkedChat(invoiceId: string) {
+		chatLinkError = null;
 		await (firstLoad ??= refresh());
 		if (linkedChatId !== invoiceId) return;
 		if (!UUID_RE.test(invoiceId)) {
-			error = m('portal.invoices.chatNotFound');
+			chatLinkError = { notFound: true };
 			return;
 		}
 		if (!items.some((inv) => inv.id === invoiceId)) {
@@ -392,16 +399,31 @@
 				const inv = await portalApi.get<PortalInvoice>(`/api/portal/invoices/${invoiceId}`);
 				if (linkedChatId !== invoiceId) return;
 				items = [inv, ...items];
-			} catch {
-				if (linkedChatId === invoiceId) error = m('portal.invoices.chatNotFound');
+			} catch (err) {
+				if (linkedChatId === invoiceId) {
+					chatLinkError = { notFound: err instanceof ApiError && err.status === 404 };
+				}
 				return;
 			}
 		}
 		if (expandedId !== invoiceId) await toggleChat(invoiceId);
+		if (linkedChatId !== invoiceId) return;
 		await tick();
-		document
-			.querySelector(`[data-chat-row="${invoiceId}"]`)
-			?.scrollIntoView({ block: 'nearest' });
+		// `CSS.escape` although the id is UUID-checked above: the selector is
+		// built from a URL parameter, and the check is not what should keep it
+		// well-formed.
+		const row = document.querySelector<HTMLElement>(
+			`[data-chat-row="${CSS.escape(invoiceId)}"]`
+		);
+		row?.scrollIntoView({ block: 'nearest' });
+		// Arriving from an email to reply: focus the composer, or — when the
+		// thread failed to load and offers no composer — its Retry, so the
+		// keyboard and screen-reader user starts where the link pointed.
+		row?.querySelector<HTMLElement>('textarea.chat-input, button')?.focus();
+	}
+
+	function retryLinkedChat() {
+		if (linkedChatId) void openLinkedChat(linkedChatId);
 	}
 
 	$effect(() => {
@@ -441,6 +463,17 @@
 	/>
 
 	{#if error}<div class="error" role="alert">{error}</div>{/if}
+	{#if chatLinkError?.notFound}
+		<div class="error" role="alert" data-testid="portal-chat-link-not-found">
+			{m('portal.invoices.chatNotFound')}
+		</div>
+	{:else if chatLinkError}
+		<LoadError
+			message={m('portal.invoices.chatLinkFailed')}
+			onretry={retryLinkedChat}
+			testId="portal-chat-link-failed"
+		/>
+	{/if}
 	{#if message}<div class="msg" role="status" aria-live="polite">{message}</div>{/if}
 
 	<PortalListFilters

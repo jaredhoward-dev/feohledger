@@ -112,6 +112,7 @@ export const messages = {
 	'portal.invoices.tableAria': 'Vos factures',
 	'portal.invoices.chatLoadFailed': 'Impossible de charger la conversation.',
 	'portal.invoices.chatNotFound': 'Cette facture est introuvable dans votre compte.',
+	'portal.invoices.chatLinkFailed': 'Impossible d’ouvrir cette conversation pour le moment.',
 	'portal.payments.title': 'Paiements',
 	'portal.payments.loadFailed': 'Échec du chargement',
 	'portal.payments.tableAria': 'Vos paiements',
