@@ -885,6 +885,20 @@
 		)
 	);
 
+	/**
+	 * How many rows "Select all N matching" would select: the open + escalated
+	 * rows within the current filters, which is what `GET /api/exceptions/ids`
+	 * resolves (`selectAllMatching` sends `status=open,escalated` under All).
+	 * Under the All chip that is NOT `total`: `total` counts the resolved and
+	 * dismissed rows too, so the button promised "Select all 45" and then
+	 * selected 15, and offered itself even when every selectable row was
+	 * already selected. The status tallies honour every filter but status, so
+	 * open + escalated is that set's size; null while it is unknown.
+	 */
+	let selectableMatchingCount = $derived(
+		statusFilter === 'all' ? (summary ? summary.open + summary.escalated : null) : total
+	);
+
 	let allSelected = $derived(
 		selectableIds.size > 0 && [...selectableIds].every((id) => selectedIds.has(id))
 	);
@@ -1150,11 +1164,11 @@
 		}}
 	>
 		{#snippet actions()}
-			{#if allSelected && !selectedAllMatching && total > selectableIds.size}
+			{#if allSelected && !selectedAllMatching && selectableMatchingCount !== null && selectableMatchingCount > selectableIds.size}
 				<button type="button" class="btn-secondary" disabled={selectingAllMatching} onclick={selectAllMatching}>
 					{selectingAllMatching
 						? m('common.loading')
-						: m('common.selectAllMatching', { total })}
+						: m('common.selectAllMatching', { total: selectableMatchingCount })}
 				</button>
 			{:else if selectedAllMatching}
 				<span class="bulk-all-matching-note">{m('common.allMatchingSelected')}</span>
