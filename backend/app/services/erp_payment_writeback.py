@@ -622,6 +622,24 @@ PENDING_CREDITS_KEY = "erp_discount_credits_pending"
 #: credit's application but not the credit can find it on retry (§577).
 PENDING_VOID_CREDITS_KEY = "erp_discount_credit_voids_pending"
 
+#: ``WorkflowInstance.state_data`` key: payment id → the ERP id of the discount
+#: credit a write-back BOOKED (outcome ``posted``). The void reverses it by this
+#: id: Xero's lookup by number is unconfirmed, and a miss there read as
+#: "nothing of ours" would void the payment over an allocated credit. Cleared
+#: when the void reverses it. Not a pending key for the delete door: while it
+#: matters (a voided payment not yet reversed) :data:`PENDING_VOIDS_KEY` holds
+#: the payment too, and a completed payment's invoice is not deletable
+#: (decisions §582).
+BOOKED_CREDITS_KEY = "erp_discount_credits_booked"
+
+#: ``WorkflowInstance.state_data`` key: payment id → a fresh token each time a
+#: write-back re-arms that payment's void (:func:`_rearm_void_if_voided`). The
+#: id is usually already in :data:`PENDING_VOIDS_KEY`, so the re-arm alone
+#: changes nothing a void that is mid-call could see; the void reads the token
+#: before its ERP call and clears the payment only if it is unchanged
+#: (decisions §582).
+VOID_REARMED_KEY = "erp_payment_void_rearmed"
+
 
 def _credit_marker(payload: DiscountCreditPayload, credit_id: str | None) -> dict:
     return {
@@ -742,6 +760,11 @@ ERP_REPORT_DISCOUNT_CREDIT_STALLED = "discount_credit_stalled"
 #: The failure message's code when a recorded credit's id is unknown and the
 #: ERP lookup did not find it: nothing is created over it (§579).
 DISCOUNT_CREDIT_UNIDENTIFIED = "discount_credit_unidentified"
+#: The failure message's code when the recorded credit id reads back without
+#: our marker (Xero may keep its own number on our create, §581's residual):
+#: the record is held and flagged, never dropped as someone's void nor booked
+#: over (decisions §582).
+DISCOUNT_CREDIT_NOT_OURS = "discount_credit_not_ours"
 
 
 def _pending_record(state: dict | None, payment_id) -> dict | None:
@@ -829,7 +852,10 @@ async def _reserve_credit(
         record, status = await _claim_record(db, invoice_id, payment_id)
         return record, status, False
     status, _run = await _payment_row(db, payment_id)
-    if instance is None or status != "completed":
+    booked = ((instance.state_data if instance else None) or {}).get(BOOKED_CREDITS_KEY) or {}
+    if instance is None or status != "completed" or str(payment_id) in booked:
+        # A credit already booked for this payment is THE credit: a re-run
+        # never books a second (decisions §582).
         await db.commit()
         return None, status, False
     until = (datetime.now(UTC) + timedelta(seconds=CREDIT_CLAIM_SECONDS)).isoformat()
@@ -858,6 +884,11 @@ async def _rearm_void_if_voided(
     if str(payment_id) not in voids:
         voids.append(str(payment_id))
     instance.state_data = {**state, PENDING_VOIDS_KEY: voids}
+    # The id is usually still pending (the void's task has not cleared it
+    # yet), so adding it changes nothing that task can see: a fresh token
+    # does, and the task clears the payment only if the token it read before
+    # its ERP call is unchanged (decisions §582).
+    _write_entry(instance, VOID_REARMED_KEY, payment_id, uuid.uuid4().hex)
     return True
 
 
@@ -975,6 +1006,9 @@ async def _record_credit_outcome(
         outcome = "void_rearmed"
     elif credit.success and status == "completed":
         kept, outcome = None, "posted"
+        if credit_id:
+            # Remembered for the void, which reverses it by this id (§582).
+            _write_entry(instance, BOOKED_CREDITS_KEY, payment_id, str(credit_id))
     elif gone or not may_stand:
         kept = None
         outcome = credit.refusal_code or "not_posted"
@@ -1023,7 +1057,14 @@ async def _record_credit_outcome(
                 **({"void_rearmed": True} if rearmed else {}),
             },
         )
-    if kept is not None and (kept.get("credit_id") is None or kept.get("exhausted")):
+    not_ours = (credit.message or "").endswith(f": {DISCOUNT_CREDIT_NOT_OURS}")
+    if kept is not None and (kept.get("credit_id") is None or kept.get("exhausted") or not_ours):
+        if kept.get("exhausted"):
+            reason = "retries_exhausted"
+        elif not_ours:
+            reason = DISCOUNT_CREDIT_NOT_OURS
+        else:
+            reason = "unidentified"
         await _open_stalled_flag(
             db,
             adapter,
@@ -1032,7 +1073,7 @@ async def _record_credit_outcome(
             run_id,
             payload.bill_id,
             kept.get("credit_id"),
-            reason="retries_exhausted" if kept.get("exhausted") else "unidentified",
+            reason=reason,
             attempts=kept.get("attempts"),
         )
     return kept
@@ -1259,11 +1300,18 @@ async def void_written_payment(org_id: uuid.UUID, payment_id: uuid.UUID) -> str:
             # What an earlier attempt recorded of our discount credit (§577):
             # the id a previous void stored before deleting anything, or the
             # one an unapplied credit's write-back stored.
-            known_credit = ((state or {}).get(PENDING_VOID_CREDITS_KEY) or {}).get(
-                str(payment_id)
-            ) or (((state or {}).get(PENDING_CREDITS_KEY) or {}).get(str(payment_id)) or {}).get(
-                "credit_id"
+            known_credit = (
+                ((state or {}).get(PENDING_VOID_CREDITS_KEY) or {}).get(str(payment_id))
+                or (((state or {}).get(PENDING_CREDITS_KEY) or {}).get(str(payment_id)) or {}).get(
+                    "credit_id"
+                )
+                # The credit a write-back booked, by id (§582): never left to
+                # Xero's unconfirmed lookup by number.
+                or ((state or {}).get(BOOKED_CREDITS_KEY) or {}).get(str(payment_id))
             )
+            # A write-back that re-arms this void while it calls the ERP
+            # changes this token; the clear below compares it (§582).
+            rearm_token = ((state or {}).get(VOID_REARMED_KEY) or {}).get(str(payment_id))
             # Nothing held across the ERP call. A rollback expires the loaded
             # rows, so what is needed after it was read above.
             await db.rollback()
@@ -1360,9 +1408,21 @@ async def void_written_payment(org_id: uuid.UUID, payment_id: uuid.UUID) -> str:
                 current = dict((instance.state_data if instance else None) or {})
                 rearmed = (current.get(PENDING_VOID_CREDITS_KEY) or {}).get(str(payment_id))
                 record_now = _pending_record(current, payment_id)
-                if instance is not None and not (rearmed and rearmed != credit_id):
+                # A payment write-back that landed after our ERP call and
+                # re-armed this void (its BillPayment may stand) leaves it
+                # pending for the next pass (§582).
+                token_now = (current.get(VOID_REARMED_KEY) or {}).get(str(payment_id))
+                if (
+                    instance is not None
+                    and not (rearmed and rearmed != credit_id)
+                    and token_now == rearm_token
+                ):
                     await _clear_pending(db, invoice_id, payment_id)
                     _write_entry(instance, PENDING_VOID_CREDITS_KEY, payment_id, None)
+                    _write_entry(instance, VOID_REARMED_KEY, payment_id, None)
+                    if credit is not None:
+                        # Reversed (or confirmed gone) by the id read above.
+                        _write_entry(instance, BOOKED_CREDITS_KEY, payment_id, None)
                     unidentified = (
                         credit is not None
                         and not credit_id
