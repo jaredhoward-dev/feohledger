@@ -115,7 +115,7 @@ test.describe('/gl-accounts — a row waiting for a decision', () => {
 
 		await expect(modal).toBeHidden();
 		await expect(row.getByText('Needs a decision')).toHaveCount(0);
-		await expect(row.locator('td', { hasText: /^40$/ })).toBeVisible();
+		await expect(row.locator('.erp-id')).toHaveText('40');
 		expect(
 			tenantPsql(
 				`SELECT erp_account_id, erp_link_confirmed_at IS NOT NULL, erp_link_candidates IS NULL ` +
