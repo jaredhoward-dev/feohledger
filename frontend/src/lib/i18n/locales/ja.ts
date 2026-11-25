@@ -345,9 +345,9 @@ export const messages = {
 	// Profile → Out of office (delegation) card; the authRefusal.delegation* keys are the
 	// POST /api/auth/delegation coded refusals (api/authRefusals.ts).
 	'profile.delegation.heading': "不在設定",
-	'profile.delegation.hint': "不在の間、承認のために割り当てられた請求書は同僚に送られます。保存するとすぐに開始し、選択した最終日の後に終了します。",
+	'profile.delegation.hint': "不在の間、承認のために新しく割り当てられた請求書は、同僚が承認できる場合はその同僚に送られ、承認できない場合はあなたのもとに残ります。保存するとすぐに開始し、選択した最終日の後に終了します。",
 	'profile.delegation.limits': "代理人は本人として承認します。代理人自身の承認上限の範囲内で行い、自分がアップロードした請求書、自分が商品を受領した請求書、自分が検品した請求書は承認できません。あなたもこれらの請求書を引き続き承認できます。",
-	'profile.delegation.statusOn': "オン：承認待ちの請求書は {date} まで {name} に送られます。",
+	'profile.delegation.statusOn': "オン：承認待ちの新しい請求書は、{name} が承認できる場合は {date} まで {name} に送られ、承認できない場合はあなたのもとに残ります。",
 	'profile.delegation.statusOff': "オフ：承認待ちの請求書はあなたに届きます。",
 	'profile.delegation.statusEnded': "オフ：{name} への代理設定は {date} に終了しました。",
 	'profile.delegation.delegate': "代理人",

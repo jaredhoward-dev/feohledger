@@ -4,10 +4,13 @@
 	 * (`GET/POST/DELETE /api/auth/delegation`, decisions §511).
 	 *
 	 * A personal setting, not an organization one, and only for an approver:
-	 * the endpoints answer 403 to a caller without `invoice.approve` (there is
-	 * nothing of theirs to hand over), so the profile page offers this section
-	 * only when `auth.can('invoice.approve')`. A 403 that still arrives (the
-	 * grant was removed in another tab) is stated as that, not as a failure.
+	 * naming a delegate (`POST`) and listing candidates answer 403 to a caller
+	 * without `invoice.approve` (there is nothing of theirs to hand over), so
+	 * the profile page offers this section only when
+	 * `auth.can('invoice.approve')`. `GET` and `DELETE` stay open, so a caller
+	 * whose grant was removed since (another tab, a stale page) still sees a
+	 * delegation left on record and can end it; the rest reads as
+	 * approvers-only, not as a failure.
 	 * Who may be named comes from `/api/auth/delegation/candidates`, which
 	 * shares the write's eligibility test, so the list never offers a colleague
 	 * the save would refuse. Refusals arrive coded and are stated in the
@@ -83,13 +86,21 @@
 		try {
 			const [current, people] = await Promise.all([
 				api.get<Delegation>('/api/auth/delegation'),
-				api.get<DelegateCandidate[]>('/api/auth/delegation/candidates')
+				api.get<DelegateCandidate[]>('/api/auth/delegation/candidates').catch((err) => {
+					// Not an approver (any more): no one to name, but the record
+					// itself is still readable and can still be ended.
+					if (err instanceof ApiError && err.status === 403) return null;
+					throw err;
+				})
 			]);
-			candidates = people;
+			forbidden = people === null;
+			candidates = people ?? [];
 			adoptCurrent(current);
 		} catch (err) {
-			if (err instanceof ApiError && err.status === 403) forbidden = true;
-			else loadError = authErrorMessage(err, m, 'profile.delegation.loadFailed');
+			if (err instanceof ApiError && err.status === 403) {
+				forbidden = true;
+				delegation = null;
+			} else loadError = authErrorMessage(err, m, 'profile.delegation.loadFailed');
 		} finally {
 			loaded = true;
 		}
@@ -161,10 +172,6 @@
 
 	{#if !loaded}
 		<LoadingState />
-	{:else if forbidden}
-		<p class="hint" data-testid="delegation-approvers-only">
-			{m('profile.delegation.approversOnly')}
-		</p>
 	{:else if loadError}
 		<LoadError message={loadError} onretry={retryLoad} testId="delegation-load-error" />
 	{:else}
@@ -195,7 +202,26 @@
 			<p class="error" id="delegation-form-error" role="alert">{formError}</p>
 		{/if}
 
-		{#if options.length === 0}
+		{#if forbidden}
+			<!-- No longer an approver, with a delegation still on record: it
+			     cannot be changed, only ended. -->
+			<p class="hint" data-testid="delegation-approvers-only">
+				{m('profile.delegation.approversOnly')}
+			</p>
+			{#if status !== 'none'}
+				<div class="actions">
+					<button
+						type="button"
+						class="btn-secondary"
+						disabled={busy}
+						onclick={end}
+						data-testid="delegation-end"
+					>
+						{status === 'ended' ? m('profile.delegation.clearEnded') : m('profile.delegation.end')}
+					</button>
+				</div>
+			{/if}
+		{:else if options.length === 0}
 			<p class="hint" data-testid="delegation-no-candidates">
 				{m('profile.delegation.noCandidates')}
 			</p>

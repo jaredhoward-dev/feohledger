@@ -390,9 +390,9 @@ export const en = {
 	// Profile → Out of office (delegation) card; the authRefusal.delegation* keys are the
 	// POST /api/auth/delegation coded refusals (api/authRefusals.ts).
 	'profile.delegation.heading': "Out of office",
-	'profile.delegation.hint': "While you are away, invoices assigned to you for approval go to a colleague instead. It starts as soon as you save it and ends after the last day you choose.",
+	'profile.delegation.hint': "While you are away, new invoices assigned to you for approval go to a colleague when they can approve them, and otherwise stay with you. It starts as soon as you save it and ends after the last day you choose.",
 	'profile.delegation.limits': "Your delegate approves as themselves: within their own approval limits, and never an invoice they uploaded, received the goods for or inspected. You can still approve these invoices too.",
-	'profile.delegation.statusOn': "On: invoices for your approval go to {name} through {date}.",
+	'profile.delegation.statusOn': "On: new invoices for your approval go to {name} through {date} when they can approve them; otherwise they stay with you.",
 	'profile.delegation.statusOff': "Off: invoices for your approval come to you.",
 	'profile.delegation.statusEnded': "Off: your delegation to {name} ended on {date}.",
 	'profile.delegation.delegate': "Delegate",

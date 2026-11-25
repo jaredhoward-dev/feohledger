@@ -77,7 +77,7 @@ test.describe("/profile — out of office", () => {
     await panel.getByTestId("delegation-save").click();
 
     await expect(panel.getByTestId("delegation-status")).toContainText(
-      "On: invoices for your approval go to Password Test through",
+      "On: new invoices for your approval go to Password Test through",
     );
 
     // The server holds it: a fresh load reads the same delegation back.
@@ -135,7 +135,7 @@ async function stubDelegation(
   page: Page,
   opts: {
     current?: DelegationBody | (() => { status: number; json?: unknown });
-    candidates?: { id: string; full_name: string }[];
+    candidates?: { id: string; full_name: string }[] | "forbidden";
     onDelete?: () => void;
   },
 ) {
@@ -158,7 +158,10 @@ async function stubDelegation(
   );
   await page.route(
     (url) => url.pathname === "/api/auth/delegation/candidates",
-    (route) => route.fulfill({ json: opts.candidates ?? [] }),
+    (route) =>
+      opts.candidates === "forbidden"
+        ? route.fulfill({ status: 403, json: { detail: "Forbidden" } })
+        : route.fulfill({ json: opts.candidates ?? [] }),
   );
 }
 
@@ -183,13 +186,40 @@ test.describe("/profile — out of office, page states (stubbed)", () => {
   });
 
   test("a 403 reads as approvers-only, not as a failure", async ({ page }) => {
-    await stubDelegation(page, {
-      current: () => ({ status: 403, json: { detail: "Forbidden" } }),
-    });
+    // The candidate list (and the write) answer 403 to a non-approver; the
+    // record itself stays readable.
+    await stubDelegation(page, { candidates: "forbidden" });
     await page.goto("/profile?section=delegation");
     const panel = page.getByTestId("delegation-panel");
     await expect(panel.getByTestId("delegation-approvers-only")).toBeVisible();
     await expect(panel.getByTestId("delegation-load-error")).toHaveCount(0);
+    await expect(panel.locator("form")).toHaveCount(0);
+  });
+
+  test("a stale delegation can still be ended after losing the approval grant", async ({
+    page,
+  }) => {
+    let deleted = false;
+    const until = new Date(Date.now() + 5 * 24 * 3600 * 1000).toISOString();
+    await stubDelegation(page, {
+      current: {
+        delegate_to_id: "d-1",
+        delegate_to_name: "Dana Delegate",
+        until,
+        is_active: true,
+      },
+      candidates: "forbidden",
+      onDelete: () => (deleted = true),
+    });
+    await page.goto("/profile?section=delegation");
+    const panel = page.getByTestId("delegation-panel");
+    await expect(panel.getByTestId("delegation-status")).toContainText("Dana Delegate");
+    await expect(panel.locator("form")).toHaveCount(0);
+    await panel.getByTestId("delegation-end").click();
+    await expect(panel.getByTestId("delegation-status")).toHaveText(
+      "Off: invoices for your approval come to you.",
+    );
+    expect(deleted).toBe(true);
   });
 
   test("no candidates: says so, and an ended delegation can still be cleared", async ({

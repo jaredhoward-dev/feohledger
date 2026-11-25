@@ -348,9 +348,9 @@ export const messages = {
 	// Profile → Out of office (delegation) card; the authRefusal.delegation* keys are the
 	// POST /api/auth/delegation coded refusals (api/authRefusals.ts).
 	'profile.delegation.heading': "Abwesenheit",
-	'profile.delegation.hint': "Während Sie abwesend sind, gehen Rechnungen, die Ihnen zur Freigabe zugewiesen werden, stattdessen an eine Kollegin oder einen Kollegen. Die Vertretung beginnt mit dem Speichern und endet nach dem gewählten letzten Abwesenheitstag.",
+	'profile.delegation.hint': "Während Sie abwesend sind, gehen neue Rechnungen, die Ihnen zur Freigabe zugewiesen werden, an eine Kollegin oder einen Kollegen, wenn diese sie freigeben dürfen; andernfalls bleiben sie bei Ihnen. Die Vertretung beginnt mit dem Speichern und endet nach dem gewählten letzten Abwesenheitstag.",
 	'profile.delegation.limits': "Ihre Vertretung gibt in eigenem Namen frei: im Rahmen ihrer eigenen Freigabegrenzen und nie eine Rechnung, die sie selbst hochgeladen, deren Ware sie angenommen oder die sie geprüft hat. Sie selbst können diese Rechnungen weiterhin freigeben.",
-	'profile.delegation.statusOn': "Aktiv: Rechnungen zu Ihrer Freigabe gehen bis einschließlich {date} an {name}.",
+	'profile.delegation.statusOn': "Aktiv: Neue Rechnungen zu Ihrer Freigabe gehen bis einschließlich {date} an {name}, wenn {name} sie freigeben darf; andernfalls bleiben sie bei Ihnen.",
 	'profile.delegation.statusOff': "Aus: Rechnungen zu Ihrer Freigabe kommen zu Ihnen.",
 	'profile.delegation.statusEnded': "Aus: Ihre Vertretung durch {name} endete am {date}.",
 	'profile.delegation.delegate': "Vertretung",
