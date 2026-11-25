@@ -5258,6 +5258,7 @@ export const messages = {
 	'glAccounts.erpLink.chooseAria': "{code} の ERP 勘定科目を選択",
 	'glAccounts.erpLink.title': "{code} はどの ERP 勘定科目ですか？",
 	'glAccounts.erpLink.intro': "同期で、この行が指す可能性のある ERP 勘定科目が複数見つかったため、どれにも紐付けませんでした。{code} で仕訳された請求書は、選択した勘定科目に計上されます。選択内容は監査証跡に記録されます。",
+	'glAccounts.erpLink.introLinked': "この行は ERP 勘定科目 {current} に紐付いていますが、以前の同期では他の ERP 勘定科目も {code} で識別していたため、この行がそれらを混同している可能性があります。確認するか別の勘定科目を選ぶまで、{code} で仕訳された請求書は引き続き {current} に計上されます。選択内容は監査証跡に記録されます。",
 	'glAccounts.erpLink.optionId': "ERP ID {id}",
 	'glAccounts.erpLink.confirm': "この勘定科目に紐付け",
 	'glAccounts.erpLink.toast.linked': "{code} を {erpCode} に紐付けました。",

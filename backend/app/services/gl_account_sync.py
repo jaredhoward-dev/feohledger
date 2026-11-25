@@ -53,6 +53,11 @@ The rules, in the order they apply (docs/decisions.md §284):
    invoices coded to it meant, so the link is dropped: those invoices are then
    refused ``account_not_linked`` before any push and get recoded. The row and
    its invoices are left in place — nothing is deleted or recoded for them.
+   A row linked to the account whose CURRENT code it shows (a top-level
+   "Depreciation" over "Truck:Depreciation", both keyed "Depreciation" before
+   §284) keeps its link — nothing proves it wrong — but is questioned: the
+   other accounts the key named are recorded as its candidates, beside its
+   own, until a person confirms one (docs/decisions.md §524).
 
 Rules 0, 3 and 4 run over the organization's WHOLE chart, whichever entity the
 sync was run under: they are about which ERP account a code or id names, not
@@ -60,7 +65,8 @@ about which subsidiary holds the row. Matching and creating (rules 1, 2) run
 over the chart being synced into.
 
 **A person settles what the rules will not guess.** A row left unlinked by rule
-3 or 4 keeps the ERP accounts it could mean (``erp_link_candidates``); an admin
+3 or 4, or kept linked but questioned by rule 4, keeps the ERP accounts it
+could mean (``erp_link_candidates``); an admin
 or AP manager picks one through ``POST /api/gl-accounts/{id}/erp-link``, and
 rules 3 and 4 never re-judge that confirmed link (it still leaves the row with
 its realm — kept for that company, and restored on a return — and dies when its
@@ -444,6 +450,9 @@ async def sync_chart_from_erp(
     # -- rules 3 and 4, over the whole organization -------------------------
     # A row a person confirmed is the answer to exactly the question these
     # rules ask, so neither re-judges it.
+    #: Linked rows rule 4 kept but asks a person about (their candidates
+    #: survive the refresh below, which otherwise clears a linked row's).
+    questioned: set[uuid.UUID] = set()
     for row in all_rows:
         linked_to = row.erp_account_id
         if linked_to is None or confirmed(row) or foreign(row):
@@ -461,6 +470,18 @@ async def sync_chart_from_erp(
             # account the row meant; nothing posts on a guess. The ERP account
             # gets its own row under its real code below.
             unlink(row, AMBIGUOUS_LEGACY, legacy_claims[row.code] | {linked_to})
+        elif linked_to in code_of_id and legacy_ambiguous(row, linked_to):
+            # Rule 4, the link that looks right: the row's code IS the
+            # account's current code (a top-level "Depreciation"), but an
+            # older adapter keyed other accounts by it too ("Truck:
+            # Depreciation"), so the row may have merged them and its link
+            # landed on the right-sounding one. Nothing proves it wrong, so it
+            # keeps posting there; but it is not trusted silently either — a
+            # person confirms it or picks another (decisions §524).
+            row.erp_link_candidates = candidates_for(
+                AMBIGUOUS_LEGACY, legacy_claims[row.code] | {linked_to}
+            )
+            questioned.add(row.id)
 
     row_by_id: dict[str, GLAccount] = {}
     row_by_code: dict[str, GLAccount] = {}
@@ -562,8 +583,8 @@ async def sync_chart_from_erp(
     # "Needs a decision": an unlinked row whose code two ERP accounts share
     # keeps them as candidates too. Then every pending decision is refreshed
     # against this pull — a candidate the ERP no longer has is dropped, and a
-    # row that got linked, or whose candidates came from another connection,
-    # stops asking.
+    # row that got linked (unless rule 4 questioned its link in this very
+    # run), or whose candidates came from another connection, stops asking.
     for code, reason in refused.items():
         row = row_by_code.get(code)
         if (
@@ -578,6 +599,8 @@ async def sync_chart_from_erp(
     for row in all_rows:
         pending = row.erp_link_candidates
         if not pending or foreign(row):
+            continue
+        if row.id in questioned:
             continue
         if row.erp_account_id is not None or pending.get("realm") != realm:
             row.erp_link_candidates = None

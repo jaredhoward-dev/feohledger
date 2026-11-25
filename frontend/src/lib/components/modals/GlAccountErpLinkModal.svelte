@@ -7,12 +7,13 @@
 	import { untrack } from 'svelte';
 
 	/**
-	 * Say which ERP account an unlinked chart row means, among the candidates
-	 * the last sync named (`account.erp_link_candidates`, docs/decisions.md
-	 * §284). The sync never guesses: a pre-§284 QuickBooks row "Depreciation"
-	 * may be the top-level account or "Truck:Depreciation", and only a person
-	 * who knows what the invoices coded to it meant can say. Nothing is
-	 * preselected, so confirming is always a choice.
+	 * Say which ERP account a chart row means, among the candidates the last
+	 * sync named (`account.erp_link_candidates`, docs/decisions.md §284). The
+	 * sync never guesses: a pre-§284 QuickBooks row "Depreciation" may be the
+	 * top-level account or "Truck:Depreciation", and only a person who knows
+	 * what the invoices coded to it meant can say. A row may already be linked
+	 * to one of them — a link the sync kept but questions (§524) — and the
+	 * intro says so. Nothing is preselected, so confirming is always a choice.
 	 */
 	let {
 		account,
@@ -23,6 +24,15 @@
 	// Fixed for the life of the dialog: the page mounts one per row.
 	const row = untrack(() => account);
 	const candidates = row.erp_link_candidates?.accounts ?? [];
+	/** The candidate the row already posts to, when the sync kept its link but
+	 *  questions it (§524); otherwise none. */
+	const current = row.erp_account_id
+		? (candidates.find((c) => c.erp_account_id === row.erp_account_id) ?? {
+				erp_account_id: row.erp_account_id,
+				code: row.erp_account_id,
+				name: row.erp_account_id
+			})
+		: null;
 	let chosen = $state<string | null>(null);
 	let saving = $state(false);
 	/** The backend's refusal, verbatim (a 409 when the candidates came from
@@ -66,7 +76,13 @@
 			handleSubmit();
 		}}
 	>
-		<p class="intro">{m('glAccounts.erpLink.intro', { code: row.code })}</p>
+		<p class="intro">
+			{#if current}
+				{m('glAccounts.erpLink.introLinked', { code: row.code, current: erpCandidateLabel(current) })}
+			{:else}
+				{m('glAccounts.erpLink.intro', { code: row.code })}
+			{/if}
+		</p>
 		<fieldset class="radio-card-group">
 			<legend class="visually-hidden">{m('glAccounts.erpLink.title', { code: row.code })}</legend>
 			{#each candidates as candidate (candidate.erp_account_id)}

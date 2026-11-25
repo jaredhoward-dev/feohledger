@@ -129,7 +129,7 @@ describe('canEditGlAccount — the PATCH follows the create rule, not the read r
 	});
 });
 
-describe('needsErpDecision — an unlinked row the sync would not guess about (§284)', () => {
+describe('needsErpDecision — a row the sync would not guess about (§284, §524)', () => {
 	const candidates = {
 		reason: 'ambiguous_legacy',
 		accounts: [
@@ -138,11 +138,11 @@ describe('needsErpDecision — an unlinked row the sync would not guess about (�
 		]
 	};
 
-	it('is true only for an unlinked row with candidates', () => {
+	it('is true for any row with candidates, linked or not', () => {
 		expect(needsErpDecision({ erp_account_id: null, erp_link_candidates: candidates })).toBe(true);
-		expect(needsErpDecision({ erp_account_id: '40', erp_link_candidates: candidates })).toBe(
-			false
-		);
+		// A link the sync kept but questions (decisions §524).
+		expect(needsErpDecision({ erp_account_id: '40', erp_link_candidates: candidates })).toBe(true);
+		expect(needsErpDecision({ erp_account_id: '40', erp_link_candidates: null })).toBe(false);
 		expect(needsErpDecision({ erp_account_id: null, erp_link_candidates: null })).toBe(false);
 		// A response from before the field existed.
 		expect(needsErpDecision({ erp_account_id: null })).toBe(false);

@@ -5349,6 +5349,7 @@ export const messages = {
 	'glAccounts.erpLink.chooseAria': "Choisir le compte ERP de {code}",
 	'glAccounts.erpLink.title': "Quel compte ERP est {code} ?",
 	'glAccounts.erpLink.intro': "La synchronisation a trouvé plusieurs comptes de l'ERP que cette ligne pourrait désigner ; elle n'en a donc associé aucun. Les factures imputées sur {code} seront comptabilisées sur le compte choisi. Votre choix est consigné dans la piste d'audit.",
+	'glAccounts.erpLink.introLinked': "Cette ligne est associée au compte de l'ERP {current}, mais avant une mise à jour la synchronisation identifiait aussi d'autres comptes de l'ERP par {code} ; la ligne a donc pu les confondre. Les factures imputées sur {code} restent comptabilisées sur {current} jusqu'à ce que vous le confirmiez ou en choisissiez un autre. Votre choix est consigné dans la piste d'audit.",
 	'glAccounts.erpLink.optionId': "ID ERP {id}",
 	'glAccounts.erpLink.confirm': "Associer à ce compte",
 	'glAccounts.erpLink.toast.linked': "{code} est désormais associé à {erpCode}.",
