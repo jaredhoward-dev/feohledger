@@ -25143,3 +25143,57 @@ push, when Intacct's reference object takes the key directly.
 
 **Unverified.** The bill line's `{"glAccount": {"key": …}}` form is checked
 against the fake ERP only; a sandbox push confirms it (followups entry).
+
+## 495. Signup and set-password record acceptance of the Terms and Privacy versions in force (round 37)
+
+**Problem.** `/legal/terms` says the Terms are accepted "by clicking an accept"
+control, and the Xero developer terms require users to agree to our own Terms
+and Privacy Policy. Signup showed a sentence beside the button and stored
+nothing, so there was no evidence any customer agreed, nor to which text.
+
+**Decision.**
+
+- **One owner for the versions.** `backend/app/services/legal_acceptance.py`
+  `CURRENT_LEGAL_VERSIONS` (`terms`, `privacy`), each the document's effective
+  date. The frontend reads `lib/legal/legalVersions.generated.ts`, written by
+  `pnpm gen:legal-versions`; `pnpm check:legal-versions` fails CI's Backend
+  lint job on drift (the `gen:pricing` shape, §253). The backend owns it
+  because it is the side that refuses and records; a vitest pins that no
+  version is later than the legal set's `LAST_UPDATED`.
+- **The client echoes the versions it showed; only the versions in force
+  pass.** An absent or stale value is a coded 422 `legal_acceptance_required`,
+  never a default, so a stale tab cannot record acceptance of text it never
+  displayed.
+- **Where.** Signup `/start` refuses without it and stores what was accepted
+  and when on the verification row; `/complete` writes the rows against the
+  admin it provisions, in the transaction that consumes the verification (the
+  user does not exist at `/start`). A set-password link (an account with **no
+  password**: admin-created, admin-reset, operator-provisioned — §283) must
+  carry it, checked before the token is consumed so a refusal leaves the link
+  usable; the check endpoint says whether to show the box. A forgot-password
+  reset of an account that already has a password is not held up — its owner
+  meets the re-prompt after signing in. `GET /api/auth/me` reports
+  `legal_acceptance_required` and `POST /api/auth/legal-acceptance` records
+  it (the re-prompt's backend; its SPA screen is a followup).
+- **Storage.** Control-plane `legal_acceptances` (migration 0143): user id,
+  organisation id, document, version, `accepted_at`, and the control used
+  (`signup` / `set_password` / `reprompt`). Append-only, unique per (user,
+  document, version), first `accepted_at` kept. No email, name, IP or user
+  agent: the IP is already on the tenant's `auth.legal.accepted` audit row,
+  like every auth event, so the table stays minimal.
+- **Retention: kept, not erased.** A DSAR erasure leaves the rows, and a
+  workspace deletion exempts the table (`CONTROL_TABLES_EXEMPT`). They are
+  the evidence a contract was formed, retained for the establishment or
+  defence of legal claims (GDPR Art. 17(3)(e)), and once the user row is
+  redacted or deleted they identify no one. The DSAR export carries them
+  (`legal_acceptances`, a counted section).
+- **No backfill.** Nobody accepted anything before this; an invented row
+  would be false evidence. Existing users meet the re-prompt.
+
+**Rejected.** *Browsewrap* (the sentence beside the button): not an accept
+control, and records nothing. *Versions owned by the frontend*: the backend
+could not refuse a stale value it did not know. *One set-level version*
+(`LAST_UPDATED`): a Cookie Notice edit would re-prompt every user for the
+Terms. *Erasing the rows on DSAR*: removes the only evidence of the contract
+the erased person's employer still holds us to. *Requiring acceptance on every
+password reset*: holds up account recovery for a step the re-prompt covers.
