@@ -280,6 +280,7 @@ export const messages = {
 	'refusal.signupSlugHeld': "Este endereço pertencia a um espaço de trabalho encerrado recentemente e fica indisponível por um tempo. Escolha outro endereço.",
 	'refusal.workspaceCloseInProgress': "Este espaço de trabalho já está sendo encerrado.",
 	'refusal.credentialBlockUnopenable': "As credenciais salvas desta seção não podem mais ser abertas, então nada foi salvo. Um administrador pode apagá-las e inserir cada uma novamente.",
+	'refusal.cardWebhookSecretFormat': "Este não é um segredo de assinatura de webhook da Lithic: ele deve começar com “whsec_”. Copie o segredo de assinatura do webhook no painel da Lithic. Nada foi salvo.",
 	'refusal.workspaceCloseAuditUnavailable': "Não foi possível encerrar o espaço de trabalho agora porque o registro de auditoria dele não pôde ser salvo. Nada foi excluído. Tente novamente em alguns minutos.",
 	'refusal.workspaceCloseIncomplete': "O encerramento do espaço de trabalho não terminou. Tente novamente; se falhar de novo, entre em contato com o suporte.",
 	'refusal.csvInvoiceNumberMatchesExisting': "O número de fatura {number} é igual, ignorando a formatação, à fatura existente {existing} deste fornecedor, por isso não foi importado. Corrija o número ou lance a fatura manualmente se for mesmo outra.",

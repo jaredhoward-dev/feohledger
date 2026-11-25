@@ -517,6 +517,56 @@ async def test_bad_bodies_are_refused_without_echoing_the_value(realdb, body):
     assert await _rows(realdb) == []
 
 
+async def _set_cards_provider(realdb, provider: str, key="a") -> None:
+    async with realdb.control_sessionmaker()() as s:
+        org = (
+            await s.execute(select(Organization).where(Organization.id == realdb.info(key).org_id))
+        ).scalar_one()
+        org.settings = {**(org.settings or {}), "cards": {"enabled": True, "provider": provider}}
+        await s.commit()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("value", [SECRET, "whsec", " WHSEC_abc", "abc_whsec_def"])
+async def test_a_lithic_card_webhook_secret_without_its_prefix_is_refused(realdb, value):
+    """Decisions §562: Lithic signs with a Standard-Webhooks `whsec_` secret and
+    the verifier fails closed on any other value, so saving one would answer
+    every real delivery with a silent 204. Refused with a coded 422 that never
+    echoes the value; nothing is sealed and nothing is audited."""
+    await _set_cards_provider(realdb, "lithic")
+    async with realdb.client(key="a", role="admin") as c:
+        resp = await c.put(f"{URL}/cards", json={"set": {"webhook_signing_secret": value}})
+    assert resp.status_code == 422, resp.text
+    detail = resp.json()["detail"]
+    assert detail["code"] == "card_webhook_secret_format"
+    assert detail["params"] == {"provider": "lithic"}
+    assert SECRET not in resp.text
+    assert await _rows(realdb) == []
+    assert await _audit(realdb, "organization.credentials_updated") == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("provider", "value"),
+    [
+        ("lithic", "whsec_MfKQ9r8GKYqrTwjUPD8ILPZIo2LaLaSw"),
+        # Nium's secret is its free-form `x-partner-key`; the mock's a hex key.
+        ("nium", "partner-key-123"),
+        ("mock", "deadbeef"),
+    ],
+)
+async def test_a_card_webhook_secret_in_its_providers_format_is_saved(realdb, provider, value):
+    await _set_cards_provider(realdb, provider)
+    async with realdb.client(key="a", role="admin") as c:
+        resp = await c.put(f"{URL}/cards", json={"set": {"webhook_signing_secret": value}})
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["cards"] == ["webhook_signing_secret"]
+    org = await _org(realdb)
+    assert (await provider_credentials.provider_config(org, "cards"))[
+        "webhook_signing_secret"
+    ] == value
+
+
 @pytest.mark.asyncio
 async def test_unknown_block_is_404(realdb):
     # A block outside CREDENTIAL_BLOCKS (and outside DEDICATED_WRITER_BLOCKS,
