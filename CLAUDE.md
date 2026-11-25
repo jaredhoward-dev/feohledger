@@ -213,7 +213,7 @@ before changing any router; the summaries below are only an index.
 | `/commerce` | Commerce platform connection (admin), location + SKU mapping, per-receipt inventory push status + retry |
 | `/erp`, `/email-intake`, `/peppol` | Inbound webhooks — ERP status (incl. QuickBooks CloudEvents, `/erp/webhook/quickbooks`, Xero invoices, `/erp/webhook/xero`, and Merge.dev per tenant, `/erp/webhook/merge_dev/{slug}`), email-to-invoice, PEPPOL AS4 receive |
 | `/approvals/slack`, `/approvals/teams` | Interactive approval from a chat message — public, HMAC + single-use action token |
-| `/organization/email-intake`, `/signup` | Per-tenant intake address; self-service tenant signup (requires Terms / Privacy acceptance) |
+| `/organization/email-intake`, `/signup`, `/workspace-lookup` | Per-tenant intake address; self-service tenant signup (requires Terms / Privacy acceptance); public "email me my workspace address" (same answer for every address, sent after the response, decisions §518) |
 | `/v1`, `/api-keys`, `/webhooks` | Public Developer API (`X-API-Key`) + published OpenAPI; API-key mgmt; outbound webhooks |
 | `/health` | Health check (public, static) + `GET /health/sweeps` (admin-gated) |
 

@@ -26252,3 +26252,59 @@ chose. The panel also follows the shared form conventions (picker field error,
 GL-list Retry, outside-click disarm, focus on open and close, locale decimal
 separator) and the shared `AUDIT_UNWRITABLE_DETAIL` is imported rather than
 duplicated.
+
+## 518. "Email me my workspace address" answers everyone alike and decides nothing on the request path (round 42)
+
+**Problem.** A user who forgets which workspace they belong to had no way back
+without support: forgot-password needs a workspace host to build its link, the
+apex has no sign-in form, and §292 only points an existing address at its
+workspace after a signup's verification link is clicked. `/find-workspace`
+said, deliberately, that nothing is looked up from an email address, because
+an answer on the page would be an account-enumeration oracle.
+
+**Decision.** `POST /api/workspace-lookup {email}` on the apex, with the form
+under `/find-workspace#email`, linked from the landing footer and from a failed
+sign-in on a workspace host. It is forgot-password's design applied to the
+workspace rather than the password:
+
+- *The route never reads `users`.* It applies the controls every address
+  shares (per-IP budget, shape, per-address budget, captcha), spawns a detached
+  task and returns one fixed `200`. The lookup, the send and the audit row run
+  in that task, so neither body, status nor latency depends on whether the
+  address has an account. Only the mailbox learns the workspace.
+- *Signup's machinery, its own budgets.* The same `check_rate_limit` and
+  `verify_captcha` as `/signup/start`, on `FEOH_WORKSPACE_LOOKUP_*` budgets so
+  neither flow spends the other's. The per-address bucket is keyed through
+  `auth_identity_key` (as forgot-password's is), so the raw address is never a
+  Redis key; it is checked before anything address-specific, so a known and an
+  unknown address exhaust it alike. Leading and trailing spaces are dropped
+  before the shape check, as sign-in drops them.
+- *The link is where the account actually signs in*:
+  `sign_in_url(..., prefer_custom_domain=True)`, the wrong-workspace refusal's
+  choice (§288), with the address prefilled. A deactivated account gets
+  nothing, like forgot-password.
+- *Not behind `FEOH_SIGNUP_ENABLED`.* An invite-only deployment still has
+  users who forget their workspace. The consequence: such a deployment may run
+  with no captcha secret (the boot guard applies only while signup is on), and
+  this route then rests on its two budgets alone — forgot-password's posture,
+  which has no captcha at all. Recorded rather than adding a second boot guard
+  that would force an invite-only deployment to hold hCaptcha keys for a
+  recovery form.
+- *The widget is shared*: signup's hCaptcha handling (blocked-script notice,
+  theme following, reset after every server answer) moved into
+  `components/auth/HCaptcha.svelte` rather than being copied.
+- *The sign-in page's link needs the apex URL*, which a workspace host cannot
+  derive from itself. It comes from the build's `PUBLIC_SITE_URL`
+  (`hostRouting.apexPageUrl`); with none declared there is no link, never a
+  guess from the current host.
+
+**Rejected.** *Answering on the page* (listing workspaces for an address): the
+oracle `/find-workspace` was written to avoid. *Awaiting the lookup and
+skipping the send for unknown addresses*: the latency difference is the oracle.
+*`services/post_commit`*: the route commits nothing, so there is no
+transaction to hang the send on; a detached task is the existing shape for a
+side effect that must not be awaited (forgot-password). *Reusing the signup
+budgets*: one person retrying a lookup would then block their own signup, and
+the reverse. *A new coded refusal for a malformed address*: `signup_email_invalid`
+already says "Enter a valid email address." in every locale, and the code says
+nothing about accounts.

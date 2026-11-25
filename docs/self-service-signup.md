@@ -81,7 +81,18 @@ The uniform `410` renders as **This link has expired** with localized copy (veri
 
 `sign_in_url` is the **existing** account's sign-in page, built like the wrong-workspace login refusal's (§288). The verification is spent when the refusal is given, so the link never reaches provisioning again, and re-opening it repeats the same refusal. The `/verify` page shows **You already have a workspace**, the localized sentence and a **Go to your workspace's sign-in page** button. If the account appears between the check and provisioning, `provision_tenant` fails on the unique index, drops the database it created and removes its control-plane rows, and `/complete` answers this same refusal instead of a 500.
 
-There is no self-service way yet to find your workspace without starting a signup: see `docs/followups.md` (an apex "email me my workspace address" form).
+Someone who only wants their sign-in page does not need to start a signup: see § Forgot your workspace, below.
+
+## Forgot your workspace — `POST /api/workspace-lookup`
+
+A user who has forgotten which workspace they sign in on has no host to run forgot-password on (it needs the tenant to build its link). The apex `/find-workspace` page carries a second form, **Forgot your workspace address?** (`#email`, `frontend/src/lib/components/auth/WorkspaceLookupForm.svelte`), linked from the landing footer and from a failed sign-in on a workspace host (to `PUBLIC_SITE_URL/find-workspace#email`; no link when the build declares no site URL). It posts `{email, captcha_token, locale}` to `POST /api/workspace-lookup` (`backend/app/api/workspace_lookup.py`), public by design, and **not** behind `FEOH_SIGNUP_ENABLED`: closing signup does not stop existing users forgetting their workspace.
+
+- **One answer for everyone.** Every well-formed address that passes the budgets and the captcha gets `200 {"status": "accepted", "message": "If that address has an account, we've emailed it…"}`, and the page shows the same "if it has an account, we've emailed it" confirmation. The route never reads `users`: it spawns a detached task (`utils/detached_tasks.spawn_detached`, forgot-password's shape) and returns, so the lookup, the send and the audit row all happen after the response and its timing says nothing either.
+- **Only the mailbox learns the workspace.** The task finds the account (case- and padding-insensitive, like sign-in); none, or a deactivated one, ends silently. Otherwise it emails the account's own `tenant_urls.sign_in_url(..., email=..., prefer_custom_domain=True)` — the workspace's custom domain when it has one, as the wrong-workspace login refusal does (§288) — with the address prefilled, the workspace's name, and an "ignore this if it wasn't you" line. Subject and copy are `workspace_lookup.*` in the email catalogue, in the account's saved language, else the form's. The send is audited in the account's tenant as `auth.workspace_lookup.emailed` (`details.ip` only).
+- **Abuse controls are signup's machinery on their own budgets**: the same `check_rate_limit` per IP (`FEOH_WORKSPACE_LOOKUP_RATE_LIMIT_PER_HOUR`, default 5), then the shape check (`422` coded `signup_email_invalid`, `params.field: "email"`), then per address (`FEOH_WORKSPACE_LOOKUP_EMAIL_RATE_LIMIT_PER_HOUR`, default 3, keyed through `auth_identity_key`, so the address never becomes part of a Redis key and a known and an unknown address exhaust it identically), then the same `verify_captcha` (`400` coded `captcha_required` / `captcha_failed` / `captcha_unavailable`). The widget is the shared `HCaptcha.svelte` the signup form uses.
+- **The address is never logged**: a failed send logs the user id and the exception class only.
+
+Why this shape, and what was rejected: [decisions.md](decisions.md) §518.
 
 The welcome email carries the **Set your password** button (with the paste-this fallback and the expiry), the workspace URL and the email as plain panel values, and a sign-in link with the address prefilled — no password anywhere. Its preheader is fixed copy ("Your workspace is live."), never the link. With no tenant base URL configured, `/complete` refuses with `503` **before** provisioning and leaves the verification unconsumed — a passwordless admin with no link to set a password (forgot-password needs that URL too) would have no way in. A Redis failure while minting yields no link (the email and the verify page point at Forgot password) rather than failing a request whose tenant already exists. The response is sent `Cache-Control: no-store`, and the issuance is audited as `auth.password_reset.requested` with `via: signup`.
 
@@ -151,6 +162,8 @@ self-service workspace closure.
 | Verify handler | `src/routes/verify/+page.svelte` |
 | Set password (the reset page in `mode=set`) | `src/routes/login/reset-password/+page.svelte` |
 | Sign in (prefills `?email=`) | `src/routes/login/+page.svelte` + `src/lib/utils/prefillEmail.ts` |
+| Find your workspace + "email me my workspace address" | `src/routes/find-workspace/+page.svelte` + `src/lib/components/auth/WorkspaceLookupForm.svelte` |
+| hCaptcha widget (signup + workspace lookup) | `src/lib/components/auth/HCaptcha.svelte` |
 
 ## Abuse mitigations
 
@@ -194,6 +207,8 @@ Adding a provider: copy `app/services/email_adapters/console_adapter.py`, implem
 | `FEOH_SIGNUP_RATE_LIMIT_PER_HOUR` | `5` | Per-IP cap on `/signup/start` (and `/signup/complete`) |
 | `FEOH_SIGNUP_EMAIL_RATE_LIMIT_PER_HOUR` | `3` | Per-email cap on verification sends (anti email-bombing) |
 | `FEOH_SLUG_CHECK_RATE_LIMIT_PER_HOUR` | `120` | Per-IP cap on `/signup/slug-check` (anti-enumeration) |
+| `FEOH_WORKSPACE_LOOKUP_RATE_LIMIT_PER_HOUR` | `5` | Per-IP cap on `POST /workspace-lookup` (§ Forgot your workspace) |
+| `FEOH_WORKSPACE_LOOKUP_EMAIL_RATE_LIMIT_PER_HOUR` | `3` | Per-address cap on `POST /workspace-lookup` (anti email-bombing) |
 
 ## Migration
 
