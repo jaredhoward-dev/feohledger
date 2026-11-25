@@ -2033,9 +2033,16 @@ async def sync_org(org: Organization, *, now: datetime, result: StatusSyncResult
     adapter = _adapter_or_none(erp_config or {})
     if adapter is None or not adapter.supports_status_sync:
         return
+    # An OAuth ERP keeps its mark on its connection block; one reached with
+    # stored credentials (NetSuite, §536) has no such block, so its mark is
+    # kept beside it, tied to the company the configuration names.
+    oauth_backed = oauth_meta.get("provider") == adapter.erp_type
+    realm = connection_realm(erp_config)
     hours = max(1, min(int(settings.erp_status_sync_lookback_hours), 24 * 30))
     since = now - timedelta(hours=hours)
-    mark = parse_timestamp(oauth_meta.get(SYNCED_THROUGH_KEY))
+    mark = parse_timestamp(
+        oauth_meta.get(SYNCED_THROUGH_KEY) if oauth_backed else direct_mark(org, realm)
+    )
     # No mark (a first pass, or a new connection after a reconnect), or one
     # older than CDC can reach: CDC alone cannot prove nothing was missed.
     full = mark is None or mark < now - _CDC_REACH
@@ -2065,37 +2072,92 @@ async def sync_org(org: Organization, *, now: datetime, result: StatusSyncResult
         bill_ids, full = exc.bill_ids, True
     if full:
         result.full_reconciliations += 1
-        bill_ids = [*bill_ids, *await _open_bill_ids(org, connection_realm(erp_config))]
+        bill_ids = [*bill_ids, *await _open_bill_ids(org, realm)]
     result.bills_read += len(set(bill_ids))
     if bill_ids:
         result.invoices_changed += await sync_bills(org, bill_ids, event_id=None)
     result.voids_pending += await resume_pending_voids(org)
-    await update_connection_metadata(
-        provider, org.id, connection_id, {SYNCED_THROUGH_KEY: now.isoformat()}
-    )
+    if oauth_backed:
+        await update_connection_metadata(
+            provider, org.id, connection_id, {SYNCED_THROUGH_KEY: now.isoformat()}
+        )
+    else:
+        await record_direct_mark(org.id, realm, now)
+
+
+#: ``Organization.settings`` key holding the sweep's mark for an ERP reached
+#: with stored credentials (no ``settings.erp.oauth`` block): ``{"realm":
+#: <connection realm>, "through": <ISO timestamp>}``. Kept outside
+#: ``settings.erp`` so saving the ERP configuration never has to carry it,
+#: and read only while ``realm`` is still the configured company's: pointing
+#: the configuration at another account starts with no mark, so the first
+#: pass reads back every payable bill (decisions §536).
+DIRECT_MARK_KEY = "erp_status_sync"
+
+
+def direct_mark(org: Organization, realm: str | None) -> str | None:
+    """The stored mark for ``realm``, or None (none, or another company's)."""
+    block = (org.settings or {}).get(DIRECT_MARK_KEY)
+    if not realm or not isinstance(block, dict) or block.get("realm") != realm:
+        return None
+    through = block.get("through")
+    return through if isinstance(through, str) else None
+
+
+async def record_direct_mark(org_id: uuid.UUID, realm: str | None, now: datetime) -> bool:
+    """Store ``now`` as the mark for ``realm`` under the org row lock, only
+    while the stored ERP configuration still names that company (a
+    reconfiguration mid-pass must not inherit this pass's mark). Returns
+    whether it wrote."""
+    from sqlalchemy.orm.attributes import flag_modified
+
+    from app.services.erp_link_realm import connection_realm
+
+    if not realm:
+        return False
+    async with control_session_factory() as session:
+        org = (
+            await session.execute(
+                select(Organization).where(Organization.id == org_id).with_for_update()
+            )
+        ).scalar_one_or_none()
+        current = dict((org.settings if org else None) or {})
+        if org is None or connection_realm(current.get("erp")) != realm:
+            await session.rollback()
+            return False
+        current[DIRECT_MARK_KEY] = {"realm": realm, "through": now.isoformat()}
+        org.settings = current
+        flag_modified(org, "settings")
+        await session.commit()
+        return True
 
 
 async def run_status_sync_once(*, now: datetime | None = None) -> StatusSyncResult:
     """One pass over every tenant connected to an ERP whose bills sync back
-    (QuickBooks Online, Xero — ``status_sync_adapter_keys``): ask its company
+    (QuickBooks Online, Xero, NetSuite — ``status_sync_adapter_keys``; an
+    OAuth ERP found by its connection block, one reached with stored
+    credentials by its ``settings.erp.type``, §536): ask its company
     for the bills and bill payments changed since its last complete pass (at
     least the lookback window) and apply each bill; read back every
     still-payable bill when the change feed cannot vouch for the gap.
     Re-applying a report changes nothing. One tenant's failure never stops the
     others."""
-    from app.services.erp_adapters.dispatcher import status_sync_adapter_keys
+    from app.services.erp_adapters.dispatcher import resolve_adapter_key, status_sync_adapter_keys
 
     result = StatusSyncResult()
     if not settings.erp_status_sync_enabled:
         return result
     moment = now or datetime.now(UTC)
-    oauth = Organization.settings["erp"]["oauth"]
+    keys = status_sync_adapter_keys()
+    erp = Organization.settings["erp"]
     async with control_session_factory() as ctrl:
         orgs = (
             (
                 await ctrl.execute(
+                    # An OAuth ERP is named by its connection block; one reached
+                    # with stored credentials (NetSuite, §536) only by its type.
                     select(Organization).where(
-                        oauth["provider"].astext.in_(status_sync_adapter_keys())
+                        or_(erp["oauth"]["provider"].astext.in_(keys), erp["type"].astext.in_(keys))
                     )
                 )
             )
@@ -2103,8 +2165,15 @@ async def run_status_sync_once(*, now: datetime | None = None) -> StatusSyncResu
             .all()
         )
     for org in orgs:
-        oauth_meta = ((org.settings or {}).get("erp") or {}).get("oauth") or {}
-        if oauth_meta.get("needs_reconnect"):
+        erp_settings = (org.settings or {}).get("erp") or {}
+        # The adapter the configuration selects, by the dispatcher's own rule:
+        # a `type` left behind under a Merge.dev integration is not swept.
+        if not isinstance(erp_settings, dict) or resolve_adapter_key(erp_settings) not in keys:
+            continue
+        oauth_meta = erp_settings.get("oauth") or {}
+        if oauth_meta.get("provider") == erp_settings.get("type") and oauth_meta.get(
+            "needs_reconnect"
+        ):
             # Nothing to read with; the connection-health notice tells the
             # admins, and the reconnect starts a new connection with no mark,
             # so its first pass reads back every payable bill.
