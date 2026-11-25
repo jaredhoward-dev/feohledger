@@ -67,6 +67,59 @@ test.describe('/exceptions load states', () => {
 		await expect(failed).toHaveCount(0);
 	});
 
+	test('Retry re-reads the chip tallies along with the list', async ({ page }) => {
+		// An outage fails both reads; Retry must recover both, or the chips and
+		// the Queue tab stay uncounted over a table that loaded fine.
+		let fail = true;
+		await page.route(
+			(url) => url.pathname === '/api/exceptions/summary',
+			(route) =>
+				fail
+					? route.fulfill({
+							status: 503,
+							contentType: 'application/json',
+							body: JSON.stringify({ detail: 'down' })
+						})
+					: route.fulfill({
+							status: 200,
+							contentType: 'application/json',
+							body: JSON.stringify(exceptionSummary({ open: 4, escalated: 2 }))
+						})
+		);
+		await page.route(
+			(url) => url.pathname === '/api/exceptions',
+			(route) =>
+				fail
+					? route.fulfill({
+							status: 503,
+							contentType: 'application/json',
+							body: JSON.stringify({ detail: 'down' })
+						})
+					: route.fulfill({
+							status: 200,
+							contentType: 'application/json',
+							body: JSON.stringify({ items: [], total: 0, page: 1, page_size: 20 })
+						})
+		);
+
+		await page.goto('/exceptions');
+		const failed = page.getByTestId('exceptions-load-error');
+		await expect(failed).toBeVisible();
+		const openChip = page.getByRole('button', { name: /^Open/ });
+		await expect(openChip.locator('.count')).toHaveCount(0);
+
+		fail = false;
+		const summaryReread = page.waitForResponse(
+			(r) => new URL(r.url()).pathname === '/api/exceptions/summary' && r.ok()
+		);
+		await failed.getByRole('button', { name: 'Retry' }).click();
+		await summaryReread;
+		await expect(openChip.locator('.count')).toHaveText('4');
+		await expect(page.getByRole('button', { name: /^Escalated/ }).locator('.count')).toHaveText(
+			'2'
+		);
+	});
+
 	test('a SLOW load shows the loading state, not the clean-queue message', async ({ page }) => {
 		await page.route('**/api/exceptions/summary*', (route) =>
 			route.fulfill({

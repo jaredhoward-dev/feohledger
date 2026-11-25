@@ -1178,9 +1178,15 @@
 	{#if errored && exceptions.length === 0 && !loading}
 		<!-- "Could not load exceptions. Try again." used to sit in the empty row
 		     with nothing to try again WITH; the reader had to reload the page. -->
+		<!-- Retry re-reads the chip tallies too: whatever failed the list most
+		     likely failed them, and the chips and the Queue tab count stayed
+		     uncounted after a successful retry until the next filter change. -->
 		<LoadError
 			message={m('exceptions.empty.errored')}
-			onretry={() => loadExceptions()}
+			onretry={() => {
+				loadExceptions();
+				loadSummary();
+			}}
 			testId="exceptions-load-error"
 		/>
 	{:else}
