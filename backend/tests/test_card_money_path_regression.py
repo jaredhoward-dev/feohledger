@@ -29,6 +29,7 @@ Runs against the opt-in `realdb` fixture (skips without `pnpm db:up`).
 
 from __future__ import annotations
 
+import base64
 import contextlib
 import hashlib
 import hmac
@@ -52,7 +53,10 @@ from app.models.workflow import AuditLog
 pytestmark = pytest.mark.asyncio
 
 TENANT = "a"
-_SECRET = "card-money-path-regression-secret"
+# One tenant secret serves every provider: Lithic needs the `whsec_<base64>`
+# shape (decisions §555); Nium compares it as the `x-partner-key` value; the
+# mock HMACs with it as text.
+_SECRET = "whsec_" + base64.b64encode(b"card-money-path-regression-secret").decode()
 
 
 # ---------------------------------------------------------------------------
@@ -416,13 +420,48 @@ async def _set_card_settings(realdb, org_id, **extra) -> None:
 
 
 def _sign(body: bytes) -> str:
+    """The mock provider's own signature (hex HMAC in `Webhook-Signature`)."""
     return hmac.new(_SECRET.encode("utf-8"), body, hashlib.sha256).hexdigest()
 
 
-def _settlement_body(token: str, *, amount, event_id: str | None = None) -> bytes:
+def _webhook_headers(
+    provider: str,
+    body: bytes,
+    *,
+    event_id: str | None = None,
+    credential: str | None = None,
+    timestamp: int | None = None,
+) -> dict[str, str]:
+    """The headers ``provider`` really authenticates a delivery with
+    (decisions §555): Lithic's Standard-Webhooks trio, Nium's `x-partner-key`
+    + `x-request-id`, the mock's hex HMAC. ``credential`` overrides the
+    signature / partner key (a forged one); ``event_id`` is the delivery id."""
+    import time
+
+    from app.services.webhook_security import sign_standard_webhook
+
+    event_id = event_id or str(uuid.uuid4())
+    headers = {"Content-Type": "application/json"}
+    if provider == "lithic":
+        ts = int(time.time()) if timestamp is None else timestamp
+        headers["webhook-id"] = event_id
+        headers["webhook-timestamp"] = str(ts)
+        headers["webhook-signature"] = (
+            credential
+            if credential is not None
+            else sign_standard_webhook(_SECRET, event_id, ts, body)
+        )
+    elif provider == "nium":
+        headers["x-request-id"] = event_id
+        headers["x-partner-key"] = credential if credential is not None else _SECRET
+    else:
+        headers["Webhook-Signature"] = credential if credential is not None else _sign(body)
+    return headers
+
+
+def _settlement_body(token: str, *, amount) -> bytes:
     payload = {
-        "eventType": "transaction.settled",
-        "webhookId": event_id or str(uuid.uuid4()),
+        "template": "CARD_SETTLEMENT_DEBIT_WEBHOOK",
         "cardHashId": token,
         "merchantName": "Acme Fuel",
     }
@@ -457,12 +496,12 @@ async def _seed_charged_card(
         return card.id
 
 
-async def _post_settlement(realdb, body: bytes) -> int:
+async def _post_settlement(realdb, body: bytes, *, event_id: str | None = None) -> int:
     async with realdb.client(key=TENANT, role=None) as c:
         resp = await c.post(
             "/api/cards/webhook/nium",
             content=body,
-            headers={"Content-Type": "application/json", "Webhook-Signature": _sign(body)},
+            headers=_webhook_headers("nium", body, event_id=event_id),
         )
     return resp.status_code
 
@@ -642,9 +681,9 @@ async def test_a_replayed_settlement_event_does_not_re_rebate_or_re_stamp(realdb
     await _set_card_settings(realdb, org_id)
 
     event_id = str(uuid.uuid4())
-    body = _settlement_body(token, amount="80.00", event_id=event_id)
-    assert await _post_settlement(realdb, body) == 204
-    assert await _post_settlement(realdb, body) == 204
+    body = _settlement_body(token, amount="80.00")
+    assert await _post_settlement(realdb, body, event_id=event_id) == 204
+    assert await _post_settlement(realdb, body, event_id=event_id) == 204
 
     card, rebates, audits = await _read_settlement(mk, card_id)
     assert len(rebates) == 1
@@ -727,8 +766,7 @@ async def test_an_authorization_event_still_stamps_the_authorized_figure(realdb)
 
     body = json.dumps(
         {
-            "eventType": "authorization.approved",
-            "webhookId": str(uuid.uuid4()),
+            "template": "CARD_POS_APPROVED_WEBHOOK",
             "cardHashId": token,
             "amount": "100.00",
             "merchantName": "Acme Fuel",
@@ -738,7 +776,7 @@ async def test_an_authorization_event_still_stamps_the_authorized_figure(realdb)
         resp = await c.post(
             "/api/cards/webhook/nium",
             content=body,
-            headers={"Content-Type": "application/json", "Webhook-Signature": _sign(body)},
+            headers=_webhook_headers("nium", body),
         )
     assert resp.status_code == 204
 
@@ -752,8 +790,7 @@ async def test_an_authorization_event_still_stamps_the_authorized_figure(realdb)
 async def _post_card_event(realdb, event_type: str, token: str, amount: str) -> int:
     body = json.dumps(
         {
-            "eventType": event_type,
-            "webhookId": str(uuid.uuid4()),
+            "template": event_type,
             "cardHashId": token,
             "amount": amount,
             "merchantName": "Acme Fuel",
@@ -763,7 +800,7 @@ async def _post_card_event(realdb, event_type: str, token: str, amount: str) -> 
         resp = await c.post(
             "/api/cards/webhook/nium",
             content=body,
-            headers={"Content-Type": "application/json", "Webhook-Signature": _sign(body)},
+            headers=_webhook_headers("nium", body),
         )
     return resp.status_code
 
@@ -771,8 +808,7 @@ async def _post_card_event(realdb, event_type: str, token: str, amount: str) -> 
 async def _post_card_event_id(realdb, event_type: str, token: str, amount: str, event_id: str):
     body = json.dumps(
         {
-            "eventType": event_type,
-            "webhookId": event_id,
+            "template": event_type,
             "cardHashId": token,
             "amount": amount,
             "merchantName": "Acme Fuel",
@@ -782,7 +818,7 @@ async def _post_card_event_id(realdb, event_type: str, token: str, amount: str, 
         resp = await c.post(
             "/api/cards/webhook/nium",
             content=body,
-            headers={"Content-Type": "application/json", "Webhook-Signature": _sign(body)},
+            headers=_webhook_headers("nium", body, event_id=event_id),
         )
     return resp.status_code
 
@@ -826,7 +862,7 @@ async def test_an_authorization_alone_leaves_the_run_card_leg_in_flight(realdb):
     with patch(
         "app.services.payment_erp_sync.dispatch_payment_sync", new=AsyncMock()
     ) as dispatched:
-        assert await _post_card_event(realdb, "authorization.approved", token, "100.00") == 204
+        assert await _post_card_event(realdb, "CARD_POS_APPROVED_WEBHOOK", token, "100.00") == 204
 
     payment, state = await _leg(realdb, pay_id)
     assert payment.settled_amount is None and payment.settled_currency is None
@@ -843,9 +879,11 @@ async def test_the_settlement_writes_the_charge_onto_its_payment_and_dispatches_
     with patch(
         "app.services.payment_erp_sync.dispatch_payment_sync", new=AsyncMock()
     ) as dispatched:
-        assert await _post_card_event(realdb, "authorization.approved", token, "100.00") == 204
+        assert await _post_card_event(realdb, "CARD_POS_APPROVED_WEBHOOK", token, "100.00") == 204
         dispatched.assert_not_awaited()
-        assert await _post_card_event(realdb, "transaction.settled", token, "90.00") == 204
+        assert (
+            await _post_card_event(realdb, "CARD_SETTLEMENT_DEBIT_WEBHOOK", token, "90.00") == 204
+        )
 
     dispatched.assert_awaited_once_with(run_id, org_id)
     payment, state = await _leg(realdb, pay_id)
@@ -857,8 +895,10 @@ async def test_a_full_settlement_covers_the_leg(realdb):
     _org_id, _run_id, pay_id, token = await _run_card_leg(realdb)
 
     with patch("app.services.payment_erp_sync.dispatch_payment_sync", new=AsyncMock()):
-        assert await _post_card_event(realdb, "authorization.approved", token, "100.00") == 204
-        assert await _post_card_event(realdb, "transaction.settled", token, "100.00") == 204
+        assert await _post_card_event(realdb, "CARD_POS_APPROVED_WEBHOOK", token, "100.00") == 204
+        assert (
+            await _post_card_event(realdb, "CARD_SETTLEMENT_DEBIT_WEBHOOK", token, "100.00") == 204
+        )
 
     payment, state = await _leg(realdb, pay_id)
     assert payment.settled_amount == Decimal("100.00")
@@ -877,7 +917,7 @@ async def test_a_reversed_or_expired_authorization_never_counts_as_paid(realdb, 
     with patch(
         "app.services.payment_erp_sync.dispatch_payment_sync", new=AsyncMock()
     ) as dispatched:
-        assert await _post_card_event(realdb, "authorization.approved", token, "100.00") == 204
+        assert await _post_card_event(realdb, "CARD_POS_APPROVED_WEBHOOK", token, "100.00") == 204
         assert await _post_card_event(realdb, follow_up, token, "100.00") == 204
 
     payment, state = await _leg(realdb, pay_id)
@@ -892,7 +932,7 @@ async def test_a_figure_stamped_at_the_authorization_does_not_count_until_settle
     `in_flight`: only the card's settlement is evidence of money moved."""
     _org_id, _run_id, pay_id, token = await _run_card_leg(realdb)
     with patch("app.services.payment_erp_sync.dispatch_payment_sync", new=AsyncMock()):
-        assert await _post_card_event(realdb, "authorization.approved", token, "100.00") == 204
+        assert await _post_card_event(realdb, "CARD_POS_APPROVED_WEBHOOK", token, "100.00") == 204
     async with realdb.sessionmaker(TENANT)() as s:
         await s.execute(
             Payment.__table__.update()
@@ -914,10 +954,12 @@ async def test_a_replayed_settlement_records_once_and_dispatches_once(realdb):
     with patch(
         "app.services.payment_erp_sync.dispatch_payment_sync", new=AsyncMock()
     ) as dispatched:
-        assert await _post_card_event(realdb, "authorization.approved", token, "100.00") == 204
+        assert await _post_card_event(realdb, "CARD_POS_APPROVED_WEBHOOK", token, "100.00") == 204
         for _ in range(2):
             assert (
-                await _post_card_event_id(realdb, "transaction.settled", token, "100.00", settle_id)
+                await _post_card_event_id(
+                    realdb, "CARD_SETTLEMENT_DEBIT_WEBHOOK", token, "100.00", settle_id
+                )
                 == 204
             )
 
@@ -954,7 +996,7 @@ async def test_a_charge_on_a_card_no_run_payment_owns_writes_no_payment(realdb):
     with patch(
         "app.services.payment_erp_sync.dispatch_payment_sync", new=AsyncMock()
     ) as dispatched:
-        assert await _post_card_event(realdb, "authorization.approved", token, "100.00") == 204
+        assert await _post_card_event(realdb, "CARD_POS_APPROVED_WEBHOOK", token, "100.00") == 204
     dispatched.assert_not_awaited()
 
 

@@ -412,9 +412,11 @@ ALTERNATE_AUTH: dict[tuple[str, str], AlternateGate] = {
     ),
     # --- webhooks: provider HMAC + event dedupe -----------------------------
     ("POST", "/cards/webhook/{provider}"): AlternateGate(
-        "Per-tenant card webhook signing secret (HMAC over the raw body), then "
-        "Redis dedupe on the provider event id.",
-        symbols=("verify_hmac_sha256", "is_event_already_processed"),
+        "Per-tenant card webhook secret, checked the way each provider really "
+        "authenticates (Lithic Standard-Webhooks HMAC + timestamp window, Nium "
+        "x-partner-key, mock hex HMAC; decisions §555), then Redis dedupe on the "
+        "provider's delivery id.",
+        symbols=("_card_webhook_verified", "is_event_already_processed"),
     ),
     ("POST", "/payments/webhook/{tenant_slug}/{provider}"): AlternateGate(
         "The adapter's parse_webhook verifies the processor HMAC (and `mock` is "

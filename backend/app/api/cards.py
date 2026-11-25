@@ -121,10 +121,14 @@ CARD_STAGE_DECLINE = "authorization.declined"
 #:   `CARD_TRANSACTION_REVERSAL_WEBHOOK` / `..._REVERSAL_ADVICE_WEBHOOK` (the
 #:   hold released) and the per-reason declines. `CARD_SETTLEMENT_CREDIT_WEBHOOK`
 #:   and `CARD_SETTLEMENT_REVERSAL_WEBHOOK` are post-settlement money coming
-#:   back (a refund flow), so they are not listed. The lower-case `eventType`
-#:   names are the shape this handler read before Nium's templates were
-#:   checked; Nium's docs do not show them, but they are kept, explicitly, so
-#:   an integration sending them is not silently dropped.
+#:   back (a refund flow), so they are not listed. Nium documents no
+#:   authorization-expiry template (`CARD_EXPIRY_CARD_WEBHOOK` is the CARD's
+#:   expiry alert) and no separate card-not-present approval:
+#:   `CARD_POS_APPROVED_WEBHOOK` is the only approved-authorization template
+#:   for a virtual card's spend. The lower-case `eventType` names this map
+#:   once kept (`authorization.approved`, `transaction.settled`, ...) appear
+#:   nowhere in Nium's docs (the whole of https://docs.nium.com/llms-full.txt
+#:   searched, 2026-11-25) and are gone (decisions §555).
 #: * Mock: the names `scripts/simulate_card_charge.py` sends
 #:   (`card_adapters.mock_adapter.MOCK_EVENT_*`).
 _CARD_EVENT_STAGES: dict[str, dict[str, str]] = {
@@ -158,13 +162,11 @@ _CARD_EVENT_STAGES: dict[str, dict[str, str]] = {
                 "wrong_expiry",
                 "expired_card",
                 "system_down",
+                "wrong_cvv2",
+                # "Declined due to the Security and Risk policy set by Nium".
+                "misc",
             )
         },
-        "authorization.approved": CARD_STAGE_AUTHORIZATION,
-        "transaction.settled": CARD_STAGE_SETTLEMENT,
-        "authorization.reversal": CARD_STAGE_REVERSAL,
-        "authorization.expired": CARD_STAGE_EXPIRY,
-        "authorization.declined": CARD_STAGE_DECLINE,
     },
     MOCK_WEBHOOK_PROVIDER: {
         MOCK_EVENT_AUTHORIZATION: CARD_STAGE_AUTHORIZATION,
@@ -249,26 +251,69 @@ def _lithic_event_type(body: dict) -> str:
     """The stage name a Lithic delivery reports: a `card_transaction.updated`
     read by its `status`, and "" for every other Lithic event type (disputes,
     3DS authentications, enhanced data...), which is no card stage even when it
-    carries a `card_token` (decisions §549)."""
-    event_type = body.get("type") or body.get("event_type") or ""
-    if str(event_type).lower() != _LITHIC_CARD_TXN_EVENT:
+    carries a `card_token` (decisions §549).
+
+    The webhook body is the Transaction object plus a top-level `event_type`
+    (lithic-openapi.yml, `card_transaction.updated` webhook, checked
+    2026-11-25); `event_type` is the only key read (decisions §555)."""
+    if str(body.get("event_type") or "").lower() != _LITHIC_CARD_TXN_EVENT:
         return ""
     return _LITHIC_STATUS_EVENTS.get(str(body.get("status") or "").upper(), "")
 
 
-def _lithic_event_id(body: dict):
-    """The dedupe key for a Lithic delivery. A `card_transaction.updated` body
-    is the transaction itself, whose `token` is the same on every update of it
-    (pending, settled, voided...), so keyed on the token alone the settlement
-    or the reversal of an authorization would be deduped as a replay of it.
-    Without an explicit `event_id`, an update is keyed by token AND status:
-    each stage applies once, and a retry of one stage is still a replay."""
-    if body.get("event_id"):
-        return body["event_id"]
-    event_type = str(body.get("type") or body.get("event_type") or "").lower()
-    if event_type == _LITHIC_CARD_TXN_EVENT and body.get("token") and body.get("status"):
-        return f"{body['token']}:{str(body['status']).upper()}"
-    return body.get("token") or body.get("id")
+#: Where each provider puts a delivery's own id — the dedupe key — and, for
+#: Lithic, the signed id (decisions §555). Lithic: `webhook-id`, "the same as
+#: `event.token`", constant across retries and part of the signed content
+#: (https://docs.lithic.com/docs/events-api). Nium: `x-request-id`, unique per
+#: event and the same on every redelivery
+#: (https://docs.nium.com/docs/developers/notifications-and-webhooks). Both
+#: checked 2026-11-25. Never a body field: a transaction's `token` is shared by
+#: every update of it, and neither provider documents an id in the body.
+_CARD_EVENT_ID_HEADERS = {
+    "lithic": "webhook-id",
+    "nium": "x-request-id",
+}
+
+
+def _card_webhook_verified(
+    provider: str, secret: str, raw_body: bytes, headers: dict, event_id: str
+) -> bool:
+    """Is this delivery authentically ``provider``'s, the way that provider
+    actually authenticates it (decisions §555)? Every path is fail-closed and
+    constant-time; the caller answers a False with a silent 204.
+
+    * Lithic: Standard-Webhooks HMAC-SHA256 over `id.timestamp.body` keyed by
+      the `whsec_` secret, the timestamp within five minutes
+      (https://docs.lithic.com/docs/events-api).
+    * Nium: documents no body signature, only a static client-configured
+      `x-partner-key` header (https://docs.nium.com/docs/developers/notifications-and-webhooks);
+      the tenant's secret is that value.
+    * Mock (local only): our own hex HMAC over the body in `Webhook-Signature`.
+    """
+    from app.services.webhook_security import (
+        extract_signature_header,
+        verify_hmac_sha256,
+        verify_shared_header_token,
+        verify_standard_webhook,
+    )
+
+    if provider == "lithic":
+        return verify_standard_webhook(
+            secret,
+            event_id,
+            extract_signature_header(headers, "webhook-timestamp"),
+            raw_body,
+            extract_signature_header(headers, "webhook-signature"),
+        )
+    if provider == "nium":
+        return verify_shared_header_token(
+            secret, extract_signature_header(headers, "x-partner-key")
+        )
+    if provider == MOCK_WEBHOOK_PROVIDER:
+        return verify_hmac_sha256(
+            secret, raw_body, extract_signature_header(headers, "Webhook-Signature")
+        )
+    return False
 
 
 def _normalize_charge_amount(
@@ -1319,15 +1364,16 @@ async def _record_settlement_after_cancel(
 async def card_webhook(provider: str, request: Request):
     """Handle charge/settlement webhooks from card providers.
 
-    Authenticated by HMAC over the raw body. The signing secret is
-    looked up off the tenant whose card the event references — we
-    can't pick the right secret without first identifying the
-    tenant, so the flow is:
+    Authenticated the way each provider really authenticates its deliveries
+    (`_card_webhook_verified`, decisions §555). The secret is looked up off
+    the tenant whose card the event references — we can't pick the right
+    secret without first identifying the tenant, so the flow is:
 
-      1. Parse the body for `card_token` + `event_id`
+      1. Parse the body for `card_token`; take the delivery id from the
+         provider's header (Lithic `webhook-id`, Nium `x-request-id`)
       2. Find the owning tenant by `card_token`
-      3. Verify HMAC against that tenant's `cards.webhook_signing_secret`
-      4. Dedupe by event id (cross-tenant key) so re-delivery is a
+      3. Verify against that tenant's `cards.webhook_signing_secret`
+      4. Dedupe by the delivery id (cross-tenant key) so re-delivery is a
          silent no-op
       5. Apply the state change inside a row-locked transaction
 
@@ -1367,16 +1413,13 @@ async def card_webhook(provider: str, request: Request):
     if provider == "lithic":
         card_token = body.get("card_token") or body.get("card", {}).get("token")
         event_type = _lithic_event_type(body)
-        event_id = _lithic_event_id(body)
         amount = body.get("amount", 0)
         merchant = body.get("merchant", {}).get("descriptor")
     elif provider == "nium":
         card_token = body.get("cardHashId")
-        # Nium's documented card webhooks name themselves in `template` (e.g.
-        # `CARD_TRANSACTION_REVERSAL_WEBHOOK`) and carry `transactionAmount`
-        # (decisions §544); `eventType` / `amount` are read first as before.
-        event_type = body.get("eventType") or body.get("template") or ""
-        event_id = body.get("webhookId") or body.get("eventId") or body.get("id")
+        # Nium's card webhooks name themselves in `template` and nowhere else
+        # (decisions §555); `amount` is read first as before (§544).
+        event_type = body.get("template") or ""
         amount = body.get("amount") or body.get("transactionAmount") or 0
         merchant = body.get("merchantName")
     elif provider == MOCK_WEBHOOK_PROVIDER and not settings.is_deployed:
@@ -1395,6 +1438,16 @@ async def card_webhook(provider: str, request: Request):
 
     if not card_token:
         return
+    if provider in _CARD_EVENT_ID_HEADERS:
+        from app.services.webhook_security import extract_signature_header
+
+        event_id = (
+            extract_signature_header(dict(request.headers), _CARD_EVENT_ID_HEADERS[provider]) or ""
+        ).strip()
+        if not event_id:
+            # No id, no dedupe: a delivery we could replay forever is refused,
+            # not applied as "always first" (decisions §555).
+            return
 
     # Find the card across tenant DBs. The lookup is fail-soft —
     # if the card isn't anywhere, we return 204 silently rather than
@@ -1403,10 +1456,8 @@ async def card_webhook(provider: str, request: Request):
 
     from app.database import control_session_factory, get_tenant_engine
     from app.services.webhook_security import (
-        extract_signature_header,
         is_event_already_processed,
         release_event_claim,
-        verify_hmac_sha256,
     )
 
     async with control_session_factory() as ctrl_db:
@@ -1456,14 +1507,10 @@ async def card_webhook(provider: str, request: Request):
                     # A mock card on a laptop tenant that set no secret: the
                     # simulator's public local key (only reachable undeployed).
                     signing_secret = MOCK_WEBHOOK_LOCAL_SECRET
-                provided_sig = extract_signature_header(
-                    dict(request.headers),
-                    "Webhook-Signature",
-                    "X-Webhook-Signature",
-                    "X-Signature",
-                )
-                if not verify_hmac_sha256(signing_secret, raw_body, provided_sig):
-                    return  # silent 204 on bad / missing signature
+                if not _card_webhook_verified(
+                    provider, signing_secret, raw_body, dict(request.headers), str(event_id)
+                ):
+                    return  # silent 204 on bad / missing / stale signature
 
                 # Dedup: if this event id has been processed already
                 # (across any tenant), short-circuit. Same response
@@ -1487,7 +1534,7 @@ async def card_webhook(provider: str, request: Request):
                         provider,
                         str(
                             body.get("type")
-                            or body.get("eventType")
+                            or body.get("event_type")
                             or body.get("template")
                             or event_type
                         )[:80],

@@ -28854,3 +28854,101 @@ unsupported / failed, RBAC, audit, the shared void with replay, a bill the
 lookup no longer names, a paid orphan, the retry door, the mock and QuickBooks
 lookups); `frontend/src/lib/api/erpOrphanBill.test.ts`;
 `frontend/tests-e2e/exceptions/void-erp-orphan-bill.spec.ts`.
+
+## 555. Each card provider's webhook is verified the way that provider authenticates it, deduped on its own delivery id, and read only by documented names (§544 / §549 follow-up, round 47)
+
+**The problem.** The card webhook checked one scheme for every provider: a hex
+HMAC-SHA256 of the raw body in `Webhook-Signature`. Neither real provider sends
+that, so every genuine Lithic or Nium delivery would have been refused (fail
+closed, but the integration could never work), while the tests passed because
+they signed the invented way. Dedupe read an id out of the body (`event_id`,
+`webhookId`, or Lithic's `token:STATUS`), which neither provider documents.
+§549 also kept five lower-case Nium names (`authorization.approved`,
+`transaction.settled`, `authorization.reversal` / `.expired` / `.declined`)
+"explicitly, unverified".
+
+**What the providers' own docs say** (all checked 2026-11-25):
+
+* **Lithic** (<https://docs.lithic.com/docs/events-api>; the
+  `webhookId` / `webhookTimestamp` / `webhookSignature` header parameters and
+  the `card_transaction.updated` webhook in
+  <https://github.com/lithic-com/lithic-openapi> `lithic-openapi.yml`): headers
+  `webhook-id` (the event token, "the same as `event.token`"),
+  `webhook-timestamp` (Unix seconds) and `webhook-signature` (space-separated
+  `v1,<base64>`, several during a key rotation); the signed content is
+  `"{id}.{timestamp}.{raw body}"`; HMAC-SHA256 keyed by the base64 part of a
+  `whsec_`-prefixed per-program secret; constant-time compare recommended. The
+  prose leaves the tolerance to the receiver; Lithic's reference verifier uses
+  five minutes. The webhook body is the Transaction object plus a top-level
+  `event_type`; `status` is one of `DECLINED`, `EXPIRED`, `PENDING`,
+  `SETTLED`, `VOIDED` (<https://docs.lithic.com/docs/transactions>); `amount`
+  is deprecated in favour of `amounts.*` but still sent.
+* **Nium** (<https://docs.nium.com/docs/developers/notifications-and-webhooks>,
+  and the whole of <https://docs.nium.com/llms-full.txt> searched): **no body
+  signature, HMAC or timestamp is documented anywhere**. Each delivery carries
+  `x-request-id` — unique per event, the same on every redelivery — and,
+  optionally, a static client-configured identifier "say `x-partner-key`".
+  Retries are off by default (at-most-once), opt-in per event, every 5 minutes
+  up to 20 times. The event is named only in the body's `template`. The
+  approved-authorization template is `CARD_POS_APPROVED_WEBHOOK`; there is no
+  separate card-not-present / e-commerce template and no authorization-expiry
+  template (`CARD_EXPIRY_CARD_WEBHOOK` is the card's own expiry alert). The
+  settlement-reversal template is `CARD_SETTLEMENT_REVERSAL_WEBHOOK`
+  (post-settlement, already unlisted). None of the five lower-case names
+  appears in Nium's docs.
+
+**Decision.**
+
+1. **Verification per provider** (`api/cards._card_webhook_verified`, the
+   primitives in `services/webhook_security`):
+   Lithic → `verify_standard_webhook` (HMAC over `id.timestamp.body`, `whsec_`
+   key required, any listed `v1` signature, timestamp within 300 s either way,
+   every comparison constant-time); Nium → `verify_shared_header_token`
+   (constant-time equality of `x-partner-key` with the tenant's secret); the
+   local-only mock keeps its own hex HMAC. The tenant still stores one sealed
+   `cards.webhook_signing_secret`; what it holds depends on the provider
+   (`backend/docs/virtual-cards.md` § Provider setup).
+2. **Dedupe on the provider's delivery id from its header**: Lithic
+   `webhook-id` (also signed, so it cannot be swapped), Nium `x-request-id`.
+   A delivery without one is a silent 204, not "always first". Two updates of
+   one Lithic transaction (PENDING then SETTLED) carry different ids, so the
+   `token:STATUS` workaround is gone.
+3. **Only documented names**: Lithic's event is read from `event_type` alone
+   (`type` is not Lithic's); Nium's from `template` alone. The five lower-case
+   Nium names are dropped (operator decision: verify and drop whichever are not
+   real). `CARD_WRONG_CVV2_WEBHOOK` and `CARD_MISC_WEBHOOK` — documented
+   declines the map had missed — are added as declines.
+
+**Trade-off: Nium's check is weaker than an HMAC, and that is Nium's
+contract, not a choice.** A static header authenticates the sender but does not
+bind the body and has no timestamp; dedupe on `x-request-id` stops a verbatim
+replay, not a captured key reused with a fresh id. The alternatives were worse:
+keeping the body HMAC leaves Nium permanently unable to deliver (and invites a
+"temporary" bypass), and accepting unauthenticated Nium deliveries is not
+fail-closed. Compensating controls to raise with Nium and the security owner
+before enabling it live: a long random partner key, rotation, Nium's source IP
+ranges if they publish them, and TLS-only. Recorded so it is not mistaken for
+an oversight.
+
+**Not changed here, recorded.** Nium's documented settlement
+(`CARD_SETTLEMENT_DEBIT_WEBHOOK`) carries its figure in `authAmount`, and its
+authorization in `transactionAmount` / `authAmount`; the handler reads
+`amount` then `transactionAmount`, so a real Nium settlement reports no amount
+and falls back as `_normalize_charge_amount` does. That is the amount branch
+(out of this lane, which is limited to verification, dedupe and the maps) and
+belongs with the card state-transition work. Nium approvals for online spend
+are assumed to arrive as `CARD_POS_APPROVED_WEBHOOK` — the docs name no other —
+which has not been seen on a live Nium sandbox.
+
+**Tests.** `backend/tests/test_webhook_security.py`: the Standard-Webhooks
+reference vector (an independently computed signature) verifies; every
+fail-closed mutation (wrong key, tampered body, other id, stale or future
+timestamp, unprefixed secret, no `v1`, missing header) is refused; through the
+handler, per provider, a correctly signed real-shape event applies, a
+wrong / stale / missing signature or partner key is a silent 204 with no state
+change and no dedup claim, a redelivery with the same id is deduped, and the
+undocumented names change nothing. `test_card_webhook_classification.py` pins
+each documented name and the dropped ones. The contract table
+(`test_webhook_contract.py`) now drives the card row through Lithic, including
+a correctly signed stale delivery. The e2e specs sign the real way
+(`frontend/tests-e2e/fixtures/cardWebhook.ts`).

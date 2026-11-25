@@ -32,7 +32,7 @@ from tests.test_card_money_path_regression import (
     _seed_invoice,
     _seed_run,
     _set_card_settings,
-    _sign,
+    _webhook_headers,
 )
 
 pytestmark = pytest.mark.asyncio
@@ -40,10 +40,11 @@ pytestmark = pytest.mark.asyncio
 TENANT = "a"
 
 
-def _body(provider: str, token: str, outcome: str, *, amount=None, event_id=None) -> bytes:
+def _body(provider: str, token: str, outcome: str, *, amount=None) -> bytes:
     """A provider's delivery for ``outcome`` (authorization / settlement /
-    reversal / expiry / decline), in that provider's own shape."""
-    event_id = event_id or str(uuid.uuid4())
+    reversal / expiry / decline), in that provider's own shape. Lithic and Nium
+    carry the delivery id in a header (`_post`'s ``event_id``), the mock in the
+    body (decisions §555). Nium has no authorization-expiry template."""
     if provider == "lithic":
         # `card_transaction.updated` carries the transaction; its `status`
         # names the outcome (https://docs.lithic.com/docs/transactions).
@@ -55,8 +56,7 @@ def _body(provider: str, token: str, outcome: str, *, amount=None, event_id=None
             "decline": "DECLINED",
         }[outcome]
         payload = {
-            "type": "card_transaction.updated",
-            "event_id": event_id,
+            "event_type": "card_transaction.updated",
             "token": f"txn_{token}",
             "card_token": token,
             "status": status,
@@ -65,17 +65,14 @@ def _body(provider: str, token: str, outcome: str, *, amount=None, event_id=None
         if amount is not None:
             payload["amount"] = int(Decimal(amount) * 100)  # minor units
     elif provider == "nium":
-        names = {
-            "authorization": {"eventType": "authorization.approved"},
-            "settlement": {"eventType": "transaction.settled"},
-            # Nium's documented reversal webhook names itself in `template`.
-            "reversal": {"template": "CARD_TRANSACTION_REVERSAL_WEBHOOK"},
-            "expiry": {"eventType": "authorization.expired"},
-            "decline": {"eventType": "authorization.declined"},
-        }
+        template = {
+            "authorization": "CARD_POS_APPROVED_WEBHOOK",
+            "settlement": "CARD_SETTLEMENT_DEBIT_WEBHOOK",
+            "reversal": "CARD_TRANSACTION_REVERSAL_WEBHOOK",
+            "decline": "CARD_INSUFFICIENT_FUNDS_DECLINED_WEBHOOK",
+        }[outcome]
         payload = {
-            **names[outcome],
-            "webhookId": event_id,
+            "template": template,
             "cardHashId": token,
             "merchantName": "Acme Fuel",
         }
@@ -99,7 +96,7 @@ def _body(provider: str, token: str, outcome: str, *, amount=None, event_id=None
         payload = {
             "card_token": token,
             "type": event_type,
-            "event_id": event_id,
+            "event_id": str(uuid.uuid4()),
             "merchant": {"descriptor": "Acme Fuel"},
         }
         if amount is not None:
@@ -107,15 +104,19 @@ def _body(provider: str, token: str, outcome: str, *, amount=None, event_id=None
     return json.dumps(payload).encode("utf-8")
 
 
-async def _post(realdb, provider: str, body: bytes, *, signature: str | None = None) -> int:
+async def _post(
+    realdb,
+    provider: str,
+    body: bytes,
+    *,
+    signature: str | None = None,
+    event_id: str | None = None,
+) -> int:
     async with realdb.client(key=TENANT, role=None) as c:
         resp = await c.post(
             f"/api/cards/webhook/{provider}",
             content=body,
-            headers={
-                "Content-Type": "application/json",
-                "Webhook-Signature": signature if signature is not None else _sign(body),
-            },
+            headers=_webhook_headers(provider, body, event_id=event_id, credential=signature),
         )
     return resp.status_code
 
@@ -159,8 +160,17 @@ async def _audits(realdb, card_id, action: str) -> list[AuditLog]:
         )
 
 
-@pytest.mark.parametrize("provider", ["lithic", "nium", "mock"])
-@pytest.mark.parametrize("lapse", ["reversal", "expiry"])
+@pytest.mark.parametrize(
+    ("provider", "lapse"),
+    [
+        ("lithic", "reversal"),
+        ("lithic", "expiry"),
+        ("nium", "reversal"),
+        # Nium documents no authorization-expiry template (decisions §555).
+        ("mock", "reversal"),
+        ("mock", "expiry"),
+    ],
+)
 async def test_a_lapsed_authorization_returns_the_card_to_unspent(realdb, provider, lapse):
     card_id, pay_id, token = await _leg_with_card(realdb, provider)
 
@@ -214,18 +224,19 @@ async def test_a_replayed_reversal_is_deduped(realdb):
     """The provider's retry of a reversal is a no-op: one audit row, and a
     fresh authorization in between is not undone by the replay."""
     card_id, _pay_id, token = await _leg_with_card(realdb, "nium")
-    reversal = _body("nium", token, "reversal", event_id=str(uuid.uuid4()))
+    reversal = _body("nium", token, "reversal")
+    reversal_id = str(uuid.uuid4())
     with patch("app.services.payment_erp_sync.dispatch_payment_sync", new=AsyncMock()):
         assert (
             await _post(realdb, "nium", _body("nium", token, "authorization", amount="100.00"))
             == 204
         )
-        assert await _post(realdb, "nium", reversal) == 204
+        assert await _post(realdb, "nium", reversal, event_id=reversal_id) == 204
         assert (
             await _post(realdb, "nium", _body("nium", token, "authorization", amount="80.00"))
             == 204
         )
-        assert await _post(realdb, "nium", reversal) == 204
+        assert await _post(realdb, "nium", reversal, event_id=reversal_id) == 204
 
     card = await _card(realdb, card_id)
     assert card.status == "charged" and card.amount_charged == Decimal("80.00")
@@ -297,17 +308,18 @@ async def test_a_partial_reversal_leaves_the_card_authorized(realdb):
 async def test_a_clearing_after_the_hold_lapsed_still_settles(realdb):
     """A force post: the clearing arrives after the authorization expired.
     Money moved, so the card completes and the leg is recorded and synced."""
-    card_id, pay_id, token = await _leg_with_card(realdb, "nium")
+    card_id, pay_id, token = await _leg_with_card(realdb, "lithic")
     with patch(
         "app.services.payment_erp_sync.dispatch_payment_sync", new=AsyncMock()
     ) as dispatched:
         assert (
-            await _post(realdb, "nium", _body("nium", token, "authorization", amount="100.00"))
+            await _post(realdb, "lithic", _body("lithic", token, "authorization", amount="100.00"))
             == 204
         )
-        assert await _post(realdb, "nium", _body("nium", token, "expiry")) == 204
+        assert await _post(realdb, "lithic", _body("lithic", token, "expiry")) == 204
         assert (
-            await _post(realdb, "nium", _body("nium", token, "settlement", amount="100.00")) == 204
+            await _post(realdb, "lithic", _body("lithic", token, "settlement", amount="100.00"))
+            == 204
         )
 
     card = await _card(realdb, card_id)
@@ -328,12 +340,12 @@ async def test_a_run_refuses_a_card_whose_authorization_lapsed(realdb):
     `first_authorized_at`, which the lapse does not clear."""
     from app.services.card_issuance import card_settlement_block
 
-    card_id, _pay_id, token = await _leg_with_card(realdb, "nium")
+    card_id, _pay_id, token = await _leg_with_card(realdb, "lithic")
     assert (await _card(realdb, card_id)).first_authorized_at is None
     assert card_settlement_block(await _card(realdb, card_id), Decimal("100.00")) is None
     with patch("app.services.payment_erp_sync.dispatch_payment_sync", new=AsyncMock()):
         assert (
-            await _post(realdb, "nium", _body("nium", token, "authorization", amount="100.00"))
+            await _post(realdb, "lithic", _body("lithic", token, "authorization", amount="100.00"))
             == 204
         )
         first = (await _card(realdb, card_id)).first_authorized_at
@@ -341,13 +353,13 @@ async def test_a_run_refuses_a_card_whose_authorization_lapsed(realdb):
         assert card_settlement_block(await _card(realdb, card_id), Decimal("100.00")) == (
             "card_already_charged"
         )
-        assert await _post(realdb, "nium", _body("nium", token, "expiry")) == 204
+        assert await _post(realdb, "lithic", _body("lithic", token, "expiry")) == 204
         # A second authorization keeps the FIRST moment.
         assert (
-            await _post(realdb, "nium", _body("nium", token, "authorization", amount="100.00"))
+            await _post(realdb, "lithic", _body("lithic", token, "authorization", amount="100.00"))
             == 204
         )
-        assert await _post(realdb, "nium", _body("nium", token, "reversal")) == 204
+        assert await _post(realdb, "lithic", _body("lithic", token, "reversal")) == 204
 
     card = await _card(realdb, card_id)
     assert card.status == "active" and card.charged_at is None
@@ -405,7 +417,9 @@ async def test_a_clearing_on_a_cancelled_card_is_flagged_never_dropped(realdb, p
             await _post(realdb, provider, _body(provider, token, "authorization", amount="100.00"))
             == 204
         )
-        assert await _post(realdb, provider, _body(provider, token, "expiry")) == 204
+        # Nium has no expiry template; its lapse is the reversal (§555).
+        lapse = "reversal" if provider == "nium" else "expiry"
+        assert await _post(realdb, provider, _body(provider, token, lapse)) == 204
         await _cancel(realdb, card_id)
         assert (
             await _post(realdb, provider, _body(provider, token, "settlement", amount="100.00"))
@@ -458,8 +472,7 @@ async def test_a_signed_lithic_event_that_is_no_card_stage_changes_nothing(reald
     card_id, pay_id, token = await _leg_with_card(realdb, "lithic")
     body = json.dumps(
         {
-            "type": event_type,
-            "event_id": str(uuid.uuid4()),
+            "event_type": event_type,
             "token": f"obj_{token}",
             "card_token": token,
             "status": "SETTLED",

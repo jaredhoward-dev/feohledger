@@ -17,14 +17,18 @@ for the HMAC + dedup helpers; this test file pins:
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import hmac
+import json
 import time
 import uuid
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+
+from app.services.webhook_security import DEDUP_PREFIX
 
 # The fake org's settings carry the webhook secrets; see the fixture.
 pytestmark = pytest.mark.usefixtures("provider_store_from_settings")
@@ -289,173 +293,385 @@ def _card_row(provider_card_id: str):
     )
 
 
-@pytest.mark.asyncio
-async def test_card_webhook_rejects_unsigned_request_silently(fake_redis):
-    """An unsigned POST that names a real card_token must NOT cause a
-    state change. The handler returns 204 either way; pin that the
-    DB commit did not run."""
-    import json
+# Each provider is verified the way it really authenticates (decisions §555):
+# Lithic — Standard-Webhooks HMAC over `id.timestamp.body`, `whsec_` key, five
+# minute window (https://docs.lithic.com/docs/events-api); Nium — the static
+# `x-partner-key` header, deduped on `x-request-id`
+# (https://docs.nium.com/docs/developers/notifications-and-webhooks).
+_LITHIC_SECRET = "whsec_" + base64.b64encode(b"lithic-test-signing-key-0001").decode()
+_NIUM_PARTNER_KEY = "nium-partner-key-0001"
 
+
+def _lithic_body(status: str = "PENDING", *, event_type: str = "card_transaction.updated") -> bytes:
+    """`card_transaction.updated` as Lithic sends it: the Transaction object
+    plus a top-level `event_type` (lithic-openapi.yml)."""
+    return json.dumps(
+        {
+            "event_type": event_type,
+            "token": "7ff4e46b-2cae-4c0b-8f1b-f2a0b4d4c0de",
+            "card_token": "card_token_abc",
+            "account_token": "bd5e5649-1be8-4117-9bc5-3268258d1417",
+            "status": status,
+            "result": "APPROVED",
+            "amount": 5000,
+            "amounts": {
+                "hold": {"amount": 5000, "currency": "USD"},
+                "settlement": {"amount": 5000 if status == "SETTLED" else 0, "currency": "USD"},
+            },
+            "merchant": {"descriptor": "ACME FUEL"},
+            "created": "2026-11-25T12:00:00Z",
+        }
+    ).encode("utf-8")
+
+
+def _lithic_headers(
+    body: bytes,
+    *,
+    msg_id: str = "65a9dad4-1b60-4686-83fd-65b25078a4b4",
+    secret: str = _LITHIC_SECRET,
+    timestamp: int | None = None,
+) -> dict:
+    from app.services.webhook_security import sign_standard_webhook
+
+    ts = int(time.time()) if timestamp is None else timestamp
+    return {
+        "webhook-id": msg_id,
+        "webhook-timestamp": str(ts),
+        "webhook-signature": sign_standard_webhook(secret, msg_id, ts, body),
+    }
+
+
+def _nium_body(template: str = "CARD_POS_APPROVED_WEBHOOK") -> bytes:
+    """A Nium card webhook as its docs show it: the event named in `template`."""
+    return json.dumps(
+        {
+            "customerHashId": "0de1e512-e0d7-4eca-ad41-dd39325facc2",
+            "walletHashId": "696bad93-bda7-4e8d-8c31-318f8d6cbc5f",
+            "cardHashId": "card_token_abc",
+            "transactionCurrency": "USD",
+            "transactionAmount": "50.00",
+            "authAmount": "50.00",
+            "merchantName": "ACME FUEL",
+            "authCode": "114733",
+            "template": template,
+        }
+    ).encode("utf-8")
+
+
+def _nium_headers(*, request_id: str = "123e4567-e89b-12d3-a456-426655440000", key=None) -> dict:
+    return {
+        "x-request-id": request_id,
+        "x-partner-key": _NIUM_PARTNER_KEY if key is None else key,
+    }
+
+
+async def _deliver(provider: str, secret: str, body: bytes, headers: dict, card):
+    """Post one delivery through the real handler against a fake tenant
+    holding ``card``; returns (result, the tenant session)."""
     from app.api.cards import card_webhook
 
-    secret = "card-s3cret"
     org = _org_with_card_secret(secret)
-    card = _card_row("card_token_abc")
-
-    body_bytes = json.dumps(
-        {"card_token": "card_token_abc", "type": "authorization", "amount": 5000, "event_id": "e1"}
-    ).encode("utf-8")
-
     tenant_factory, db = _fake_tenant_session_factory(card)
-
     with (
         patch("app.database.control_session_factory", _fake_ctrl_session_factory([org])),
         patch("app.database.get_tenant_engine", return_value=MagicMock()),
         patch("sqlalchemy.ext.asyncio.async_sessionmaker", return_value=tenant_factory),
     ):
-        # No signature header at all
-        result = await card_webhook(provider="lithic", request=_fake_request(body_bytes))
+        result = await card_webhook(provider=provider, request=_fake_request(body, headers))
+    return result, db
 
-    assert result is None  # silent 204
-    db.commit.assert_not_called()
-    assert card.status == "created", "card status must not change without HMAC verification"
+
+# --- the shared verifier ----------------------------------------------------
+
+
+def test_standard_webhook_accepts_lithic_signature_and_any_rotated_one():
+    from app.services.webhook_security import sign_standard_webhook, verify_standard_webhook
+
+    body = _lithic_body()
+    ts = int(time.time())
+    good = sign_standard_webhook(_LITHIC_SECRET, "msg_1", ts, body)
+    assert verify_standard_webhook(_LITHIC_SECRET, "msg_1", str(ts), body, good)
+    # During a rotation the header lists several; any one matching suffices.
+    assert verify_standard_webhook(_LITHIC_SECRET, "msg_1", str(ts), body, f"v1,AAAA {good} v2,zzz")
+
+
+def test_standard_webhook_matches_the_published_reference_vector():
+    """The Standard-Webhooks reference example (the Svix scheme Lithic uses):
+    an independently computed signature, not our own signer."""
+    from app.services.webhook_security import verify_standard_webhook
+
+    secret = "whsec_MfKQ9r8GKYqrTwjUPD8ILPZIo2LaLaSw"
+    msg_id = "msg_p5jXN8AQM9LWM0D4loKWxJek"
+    ts = "1614265330"
+    body = b'{"test": 2432232314}'
+    sig = "v1,g0hM9SsE+OTPJTGt/tmIKtSyZlE3uFJELVlNIOLJ1OE="
+    assert verify_standard_webhook(secret, msg_id, ts, body, sig, now=1614265330)
+    assert not verify_standard_webhook(secret, msg_id, ts, body + b" ", sig, now=1614265330)
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        "wrong_secret",
+        "tampered_body",
+        "other_id",
+        "stale",
+        "future",
+        "no_prefix_secret",
+        "no_v1",
+        "non_numeric_ts",
+        "missing_sig",
+        "missing_ts",
+        "missing_id",
+    ],
+)
+def test_standard_webhook_fails_closed(mutate):
+    from app.services.webhook_security import sign_standard_webhook, verify_standard_webhook
+
+    body = _lithic_body()
+    now = 1_800_000_000
+    ts = now
+    secret, msg_id, ts_text, sig = (
+        _LITHIC_SECRET,
+        "msg_1",
+        str(ts),
+        sign_standard_webhook(_LITHIC_SECRET, "msg_1", ts, body),
+    )
+    verify_body = body
+    if mutate == "wrong_secret":
+        secret = "whsec_" + base64.b64encode(b"attacker").decode()
+    elif mutate == "tampered_body":
+        verify_body = body.replace(b"5000", b"9999")
+    elif mutate == "other_id":
+        msg_id = "msg_2"
+    elif mutate == "stale":
+        now = ts + 301
+    elif mutate == "future":
+        now = ts - 301
+    elif mutate == "no_prefix_secret":
+        secret = _LITHIC_SECRET.removeprefix("whsec_")
+    elif mutate == "no_v1":
+        sig = sig.replace("v1,", "v2,")
+    elif mutate == "non_numeric_ts":
+        ts_text = "1.8e9"
+    elif mutate == "missing_sig":
+        sig = None
+    elif mutate == "missing_ts":
+        ts_text = None
+    elif mutate == "missing_id":
+        msg_id = None
+    assert not verify_standard_webhook(secret, msg_id, ts_text, verify_body, sig, now=now)
+
+
+def test_standard_webhook_accepts_inside_the_window():
+    from app.services.webhook_security import sign_standard_webhook, verify_standard_webhook
+
+    body = _lithic_body()
+    ts = 1_800_000_000
+    sig = sign_standard_webhook(_LITHIC_SECRET, "m", ts, body)
+    assert verify_standard_webhook(_LITHIC_SECRET, "m", str(ts), body, sig, now=ts + 300)
+    assert verify_standard_webhook(_LITHIC_SECRET, "m", str(ts), body, sig, now=ts - 300)
+
+
+def test_shared_header_token_is_exact_and_fails_closed():
+    from app.services.webhook_security import verify_shared_header_token
+
+    assert verify_shared_header_token("k1", "k1")
+    assert not verify_shared_header_token("k1", "k2")
+    assert not verify_shared_header_token("k1", "k1 ")
+    assert not verify_shared_header_token("", "")
+    assert not verify_shared_header_token("k1", None)
+
+
+# --- Lithic through the handler ---------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_card_webhook_rejects_wrong_signature_silently(fake_redis):
-    """A signature minted with the wrong secret must be refused —
-    the verification step is the only thing standing between a
-    public webhook URL and a rebate-mint vector."""
-    import json
-
-    from app.api.cards import card_webhook
-
-    org = _org_with_card_secret("real-secret")
+async def test_lithic_correctly_signed_real_shape_event_charges_the_card(fake_redis):
+    """Positive control: without it the negatives could pass because every
+    request is rejected."""
+    body = _lithic_body("PENDING")
     card = _card_row("card_token_abc")
+    result, db = await _deliver("lithic", _LITHIC_SECRET, body, _lithic_headers(body), card)
+    assert result is None
+    assert card.status == "charged"
+    db.commit.assert_called()
+    # Deduped on Lithic's own event id, the `webhook-id` header.
+    assert f"{DEDUP_PREFIX}lithic:65a9dad4-1b60-4686-83fd-65b25078a4b4" in fake_redis.store
 
-    body_bytes = json.dumps(
-        {"card_token": "card_token_abc", "type": "authorization", "amount": 5000, "event_id": "e2"}
-    ).encode("utf-8")
-    wrong_sig = _sign("attacker-guess", body_bytes)
 
-    tenant_factory, db = _fake_tenant_session_factory(card)
-
-    with (
-        patch("app.database.control_session_factory", _fake_ctrl_session_factory([org])),
-        patch("app.database.get_tenant_engine", return_value=MagicMock()),
-        patch("sqlalchemy.ext.asyncio.async_sessionmaker", return_value=tenant_factory),
-    ):
-        result = await card_webhook(
-            provider="lithic",
-            request=_fake_request(body_bytes, {"Webhook-Signature": wrong_sig}),
-        )
-
+@pytest.mark.parametrize(
+    "headers_for",
+    [
+        pytest.param(lambda body: {}, id="unsigned"),
+        pytest.param(
+            lambda body: _lithic_headers(
+                body, secret="whsec_" + base64.b64encode(b"attacker-guess").decode()
+            ),
+            id="wrong-secret",
+        ),
+        pytest.param(
+            lambda body: _lithic_headers(body, timestamp=int(time.time()) - 600), id="stale"
+        ),
+        pytest.param(
+            lambda body: {
+                k: v for k, v in _lithic_headers(body).items() if k != "webhook-timestamp"
+            },
+            id="no-timestamp",
+        ),
+        pytest.param(
+            lambda body: {k: v for k, v in _lithic_headers(body).items() if k != "webhook-id"},
+            id="no-id",
+        ),
+        pytest.param(
+            lambda body: {"Webhook-Signature": _sign(_LITHIC_SECRET, body)},
+            id="old-hex-hmac-scheme",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_lithic_unverifiable_delivery_is_a_silent_204_and_changes_nothing(
+    fake_redis, headers_for
+):
+    body = _lithic_body("PENDING")
+    card = _card_row("card_token_abc")
+    result, db = await _deliver("lithic", _LITHIC_SECRET, body, headers_for(body), card)
     assert result is None
     db.commit.assert_not_called()
     assert card.status == "created"
+    assert fake_redis.store == {}, "no dedup claim before verification"
 
 
 @pytest.mark.asyncio
 async def test_card_webhook_dedups_replayed_event(fake_redis):
-    """A correctly-signed event that's already been processed must
-    NOT re-trigger the rebate flow on the second delivery. Without
-    this, a settled-event retry creates a duplicate rebate row."""
-    import json
+    """Lithic's retry of one delivery (same `webhook-id`) must not re-run the
+    settlement; without this a retry mints a second rebate."""
+    body = _lithic_body("SETTLED")
+    headers = _lithic_headers(body, msg_id="evt_dup_check")
 
-    from app.api.cards import card_webhook
-
-    secret = "real-secret"
-    org = _org_with_card_secret(secret)
-
-    body_bytes = json.dumps(
-        {
-            "card_token": "card_token_abc",
-            # Lithic's real event, read by its status (decisions §549).
-            "type": "card_transaction.updated",
-            "status": "SETTLED",
-            "amount": 5000,
-            "event_id": "evt_dup_check",
-        }
-    ).encode("utf-8")
-    sig = _sign(secret, body_bytes)
-
-    # First delivery — card should advance
     card_first = _card_row("card_token_abc")
     card_first.status = "charged"  # settling assumes the auth already landed
     card_first.amount_charged = 5000
-    tenant_factory_1, db_1 = _fake_tenant_session_factory(card_first)
-    with (
-        patch("app.database.control_session_factory", _fake_ctrl_session_factory([org])),
-        patch("app.database.get_tenant_engine", return_value=MagicMock()),
-        patch("sqlalchemy.ext.asyncio.async_sessionmaker", return_value=tenant_factory_1),
-    ):
-        await card_webhook(
-            provider="lithic",
-            request=_fake_request(body_bytes, {"Webhook-Signature": sig}),
-        )
-    assert card_first.status == "completed"  # advanced
+    _result, db_1 = await _deliver("lithic", _LITHIC_SECRET, body, headers, card_first)
+    assert card_first.status == "completed"
     db_1.commit.assert_called()
 
-    # Second delivery of the SAME event — must short-circuit before
-    # touching state, even though the signature is correct.
     card_second = _card_row("card_token_abc")
     card_second.status = "charged"
     card_second.amount_charged = 5000
-    tenant_factory_2, db_2 = _fake_tenant_session_factory(card_second)
-    with (
-        patch("app.database.control_session_factory", _fake_ctrl_session_factory([org])),
-        patch("app.database.get_tenant_engine", return_value=MagicMock()),
-        patch("sqlalchemy.ext.asyncio.async_sessionmaker", return_value=tenant_factory_2),
-    ):
-        await card_webhook(
-            provider="lithic",
-            request=_fake_request(body_bytes, {"Webhook-Signature": sig}),
-        )
-    assert card_second.status == "charged", (
-        "second delivery of the same event must not advance the card"
-    )
+    _result, db_2 = await _deliver("lithic", _LITHIC_SECRET, body, headers, card_second)
+    assert card_second.status == "charged", "a retried delivery must not advance the card"
     db_2.commit.assert_not_called()
 
 
 @pytest.mark.asyncio
-async def test_card_webhook_accepts_correctly_signed_first_delivery(fake_redis):
-    """Positive control — confirm the happy path still works once
-    HMAC + dedup are in place. Without it, the negatives could pass
-    because every request is rejected."""
-    import json
-
-    from app.api.cards import card_webhook
-
-    secret = "real-secret"
-    org = _org_with_card_secret(secret)
+async def test_lithic_two_updates_of_one_transaction_are_not_deduped_as_one(fake_redis):
+    """The transaction `token` is shared by its PENDING and SETTLED updates;
+    keyed on the delivery id, the settlement is not mistaken for a replay."""
     card = _card_row("card_token_abc")
+    pending = _lithic_body("PENDING")
+    await _deliver("lithic", _LITHIC_SECRET, pending, _lithic_headers(pending, msg_id="e1"), card)
+    assert card.status == "charged"
+    settled = _lithic_body("SETTLED")
+    await _deliver("lithic", _LITHIC_SECRET, settled, _lithic_headers(settled, msg_id="e2"), card)
+    assert card.status == "completed"
 
-    body_bytes = json.dumps(
-        {
-            "card_token": "card_token_abc",
-            # Lithic's real event, read by its status (decisions §549).
-            "type": "card_transaction.updated",
-            "status": "PENDING",
-            "amount": 5000,
-            "event_id": "evt_ok",
-        }
-    ).encode("utf-8")
-    sig = _sign(secret, body_bytes)
 
-    tenant_factory, db = _fake_tenant_session_factory(card)
-    with (
-        patch("app.database.control_session_factory", _fake_ctrl_session_factory([org])),
-        patch("app.database.get_tenant_engine", return_value=MagicMock()),
-        patch("sqlalchemy.ext.asyncio.async_sessionmaker", return_value=tenant_factory),
-    ):
-        result = await card_webhook(
-            provider="lithic",
-            request=_fake_request(body_bytes, {"Webhook-Signature": sig}),
-        )
+@pytest.mark.asyncio
+async def test_lithic_undocumented_type_key_is_no_stage(fake_redis):
+    """Lithic names the event in `event_type`; a body using `type` instead is
+    signed and valid but reports no stage (decisions §555)."""
+    payload = json.loads(_lithic_body("PENDING"))
+    payload["type"] = payload.pop("event_type")
+    body = json.dumps(payload).encode()
+    card = _card_row("card_token_abc")
+    await _deliver("lithic", _LITHIC_SECRET, body, _lithic_headers(body), card)
+    assert card.status == "created"
 
+
+# --- Nium through the handler -----------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_nium_partner_key_delivery_charges_the_card_and_dedupes_on_request_id(
+    fake_redis,
+):
+    body = _nium_body("CARD_POS_APPROVED_WEBHOOK")
+    card = _card_row("card_token_abc")
+    result, db = await _deliver("nium", _NIUM_PARTNER_KEY, body, _nium_headers(), card)
     assert result is None
     assert card.status == "charged"
     db.commit.assert_called()
+    assert f"{DEDUP_PREFIX}nium:123e4567-e89b-12d3-a456-426655440000" in fake_redis.store
+
+
+@pytest.mark.parametrize(
+    "headers",
+    [
+        pytest.param({"x-request-id": "r1"}, id="no-partner-key"),
+        pytest.param(_nium_headers(key="wrong-key"), id="wrong-partner-key"),
+        pytest.param({"x-partner-key": _NIUM_PARTNER_KEY}, id="no-request-id"),
+        pytest.param(
+            {"x-request-id": "r1", "Webhook-Signature": _sign(_NIUM_PARTNER_KEY, _nium_body())},
+            id="old-hex-hmac-scheme",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_nium_unverifiable_delivery_is_a_silent_204_and_changes_nothing(fake_redis, headers):
+    card = _card_row("card_token_abc")
+    result, db = await _deliver("nium", _NIUM_PARTNER_KEY, _nium_body(), headers, card)
+    assert result is None
+    db.commit.assert_not_called()
+    assert card.status == "created"
+    assert fake_redis.store == {}
+
+
+@pytest.mark.asyncio
+async def test_nium_redelivery_with_the_same_request_id_is_deduped(fake_redis):
+    body = _nium_body("CARD_SETTLEMENT_DEBIT_WEBHOOK")
+    first = _card_row("card_token_abc")
+    first.status, first.amount_charged = "charged", 50
+    await _deliver("nium", _NIUM_PARTNER_KEY, body, _nium_headers(request_id="r-9"), first)
+    assert first.status == "completed"
+    second = _card_row("card_token_abc")
+    second.status, second.amount_charged = "charged", 50
+    _r, db = await _deliver(
+        "nium", _NIUM_PARTNER_KEY, body, _nium_headers(request_id="r-9"), second
+    )
+    assert second.status == "charged"
+    db.commit.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "event_type",
+    [
+        "authorization.approved",
+        "transaction.settled",
+        "authorization.reversal",
+        "authorization.expired",
+        "authorization.declined",
+    ],
+)
+@pytest.mark.asyncio
+async def test_nium_undocumented_lower_case_names_change_nothing(fake_redis, event_type):
+    """§549 kept these unverified; Nium's docs show none of them, so a signed
+    delivery naming one (in `eventType` or `template`) is inert (§555)."""
+    for key in ("eventType", "template"):
+        payload = json.loads(_nium_body())
+        payload.pop("template")
+        payload[key] = event_type
+        card = _card_row("card_token_abc")
+        card.status = "charged"
+        card.amount_charged = 50
+        await _deliver(
+            "nium",
+            _NIUM_PARTNER_KEY,
+            json.dumps(payload).encode(),
+            _nium_headers(request_id=f"{key}-{event_type}"),
+            card,
+        )
+        assert card.status == "charged" and card.amount_charged == 50
 
 
 @pytest.mark.asyncio
@@ -464,26 +680,16 @@ async def test_card_webhook_releases_dedup_claim_when_commit_fails(fake_redis):
     dedup claim, the claim must be RELEASED so the provider's retry can
     reprocess. Otherwise the event is stranded as "processed" for the full
     TTL and the rebate / charge is dropped forever."""
-    import json
 
     from app.api.cards import card_webhook
     from app.services.webhook_security import is_event_already_processed
 
-    secret = "real-secret"
+    secret = _LITHIC_SECRET
     org = _org_with_card_secret(secret)
     card = _card_row("card_token_abc")
 
-    body_bytes = json.dumps(
-        {
-            "card_token": "card_token_abc",
-            # Lithic's real event, read by its status (decisions §549).
-            "type": "card_transaction.updated",
-            "status": "PENDING",
-            "amount": 5000,
-            "event_id": "evt_commit_fail",
-        }
-    ).encode("utf-8")
-    sig = _sign(secret, body_bytes)
+    body_bytes = _lithic_body("PENDING")
+    headers = _lithic_headers(body_bytes, msg_id="evt_commit_fail")
 
     tenant_factory, db = _fake_tenant_session_factory(card)
     # The commit fails (deadlock / pool exhaustion) — the handler must roll
@@ -497,7 +703,7 @@ async def test_card_webhook_releases_dedup_claim_when_commit_fails(fake_redis):
     ):
         result = await card_webhook(
             provider="lithic",
-            request=_fake_request(body_bytes, {"Webhook-Signature": sig}),
+            request=_fake_request(body_bytes, headers),
         )
 
     assert result is None  # still a silent 204
@@ -512,16 +718,13 @@ async def test_card_webhook_rejects_when_secret_unconfigured(fake_redis):
     any webhook — even an "unsigned" one. Otherwise activating cards
     for a tenant before setting the secret silently makes that
     tenant's rebate flow forgeable."""
-    import json
 
     from app.api.cards import card_webhook
 
     org = _org_with_card_secret("")  # blank
     card = _card_row("card_token_abc")
 
-    body_bytes = json.dumps(
-        {"card_token": "card_token_abc", "type": "authorization", "amount": 1, "event_id": "e3"}
-    ).encode("utf-8")
+    body_bytes = _lithic_body("PENDING")
 
     tenant_factory, db = _fake_tenant_session_factory(card)
     with (
@@ -531,11 +734,16 @@ async def test_card_webhook_rejects_when_secret_unconfigured(fake_redis):
     ):
         await card_webhook(
             provider="lithic",
-            request=_fake_request(body_bytes, {"Webhook-Signature": _sign("anything", body_bytes)}),
+            request=_fake_request(body_bytes, _lithic_headers(body_bytes)),
         )
-
     db.commit.assert_not_called()
     assert card.status == "created"
+
+    # Nium: an empty partner key on both sides is not a match.
+    nium_card = _card_row("card_token_abc")
+    _r, nium_db = await _deliver("nium", "", _nium_body(), _nium_headers(key=""), nium_card)
+    nium_db.commit.assert_not_called()
+    assert nium_card.status == "created"
 
 
 # ---------------------------------------------------------------------------

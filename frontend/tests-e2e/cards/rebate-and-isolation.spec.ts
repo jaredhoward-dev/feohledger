@@ -1,4 +1,4 @@
-import { createHmac, randomUUID } from 'node:crypto';
+import { randomUUID } from 'node:crypto';
 
 import type { APIRequestContext } from '@playwright/test';
 
@@ -10,6 +10,7 @@ import {
 	tenantPsql,
 	test
 } from '../fixtures/helpers';
+import { lithicHeaders, lithicSecret } from '../fixtures/cardWebhook';
 
 /**
  * Rebate math correctness (exact Decimal) + tenant isolation on the card
@@ -25,7 +26,7 @@ import {
  * a 404 (tenant DB scoping at the data layer).
  */
 
-const SECRET = 'wh_secret_rebate_e2e_0002';
+const SECRET = lithicSecret('wh_secret_rebate_e2e_0002');
 const TOKEN = `e2e-rebate-${randomUUID()}`;
 
 // The signing secret is sealed in `provider_credentials`, not the settings
@@ -61,17 +62,17 @@ function settleBody(eventId: string): string {
 	// whose `status` is `SETTLED`, carrying the settled amount in cents — the
 	// same 1234.56 the card was charged, so the rebate base is unchanged.
 	return JSON.stringify({
-		type: 'card_transaction.updated',
+		event_type: 'card_transaction.updated',
 		token: `txn-${eventId}`,
 		card_token: TOKEN,
 		status: 'SETTLED',
-		event_id: eventId,
 		amount: 123456
 	});
 }
 
-function sign(rawBody: string): string {
-	return createHmac('sha256', SECRET).update(rawBody).digest('hex');
+/** Signed as Lithic signs (decisions §555): Standard-Webhooks headers. */
+function signed(rawBody: string): Record<string, string> {
+	return lithicHeaders(SECRET, rawBody, { id: randomUUID() });
 }
 
 test.describe('card rebate math + tenant isolation', () => {
@@ -81,7 +82,7 @@ test.describe('card rebate math + tenant isolation', () => {
 		try {
 			const body = settleBody(randomUUID());
 			const resp = await request.post(`${API_BASE}/api/cards/webhook/lithic`, {
-				headers: { 'Content-Type': 'application/json', 'Webhook-Signature': sign(body) },
+				headers: signed(body),
 				data: body
 			});
 			expect(resp.status()).toBe(204);

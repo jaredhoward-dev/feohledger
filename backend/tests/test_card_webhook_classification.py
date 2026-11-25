@@ -42,7 +42,7 @@ def _lithic_stage(body: dict) -> str:
 
 @pytest.mark.parametrize(("status", "stage"), list(_LITHIC_STAGES.items()))
 def test_each_lithic_transaction_status_maps_to_its_stage(status, stage):
-    assert _lithic_stage({"type": "card_transaction.updated", "status": status}) == stage
+    assert _lithic_stage({"event_type": "card_transaction.updated", "status": status}) == stage
 
 
 @pytest.mark.parametrize(
@@ -67,7 +67,14 @@ def test_each_lithic_transaction_status_maps_to_its_stage(status, stage):
 )
 def test_other_lithic_event_types_are_no_stage(event_type):
     # Even with a status a card transaction would carry.
-    assert _lithic_stage({"type": event_type, "status": "SETTLED"}) == ""
+    assert _lithic_stage({"event_type": event_type, "status": "SETTLED"}) == ""
+
+
+def test_lithic_names_the_event_only_in_event_type():
+    """The webhook body is the Transaction plus `event_type`
+    (lithic-openapi.yml); a `type` key is not Lithic's and reads as nothing
+    (decisions §555)."""
+    assert _lithic_stage({"type": "card_transaction.updated", "status": "SETTLED"}) == ""
     assert _classify_card_event("") == (False, False)
 
 
@@ -80,12 +87,10 @@ def test_other_lithic_event_types_are_no_stage(event_type):
         ("CARD_TRANSACTION_REVERSAL_ADVICE_WEBHOOK", "authorization.reversal"),
         ("CARD_INSUFFICIENT_FUNDS_DECLINED_WEBHOOK", "authorization.declined"),
         ("CARD_WRONG_EXPIRY_WEBHOOK", "authorization.declined"),
-        # The `eventType` names this handler has always read.
-        ("authorization.approved", "authorization"),
-        ("transaction.settled", "settlement"),
-        ("authorization.reversal", "authorization.reversal"),
-        ("authorization.expired", "authorization.expired"),
-        ("authorization.declined", "authorization.declined"),
+        ("CARD_WRONG_CVV2_WEBHOOK", "authorization.declined"),
+        ("CARD_MISC_WEBHOOK", "authorization.declined"),
+        ("CARD_EXPIRED_CARD_WEBHOOK", "authorization.declined"),
+        ("CARD_SYSTEM_DOWN_WEBHOOK", "authorization.declined"),
     ],
 )
 def test_each_known_nium_name_maps_to_its_stage(name, stage):
@@ -101,6 +106,15 @@ def test_each_known_nium_name_maps_to_its_stage(name, stage):
         "CARD_REFUND_APPROVAL_WEBHOOK",
         "CARD_3DS_OTP_WEBHOOK",
         "CARD_ADD_CARD_WEBHOOK",
+        # The card's own expiry alert, not an authorization expiring.
+        "CARD_EXPIRY_CARD_WEBHOOK",
+        "CARD_ATM_APPROVED_WEBHOOK",
+        # Never in Nium's docs (decisions §555): §549 kept them, now gone.
+        "authorization.approved",
+        "transaction.settled",
+        "authorization.reversal",
+        "authorization.expired",
+        "authorization.declined",
         "transaction",
         "settlement.completed",
         "transaction.refund",
@@ -203,26 +217,19 @@ def test_everything_else_is_not_a_lapse(stage):
 
 
 def test_lithic_unknown_status_is_inert():
-    assert _lithic_event_type({"type": "card_transaction.updated", "status": "BOUNCED"}) == ""
-    assert _lithic_event_type({"type": "card_transaction.updated"}) == ""
-    assert _lithic_event_type({"type": "card_transaction.updated", "status": "pending"}) == (
-        "authorization"
-    )
+    evt = "card_transaction.updated"
+    assert _lithic_event_type({"event_type": evt, "status": "BOUNCED"}) == ""
+    assert _lithic_event_type({"event_type": evt}) == ""
+    assert _lithic_event_type({"event_type": evt, "status": "pending"}) == "authorization"
     assert _lithic_event_type({}) == ""
 
 
-def test_lithic_transaction_stages_dedupe_separately():
-    """The transaction token is the same on every update of it; keyed on it
-    alone, the reversal would be deduped as a replay of the authorization."""
-    from app.api.cards import _lithic_event_id
+def test_lithic_and_nium_dedupe_on_their_delivery_id_header():
+    """Each provider's own delivery id, never a body field: Lithic's signed
+    `webhook-id`, Nium's `x-request-id` (decisions §555)."""
+    from app.api.cards import _CARD_EVENT_ID_HEADERS
 
-    base = {"type": "card_transaction.updated", "token": "txn_1"}
-    pending = _lithic_event_id({**base, "status": "PENDING"})
-    voided = _lithic_event_id({**base, "status": "VOIDED"})
-    assert pending != voided
-    assert pending == _lithic_event_id({**base, "status": "PENDING"})
-    assert _lithic_event_id({**base, "status": "VOIDED", "event_id": "evt_9"}) == "evt_9"
-    assert _lithic_event_id({"type": "authorization", "token": "t"}) == "t"
+    assert _CARD_EVENT_ID_HEADERS == {"lithic": "webhook-id", "nium": "x-request-id"}
 
 
 def test_a_partial_reversal_is_one_below_the_authorized_figure():
