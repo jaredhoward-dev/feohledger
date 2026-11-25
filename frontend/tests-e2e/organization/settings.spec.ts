@@ -86,6 +86,9 @@ const PANELS = [
 	['security', 'Security'],
 	['sso', 'Single Sign-On'],
 	['fraud', 'Fraud Detection'],
+	// Their admin-only body for a clerk is held by org-controls.spec.ts.
+	['line-total-check', 'Line-total check'],
+	['exception-agents', 'Exception agents'],
 	['residency', 'Data Residency'],
 	['plan', 'Plan'],
 	['close', 'Close this workspace']
