@@ -397,8 +397,8 @@ a definition as JSON). All wrap the shared `ui/Modal.svelte` and call the
   `privacy_acknowledgement_required` stale-versions code) and an optional
   `mark` snippet drawn in place of our wordmark. The supplier-portal layout
   draws it with `documents="privacy"`, the tenant's white-label mark,
-  `onaccept={() => portalAuth.acknowledgeLegal()}` and
-  `onlogout={() => portalAuth.logout()}` while the portal user's
+  `onaccept={portalAuth.acknowledgeLegal}` and its own logout handler
+  (`portalAuth.logout`) while the portal user's
   `legal_acceptance_required` is true (decisions §500).
   `docs/authentication.md` § Terms and Privacy acceptance.
 - `NotificationBell.svelte` — bell + unread badge in the sidebar header with a
