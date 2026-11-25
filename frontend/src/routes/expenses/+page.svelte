@@ -30,7 +30,9 @@
 		RECONCILIATION_STATUSES,
 		reconciliationStatusLabelKey,
 		canAuthorLooseLine,
-		RECONCILIATION_STATUS_TONES
+		RECONCILIATION_STATUS_TONES,
+		preapprovalBalance,
+		drawsPreapproval
 	} from '#lib/types/expense.ts';
 	import { expenseStore } from '#lib/stores/expenses.svelte.ts';
 	import { auth } from '#lib/stores/auth.svelte.ts';
@@ -1586,6 +1588,11 @@
 							     that chip. -->
 							<span class="status-cell">
 								<Badge tone={EXPENSE_STATUS_TONES[exp.status as ExpenseStatus]} variant={exp.status}>{statusLabel(exp.status)}</Badge>
+								{#if drawsPreapproval(exp)}
+									<span class="violation-chip" data-testid="expense-preapproval-draw">
+										<Badge tone="success" variant="preapproval-draw" title={m('expenses.preapprovalDraw.title', { amount: formatMoney(exp.preapproval_drawn_amount, { currency: exp.currency }) })}>{m('expenses.preapprovalDraw.badge')}</Badge>
+									</span>
+								{/if}
 								{#if exp.policy_violations && exp.policy_violations.length}
 									<span class="violation-chip">
 										<Badge tone="danger" variant="violation" title={violationTitle(exp.policy_violations)}>⚠ {exp.policy_violations.length}</Badge>
@@ -1775,6 +1782,11 @@
 								<td>
 									<span class="status-cell">
 										<Badge tone={EXPENSE_STATUS_TONES[exp.status as ExpenseStatus]} variant={exp.status}>{statusLabel(exp.status)}</Badge>
+										{#if drawsPreapproval(exp)}
+											<span class="violation-chip" data-testid="expense-preapproval-draw">
+												<Badge tone="success" variant="preapproval-draw" title={m('expenses.preapprovalDraw.title', { amount: formatMoney(exp.preapproval_drawn_amount, { currency: exp.currency }) })}>{m('expenses.preapprovalDraw.badge')}</Badge>
+											</span>
+										{/if}
 										{#if exp.policy_violations && exp.policy_violations.length}
 											<span class="violation-chip">
 												<Badge tone="danger" variant="violation" title={violationTitle(exp.policy_violations)}>⚠ {exp.policy_violations.length}</Badge>
@@ -1928,6 +1940,7 @@
 				{ label: m('expenses.preapprovals.col.title') },
 				{ label: m('expenses.preapprovals.col.category') },
 				{ label: m('expenses.preapprovals.col.estimated'), class: 'right' },
+				{ label: m('expenses.preapprovals.col.remaining'), class: 'right' },
 				{ label: m('expenses.preapprovals.col.status') },
 				{ label: '', class: 'actions-col' }
 			]}
@@ -1937,10 +1950,26 @@
 		>
 			{#snippet body()}
 				{#each preapprovals as pa (pa.id)}
+					{@const balance = preapprovalBalance(pa)}
 					<tr>
 						<td>{pa.title}</td>
 						<td>{pa.category ?? '—'}</td>
 						<td class="right mono"><Money amount={pa.estimated_amount} currency={pa.currency} /></td>
+						<!-- The draw-down (decisions §563): what is left of an approved
+						     estimate after the submitted lines it covers. A pending or
+						     rejected request covers nothing, so it shows no balance. -->
+						<td class="right mono" data-testid="preapproval-remaining">
+							{#if balance}
+								<Money amount={balance.remaining} currency={pa.currency} />
+								<span class="cell-sub">
+									{balance.exhausted
+										? m('expenses.preapprovals.exhausted')
+										: m('expenses.preapprovals.drawn', { amount: formatMoney(balance.drawn, { currency: pa.currency }) })}
+								</span>
+							{:else}
+								<span class="muted">—</span>
+							{/if}
+						</td>
 						<td><Badge tone={EXPENSE_PREAPPROVAL_STATUS_TONES[pa.status as ExpensePreapprovalStatus]} variant={pa.status}>{preapprovalStatusLabel(pa.status)}</Badge></td>
 						<td class="actions">
 							{#if canDecidePreapproval(pa)}
@@ -2356,6 +2385,15 @@
 	.violation-chip {
 		display: inline-flex;
 		cursor: help;
+	}
+
+	/* A pre-approval's draw-down under its remaining balance (decisions §563):
+	   a second, quieter line in the same cell, so the figure stays the one the
+	   column is sorted and scanned by. */
+	.cell-sub {
+		display: block;
+		font-size: 0.75rem;
+		color: var(--text-muted);
 	}
 
 	.bulk-gl-select {

@@ -15,7 +15,9 @@ import {
 	expensePreapprovalStatusLabelKey,
 	reconciliationStatusLabelKey,
 	isLineCreator,
-	canAuthorLooseLine
+	canAuthorLooseLine,
+	preapprovalBalance,
+	drawsPreapproval
 } from './expense';
 import { EN_ALL } from '#lib/i18n/allMessages.ts';
 import type { MessageKey } from '#lib/i18n/messages.ts';
@@ -123,5 +125,43 @@ describe('isLineCreator / canAuthorLooseLine', () => {
 		expect(canAuthorLooseLine({ report_id: null, created_by_user_id: other }, me)).toBe(false);
 		expect(canAuthorLooseLine({ report_id: null, created_by_user_id: me }, me)).toBe(true);
 		expect(canAuthorLooseLine({ report_id: 'r1', created_by_user_id: other }, me)).toBe(true);
+	});
+});
+
+describe('preapprovalBalance (decisions §563)', () => {
+	it('shows the draw-down of an approved pre-approval', () => {
+		expect(
+			preapprovalBalance({ status: 'approved', drawn_amount: 400, remaining_amount: 100 })
+		).toEqual({ drawn: 400, remaining: 100, exhausted: false });
+	});
+
+	it('marks a spent estimate as exhausted', () => {
+		expect(
+			preapprovalBalance({ status: 'approved', drawn_amount: '500.00', remaining_amount: '0.00' })
+		).toEqual({ drawn: '500.00', remaining: '0.00', exhausted: true });
+	});
+
+	it('has no balance for a pending or rejected request, or a missing figure', () => {
+		expect(
+			preapprovalBalance({ status: 'pending', drawn_amount: 0, remaining_amount: null })
+		).toBeNull();
+		expect(
+			preapprovalBalance({ status: 'rejected', drawn_amount: 0, remaining_amount: 50 })
+		).toBeNull();
+		expect(preapprovalBalance({ status: 'approved', remaining_amount: undefined })).toBeNull();
+		expect(preapprovalBalance({ status: 'approved', remaining_amount: 'nope' })).toBeNull();
+	});
+
+	it('reads a missing drawn figure as nothing drawn', () => {
+		expect(preapprovalBalance({ status: 'approved', remaining_amount: 80 })?.drawn).toBe(0);
+	});
+});
+
+describe('drawsPreapproval', () => {
+	it('is true only for a line with a recorded draw', () => {
+		expect(drawsPreapproval({ preapproval_id: 'p1', preapproval_drawn_amount: 400 })).toBe(true);
+		expect(drawsPreapproval({ preapproval_id: null, preapproval_drawn_amount: null })).toBe(false);
+		expect(drawsPreapproval({})).toBe(false);
+		expect(drawsPreapproval({ preapproval_id: 'p1', preapproval_drawn_amount: null })).toBe(false);
 	});
 });
