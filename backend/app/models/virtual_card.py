@@ -122,7 +122,8 @@ class CardTransactionEvent(Base, TimestampMixin):
       it and is applied as already lapsed instead of charging the card.
     * ``clearing`` — each clearing applied to the card. ``event_key`` is that
       clearing's own identity (Lithic's clearing event token, else the
-      transaction token and its cumulative settled figure; the delivery id for
+      delivery id with the transaction token and its cumulative settled figure
+      when the body has no `events`, decisions §561; the delivery id for
       the mock), so an incremental capture is added exactly once even when the
       Redis event-id claim is gone.
 

@@ -1357,9 +1357,13 @@ def _clearing_key(provider: str, body: dict, transaction_id, event_id, cleared) 
     Return, Authorization Reversal, and Authorization Expiry messages on this
     same transaction", https://docs.lithic.com/docs/transaction-flow, checked
     2026-11-25). The newest financial event's token names this delivery's
-    clearing; without `events`, the transaction token and its cumulative
-    settled figure do (a different total is a different clearing). Nium and the
-    mock: the delivery id."""
+    clearing. Without `events` nothing in the body tells two clearings at the
+    same cumulative total apart (a clearing, a RETURN, another clearing back to
+    that total), so the delivery's own `webhook-id` does (§561): every delivery
+    is its own clearing, a retry of it (same id) stays a replay, and a delivery
+    that adds nothing is refused as `not_an_increase` on the record rather than
+    dropped unseen. The delivery id leads the key, so the 255-character clip
+    never merges two deliveries. Nium and the mock: the delivery id."""
     if provider == "lithic":
         tokens = [
             e.get("token")
@@ -1370,8 +1374,8 @@ def _clearing_key(provider: str, body: dict, transaction_id, event_id, cleared) 
         ]
         if tokens:
             return f"event:{tokens[-1]}"
-        if transaction_id and cleared is not None:
-            return f"total:{transaction_id}:{cleared}"
+        if event_id and transaction_id and cleared is not None:
+            return f"delivery:{event_id}:total:{transaction_id}:{cleared}"
         return None
     return f"delivery:{event_id}" if event_id else None
 

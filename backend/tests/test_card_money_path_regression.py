@@ -1828,21 +1828,62 @@ async def test_a_lithic_retry_is_deduped_and_a_second_clearing_still_applies(rea
     assert row.details["cleared_amount"] == "50.00"
 
 
-async def test_a_lithic_clearing_without_events_is_keyed_by_its_cumulative_total(realdb):
-    """No `events` list: the transaction token and its cumulative figure name
-    the clearing, so a higher total applies once and a repeat is a replay."""
+async def test_a_lithic_clearing_without_events_is_keyed_by_its_delivery(realdb):
+    """No `events` list: the delivery id (with the transaction token and its
+    cumulative figure) names the clearing (decisions §561). A higher total
+    applies once; a retry of that delivery (same `webhook-id`) is a replay; the
+    same total under a NEW delivery adds nothing and is refused on the record."""
     from tests.test_card_authorization_lapse import _body, _leg_with_card, _post
 
     card_id, pay_id, token = await _leg_with_card(realdb, "lithic", amount=Decimal("150.00"))
+    second_id = str(uuid.uuid4())
     with patch("app.services.payment_erp_sync.dispatch_payment_sync", new=AsyncMock()):
-        for amount in ("100.00", "150.00", "150.00"):
-            assert (
-                await _post(realdb, "lithic", _body("lithic", token, "settlement", amount=amount))
-                == 204
-            )
+        for amount, event_id in (
+            ("100.00", None),
+            ("150.00", second_id),
+            ("150.00", second_id),  # retry of the same delivery
+            ("150.00", None),  # the same total, another delivery
+        ):
+            body = _body("lithic", token, "settlement", amount=amount)
+            assert await _post(realdb, "lithic", body, event_id=event_id) == 204
     payment, _state = await _leg(realdb, pay_id)
     assert payment.settled_amount == Decimal("150.00")
     assert len(await _card_audits(realdb, card_id, "card.clearing_added")) == 1
+    (refused,) = await _card_audits(realdb, card_id, "card.clearing_refused")
+    assert refused.details["reason"] == "not_an_increase"
+    keys = [r.event_key for r in await _clearing_rows(realdb, card_id)]
+    assert len(keys) == 3 and all(k.startswith("delivery:") for k in keys)
+
+
+async def test_a_lithic_clearing_return_clearing_without_events_is_three_clearings(realdb):
+    """Decisions §561: a clearing to 100.00, a RETURN to 80.00 and a clearing
+    back to 100.00, none carrying `events`. Keyed by the cumulative total the
+    third collided with the first and was dropped unseen, leaving the refused
+    return as the last word on the card. Keyed by delivery, each is recorded:
+    the card stays at 100.00 (a return is never applied, §544), and both
+    the return and the re-clearing are on the record for the refund flow."""
+    from tests.test_card_authorization_lapse import _body, _leg_with_card, _post
+
+    card_id, pay_id, token = await _leg_with_card(realdb, "lithic", amount=Decimal("100.00"))
+    with patch(
+        "app.services.payment_erp_sync.dispatch_payment_sync", new=AsyncMock()
+    ) as dispatched:
+        for amount in ("100.00", "80.00", "100.00"):
+            body = _body("lithic", token, "settlement", amount=amount)
+            assert await _post(realdb, "lithic", body) == 204
+    assert dispatched.await_count == 1  # the first settlement only
+
+    async with realdb.sessionmaker(TENANT)() as s:
+        card = await s.get(VirtualCard, card_id)
+    assert card.amount_charged == Decimal("100.00")
+    payment, state = await _leg(realdb, pay_id)
+    assert payment.settled_amount == Decimal("100.00") and state == "covered"
+    assert await _card_audits(realdb, card_id, "card.clearing_added") == []
+    refused = await _card_audits(realdb, card_id, "card.clearing_refused")
+    assert [r.details["reason"] for r in refused] == ["not_an_increase", "not_an_increase"]
+    rows = await _clearing_rows(realdb, card_id)
+    assert len(rows) == 3
+    assert len({r.event_key for r in rows}) == 3
 
 
 async def test_clearings_past_what_the_card_pays_open_one_blocking_flag(realdb):

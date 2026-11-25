@@ -1183,8 +1183,9 @@ Return, Authorization Reversal, and Authorization Expiry messages on this same
 transaction" (<https://docs.lithic.com/docs/transaction-flow>, checked
 2026-11-25). Every applied clearing is recorded in `card_transaction_events`
 (kind `clearing`) under its own identity (`_clearing_key`: the newest Lithic
-financial event's `token` in `events`, else the transaction token and its
-cumulative figure; the delivery id for Nium and the mock), so each is applied
+financial event's `token` in `events`, else the delivery's `webhook-id` with
+the transaction token and its cumulative figure, §561; the delivery id for
+Nium and the mock), so each is applied
 once even past the Redis dedupe. On a `completed` card
 (`_record_further_clearing`):
 
@@ -1205,13 +1206,17 @@ The money moved, so the figure is recorded; the flag is how a person learns of
 the overcharge, since over-settlement reads `covered`. While that flag is
 open, a further clearing does not open another or rewrite its figure: the
 newest total is on the card, the payment and the `card.clearing_added` rows.
-The `total:` clearing key (Lithic without `events`) is a convenience, not an
-identity: the delta is always `reported − amount_charged`, so a repeat or a
-return to an earlier total never adds twice. **Delivery dedupe and clearing
+The `delivery:…:total:` clearing key (Lithic without `events`) names the
+delivery, not the total (decisions §561): keyed by the total alone, a clearing,
+a `RETURN` and a clearing back to the same total collided, and the third was
+dropped unseen. Now each delivery is its own clearing and a retry of it (same
+`webhook-id`) is still a replay; the delta is always `reported −
+amount_charged`, so a repeat of a total never adds twice, it is refused on the
+record (`not_an_increase`). **Delivery dedupe and clearing
 identity are two layers (decisions §557):** the Redis dedupe keys on the
 delivery's `webhook-id` header (one per delivery, the same on every retry,
 §555), so a retry stops there; a second clearing is a new delivery with a new
-id and reaches this branch, where its own `events` token (or cumulative total)
+id and reaches this branch, where its own `events` token (or delivery id)
 says whether it was already applied — which also catches a redelivery that
 outlived the Redis window. **Not verified:** that Lithic sends a
 `card_transaction.updated` per clearing (its docs say a webhook is sent "at
