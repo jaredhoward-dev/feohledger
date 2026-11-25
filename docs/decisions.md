@@ -30718,3 +30718,88 @@ Each of these fails on the code before this entry. Also:
   pending write on the instance and refuses. This fails without the lock.
 - `test_peppol_adapters.py`: a bare 404, or one with a non-JSON body, is
   `unknown`.
+
+## 582. A booked discount credit is reversed by its id; a payment void re-armed mid-void stays pending; a failure before the create is not posted; a recorded credit that is not ours is held, never dropped (§581 final review, round 49)
+
+A last money-path review of §581 found five gaps and closed one residual.
+
+**1. A posted credit's id was forgotten (Xero: Critical).** On outcome
+`posted` the record was dropped and nothing kept the credit's id. A later void
+then had no `known_credit`, and Xero fell back to its lookup by
+`CreditNoteNumber`, which §577 lists as unconfirmed. A miss there read as "no
+discount credit of ours": the payment was voided, the markers cleared, no flag,
+and CN-1 stayed allocated (the bill showed $98 due, and a $100 re-pay was
+refused). Now `posted` writes the id to `state_data.erp_discount_credits_booked
+[<payment id>]`, the void reads it as `known_credit` (after the two pending
+maps), so Xero voids by id, and the entry is cleared when the void reverses
+the credit. `_reserve_credit` also books nothing while the entry is there, so
+a write-back re-run after a posted credit makes no second create.
+- **Why a state map, not a `Payment` column (no migration 0152).** Every other
+  fact about our ERP documents for a payment already lives in the instance's
+  `state_data`, under the lock order §581 set (invoice `FOR KEY SHARE`, then
+  instance). A column would split the void's read across two rows and two
+  lock paths for one id.
+- **Why not a delete-door key.** The entry matters only while a voided payment
+  is not yet reversed, and in that window `erp_payment_voids_pending` holds
+  the payment (the door already refuses on it). For a `completed` payment the
+  invoice is `paid` or `done`, which the status check already refuses. Adding
+  it to `_ERP_PENDING_KEYS` would refuse every delete of an invoice whose
+  credit was ever booked, for nothing.
+
+**2. The void's final clear could erase the write-back's re-arm (Critical).**
+§581's `_rearm_void_if_voided` adds the payment to `erp_payment_voids_pending`,
+where it usually still is (the void's task has not cleared it yet), so the
+re-arm changed nothing the void could see. The void, having found no
+BillPayment, then cleared it, and BP-1 stood on a voided payment's bill. Now
+the re-arm also writes a fresh token to `state_data.erp_payment_void_rearmed
+[<payment id>]`. The void reads the token before its ERP call and clears the
+payment (and the token) only if it is unchanged under the final lock;
+otherwise the payment stays pending and the next pass voids BP-1.
+- **Residual (unchanged):** §581's window when recording the write-back's
+  outcome itself rolls back still stands. The token closes only the race
+  between a committed re-arm and the void's clear.
+
+**3. A transient failure before the create became a permanent stall.** A 5xx,
+network error or token refresh failure while reading the bill (QuickBooks
+`_live_bill` / `_bill_payments`, Xero `_headers` / `_read_bill`) returned
+`not_posted=False`, so the reservation kept `credit_id: null` and stalled as
+`unidentified`, though no create was sent. Now both adapters' failure paths
+set `not_posted` to whether the create request had gone out: before it, the
+reservation is dropped as a plain refusal and a later write-back or sweep
+retries. A create whose answer is lost stays not-`not_posted`.
+
+**4. Xero lost a just-created note's id on a later failure.** A 503 on the
+read-back, or a network error on the allocation or the final bill read, went
+to the `except` handlers without the id Xero had answered our create with.
+Now the id (or that of a live note of ours found by number) rides every later
+failure, with `not_posted` false.
+
+**5. QuickBooks' void reported success for a recorded credit that was not
+ours.** `_our_vendor_credit` answered None both for a 404 and for a marker
+mismatch, and the void read both as "gone". Now `_read_vendor_credit` answers
+None only for a 404 / object-not-found; a credit without our marker is
+refused `discount_credit_not_ours` with its id, as Xero's void does (§581).
+The void stops there and is flagged with the id.
+
+**6. §581's residual: a recorded note not ours was dropped silently.** When
+Xero (or QuickBooks) reads a recorded id back without our marker, `post` used
+to refuse `bill_payment_voided`, and the write-back dropped the record as
+someone's decision. Now both adapters fail with the id and the message code
+`discount_credit_not_ours` (not a registered refusal code: it never reaches
+an invoice's push error). The write-back holds the record and opens the
+`discount_credit_stalled` flag with `reason: discount_credit_not_ours`. A
+voided or deleted credit of ours is still `bill_payment_voided` and dropped.
+
+**Tests.** Each fails on the code before this entry.
+- `test_erp_payment_writeback.py`: a booked credit voided by its id when the
+  number lookup misses; a re-run after a booked credit makes no second
+  create; a write-back re-arm landing between the void's ERP call and its
+  final lock leaves the void pending, and the next pass voids BP-9; a
+  recorded credit that is not ours is held and flagged.
+- `test_xero_status_sync_adapter.py`: a bill read 503 and a token refresh
+  failure before the create are `not_posted`; a created note keeps its id when
+  its read-back or its allocation fails; a recorded note without our number
+  is held, not refused `bill_payment_voided`.
+- `test_qbo_status_sync_adapter.py`: a bill read 503, a network error and a
+  token refresh failure before the create are `not_posted`; a recorded credit
+  not ours is held on post and refused on void.

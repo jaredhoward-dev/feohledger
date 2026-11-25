@@ -678,7 +678,7 @@ discount_credit_stalled`, `reason: unidentified`, `discount_credit_marker:
 "FeohLedger discount <payment id>"`) for a person to find it. QuickBooks
 VendorCredit is not queried by `VendorRef` / `TxnDate`: that filter is not in
 the schema §577 confirmed. Xero now honours `credit_id` too (reads that credit
-note by id; voided or not ours is `bill_payment_voided`). A void with such a
+note by id; voided is `bill_payment_voided`, not ours is held, §582). A void with such a
 record voids our payment but keeps the record, flags it, and reports failure.
 Each attempt is claimed per record (`claimed_until`), its outcome written under
 the instance lock after re-reading the payment — a void that committed during
@@ -703,6 +703,22 @@ BillPayment was being written is put back in `erp_payment_voids_pending`
 the void's own pass could not yet see. Xero's `void_discount_credit` reverses
 a recorded `credit_id` by id and refuses (never reports done) one that is not
 ours.
+
+**A booked credit is remembered; a re-armed void survives the void's clear**
+(decisions §582). A credit the write-back applied (`posted`) leaves its id in
+`state_data.erp_discount_credits_booked[<payment id>]`; the void reverses it
+by that id (never by Xero's unconfirmed number lookup) and drops the entry,
+and a write-back re-run books no second credit while it is there. Re-arming a
+void also writes a fresh token to `state_data.erp_payment_void_rearmed`; the
+void reads it before its ERP call and clears the payment only if it is
+unchanged, so a write-back that lands mid-void leaves the void pending for the
+next pass. In both adapters any failure before the create request goes out
+(a 5xx or network error reading the bill, a token refresh) is `not_posted`, so
+the reservation is dropped and retried instead of stalling as `unidentified`;
+Xero keeps a just-created note's id on every later failure. A recorded credit
+that reads back without our marker is refused as `discount_credit_not_ours` by
+both adapters' void and post: the record is held and flagged (`reason:
+discount_credit_not_ours`), never dropped or reported reversed.
 
 The code is exercised against `tools/fake-erp` and the adapter doubles only,
 not yet a real company; a read-back that is not what we wrote fails closed
