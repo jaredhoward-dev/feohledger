@@ -635,6 +635,19 @@ One entry remains of what round 29 could not close in the slice that found it.
       or the endpoint's removal.
       **Trigger:** the #328 product review.
 
+### Surfaced by the /vendors UI round (2026-11-24)
+
+- [ ] **(c) A row Verify / Reject on `/vendors` drops every page Load more
+      added.** `verifyVendor` and `rejectVendor` refetch with `fetchVendors()`,
+      which reloads page 1 only, so a reviewer working down page 3 lands back
+      on the first 20 rows and loses their place after each decision. The
+      endpoints return the vendor but not its new `status_actions` verdict, so
+      patching the row in place would withhold its next action until a reload.
+      **Durable fix:** refetch the loaded extent (`page_size = vendors.length`,
+      or re-read the loaded pages) after a row decision, or return
+      `status_actions` from `/verify` and `/reject` and patch the row.
+      **Trigger:** the next change to the `/vendors` row actions.
+
 ### Surfaced by the round-30 batch (2026-09-11)
 
 One of the eight entries this round opened remains — a finding that could not
