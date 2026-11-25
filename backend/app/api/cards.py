@@ -39,6 +39,10 @@ from app.schemas.virtual_card import (
     RebateResponse,
     RebateStatusBreakdown,
 )
+from app.services.card_adapters.mock_adapter import (
+    MOCK_WEBHOOK_LOCAL_SECRET,
+    MOCK_WEBHOOK_PROVIDER,
+)
 from app.services.card_issuance import CARD_SPENT_STATUSES, CardSkip
 from app.services.credential_crypto import CredentialCryptoError
 from app.services.currency_conversion import (
@@ -1136,6 +1140,17 @@ async def card_webhook(provider: str, request: Request):
         event_id = body.get("webhookId") or body.get("eventId") or body.get("id")
         amount = body.get("amount", 0)
         merchant = body.get("merchantName")
+    elif provider == MOCK_WEBHOOK_PROVIDER and not settings.is_deployed:
+        # The local equivalent of a provider's charge (guard rail 7, decisions
+        # §541): `scripts/simulate_card_charge.py` sends a mock card's
+        # authorization / settlement here, signed, so a laptop's card-paid run
+        # reaches `paid` through this same handler and `record_card_spend`.
+        # Never in a deployed environment: there it is an unknown provider.
+        card_token = body.get("card_token")
+        event_type = body.get("type", "")
+        event_id = body.get("event_id")
+        amount = body.get("amount", 0)
+        merchant = (body.get("merchant") or {}).get("descriptor")
     else:
         return
 
@@ -1198,6 +1213,10 @@ async def card_webhook(provider: str, request: Request):
                     logger.error("Card webhook: the tenant's card credentials could not be opened")
                     return Response(status_code=503)
                 signing_secret = card_config.get("webhook_signing_secret", "")
+                if provider == MOCK_WEBHOOK_PROVIDER and not signing_secret:
+                    # A mock card on a laptop tenant that set no secret: the
+                    # simulator's public local key (only reachable undeployed).
+                    signing_secret = MOCK_WEBHOOK_LOCAL_SECRET
                 provided_sig = extract_signature_header(
                     dict(request.headers),
                     "Webhook-Signature",

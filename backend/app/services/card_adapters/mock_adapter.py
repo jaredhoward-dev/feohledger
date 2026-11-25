@@ -1,7 +1,11 @@
 """Mock card adapter for development and testing."""
 
 import asyncio
+import hashlib
+import hmac
+import json
 import uuid
+from decimal import Decimal
 
 from app.services.card_adapters.base import (
     CardAdapter,
@@ -11,6 +15,51 @@ from app.services.card_adapters.base import (
     VirtualCardPayload,
 )
 from app.services.card_adapters.dispatcher import register_card_adapter
+
+#: The card webhook's ``{provider}`` segment for a mock card's simulated events
+#: (``POST /api/cards/webhook/mock``), accepted only outside a deployed
+#: environment (decisions §541).
+MOCK_WEBHOOK_PROVIDER = "mock"
+#: What a mock card's simulated event is signed with when the tenant set no
+#: ``webhook_signing_secret`` of its own. Public by design: the mock webhook
+#: branch exists only where ``settings.is_deployed`` is False, so this signs
+#: nothing a deployed handler would accept. A tenant secret, when set, is used
+#: instead, exactly as a real provider's delivery is checked.
+MOCK_WEBHOOK_LOCAL_SECRET = "feohledger-mock-card-webhook-local-only"
+#: The two events a mock card can be sent: the charge and its settlement, named
+#: so the webhook's own ``_classify_card_event`` reads them as Lithic's are.
+MOCK_EVENT_AUTHORIZATION = "authorization"
+MOCK_EVENT_SETTLEMENT = "settlement"
+
+
+def mock_card_event(
+    card_token: str,
+    *,
+    event_type: str,
+    amount: Decimal,
+    event_id: str | None = None,
+    merchant: str = "Mock Merchant",
+) -> bytes:
+    """The raw body of a simulated provider event for a mock card. ``amount``
+    is in MAJOR units, sent as a decimal string (never a float), as Nium's
+    are; the webhook's ``_normalize_charge_amount`` reads it that way."""
+    return json.dumps(
+        {
+            "card_token": card_token,
+            "type": event_type,
+            "event_id": event_id or f"mock_evt_{uuid.uuid4().hex}",
+            "amount": str(amount),
+            "merchant": {"descriptor": merchant},
+        },
+        separators=(",", ":"),
+    ).encode()
+
+
+def sign_mock_card_event(secret: str, raw_body: bytes) -> str:
+    """The hex HMAC-SHA256 the webhook checks (``webhook_security
+    .verify_hmac_sha256``), the same scheme as a real provider's delivery."""
+    return hmac.new(secret.encode("utf-8"), raw_body, hashlib.sha256).hexdigest()
+
 
 # Fixed namespace so a given idempotency key always maps to the same mock card
 # id, in this process and the next one.
