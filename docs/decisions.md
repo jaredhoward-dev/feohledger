@@ -26894,3 +26894,30 @@ specificity against `app.css`'s control base and reaches every `.card` in the
 app; scoped copies are the existing `organization/` pattern (`LineTotalCheckPanel`)
 and keep each panel's look provably identical. *Fewer, bigger props by passing
 the whole page state*: it would re-couple every panel to every other.
+
+## 531. `formatPeriod` assembles its label from parts, so a CLDR update cannot change it (round 44)
+
+**Problem.** `formatPeriod` (the chart-axis label on `/cfo` and the cash-flow
+panels) returned `toLocaleDateString(locale, {month: 'short', year: '2-digit'})`
+verbatim. CLDR 49 (ICU 79, shipped in Node 26) changed English's short-year
+patterns to carry an elision apostrophe: "Jun ’26" and "Jun 20, ’26" where
+CLDR 47 / 48 (Node 20 / 24, CI's Node 24) say "Jun 26" and "Jun 20, 26".
+`time.test.ts` failed on a Node 26 machine and passed in CI. The code, not the
+machine, was the fragile part: browsers ship their own ICU, so the label would
+have changed per user as their browser updated, with no change of ours.
+
+**Decision.** Build the label from `Intl.DateTimeFormat.formatToParts` and strip
+`’` / `'` from the literal that directly precedes the `year` part. CLDR still
+owns order, month names and every other separator (pt-BR "jun. de 26", ja
+"26年6月", de "Juni 26" are unchanged on CLDR 47–49). The unit test feeds the
+CLDR 49 part shape through a `formatToParts` spy, so both shapes are pinned on
+whichever ICU runs the suite.
+
+**Rejected.** *Adopt the apostrophe everywhere*: it does disambiguate "Jun ’26"
+from the 26th of June, but `formatMonth` already exists for a standalone month
+label (full year), and producing the mark on older CLDR means hand-inserting a
+locale-specific character, which is worse than removing one. *Pin Node 24
+locally / add an engines check*: the repo already runs fine on Node 26; the
+drift is in CLDR, which also reaches users through their browser, so a toolchain
+pin would hide the defect rather than fix it. *Loosen the test to accept either
+shape*: the variance is the bug (guard rail 4).

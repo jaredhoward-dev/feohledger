@@ -145,19 +145,37 @@ export function formatDate(
  * `YYYY-MM-DD` (day/week). Month keys render month + 2-digit year; day/week
  * keys add the day-of-month. Drives its locale off the active i18n locale,
  * the same way {@link formatDate} does. Returns the raw key unchanged if it
- * isn't a parseable date.
+ * isn't a parseable date. The output is the same on every CLDR version: no
+ * year-elision apostrophe ("Jun 26", never "Jun ’26").
  */
 export function formatPeriod(p: string): string {
 	// month keys are YYYY-MM; day/week keys are YYYY-MM-DD.
 	const isMonthKey = p.length === 7;
 	const d = parseLocalDate(p);
 	if (!d) return p;
-	return d.toLocaleDateString(getActiveFormatLocale(), {
+	// Assembled from parts rather than `toLocaleDateString`, so the label does
+	// not change with the runtime's CLDR version. CLDR 49 (ICU 79: Node 26,
+	// and browsers as they update) gave English a year-elision apostrophe
+	// ("Jun ’26", "Jun 20, ’26") where every earlier CLDR, and CI's Node 24,
+	// says "Jun 26". The apostrophe is dropped from the literal before the
+	// year; CLDR still decides order, month names and every other separator.
+	// docs/decisions.md §531.
+	const parts = new Intl.DateTimeFormat(getActiveFormatLocale(), {
 		month: 'short',
 		day: isMonthKey ? undefined : 'numeric',
 		year: '2-digit'
-	});
+	}).formatToParts(d);
+	return parts
+		.map((part, i) =>
+			part.type === 'literal' && parts[i + 1]?.type === 'year'
+				? part.value.replace(YEAR_ELISION, '')
+				: part.value
+		)
+		.join('');
 }
+
+/** A year-elision mark ("’26") a newer CLDR puts before a two-digit year. */
+const YEAR_ELISION = /[\u2019']/g;
 
 /**
  * A `YYYY-MM` month key as a reader says it, with the full year: "Nov 2026"
