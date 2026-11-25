@@ -25588,8 +25588,11 @@ answer it on.
   `privacy_acknowledgement_required`; 10/min per vendor user, like the
   employee endpoint; a first acknowledgement is audited
   `portal.legal.accepted` through the same helper as the set-password path; a
-  repeat writes nothing. It answers with the profile so the client needs no
-  second `/me`.
+  repeat writes nothing. That audit row is best-effort and dispatched after the
+  acknowledgement commits (`dispatch_auth_audit` swallows its own failure), as
+  on the set-password path: the acceptance table is the record of consent, and
+  an audit store outage must not refuse a supplier's acknowledgement. It
+  answers with the profile so the client needs no second `/me`.
 - **One profile builder.** Every route that answers with `PortalMeResponse`
   (`/me`, `PATCH /me`, change-password, MFA verify / disable) goes through
   `_portal_me_response`. The portal store replaces its copy of the user with
@@ -25682,6 +25685,20 @@ keep the whole-block replacement, so a save of a sibling key could still flip
 either control. *Refusing the whole `exception_agents` block on PATCH*: its
 other keys (`amount_tolerance_pct`, `po_match_window_days`) have no other
 writer yet.
+
+**Amendment (round 39 gate-fix).** The line-total GET reads the stored value
+for its truthiness, exactly as `invoice_warnings` does: it first read anything
+but a stored `False` as on, so a stored `0` / `null` had the engine's check off
+while the endpoint said on, and `PUT {enabled:true}` was a no-op. The PUT also
+rewrites a stored value that reads the same but is not the canonical one (a
+`0` for `False`, an unknown autonomy level read as `conservative`), audited
+with the raw value under `stored`. `guard_owned_keys` now 422s a present
+`fraud_rules` / `exception_agents` that is not an object (`null` replaced the
+block unaudited; a string crashed every later read of it), and accepts the
+owned key only as a real bool / a known level, so `0 == False` no longer
+passes. Turning the check off stops new findings only: an open
+`line_total_mismatch` stays open and keeps blocking the payment run until a
+person clears it.
 
 ## 503. Mobile Help opens the web help centre at the platform tenant URL, built from `/api/public-config` (round 39)
 

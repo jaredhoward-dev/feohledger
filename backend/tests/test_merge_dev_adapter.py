@@ -724,6 +724,17 @@ def test_changed_bills_states_since_in_utc():
     assert {c[1]["modified_after"] for c in calls} == {"2026-11-20T09:30:00Z"}
 
 
+def test_changed_bills_refuses_a_naive_since_before_any_call():
+    """A naive datetime would be read as the host's local time; refuse it
+    rather than shift the change window by the server's UTC offset."""
+    get, calls = _routed({"invoices": [_page([])], "payments": [_page([])]})
+    with patch("httpx.AsyncClient") as cm:
+        cm.return_value.__aenter__.return_value.get = get
+        with pytest.raises(ValueError, match="timezone-aware"):
+            _run(MergeDevAdapter(_ADAPTER).changed_bills(datetime(2026, 11, 20, 9, 30)))
+    assert calls == []
+
+
 @pytest.mark.parametrize("failing", ["invoices", "payments"])
 @pytest.mark.parametrize("status", [401, 429, 500])
 def test_changed_bills_never_returns_part_of_a_listing(failing, status):

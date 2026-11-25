@@ -55,6 +55,7 @@ from app.services import mfa, password_reset, portal_legal_acceptance
 from app.services.audit_dispatch import dispatch_auth_audit, queue_auth_audit
 from app.services.credential_upgrade import upgrade_password_hash
 from app.services.email_adapters import EmailMessage, get_email_adapter, is_supported_locale
+from app.services.legal_acceptance import SOURCE_REPROMPT
 from app.services.rate_limit import (
     EMAIL_OTP_PER_ACCOUNT_PER_HOUR,
     LOGIN_FAILURE_LIMIT,
@@ -468,7 +469,7 @@ async def portal_acknowledge_legal(
         )
     missing = await portal_legal_acceptance.missing_documents(db, vu.id)
     await portal_legal_acceptance.record_acknowledgement(
-        db, vendor_user_id=vu.id, source=portal_legal_acceptance.SOURCE_REPROMPT
+        db, vendor_user_id=vu.id, source=SOURCE_REPROMPT
     )
     await db.commit()
     if missing:
@@ -477,7 +478,7 @@ async def portal_acknowledge_legal(
             action="portal.legal.accepted",
             details={
                 "versions": portal_legal_acceptance.current_portal_versions(),
-                "source": portal_legal_acceptance.SOURCE_REPROMPT,
+                "source": SOURCE_REPROMPT,
                 "ip": resolve_client_ip(request),
             },
         )

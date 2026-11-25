@@ -91,6 +91,13 @@ its own panel, `/organization?section=line-total-check`. The generic `PATCH
 /api/organization` carries the stored value across a `fraud_rules` save and
 refuses a different one; the Fraud Detection form leaves the key out of its
 save. The switch applies from each invoice's next warning refresh.
+Turning it off stops new findings only: the next refresh drops the warning
+from the invoice, but an open or escalated `line_total_mismatch` exception
+stays open and keeps blocking the payment run until a person resolves or
+dismisses it (pinned in `tests/test_organization_controls.py`). A stored value
+is read for its truthiness, as the engine reads it, so a `0` / `null` reads
+off; the PUT rewrites any non-bool to a real one, and the generic `PATCH`
+accepts only a real bool for the key.
 
 ### Extraction's self-correction pass uses the same definition
 

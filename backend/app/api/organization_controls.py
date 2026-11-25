@@ -21,7 +21,7 @@ different one (`guard_owned_keys`), so these are the one way to change them.
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import Literal
+from typing import Literal, get_args
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, ConfigDict, StrictBool
@@ -50,6 +50,7 @@ AUDIT_UNWRITABLE_DETAIL = (
 )
 
 AutonomyLevel = Literal["conservative", "balanced", "aggressive"]
+AUTONOMY_LEVELS: frozenset[str] = frozenset(get_args(AutonomyLevel))
 
 
 class LineTotalCheckSetting(BaseModel):
@@ -65,12 +66,24 @@ class AutonomySetting(BaseModel):
 
 
 def line_total_check_enabled(org_settings: dict | None) -> bool:
-    """The rule as the warning engine reads it: an explicit stored value, else
-    the default. Anything but a stored `False` leaves the check on — the
-    engine only skips it on a falsy value, and only a bool is ever written."""
+    """The rule exactly as the warning engine reads it (`invoice_warnings`
+    `_fraud_config` + `if cfg[...]`): the stored value, else the default, taken
+    for its truthiness. A stored `0` / `None` / `""` turns the engine's check
+    off, so it must read off here too — reporting it on would hide a disabled
+    payment control and turn the PUT that re-enables it into a no-op."""
     rules = (org_settings or {}).get("fraud_rules") or {}
     value = rules.get(LINE_TOTAL_RULE, DEFAULT_FRAUD_RULES[LINE_TOTAL_RULE])
-    return value is not False
+    return bool(value)
+
+
+def _owned_value_refusal(block: str, key: str, path: str) -> HTTPException:
+    return HTTPException(
+        status_code=422,
+        detail=(
+            f"{block}.{key} is changed through {path}, which audits the "
+            "change; leave it out of this save."
+        ),
+    )
 
 
 def guard_owned_keys(incoming: dict, stored: dict | None) -> None:
@@ -79,28 +92,50 @@ def guard_owned_keys(incoming: dict, stored: dict | None) -> None:
 
     It replaces each top-level block whole, so a `fraud_rules` or
     `exception_agents` save that omits the key would drop it, and one that
-    names a different value would change it unrecorded. An omitted key gets
-    the stored value carried across; a value equal to the effective one passes;
-    a different one is a 422 naming the endpoint that owns it. Mutates
-    `incoming` in place.
+    names a different value would change it unrecorded. So:
+
+    * a block that is present but not an object (`null`, a string, a list) is
+      a 422 — it would replace the whole block, owned key included, and a
+      non-object block crashes every later reader of it;
+    * an omitted key gets the stored value carried across;
+    * a named key must be the canonical type — a real bool for the line-total
+      rule, one of the known levels for autonomy (`0 == False` is not an
+      equal value here) — and equal to the effective one, or it is a 422
+      naming the endpoint that owns it.
+
+    Mutates `incoming` in place.
     """
     stored = stored or {}
-    for block, key, effective, path in (
-        ("fraud_rules", LINE_TOTAL_RULE, line_total_check_enabled(stored), LINE_TOTAL_PATH),
-        ("exception_agents", AUTONOMY_KEY, resolve_autonomy_level(stored), AUTONOMY_PATH),
+    for block, key, effective, canonical, path in (
+        (
+            "fraud_rules",
+            LINE_TOTAL_RULE,
+            line_total_check_enabled(stored),
+            lambda v: type(v) is bool,
+            LINE_TOTAL_PATH,
+        ),
+        (
+            "exception_agents",
+            AUTONOMY_KEY,
+            resolve_autonomy_level(stored),
+            lambda v: isinstance(v, str) and v in AUTONOMY_LEVELS,
+            AUTONOMY_PATH,
+        ),
     ):
-        if block not in incoming or not isinstance(incoming[block], dict):
+        if block not in incoming:
             continue
         new_block = incoming[block]
+        if not isinstance(new_block, dict):
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"settings.{block} must be an object; {block}.{key} is changed through {path}."
+                ),
+            )
         if key in new_block:
-            if new_block[key] != effective:
-                raise HTTPException(
-                    status_code=422,
-                    detail=(
-                        f"{block}.{key} is changed through {path}, which audits the "
-                        "change; leave it out of this save."
-                    ),
-                )
+            value = new_block[key]
+            if not canonical(value) or value != effective:
+                raise _owned_value_refusal(block, key, path)
             continue
         stored_block = stored.get(block)
         if isinstance(stored_block, dict) and key in stored_block:
@@ -118,13 +153,23 @@ async def _set_one_key(
     effective: Callable[[dict | None], object],
     action: str,
 ) -> Organization:
-    """Under the org row lock: read the effective value, and when it differs
+    """Under the org row lock: read the effective value, and when it differs —
+    or the stored value reads the same but is not the canonical one (a `0`
+    where the rule wants `False`, an unknown level read as `conservative`) —
     write the audit row FIRST, then the one key with its block's siblings
     carried. Returns the locked, refreshed organization."""
     org = await lock_organization(db, org)
     before = effective(org.settings)
-    if before == after:
+    stored_block = (org.settings or {}).get(block)
+    has_raw = isinstance(stored_block, dict) and key in stored_block
+    raw = stored_block[key] if has_raw else None
+    canonical = not has_raw or (type(raw) is type(after) and raw == after)
+    if before == after and canonical:
         return org
+    details: dict = {"setting": f"{block}.{key}", "old": before, "new": after}
+    if not canonical:
+        # The effective value may not move; record what was rewritten.
+        details["stored"] = raw
     try:
         await record_auth_audit_or_raise(
             organization_id=org.id,
@@ -132,13 +177,12 @@ async def _set_one_key(
             action=action,
             entity_type="organization",
             entity_id=org.id,
-            details={"setting": f"{block}.{key}", "old": before, "new": after},
+            details=details,
         )
     except Exception:
         await db.rollback()
         raise HTTPException(status_code=503, detail=AUDIT_UNWRITABLE_DETAIL) from None
     existing = dict(org.settings or {})
-    stored_block = existing.get(block)
     existing[block] = {**(stored_block if isinstance(stored_block, dict) else {}), key: after}
     org.settings = existing
     flag_modified(org, "settings")

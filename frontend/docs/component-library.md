@@ -392,6 +392,14 @@ a definition as JSON). All wrap the shared `ui/Modal.svelte` and call the
   mounts and the URL survives; a 422 on a ticked box shows the box's
   documents-changed reload state, anything else (the 429) an alert.
   `<LegalAcceptStep onaccept={() => auth.acceptLegal()} onlogout={() => auth.logout()} />`.
+  Also takes `documents` (`"terms_privacy"` by default; `"privacy"` for the
+  Privacy Policy copy, the box's `privacy` form and the
+  `privacy_acknowledgement_required` stale-versions code) and an optional
+  `mark` snippet drawn in place of our wordmark. The supplier-portal layout
+  draws it with `documents="privacy"`, the tenant's white-label mark,
+  `onaccept={portalAuth.acknowledgeLegal}` and its own logout handler
+  (`portalAuth.logout`) while the portal user's
+  `legal_acceptance_required` is true (decisions §500).
   `docs/authentication.md` § Terms and Privacy acceptance.
 - `NotificationBell.svelte` — bell + unread badge in the sidebar header with a
   recent-notifications popover (replaced the old Notifications nav row; the full
