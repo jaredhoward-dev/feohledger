@@ -10,6 +10,7 @@
 	import { authErrorMessage } from '#lib/api/authRefusals.ts';
 	import { nextFromParams, postLoginTarget, withNext } from '#lib/utils/postLoginRedirect.ts';
 	import { normalizeOneTimeCode } from '#lib/utils/oneTimeCode.ts';
+	import { storageGet, storageRemove } from '#lib/utils/safeStorage.ts';
 
 	type Method = 'totp' | 'passkey' | 'email';
 
@@ -45,19 +46,11 @@
 	}
 
 	function readChallenge(): string | null {
-		try {
-			return sessionStorage.getItem(CHALLENGE_KEY);
-		} catch {
-			return null;
-		}
+		return storageGet(CHALLENGE_KEY, 'session');
 	}
 
 	function clearChallenge() {
-		try {
-			sessionStorage.removeItem(CHALLENGE_KEY);
-		} catch {
-			// Storage blocked — nothing was stored to clear.
-		}
+		storageRemove(CHALLENGE_KEY, 'session');
 	}
 
 	onMount(() => {

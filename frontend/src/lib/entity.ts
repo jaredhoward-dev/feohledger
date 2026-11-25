@@ -1,4 +1,5 @@
 import { getTenantStorageKey } from '#lib/tenant.ts';
+import { storageGet, storageRemove, storageSet } from '#lib/utils/safeStorage.ts';
 
 /**
  * Multi-entity (subsidiary) selection — the client half of the backend's
@@ -30,7 +31,8 @@ export function getStoredEntitySelection(): string {
 	if (typeof window === 'undefined') return ALL_ENTITIES;
 	const key = storageKey();
 	if (!key) return ALL_ENTITIES;
-	return localStorage.getItem(key) || ALL_ENTITIES;
+	// Blocked storage reads as the consolidated default (decisions §514).
+	return storageGet(key) || ALL_ENTITIES;
 }
 
 /**
@@ -47,8 +49,8 @@ export function setStoredEntitySelection(value: string): void {
 	const key = storageKey();
 	if (!key) return;
 	if (value === ALL_ENTITIES) {
-		localStorage.removeItem(key);
+		storageRemove(key);
 	} else {
-		localStorage.setItem(key, value);
+		storageSet(key, value);
 	}
 }

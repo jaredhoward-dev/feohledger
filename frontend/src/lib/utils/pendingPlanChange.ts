@@ -19,16 +19,14 @@
  * node environment reaches all of it; blocked storage only costs the resume.
  */
 
+import { storageArea } from '#lib/utils/safeStorage.ts';
+
 export const PENDING_PLAN_KEY = 'billing_pending_plan';
 
 export type PendingPlanStorage = Pick<Storage, 'getItem' | 'setItem' | 'removeItem'>;
 
 function defaultStorage(): PendingPlanStorage | null {
-	try {
-		return typeof sessionStorage === 'undefined' ? null : sessionStorage;
-	} catch {
-		return null;
-	}
+	return storageArea('session');
 }
 
 /**

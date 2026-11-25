@@ -1,7 +1,7 @@
 // Typed helpers for the expense + expense-report endpoints. All requests route
 // through the shared `api` client (Bearer + X-Tenant-Slug + X-Entity-ID +
 // 401-bounce). Mirrors the pattern of `src/lib/api/contracts.ts`.
-import { api, apiErrorFromBody, endSessionIfRejected } from '#lib/api.ts';
+import { api, apiErrorFromBody, endSessionIfRejected, getToken } from '#lib/api.ts';
 import { localizeApiDetail } from '#lib/api/codedRefusals.ts';
 import { m } from '#lib/i18n/store.svelte.ts';
 import { getApiBase, getTenantSlug } from '#lib/tenant.ts';
@@ -354,7 +354,7 @@ function parseSubmitViolations(body: unknown): { violations: PolicyViolation[]; 
 
 export async function submitReport(id: string): Promise<SubmitReportResult> {
 	const base = getApiBase();
-	const token = typeof window !== 'undefined' ? localStorage.getItem('auth_token') : null;
+	const token = getToken();
 	const headers: Record<string, string> = { 'Content-Type': 'application/json' };
 	if (token) headers['Authorization'] = `Bearer ${token}`;
 	const tenant = getTenantSlug();

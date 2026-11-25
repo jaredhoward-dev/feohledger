@@ -1,4 +1,6 @@
 <script lang="ts" module>
+	import { storageGet, storageRemove, storageSet } from '#lib/utils/safeStorage.ts';
+
 	/**
 	 * Cookie / consent banner — GDPR (ePrivacy) + CCPA non-essential consent.
 	 *
@@ -19,8 +21,9 @@
 
 	/** Read the persisted non-essential-storage consent choice (or `null`). */
 	export function getConsent(): ConsentChoice | null {
-		if (typeof localStorage === 'undefined') return null;
-		const v = localStorage.getItem(CONSENT_KEY);
+		// Guarded: `typeof localStorage` itself runs the getter, which throws
+		// where the browser blocks site storage (decisions §514).
+		const v = storageGet(CONSENT_KEY);
 		return v === 'accepted' || v === 'rejected' ? v : null;
 	}
 
@@ -42,11 +45,8 @@
 	 * full load.
 	 */
 	export function resetConsent(): void {
-		try {
-			localStorage.removeItem(CONSENT_KEY);
-		} catch {
-			// Storage blocked — the banner still reopens for this session below.
-		}
+		// Storage blocked — the banner still reopens for this session below.
+		storageRemove(CONSENT_KEY);
 		if (typeof window !== 'undefined') {
 			window.dispatchEvent(new CustomEvent(CONSENT_RESET_EVENT));
 		}
@@ -123,13 +123,10 @@
 	});
 
 	function record(value: ConsentChoice) {
-		try {
-			localStorage.setItem(CONSENT_KEY, value);
-		} catch {
-			// Storage may be blocked (private mode / disabled). Hiding the banner
-			// for the session is the safe, honest outcome — we simply won't load
-			// any non-essential script either way.
-		}
+		// Storage may be blocked (private mode / disabled). Hiding the banner
+		// for the session is the safe, honest outcome — we simply won't load
+		// any non-essential script either way.
+		storageSet(CONSENT_KEY, value);
 		choice = value;
 	}
 </script>
