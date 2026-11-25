@@ -83,6 +83,7 @@ SWEEP_SUBPROCESSOR_NOTICES = "subprocessor-notices"
 SWEEP_ERP_AUTO_SEND = "erp-auto-send"
 SWEEP_ERP_BUDGET_RETRY = "erp-budget-retry"
 SWEEP_ERP_STATUS_POLL = "erp-status-poll"
+SWEEP_MERGE_READBACK = "merge-readback"
 
 #: Every sweep name → the ``Settings`` attribute that gates it. The mapping is
 #: what lets the health endpoint distinguish "operator turned this off" from
@@ -110,6 +111,7 @@ SWEEP_ENABLED_FLAGS: dict[str, str] = {
     SWEEP_ERP_AUTO_SEND: "erp_auto_send_sweep_enabled",
     SWEEP_ERP_BUDGET_RETRY: "erp_budget_retry_sweep_enabled",
     SWEEP_ERP_STATUS_POLL: "erp_status_poll_sweep_enabled",
+    SWEEP_MERGE_READBACK: "merge_readback_sweep_enabled",
 }
 
 ALL_SWEEPS: tuple[str, ...] = tuple(SWEEP_ENABLED_FLAGS)

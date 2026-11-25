@@ -473,6 +473,19 @@ class Settings(BaseSettings):
     erp_status_poll_sweep_enabled: bool = False
     erp_status_poll_sweep_interval_seconds: int = Field(default=900, ge=60)
     erp_status_poll_sweep_batch_size: int = Field(default=50, ge=1)
+    # Merge.dev bill read-back (decisions §540, `services/merge_readback_sweep`):
+    # the backstop for the Merge webhook, which drops a delivery it cannot
+    # verify (credentials unopenable, unseal budget spent for a cold tenant,
+    # §408 / §525 / §527). Lists each Merge tenant's bills changed since its
+    # cursor (`settings.erp_merge_readback`; the first pass looks back
+    # `lookback_hours`), keeps those we pushed, reads at most `batch_size` back
+    # a tick and applies each with the webhook's own reconciler. Stops a
+    # tenant's pass at the ERP call budget. Off by default like every sweep
+    # that calls out.
+    merge_readback_sweep_enabled: bool = False
+    merge_readback_sweep_interval_seconds: int = Field(default=900, ge=60)
+    merge_readback_sweep_lookback_hours: int = Field(default=48, ge=1)
+    merge_readback_sweep_batch_size: int = Field(default=50, ge=1)
 
     # Commerce / inventory sync (decisions §273, `services/commerce_sync.py`).
     # OPERATOR-only override that points EVERY commerce adapter at one fake
