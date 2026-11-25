@@ -86,9 +86,10 @@
 	import RowAction from '#lib/components/ui/RowAction.svelte';
 	import RefusalNote from '#lib/components/ui/RefusalNote.svelte';
 	import BulkBar from '#lib/components/ui/BulkBar.svelte';
+	import LinkedMessage from '#lib/components/ui/LinkedMessage.svelte';
 	import Money from '#lib/components/ui/Money.svelte';
 	import ExpensePicker from '#lib/components/ui/ExpensePicker.svelte';
-	import { composableReports, type ExpensePickerOption } from '#lib/utils/expensePicker.ts';
+	import { composableReports, splitAttachable, type ExpensePickerOption } from '#lib/utils/expensePicker.ts';
 	import type { SearchPickerLoad } from '#lib/utils/searchPicker.ts';
 	import { DEFAULT_CURRENCY, formatMoney } from '#lib/utils/money.ts';
 	import { formatCurrencyTotals } from '#lib/utils/currencyGroups.ts';
@@ -98,7 +99,7 @@
 	import { isRowOpenClick } from '#lib/utils/rowNav.ts';
 	import { pruneSelection } from '#lib/utils/selection.ts';
 	import { page } from '$app/state';
-	import { replaceState } from '$app/navigation';
+	import { afterNavigate, replaceState } from '$app/navigation';
 	import { untrack } from 'svelte';
 	import { createRequestSequencer } from '#lib/utils/requestSequence.ts';
 	import { appendUnique } from '#lib/utils/pagination.ts';
@@ -162,6 +163,11 @@
 	// whenever the filters actually change.
 	let selectedAllMatching = $state(false);
 	let selectingAllMatching = $state(false);
+	// The server's attachable subset of an all-matching selection
+	// (`GET /api/expenses/ids?attachable=true`), resolved alongside it: the
+	// bulk "Add to report" can judge only loaded rows itself. Read only while
+	// `selectedAllMatching` holds.
+	let matchingAttachable = $state<Set<string> | null>(null);
 
 	// Chip statuses = the reachable subset ∪ whatever is ACTIVE. The subset omits
 	// `rejected` and `reimbursed` because nothing in the backend ever assigns
@@ -479,8 +485,13 @@
 	async function selectAllMatching() {
 		selectingAllMatching = true;
 		try {
-			const res = await getExpenseIds(buildParams());
+			const params = buildParams();
+			const [res, attachableRes] = await Promise.all([
+				getExpenseIds(params),
+				canCreate ? getExpenseIds({ ...params, attachable: true }) : Promise.resolve(null)
+			]);
 			selected = new Set(res.ids);
+			matchingAttachable = attachableRes ? new Set(attachableRes.ids) : null;
 			selectedAllMatching = true;
 			if (res.truncated) {
 				toast(
@@ -568,18 +579,41 @@
 		});
 	});
 
-	// One attach call over the whole selection: the server checks every line
-	// (its creator, the source report it may sit on, the conversion into the
-	// report's currency) and refuses the whole attach on the first it cannot
-	// take, so a partial report is never left behind. Its refusal is shown as
-	// the server's own localized sentence.
+	// Only the selected lines an attach by the caller would take are sent:
+	// their own (or unrecorded) loose draft lines. A line already on a report
+	// is skipped and counted, never sent — the endpoint would move it off that
+	// report silently (decisions §515) — and so are a colleague's lines and
+	// non-drafts, which it would refuse. An all-matching selection is judged by
+	// the server's own attachable set, since most of it was never loaded.
+	const bulkAttach = $derived(
+		splitAttachable(
+			selected,
+			expenseStore.all,
+			auth.user?.id,
+			selectedAllMatching ? (matchingAttachable ?? new Set()) : null
+		)
+	);
+
+	// One attach call over the attachable lines: the server still checks every
+	// line (its creator, the conversion into the report's currency) and refuses
+	// the whole attach on the first it cannot take, so a partial report is
+	// never left behind. Its refusal is shown as the server's own localized
+	// sentence.
 	async function applyBulkAttach() {
-		if (selected.size === 0 || !bulkReportId) return;
+		const { attachable, skipped } = bulkAttach;
+		if (attachable.length === 0 || !bulkReportId) return;
 		bulkBusy = true;
 		try {
-			const report = await attachExpenses(bulkReportId, [...selected], false);
+			const report = await attachExpenses(bulkReportId, attachable, false);
 			toast(
-				m('expenses.bulk.addedToReport', { n: selected.size, report: report.report_number }),
+				skipped
+					? m('expenses.bulk.addedToReportSkipped', {
+							n: attachable.length,
+							total: attachable.length + skipped,
+							skipped,
+							report: report.report_number
+						})
+					: m('expenses.bulk.addedToReport', { n: attachable.length, report: report.report_number }),
 				'success'
 			);
 			selected = new Set();
@@ -931,6 +965,16 @@
 	// …and so does `?tab=policies` for a reader without the Policies tab.
 	$effect(() => {
 		if (tab === 'policies' && !canManagePolicies) untrack(() => switchTab('expenses'));
+	});
+
+	// A link to `?tab=…` on this page (the bulk bar's "create one on the
+	// Reports tab") is a same-route navigation: the page is not remounted, so
+	// `tab` — read from the URL once — follows it here. `replaceState` writes
+	// from `syncUrl()` are not navigations and never reach this.
+	afterNavigate(({ type, to }) => {
+		if (type === 'enter' || !to) return;
+		const next = parseTab(to.url.searchParams.get('tab'));
+		if (next !== tab) switchTab(next);
 	});
 
 	function switchTab(next: Tab) {
@@ -2097,7 +2141,16 @@
 						<span class="bulk-all-matching-note">{m('expenses.bulk.reportsLoadFailed')}</span>
 						<button type="button" class="btn-secondary" onclick={() => loadBulkReports()}>{m('common.retry')}</button>
 					{:else if bulkReportsState === 'ready' && bulkReports.length === 0}
-						<span class="bulk-all-matching-note">{m('expenses.bulk.noDraftReports')}</span>
+						<span class="bulk-all-matching-note" data-testid="expense-bulk-no-draft-reports">
+							<LinkedMessage
+								text={m('expenses.bulk.noDraftReports')}
+								links={{ link: { href: '/expenses?tab=reports', label: m('expenses.bulk.noDraftReportsLink') } }}
+							/>
+						</span>
+					{:else if bulkAttach.attachable.length === 0}
+						<!-- Nothing selected is one an attach would take: say why
+						     rather than offer a button the server refuses. -->
+						<span class="bulk-all-matching-note" data-testid="expense-bulk-none-attachable">{m('expenses.bulk.noneAttachable')}</span>
 					{:else}
 						<select
 							class="bulk-gl-select"
@@ -2121,8 +2174,11 @@
 							onclick={applyBulkAttach}
 							data-testid="expense-bulk-add-submit"
 						>
-							{m('expenses.bulk.addToReport', { n: selected.size })}
+							{m('expenses.bulk.addToReport', { n: bulkAttach.attachable.length })}
 						</button>
+						{#if bulkAttach.skipped > 0}
+							<span class="bulk-all-matching-note" data-testid="expense-bulk-skip-note">{m('expenses.bulk.willSkip', { n: bulkAttach.skipped })}</span>
+						{/if}
 					{/if}
 				</span>
 			{/if}

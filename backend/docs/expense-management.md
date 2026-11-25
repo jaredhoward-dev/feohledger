@@ -196,11 +196,17 @@ free-text "Expense ID to attach" box (with a datalist of the loaded page's
 lines), which needed an id no screen shows. The expenses list's bulk bar adds
 **Add to report**: the selection goes onto one of the caller's own draft
 reports (`GET /api/expense-reports?mine=true&status=draft`, kept to the rows
-whose `actions.compose` is null) in ONE attach call. The server refuses the
-whole call on the first line it cannot take (a colleague's line, a line on a
-locked report, a currency with no rate), so no partial report is left, and the
-page shows its localized refusal. A selected line already on another of the
-caller's unlocked reports is moved, as the endpoint has always done.
+whose `actions.compose` is null) in ONE attach call. Only the selected lines
+an attach by the caller would take are sent (on no report, `draft`, theirs or
+unrecorded — `utils/expensePicker.splitAttachable` over the loaded rows, or
+`GET /api/expenses/ids?attachable=true` for a "select all N matching"
+selection); the rest are skipped and counted ("M of N added, K skipped"), so a
+line already on another report is never moved by an "add". With nothing
+attachable the bar says why instead of offering the button, and with no draft
+report it links to the Reports tab. The server still refuses the whole call on
+the first line it cannot take (a currency with no rate, a row changed since it
+loaded), so no partial report is left, and the page shows its localized
+refusal.
 
 The server is the
 control; the web app offers attach / detach / submit / approve / reject from
@@ -272,7 +278,7 @@ string-Decimal amounts — never PII.
 
 | Method | Path | Purpose |
 |--------|------|---------|
-| GET | `/api/expenses` | List, paginated, entity-scoped (`X-Entity-ID`); `?status=` + `?report_id=` + `?search=` filters, all composable. `?attachable=true` (list only) narrows to the lines an attach by the CALLER accepts — on no report, `draft`, created by the caller or by nobody recorded (`_attachable_by`, the attach gate's rule) — the report attach picker's source (decisions §515). `search` ILIKEs the three free-text columns the row renders — `merchant`, `description`, `category`. Before it existed the page could only filter the rows it had already loaded, so a term matching an expense past the first page read as "nothing matched". |
+| GET | `/api/expenses` | List, paginated, entity-scoped (`X-Entity-ID`); `?status=` + `?report_id=` + `?search=` filters, all composable. `?attachable=true` (also on `GET /api/expenses/ids`, the select-all resolver) narrows to the lines an attach by the CALLER accepts — on no report, `draft`, created by the caller or by nobody recorded (`_attachable_by`, the attach gate's rule) — the report attach picker's source (decisions §515). `search` ILIKEs the three free-text columns the row renders — `merchant`, `description`, `category`. Before it existed the page could only filter the rows it had already loaded, so a term matching an expense past the first page read as "nothing matched". |
 | POST | `/api/expenses` | Create an expense, stamping the caller as `created_by_user_id` (the line's owner while it sits on no report — [Line ownership](#line-ownership--a-line-on-no-report-is-its-creators)). With `report_id`, only that report's owner may create it (**403** `expense_report_not_owner` — [Report ownership](#report-ownership--only-the-owner-composes-edits-or-submits-a-report)). `amount` must be **strictly positive** (`gt=0` → 422 otherwise; a negative line could net a report under the CFO threshold while hiding a large expense). Lands under the selected entity (or the tenant default). If `report_id` is supplied this **is** an attach and gates like one: the target report must still be a `draft` (**409** otherwise, same rule as `POST /api/expense-reports/{id}/expenses`), and its `total_amount` is then recomputed. Creating straight onto a locked report used to be the one attach path with no gate — it moved an approved report's total past the CFO threshold it was approved under, and nulled the locked `reporting_*` figure that decision was derived from. |
 | GET | `/api/expenses/receipt/{file_key:path}` | Download proxy for a stored receipt. The owning expense is parsed from the key, resolved within the selected entity, and must hold this key as its current `receipt_file_key` (`api/file_proxy`); every refusal is the same 404 as a missing file. Declared before `/{expense_id}` so `receipt` isn't captured as an id. |
 | POST | `/api/expenses/{id}/receipt` | Upload a receipt to S3 (`upload_expense_receipt`) and stamp `receipt_file_key`. On a line that sits on a report, owner only (**403** `expense_report_not_owner`); on a line on no report, its creator only (**403** `expense_not_creator`). **409** when the line sits on a locked report (submitted/pending_approval/approved/reimbursed) — the receipt is the evidence the approver reviewed, so it is frozen with the rest of the line (checked before the upload, so a refused replacement never reaches storage). A `rejected` report's lines stay uploadable. |

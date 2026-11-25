@@ -18,12 +18,19 @@ import {
  *   (`GET /api/expenses?attachable=true`) and never a colleague's, and
  *   picking one and pressing Attach puts it on the report.
  * - "Add to report" on the expenses list's bulk bar adds the selection to one
- *   of the reader's own draft reports, and a line the server refuses (a
- *   colleague's) is refused whole, with the server's own sentence on screen.
+ *   of the reader's own draft reports. Only the lines an attach would take
+ *   are sent: a line already on another report is skipped, never moved, and
+ *   a colleague's line is skipped rather than sent to be refused; the toast
+ *   says how many were added and how many skipped.
+ * - With no draft report to add to, the bar says so and links to the Reports
+ *   tab.
  *
- * Real stack, no stubs: the colleague's line is created by the worker's clerk
- * through the API; the page is read as the worker admin (the default storage
- * state), who owns the report.
+ * Real stack: the colleague's line is created by the worker's clerk through
+ * the API; the page is read as the worker admin (the default storage state),
+ * who owns the report. The one stub is the no-draft-reports case, which
+ * answers the bar's own `mine=true&status=draft` read with an empty page:
+ * the shared worker admin may own drafts other specs left, and deleting them
+ * would race those specs.
  */
 
 interface Created {
@@ -130,52 +137,108 @@ test.describe('/expenses — attach by picking, not by id (§515)', () => {
 		}
 	});
 
-	test('"Add to report" adds the selection, and a colleague\'s line is refused whole with the server\'s reason', async ({
+	test('"Add to report" sends only attachable lines and reports the rest as skipped', async ({
 		page,
 		tenantClerk
 	}) => {
 		const tag = `E2E-Bulk-${Date.now()}`;
 		const mine = `${tag} Mine`;
 		const theirs = `${tag} Theirs`;
+		const placed = `${tag} Placed`;
 		const reportNumber = `E2E-BULK-${Date.now()}`;
+		const otherNumber = `E2E-BULK-OTHER-${Date.now()}`;
 		const ids: string[] = [];
 		let reportId: string | null = null;
+		let otherId: string | null = null;
 		try {
 			await page.goto('/expenses');
-			ids.push(await createExpense(page, await authedTenantHeaders(page), mine));
+			const own = await authedTenantHeaders(page);
+			ids.push(await createExpense(page, own, mine));
 			ids.push(await createExpense(page, await clerkHeaders(page, tenantClerk), theirs));
+			ids.push(await createExpense(page, own, placed));
 			reportId = await createReport(page, reportNumber);
+			// The reader's own line, already on their OTHER draft report: the
+			// endpoint would move it; the bulk add must leave it where it is.
+			otherId = await createReport(page, otherNumber);
+			const onOther = await page.request.post(`${API_BASE}/api/expense-reports/${otherId}/expenses`, {
+				headers: own,
+				data: { expense_ids: [ids[2]], detach: false }
+			});
+			expect(onOther.status()).toBe(200);
 
 			await page.goto(`/expenses?search=${encodeURIComponent(tag)}`);
 
-			// The colleague's line in the selection: the server refuses the whole
-			// attach, and its sentence is what the reader sees.
-			await page.getByRole('checkbox', { name: `Select expense ${mine}` }).check();
+			// Only lines an attach would refuse or move: nothing to send, and the
+			// bar says why instead of offering the button.
 			await page.getByRole('checkbox', { name: `Select expense ${theirs}` }).check();
+			await page.getByRole('checkbox', { name: `Select expense ${placed}` }).check();
+			await expect(page.getByTestId('expense-bulk-none-attachable')).toHaveText(
+				"None of the selected lines can be added: each is already on a report, not a draft, or someone else's."
+			);
+			await expect(page.getByTestId('expense-bulk-add-submit')).toHaveCount(0);
+
+			// Add the reader's own loose line: one is sent, two are skipped.
+			await page.getByRole('checkbox', { name: `Select expense ${mine}` }).check();
+			const submit = page.getByTestId('expense-bulk-add-submit');
+			await expect(submit).toHaveText('Add 1 to report');
+			await expect(page.getByTestId('expense-bulk-skip-note')).toHaveText(
+				'2 will be skipped (already on a report, not a draft, or not yours)'
+			);
 			const select = page.getByTestId('expense-bulk-report-select');
 			await expect(select).toBeEnabled();
 			await select.selectOption(reportId);
-			const refused = page.waitForResponse(isAttachPost(reportId));
-			await page.getByTestId('expense-bulk-add-submit').click();
-			expect((await refused).status()).toBe(403);
-			await expect(
-				page.getByText('This expense was created by someone else. Only its creator can put it on a report.')
-			).toBeVisible();
-			expect(reportIdOf(ids[0])).toBe('');
-
-			// Just the reader's own line: added.
-			await page.getByRole('checkbox', { name: `Select expense ${theirs}` }).uncheck();
-			await select.selectOption(reportId);
 			const added = page.waitForResponse(isAttachPost(reportId));
-			await page.getByTestId('expense-bulk-add-submit').click();
+			await submit.click();
 			const res = await added;
 			expect(res.status()).toBe(200);
 			expect(res.request().postDataJSON()).toEqual({ expense_ids: [ids[0]], detach: false });
-			await expect(page.getByText(`1 added to ${reportNumber}`)).toBeVisible();
+			await expect(
+				page.getByText(
+					`1 of 3 added to ${reportNumber}; 2 skipped (already on a report, not a draft, or not yours)`
+				)
+			).toBeVisible();
 			expect(reportIdOf(ids[0])).toBe(reportId);
 			expect(reportIdOf(ids[1])).toBe('');
+			// Skipped, not moved.
+			expect(reportIdOf(ids[2])).toBe(otherId);
 		} finally {
+			cleanup(otherId, []);
 			cleanup(reportId, ids);
+		}
+	});
+
+	test('with no draft report the bar says so and links to the Reports tab', async ({ page }) => {
+		const tag = `E2E-NoDraft-${Date.now()}`;
+		const ids: string[] = [];
+		try {
+			await page.goto('/expenses');
+			ids.push(await createExpense(page, await authedTenantHeaders(page), `${tag} Mine`));
+			// The bar's own read of the reader's draft reports, answered empty.
+			await page.route(
+				(url) =>
+					url.pathname === '/api/expense-reports' &&
+					url.searchParams.get('mine') === 'true' &&
+					url.searchParams.get('status') === 'draft',
+				(route) =>
+					route.fulfill({
+						status: 200,
+						contentType: 'application/json',
+						body: JSON.stringify({ items: [], total: 0, page: 1, page_size: 100 })
+					})
+			);
+
+			await page.goto(`/expenses?search=${encodeURIComponent(tag)}`);
+			await page.getByRole('checkbox', { name: `Select expense ${tag} Mine` }).check();
+
+			const empty = page.getByTestId('expense-bulk-no-draft-reports');
+			await expect(empty).toHaveText('You have no draft reports. Create one on the Reports tab.');
+			await expect(page.getByTestId('expense-bulk-report-select')).toHaveCount(0);
+
+			await empty.getByRole('link', { name: 'Create one on the Reports tab' }).click();
+			await expect(page).toHaveURL(/[?&]tab=reports(&|$)/);
+			await expect(page.getByRole('tab', { name: 'Reports' })).toHaveAttribute('aria-selected', 'true');
+		} finally {
+			cleanup(null, ids);
 		}
 	});
 });
