@@ -23,11 +23,15 @@ from app.services.erp_adapters.base import (
     BILL_PAYMENT_VOIDED,
     PAYMENT_ACCOUNT_NOT_MAPPED,
     PAYMENT_EXCEEDS_BALANCE,
+    DiscountCreditPayload,
     ErpBillState,
     ErpListingIncomplete,
     PaymentPayload,
 )
-from app.services.erp_adapters.quickbooks_online import QuickBooksOnlineAdapter
+from app.services.erp_adapters.quickbooks_online import (
+    CURRENCY_MISMATCH,
+    QuickBooksOnlineAdapter,
+)
 from app.utils.json_money import dumps_exact_json
 
 REALM = "9130"
@@ -67,6 +71,8 @@ class _Qbo:
         self.cdc: dict = {"CDCResponse": [{"QueryResponse": [{"Bill": []}, {"BillPayment": []}]}]}
         self.post_answer: MagicMock | None = None
         self.next_id = 900
+        self.vendor_credits: dict[str, dict] = {}
+        self.fail_apply = False
 
     def bill(self, bill_id="501", total="100.00", balance=None, note=f"FeohLedger {CORR}", **kw):
         self.bills[bill_id] = {
@@ -113,8 +119,27 @@ class _Qbo:
         if path.startswith("billpayment/"):
             record = self.payments.get(path.split("/", 1)[1])
             return _resp(200, {"BillPayment": record}) if record else _gone()
+        if path.startswith("vendorcredit"):
+            return self._vendor_credit(method, path, params, content)
         if method == "POST" and path == "billpayment":
             body = json.loads(content, parse_float=Decimal)
+            if (params or {}).get("operation") == "delete":
+                record = self.payments.pop(body["Id"])
+                for line in record["Line"]:
+                    for link in line["LinkedTxn"]:
+                        if link["TxnType"] == "Bill":
+                            bill = self.bills[link["TxnId"]]
+                            bill["Balance"] += line["Amount"]
+                            bill["LinkedTxn"] = [
+                                t for t in bill["LinkedTxn"] if t["TxnId"] != body["Id"]
+                            ]
+                return _resp(200, {"BillPayment": {"Id": body["Id"], "status": "Deleted"}})
+            if any(
+                t["TxnType"] == "VendorCredit"
+                for line in body.get("Line") or []
+                for t in line["LinkedTxn"]
+            ):
+                return self._apply_credit(body, params)
             if (params or {}).get("include") == "void":
                 record = self.payments[body["Id"]]
                 bill_id = record["Line"][0]["LinkedTxn"][0]["TxnId"]
@@ -136,6 +161,42 @@ class _Qbo:
             self.replays[rid] = {"BillPayment": self.payments[pid]}
             return _resp(200, {"BillPayment": self.payments[pid]})
         raise AssertionError(f"unexpected {method} {url}")
+
+    # VendorCredit and its $0 BillPayment application (decisions §575).
+    def _vendor_credit(self, method, path, params, content):
+        if method == "GET":
+            record = self.vendor_credits.get(path.split("/", 1)[1])
+            return _resp(200, {"VendorCredit": record}) if record else _gone()
+        body = json.loads(content, parse_float=Decimal)
+        if (params or {}).get("operation") == "delete":
+            self.vendor_credits.pop(body["Id"])
+            return _resp(200, {"VendorCredit": {"Id": body["Id"], "status": "Deleted"}})
+        rid = (params or {}).get("requestid")
+        if rid in self.replays:
+            return _resp(200, self.replays[rid])
+        vid = f"vc-{len(self.vendor_credits) + 1}"
+        self.vendor_credits[vid] = {**body, "Id": vid, "SyncToken": "0"}
+        self.replays[rid] = {"VendorCredit": self.vendor_credits[vid]}
+        return _resp(200, self.replays[rid])
+
+    def _apply_credit(self, body, params):
+        if self.fail_apply:
+            return _resp(400, {"Fault": {"Error": [{"code": "6000", "element": "Line"}]}})
+        rid = (params or {}).get("requestid")
+        if rid in self.replays:
+            return _resp(200, self.replays[rid])
+        assert body["TotalAmt"] == 0
+        pid = str(self.next_id)
+        self.next_id += 1
+        self.payments[pid] = {**body, "Id": pid, "SyncToken": "0"}
+        for line in body["Line"]:
+            for link in line["LinkedTxn"]:
+                if link["TxnType"] == "Bill":
+                    bill = self.bills[link["TxnId"]]
+                    bill["Balance"] -= line["Amount"]
+                    bill["LinkedTxn"].append({"TxnId": pid, "TxnType": "BillPaymentCheck"})
+        self.replays[rid] = {"BillPayment": self.payments[pid]}
+        return _resp(200, self.replays[rid])
 
     def posts(self):
         return [
@@ -845,3 +906,119 @@ def test_an_erp_without_status_sync_answers_fail_closed_by_default():
     assert asyncio.run(adapter.void_payment(_payload())).success is False
     assert asyncio.run(adapter.bills_for_payment("9")) == []
     assert asyncio.run(adapter.changed_bills(datetime(2026, 10, 1, tzinfo=UTC))) == []
+
+
+# ---------------------------------------------------------------------------
+# early-payment discount booked as a VendorCredit (decisions §575)
+
+
+def _credit(**overrides) -> DiscountCreditPayload:
+    base = dict(
+        payment_id=PAYMENT_ID,
+        bill_id="501",
+        amount=Decimal("2.00"),
+        currency="USD",
+        credit_on=date(2026, 10, 2),
+        discount_account_erp_id="88",
+        pay_from_account_erp_id="35",
+    )
+    base.update(overrides)
+    return DiscountCreditPayload(**base)
+
+
+def _discounted(qbo: _Qbo) -> dict:
+    bill = qbo.bill()
+    assert _run(qbo, lambda: _adapter().post_payment(_payload(amount=Decimal("98.00")))).success
+    assert bill["Balance"] == Decimal("2.00")
+    return bill
+
+
+def _bodies(qbo: _Qbo, path: str) -> list[dict]:
+    return [
+        json.loads(c["content"], parse_float=Decimal)
+        for c in qbo.calls
+        if c["method"] == "POST"
+        and c["url"].endswith(f"/{path}")
+        and not (c["params"] or {}).get("operation")
+    ]
+
+
+def test_the_discount_is_booked_as_a_vendor_credit_applied_to_the_bill():
+    qbo = _Qbo()
+    bill = _discounted(qbo)
+    result = _run(qbo, lambda: _adapter().post_discount_credit(_credit()))
+    assert result.success, result.message
+    assert result.erp_document_id == "vc-1" and result.bill_balance_after == Decimal("0")
+    [credit] = _bodies(qbo, "vendorcredit")
+    assert credit["VendorRef"] == {"value": "56"}
+    assert credit["PrivateNote"] == f"FeohLedger discount {PAYMENT_ID}"
+    assert credit["CurrencyRef"] == {"value": "USD"}
+    assert credit["Line"] == [
+        {
+            "Amount": Decimal("2.00"),
+            "DetailType": "AccountBasedExpenseLineDetail",
+            "Description": "Early-payment discount",
+            "AccountBasedExpenseLineDetail": {"AccountRef": {"value": "88"}},
+        }
+    ]
+    apply = _bodies(qbo, "billpayment")[-1]
+    assert apply["TotalAmt"] == 0
+    assert [line["LinkedTxn"] for line in apply["Line"]] == [
+        [{"TxnId": "501", "TxnType": "Bill"}],
+        [{"TxnId": "vc-1", "TxnType": "VendorCredit"}],
+    ]
+    # Our payment plus our credit are ours: not news to the status sync, and
+    # the $0 application is never mistaken for a voided write-back of ours.
+    report = _run(qbo, lambda: _adapter().bill_report("501"))
+    assert report.state is ErpBillState.paid
+    assert report.paid_only_by_us and not report.reduced_outside
+    assert bill["Balance"] == 0
+    replay = _run(qbo, lambda: _adapter().post_payment(_payload(amount=Decimal("98.00"))))
+    assert replay.success
+
+
+def test_a_replay_of_the_discount_credit_books_nothing_twice():
+    qbo = _Qbo()
+    _discounted(qbo)
+    first = _run(qbo, lambda: _adapter().post_discount_credit(_credit()))
+    again = _run(qbo, lambda: _adapter().post_discount_credit(_credit()))
+    assert again.success and again.erp_document_id == first.erp_document_id
+    assert len(_bodies(qbo, "vendorcredit")) == 1 and len(qbo.vendor_credits) == 1
+
+
+def test_a_credit_created_but_not_applied_is_applied_once_on_retry():
+    qbo = _Qbo()
+    bill = _discounted(qbo)
+    qbo.fail_apply = True
+    assert not _run(qbo, lambda: _adapter().post_discount_credit(_credit())).success
+    qbo.fail_apply = False
+    retried = _run(qbo, lambda: _adapter().post_discount_credit(_credit()))
+    assert retried.success and retried.erp_document_id == "vc-1"
+    assert len(qbo.vendor_credits) == 1 and bill["Balance"] == 0
+
+
+def test_voiding_deletes_the_application_and_the_credit_once():
+    qbo = _Qbo()
+    bill = _discounted(qbo)
+    _run(qbo, lambda: _adapter().post_discount_credit(_credit()))
+    voided = _run(qbo, lambda: _adapter().void_discount_credit(_credit()))
+    assert voided.success and voided.erp_document_id == "vc-1"
+    assert qbo.vendor_credits == {} and bill["Balance"] == Decimal("2.00")
+    again = _run(qbo, lambda: _adapter().void_discount_credit(_credit()))
+    assert again.success and again.erp_document_id is None
+
+
+@pytest.mark.parametrize(
+    ("overrides", "code"),
+    [
+        ({"currency": "EUR"}, CURRENCY_MISMATCH),
+        ({"amount": Decimal("2.01")}, PAYMENT_EXCEEDS_BALANCE),
+        ({"discount_account_erp_id": None}, PAYMENT_ACCOUNT_NOT_MAPPED),
+    ],
+)
+def test_the_discount_credit_refuses_before_writing(overrides, code):
+    qbo = _Qbo()
+    _discounted(qbo)
+    result = _run(qbo, lambda: _adapter().post_discount_credit(_credit(**overrides)))
+    assert not result.success and result.refusal_code == code and result.not_posted
+    assert not _bodies(qbo, "vendorcredit")

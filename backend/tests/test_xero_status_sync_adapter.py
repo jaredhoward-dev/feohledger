@@ -33,6 +33,7 @@ from app.services.erp_adapters.base import (
     PAYMENT_ACCOUNT_NOT_MAPPED,
     PAYMENT_EXCEEDS_BALANCE,
     PAYMENTS_SCOPE_MISSING,
+    DiscountCreditPayload,
     ErpBillState,
     ErpListingIncomplete,
     ErpScopeMissing,
@@ -76,6 +77,8 @@ class _Xero:
         self.extra_changed: list[dict] = []
         self.lose_next_put = False
         self.next_id = 1
+        self.credit_notes: dict[str, dict] = {}
+        self.fail_allocation = False
 
     # -- state ---------------------------------------------------------------
 
@@ -201,6 +204,73 @@ class _Xero:
             assert json.loads(request.content) == {"Status": "DELETED"}
             self.delete_payment(pid)
             return self._json(200, {"Payments": [self.payments[pid]]})
+        if "CreditNotes" in path:
+            return self._credit_notes(request, path, q)
+        raise AssertionError(f"unexpected {request.method} {request.url}")
+
+    # Credit notes (decisions §575), in the shapes Xero documents for an
+    # ACCPAYCREDIT and its allocations.
+    def _credit_notes(self, request, path, q) -> httpx.Response:
+        parts = path.split("/")
+        if request.method == "GET" and path == "CreditNotes":
+            rows = list(self.credit_notes.values())
+            for value in re.findall(r'CreditNoteNumber=="([^"]*)"', q.get("where", "")):
+                rows = [r for r in rows if r["CreditNoteNumber"] == value]
+            return self._json(200, {"CreditNotes": [dict(r, Allocations=[]) for r in rows]})
+        if request.method == "GET" and len(parts) == 2:
+            note = self.credit_notes.get(parts[1])
+            return self._json(200, {"CreditNotes": [note]}) if note else self._json(404, {})
+        if request.method == "PUT" and path == "CreditNotes":
+            key = request.headers.get("Idempotency-Key")
+            if key in self.replays:
+                return self._json(200, self.replays[key])
+            [item] = json.loads(request.content, parse_float=Decimal)["CreditNotes"]
+            assert item["Type"] == "ACCPAYCREDIT" and item["Status"] == "AUTHORISED"
+            cid = f"cn-ours-{len(self.credit_notes) + 1}"
+            [line] = item["LineItems"]
+            self.credit_notes[cid] = {
+                **item,
+                "CreditNoteID": cid,
+                "Total": Decimal(str(line["UnitAmount"])),
+                "RemainingCredit": Decimal(str(line["UnitAmount"])),
+                "Allocations": [],
+            }
+            answer = {"CreditNotes": [dict(self.credit_notes[cid])]}
+            self.replays[key] = answer
+            return self._json(200, answer)
+        if request.method == "PUT" and len(parts) == 3 and parts[2] == "Allocations":
+            if self.fail_allocation:
+                return self._json(400, {"Type": "ValidationException"})
+            note = self.credit_notes[parts[1]]
+            [item] = json.loads(request.content, parse_float=Decimal)["Allocations"]
+            amount = Decimal(str(item["Amount"]))
+            bill = self.bills[item["Invoice"]["InvoiceID"]]
+            if amount > bill["AmountDue"] or amount > note["RemainingCredit"]:
+                return self._json(400, {"Type": "ValidationException"})
+            aid = f"alloc-{len(note['Allocations']) + 1}"
+            note["Allocations"].append(
+                {"AllocationID": aid, "Amount": amount, "Invoice": {"InvoiceID": bill["InvoiceID"]}}
+            )
+            note["RemainingCredit"] -= amount
+            bill["CreditNotes"].append({"CreditNoteID": parts[1]})
+            bill["AmountCredited"] += amount
+            self._settle(bill)
+            return self._json(200, {"Allocations": [note["Allocations"][-1]]})
+        if request.method == "DELETE" and len(parts) == 4 and parts[2] == "Allocations":
+            note = self.credit_notes[parts[1]]
+            [alloc] = [a for a in note["Allocations"] if a["AllocationID"] == parts[3]]
+            note["Allocations"].remove(alloc)
+            note["RemainingCredit"] += alloc["Amount"]
+            bill = self.bills[alloc["Invoice"]["InvoiceID"]]
+            bill["AmountCredited"] -= alloc["Amount"]
+            self._settle(bill)
+            return httpx.Response(204)
+        if request.method == "POST" and len(parts) == 2:
+            note = self.credit_notes[parts[1]]
+            [item] = json.loads(request.content)["CreditNotes"]
+            assert item["Status"] == "VOIDED" and not note["Allocations"]
+            note["Status"] = "VOIDED"
+            return self._json(200, {"CreditNotes": [note]})
         raise AssertionError(f"unexpected {request.method} {request.url}")
 
     @staticmethod
@@ -884,3 +954,115 @@ def test_a_report_says_whether_our_write_back_is_on_the_bill_and_what_else_came_
     theirs = _report(xero, "no-write-back")
     assert theirs.our_payment_applied is False
     assert theirs.reduced_outside_amount == Decimal("250.00")
+
+
+# ---------------------------------------------------------------------------
+# early-payment discount booked as a credit note (decisions §575)
+
+DISCOUNT_ACCOUNT = "acc-discount-4900"
+
+
+def _credit(**kw) -> DiscountCreditPayload:
+    base = dict(
+        payment_id=PAYMENT_ID,
+        bill_id=BILL,
+        amount=Decimal("5.00"),
+        currency="ZAR",
+        credit_on=date(2026, 10, 3),
+        discount_account_erp_id=DISCOUNT_ACCOUNT,
+        pay_from_account_erp_id=BANK,
+    )
+    base.update(kw)
+    return DiscountCreditPayload(**base)
+
+
+def _discounted_bill(xero):
+    bill = xero.bill()
+    bill["Contact"] = {"ContactID": "contact-77"}
+    asyncio.run(_adapter().post_payment(_payload(amount=Decimal("245.00"))))
+    assert bill["AmountDue"] == Decimal("5.00")
+    return bill
+
+
+def test_the_discount_is_booked_as_a_credit_note_allocated_to_the_bill(xero):
+    bill = _discounted_bill(xero)
+    result = asyncio.run(_adapter().post_discount_credit(_credit()))
+    assert result.success, result.message
+    assert result.bill_balance_after == Decimal("0") and bill["Status"] == "PAID"
+    [put] = xero.sent("PUT", "/CreditNotes")
+    [note] = json.loads(put.content, parse_float=Decimal)["CreditNotes"]
+    assert note["Contact"] == {"ContactID": "contact-77"}
+    assert note["CurrencyCode"] == "ZAR"
+    assert note["CreditNoteNumber"] == f"FeohLedger discount {PAYMENT_ID}"
+    assert note["LineItems"] == [
+        {
+            "Description": "Early-payment discount",
+            "Quantity": Decimal("1"),
+            "UnitAmount": Decimal("5.00"),
+            "AccountID": DISCOUNT_ACCOUNT,
+        }
+    ]
+    [alloc] = xero.sent("PUT", "/Allocations")
+    assert json.loads(alloc.content, parse_float=Decimal)["Allocations"] == [
+        {"Amount": Decimal("5.00"), "Invoice": {"InvoiceID": BILL}, "Date": "2026-10-03"}
+    ]
+    assert put.headers["Idempotency-Key"] != alloc.headers["Idempotency-Key"]
+    # Our payment and our discount credit together are not news (§386's rule).
+    report = _report(xero)
+    assert report.state is ErpBillState.paid
+
+
+def test_a_replay_of_the_discount_credit_books_nothing_twice(xero):
+    _discounted_bill(xero)
+    first = asyncio.run(_adapter().post_discount_credit(_credit()))
+    again = asyncio.run(_adapter().post_discount_credit(_credit()))
+    assert again.success and again.erp_document_id == first.erp_document_id
+    assert len(xero.sent("PUT", "/CreditNotes")) == 1
+    assert len(xero.sent("PUT", "/Allocations")) == 1
+
+
+def test_a_credit_note_created_but_not_allocated_is_allocated_on_retry(xero):
+    bill = _discounted_bill(xero)
+    xero.fail_allocation = True
+    failed = asyncio.run(_adapter().post_discount_credit(_credit()))
+    assert not failed.success and failed.erp_document_id
+    xero.fail_allocation = False
+    retried = asyncio.run(_adapter().post_discount_credit(_credit()))
+    assert retried.success and retried.erp_document_id == failed.erp_document_id
+    assert len(xero.credit_notes) == 1 and bill["AmountDue"] == Decimal("0")
+
+
+def test_voiding_removes_the_allocation_then_voids_the_credit_note_once(xero):
+    bill = _discounted_bill(xero)
+    booked = asyncio.run(_adapter().post_discount_credit(_credit()))
+    voided = asyncio.run(_adapter().void_discount_credit(_credit()))
+    assert voided.success and voided.erp_document_id == booked.erp_document_id
+    assert xero.credit_notes[booked.erp_document_id]["Status"] == "VOIDED"
+    assert bill["AmountDue"] == Decimal("5.00")
+    again = asyncio.run(_adapter().void_discount_credit(_credit()))
+    assert again.success and again.erp_document_id is None
+    assert len(xero.sent("DELETE", "/Allocations/alloc-1")) == 1
+
+
+def test_a_voided_credit_of_ours_is_not_booked_again(xero):
+    _discounted_bill(xero)
+    asyncio.run(_adapter().post_discount_credit(_credit()))
+    asyncio.run(_adapter().void_discount_credit(_credit()))
+    result = asyncio.run(_adapter().post_discount_credit(_credit()))
+    assert not result.success and result.refusal_code == BILL_PAYMENT_VOIDED
+    assert result.refusal_params == {"document": "discount_credit"}
+
+
+@pytest.mark.parametrize(
+    ("credit", "code"),
+    [
+        ({"currency": "USD"}, CURRENCY_MISMATCH),
+        ({"amount": Decimal("5.01")}, PAYMENT_EXCEEDS_BALANCE),
+        ({"discount_account_erp_id": None}, PAYMENT_ACCOUNT_NOT_MAPPED),
+    ],
+)
+def test_the_discount_credit_refuses_before_writing(xero, credit, code):
+    _discounted_bill(xero)
+    result = asyncio.run(_adapter().post_discount_credit(_credit(**credit)))
+    assert not result.success and result.refusal_code == code and result.not_posted
+    assert not xero.sent("PUT", "/CreditNotes")

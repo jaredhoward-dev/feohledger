@@ -32,6 +32,14 @@ Rules this module owns:
 * **A bill left partly open in the ERP is flagged** (a discount or credit
   taken in FeohLedger that the ERP does not know about) — the ERP's books
   would otherwise show the difference as still owed.
+* **An early-payment discount is booked as a vendor credit only by the org's
+  opt-in** (``settings.erp.book_discount_as_credit: "on"`` with
+  ``discount_credit_account``, a GL code of ours, decisions §575): after the
+  payment is written, the adapter books ``Payment.discount_amount`` as a credit
+  applied to the bill, idempotent on the payment id. A refused or failed
+  credit is audited coded (``payment.erp_discount_credit_failed``) and the
+  bill's open balance is flagged exactly as without the opt-in, so a person
+  books it. A void reverses our credit before it voids our payment.
 """
 
 from __future__ import annotations
@@ -48,6 +56,7 @@ from app.models.invoice import Invoice
 from app.models.payment import Payment
 from app.services.audit_dispatch import dispatch_audit
 from app.services.erp_adapters.base import (
+    DiscountCreditPayload,
     ErpAdapter,
     ErpPostResult,
     PaymentPayload,
@@ -64,6 +73,18 @@ logger = logging.getLogger(__name__)
 #: booked from: one for bank rails, one for card rails.
 BANK_ACCOUNT_KEY = "bill_payment_bank_account"
 CARD_ACCOUNT_KEY = "bill_payment_card_account"
+#: The ``settings.erp`` opt-in (``"on"`` / ``"off"``, absent = off) that books
+#: an early-payment discount as a vendor credit applied to the bill, and the GL
+#: code (our chart) of the account it is booked to (decisions §575).
+DISCOUNT_CREDIT_KEY = "book_discount_as_credit"
+DISCOUNT_ACCOUNT_KEY = "discount_credit_account"
+
+
+def discount_credit_on(erp_config: dict | None) -> bool:
+    """Has the org opted in to booking discounts as credits? Only the literal
+    ``"on"`` is yes: anything else, absent included, is the default off."""
+    return str((erp_config or {}).get(DISCOUNT_CREDIT_KEY) or "").strip().lower() == "on"
+
 
 #: ``erp_report["kind"]`` of the rows this module opens. The sentence is for an
 #: AP user (``invoice_warning_catalog``); the payment, its run, the bill and the
@@ -122,23 +143,10 @@ async def build_payment_payload(
     bill_id: str,
     erp_config: dict,
 ) -> PaymentPayload:
-    from app.services.gl_chart import resolve_erp_account_ids
-
     card = (payment.method or "") in CARD_PAYMENT_METHODS
     code = str((erp_config or {}).get(CARD_ACCOUNT_KEY if card else BANK_ACCOUNT_KEY) or "")
     code = code.strip() or None
-    account_erp_id = None
-    if code:
-        realm = connection_realm(erp_config)
-        ids = await resolve_erp_account_ids(
-            db,
-            invoice.organization_id,
-            invoice.entity_id,
-            [code],
-            realm=realm,
-            trust_legacy=legacy_links_trusted(erp_config, realm),
-        )
-        account_erp_id = ids.get(code)
+    account_erp_id = await _resolve_account(db, invoice, erp_config, code)
     paid_at = payment.completed_at
     currency = (invoice.currency or "").upper()
     # What reached the supplier: the rail's settled figure when it is in the
@@ -157,6 +165,54 @@ async def build_payment_payload(
         card=card,
         pay_from_account_erp_id=account_erp_id,
         reference=payment.reference,
+    )
+
+
+async def _resolve_account(
+    db: AsyncSession, invoice: Invoice, erp_config: dict, code: str | None
+) -> str | None:
+    """Our GL ``code``'s ERP id under the current realm, or None."""
+    from app.services.gl_chart import resolve_erp_account_ids
+
+    if not code:
+        return None
+    realm = connection_realm(erp_config)
+    ids = await resolve_erp_account_ids(
+        db,
+        invoice.organization_id,
+        invoice.entity_id,
+        [code],
+        realm=realm,
+        trust_legacy=legacy_links_trusted(erp_config, realm),
+    )
+    return ids.get(code)
+
+
+async def build_discount_credit_payload(
+    db: AsyncSession,
+    *,
+    payment: Payment,
+    invoice: Invoice,
+    payment_payload: PaymentPayload,
+    erp_config: dict,
+) -> DiscountCreditPayload | None:
+    """The credit to book for ``payment``'s early-payment discount, or None
+    when the org has not opted in or the payment took no discount."""
+    if not discount_credit_on(erp_config):
+        return None
+    discount = Decimal(payment.discount_amount) if payment.discount_amount else Decimal(0)
+    if discount <= 0:
+        return None
+    code = str((erp_config or {}).get(DISCOUNT_ACCOUNT_KEY) or "").strip() or None
+    return DiscountCreditPayload(
+        payment_id=payment_payload.payment_id,
+        bill_id=payment_payload.bill_id,
+        amount=discount,
+        currency=payment_payload.currency,
+        credit_on=payment_payload.paid_on,
+        discount_account_erp_id=await _resolve_account(db, invoice, erp_config, code),
+        pay_from_account_erp_id=payment_payload.pay_from_account_erp_id,
+        card=payment_payload.card,
     )
 
 
@@ -200,16 +256,35 @@ async def write_back_payment(
         await db.commit()
         return SKIPPED
     correlation = invoice.correlation_id or payment.correlation_id or invoice.id
+    credit_payload: DiscountCreditPayload | None = None
+    credit: ErpPostResult | None = None
     try:
         payload = await build_payment_payload(
             db, payment=payment, invoice=invoice, bill_id=bill_id, erp_config=erp_config
         )
+        if getattr(adapter, "supports_discount_credit", False) is True:
+            credit_payload = await build_discount_credit_payload(
+                db,
+                payment=payment,
+                invoice=invoice,
+                payment_payload=payload,
+                erp_config=erp_config,
+            )
         # End the read transaction: no connection is held open across the ERP
         # call (the caller's session does not expire rows on commit).
         await db.commit()
         result = await adapter.post_payment(payload)
     except Exception as exc:  # noqa: BLE001 — an adapter bug is a failed write-back
         result = ErpPostResult(success=False, message=f"write-back error: {exc.__class__.__name__}")
+    if result.success and credit_payload is not None:
+        # Only after our payment stands on the bill: the credit is capped by
+        # what the bill still has open AFTER it (the adapter refuses more).
+        try:
+            credit = await adapter.post_discount_credit(credit_payload)
+        except Exception as exc:  # noqa: BLE001 — an adapter bug is a failed credit
+            credit = ErpPostResult(
+                success=False, message=f"discount credit error: {exc.__class__.__name__}"
+            )
 
     try:
         if result.success:
@@ -232,7 +307,35 @@ async def write_back_payment(
                     ),
                 },
             )
-            if result.bill_balance_after is not None and result.bill_balance_after > 0:
+            balance_after = result.bill_balance_after
+            credit_refusal = None
+            if credit is not None:
+                credit_refusal = _refusal(credit)
+                await dispatch_audit(
+                    db,
+                    correlation_id=correlation,
+                    organization_id=invoice.organization_id,
+                    actor_id=None,
+                    action=(
+                        "payment.erp_discount_credit_posted"
+                        if credit.success
+                        else "payment.erp_discount_credit_failed"
+                    ),
+                    entity_type="payment",
+                    entity_id=payment.id,
+                    details={
+                        "erp_type": adapter.erp_type,
+                        "bill_id": bill_id,
+                        "erp_document_id": credit.erp_document_id,
+                        "discount_amount": str(credit_payload.amount),
+                        "currency": credit_payload.currency,
+                        **({} if credit.success else {"error": credit.message}),
+                        **({"refusal": credit_refusal} if credit_refusal else {}),
+                    },
+                )
+                if credit.success and credit.bill_balance_after is not None:
+                    balance_after = credit.bill_balance_after
+            if balance_after is not None and balance_after > 0:
                 await open_erp_reconciliation_exception(
                     db,
                     invoice,
@@ -240,7 +343,7 @@ async def write_back_payment(
                     finding=erp_finding(
                         "erp_payment_writeback_balance_open",
                         adapter.erp_type,
-                        amount=result.bill_balance_after,
+                        amount=balance_after,
                         currency=invoice.currency,
                     ),
                     erp_report=_writeback_report(
@@ -250,12 +353,25 @@ async def write_back_payment(
                         payment_run_id=payment.payment_run_id,
                         bill_id=bill_id,
                         erp_payment_id=result.erp_document_id,
-                        bill_balance_after=str(result.bill_balance_after),
+                        bill_balance_after=str(balance_after),
                         # An early-payment discount taken here is the usual
                         # reason: no ERP payment carries one (§295, §386), so
                         # the bookkeeper records it there.
                         discount_amount=(
                             str(payment.discount_amount) if payment.discount_amount else None
+                        ),
+                        # The opt-in's credit, when it was tried and did not
+                        # book: its coded reason, so the person sees why (§575).
+                        **(
+                            {
+                                "discount_credit_failure": (
+                                    credit_refusal["code"]
+                                    if credit_refusal
+                                    else "erp_discount_credit_failed"
+                                )
+                            }
+                            if credit is not None and not credit.success
+                            else {}
                         ),
                     ),
                 )
@@ -513,8 +629,40 @@ async def void_written_payment(org_id: uuid.UUID, payment_id: uuid.UUID) -> str:
             # Nothing held across the ERP call. A rollback expires the loaded
             # rows, so what is needed after it was read above.
             await db.rollback()
-            result = await adapter.void_payment(payload)
+            # Our discount credit first (§575), whatever the opt-in says now:
+            # it may have been booked while it was on. A failure stops here,
+            # the marker stays, and the retry starts from the credit again.
+            credit = None
+            if getattr(adapter, "supports_discount_credit", False) is True:
+                credit = await adapter.void_discount_credit(
+                    DiscountCreditPayload(
+                        payment_id=str(payment_id),
+                        bill_id=bill_id,
+                        amount=Decimal(0),
+                        currency=payload.currency,
+                        credit_on=payload.paid_on,
+                    )
+                )
+            if credit is not None and not credit.success:
+                result = credit
+            else:
+                result = await adapter.void_payment(payload)
             invoice = await db.get(Invoice, invoice_id)
+            if credit is not None and credit.success and credit.erp_document_id:
+                await dispatch_audit(
+                    db,
+                    correlation_id=correlation,
+                    organization_id=invoice.organization_id,
+                    actor_id=None,
+                    action="payment.erp_discount_credit_reversed",
+                    entity_type="payment",
+                    entity_id=payment_id,
+                    details={
+                        "erp_type": adapter.erp_type,
+                        "bill_id": bill_id,
+                        "erp_document_id": credit.erp_document_id,
+                    },
+                )
             refusal = _refusal(result)
             if result.success:
                 voided = bool(result.erp_document_id)
@@ -535,6 +683,11 @@ async def void_written_payment(org_id: uuid.UUID, payment_id: uuid.UUID) -> str:
                     "erp_document_id": result.erp_document_id,
                     **({} if result.success else {"error": result.message}),
                     **({"refusal": refusal} if refusal else {}),
+                    **(
+                        {"document": "discount_credit"}
+                        if credit is not None and result is credit
+                        else {}
+                    ),
                 },
             )
             if result.success:

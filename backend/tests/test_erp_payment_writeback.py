@@ -533,3 +533,176 @@ async def test_a_failed_void_write_back_is_not_swallowed_by_an_unrelated_live_ro
         "payment_void_writeback_failed",
         "payment_writeback_balance_open",
     ]
+
+
+# ---------------------------------------------------------------------------
+# The opt-in: the discount booked as a vendor credit applied to the bill (§575)
+# ---------------------------------------------------------------------------
+
+
+class FakeQboWithCredit(FakeQbo):
+    supports_discount_credit = True
+
+    def __init__(self, result=None, credit=None):
+        super().__init__(
+            result
+            or ErpPostResult(success=True, erp_document_id="BP-9", bill_balance_after=Decimal("2"))
+        )
+        self.post_discount_credit = AsyncMock(
+            return_value=credit
+            or ErpPostResult(success=True, erp_document_id="VC-1", bill_balance_after=Decimal(0))
+        )
+        self.void_discount_credit = AsyncMock(
+            return_value=ErpPostResult(success=True, erp_document_id="VC-1")
+        )
+
+
+DISCOUNT_ON = {"book_discount_as_credit": "on", "discount_credit_account": "4900"}
+
+
+async def _discounted(realdb, **erp_extra):
+    await _configure(realdb, **erp_extra)
+    run_id, inv_id, pay_id = await _seed(realdb)
+    async with realdb.sessionmaker("a")() as s:
+        payment = await s.get(Payment, pay_id)
+        payment.amount = Decimal("98.00")
+        payment.discount_amount = Decimal("2.00")
+        s.add(
+            GLAccount(
+                organization_id=realdb.info("a").org_id,
+                code="4900",
+                name="Discounts received",
+                erp_account_id="88",
+                erp_link_realm=REALM,
+            )
+        )
+        await s.commit()
+    return run_id, inv_id, pay_id
+
+
+async def test_with_the_opt_in_the_discount_is_booked_and_the_bill_is_not_flagged(realdb):
+    run_id, inv_id, pay_id = await _discounted(realdb, **DISCOUNT_ON)
+    adapter = FakeQboWithCredit()
+    await _sync(realdb, run_id, adapter)
+    (credit,) = adapter.post_discount_credit.await_args.args
+    assert credit.payment_id == str(pay_id) and credit.bill_id == "501"
+    assert credit.amount == Decimal("2.00") and credit.currency == "USD"
+    # The org's discount account and the payment's own pay-from account, as
+    # QuickBooks knows them.
+    assert credit.discount_account_erp_id == "88" and credit.pay_from_account_erp_id == "35"
+    rows = await _rows(realdb, AuditLog, entity_id=pay_id)
+    [posted] = [r for r in rows if r.action == "payment.erp_discount_credit_posted"]
+    assert posted.details["discount_amount"] == "2.00"
+    assert posted.details["erp_document_id"] == "VC-1"
+    # The credit closed the bill in the ERP: nothing left for a person.
+    assert await _rows(realdb, APException, invoice_id=inv_id) == []
+
+
+async def test_without_the_opt_in_nothing_changes(realdb):
+    run_id, inv_id, pay_id = await _discounted(realdb)
+    adapter = FakeQboWithCredit()
+    await _sync(realdb, run_id, adapter)
+    adapter.post_discount_credit.assert_not_awaited()
+    [flag] = await _rows(realdb, APException, invoice_id=inv_id)
+    assert flag.erp_report["kind"] == "payment_writeback_balance_open"
+    assert flag.erp_report["discount_amount"] == "2.00"
+    assert "discount_credit_failure" not in flag.erp_report
+
+
+async def test_a_payment_with_no_discount_books_no_credit(realdb):
+    await _configure(realdb, **DISCOUNT_ON)
+    run_id, _, _ = await _seed(realdb)
+    adapter = FakeQboWithCredit(
+        ErpPostResult(success=True, erp_document_id="BP-9", bill_balance_after=Decimal(0))
+    )
+    await _sync(realdb, run_id, adapter)
+    adapter.post_discount_credit.assert_not_awaited()
+
+
+async def test_a_refused_credit_is_coded_and_leaves_the_flag_for_a_person(realdb):
+    run_id, inv_id, pay_id = await _discounted(realdb, **DISCOUNT_ON)
+    adapter = FakeQboWithCredit(credit=erp_refusal("quickbooks_online", "currency_mismatch"))
+    await _sync(realdb, run_id, adapter)
+    [invoice] = await _rows(realdb, Invoice, id=inv_id)
+    assert invoice.status == InvoiceStatus.paid
+    rows = await _rows(realdb, AuditLog, entity_id=pay_id)
+    [failed] = [r for r in rows if r.action == "payment.erp_discount_credit_failed"]
+    assert failed.details["refusal"]["code"] == "currency_mismatch"
+    [flag] = await _rows(realdb, APException, invoice_id=inv_id)
+    assert flag.erp_report["kind"] == "payment_writeback_balance_open"
+    assert flag.erp_report["bill_balance_after"] == "2"
+    assert flag.erp_report["discount_credit_failure"] == "currency_mismatch"
+
+
+async def test_an_unlinked_discount_account_reaches_the_adapter_as_unmapped(realdb):
+    run_id, _, _ = await _discounted(
+        realdb, book_discount_as_credit="on", discount_credit_account="4999"
+    )
+    adapter = FakeQboWithCredit()
+    await _sync(realdb, run_id, adapter)
+    (credit,) = adapter.post_discount_credit.await_args.args
+    assert credit.discount_account_erp_id is None
+
+
+async def test_a_failed_payment_write_back_books_no_credit(realdb):
+    run_id, _, _ = await _discounted(realdb, **DISCOUNT_ON)
+    adapter = FakeQboWithCredit(erp_refusal("quickbooks_online", "bill_not_in_erp"))
+    await _sync(realdb, run_id, adapter)
+    adapter.post_discount_credit.assert_not_awaited()
+
+
+async def test_a_void_reverses_our_credit_before_our_payment(realdb):
+    run_id, inv_id, pay_id = await _discounted(realdb, **DISCOUNT_ON)
+    adapter = FakeQboWithCredit()
+    await _sync(realdb, run_id, adapter)
+    order: list[str] = []
+    adapter.void_discount_credit.side_effect = lambda p: (
+        order.append("credit") or ErpPostResult(success=True, erp_document_id="VC-1")
+    )
+    adapter.void_payment.side_effect = lambda p: (
+        order.append("payment") or ErpPostResult(success=True, erp_document_id="BP-9")
+    )
+    org_id = realdb.info("a").org_id
+    with patch("app.services.erp_adapters.get_erp_adapter", return_value=adapter):
+        outcome = await erp_payment_writeback.void_written_payment(org_id, pay_id)
+    assert outcome == erp_payment_writeback.WROTE and order == ["credit", "payment"]
+    (credit,) = adapter.void_discount_credit.await_args.args
+    assert credit.payment_id == str(pay_id) and credit.bill_id == "501"
+    actions = {r.action for r in await _rows(realdb, AuditLog, entity_id=pay_id)}
+    assert {"payment.erp_discount_credit_reversed", "payment.erp_voided"} <= actions
+
+
+async def test_a_credit_that_cannot_be_reversed_stops_the_void_and_is_flagged(realdb):
+    run_id, inv_id, pay_id = await _discounted(realdb, **DISCOUNT_ON)
+    adapter = FakeQboWithCredit()
+    await _sync(realdb, run_id, adapter)
+    adapter.void_discount_credit.return_value = ErpPostResult(
+        success=False, message="quickbooks_online void failed: network_error"
+    )
+    org_id = realdb.info("a").org_id
+    with patch("app.services.erp_adapters.get_erp_adapter", return_value=adapter):
+        outcome = await erp_payment_writeback.void_written_payment(org_id, pay_id)
+    assert outcome == erp_payment_writeback.FAILED
+    adapter.void_payment.assert_not_awaited()
+    rows = await _rows(realdb, AuditLog, entity_id=pay_id)
+    [failed] = [r for r in rows if r.action == "payment.erp_void_failed"]
+    assert failed.details["document"] == "discount_credit"
+    [flag] = await _rows(realdb, APException, invoice_id=inv_id)
+    assert flag.erp_report["kind"] == "payment_void_writeback_failed"
+
+
+@pytest.mark.parametrize(
+    ("erp", "refused"),
+    [
+        ({}, False),
+        ({"book_discount_as_credit": "off"}, False),
+        ({"book_discount_as_credit": "on", "discount_credit_account": "4900"}, False),
+        ({"book_discount_as_credit": "on"}, True),
+        ({"book_discount_as_credit": "on", "discount_credit_account": "  "}, True),
+        ({"book_discount_as_credit": "yes", "discount_credit_account": "4900"}, True),
+    ],
+)
+def test_the_opt_in_needs_an_account(erp, refused):
+    from app.services.erp_adapters.catalog import discount_credit_refusal
+
+    assert (discount_credit_refusal({"type": "xero", **erp}) is not None) is refused
