@@ -903,11 +903,12 @@ lands. Pure doc drift was corrected in the same PR. The two diagnosed defects
       Reviewed by a fluent finance reader per locale, not machine output.
       **Trigger:** the first customer contract in a non-English market, or a
       locale's tenants passing a share of active users worth the review cost.
-- [ ] **(c) Settings with a backend and no screen.** Approval delegation,
-      per-vendor / per-GL match tolerance and the SCIM bearer token exist in
-      the API with no UI, so help can describe their effect but can't tell
-      anyone where to change them. (The exception-agent autonomy level and
-      the line-total check got their panels in round 39, decisions §502.)
+- [ ] **(c) Settings with a backend and no screen.** Approval delegation
+      and the SCIM bearer token exist in the API with no UI, so help can
+      describe their effect but can't tell anyone where to change them. (The
+      exception-agent autonomy level and the line-total check got their
+      panels in round 39, decisions §502; per-vendor / per-GL match tolerance
+      in round 41, §512.)
       **Durable fix:** a panel each in `/organization`, each with its own help
       guide step. **Trigger:** the first customer asking to change
       one, or SCIM onboarding for an enterprise tenant.

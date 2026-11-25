@@ -1035,6 +1035,43 @@ approval queue as clean, with no log line to notice. Bools are still rejected
 (`true` would resolve to a 1% tolerance nobody asked for) and so are non-finite
 values; both fall through rather than becoming a rule.
 
+#### Changing the rules: `/organization?section=match-rules`
+
+The whole `settings.matching` block has one writer, the audited
+`/api/organization/match-rules` router (`api/organization_match_rules.py`,
+decisions §512), and one screen, **Organization → PO match rules** (under
+Money). Admin only, read and write, like every other `/organization` writer.
+
+| Route | Does |
+|-------|------|
+| `GET /api/organization/match-rules` | `{organization, built_in, vendor_rules[], commodity_rules[]}`. Each layer's `tolerance_pct` / `require_inspection` is the value the resolver applies there (through its own `_coerce_*`), or `null` when the layer does not set it and the next one decides. A stored value the resolver ignores reads `null`, never as a rule in force. Vendor rows carry `vendor_name` (`null` for a vendor that no longer exists), GL rows the chart's `gl_account_name` |
+| `PUT …/organization` | Sets the organization layer; a `null` field falls back to the built-in (5 %, no inspection) |
+| `PUT` / `DELETE …/vendors/{vendor_id}` | Creates, replaces or removes one vendor's rule. The vendor must exist (404 `match_rule_vendor_not_found`) |
+| `PUT` / `DELETE …/commodities/{gl_code}` | The same for one header GL code, which must be in the chart (404 `match_rule_gl_account_not_found`) |
+
+A tolerance is an exact decimal (number or string) in percentage points, 0–100,
+at most two places; it is stored as its exact decimal string (`"2.5"`). Refusals
+are coded (`match_tolerance_invalid`, `match_tolerance_out_of_range` with
+`{min, max}`, `match_tolerance_too_precise` with `{places}`, `match_rule_empty`
+for a rule that sets neither field). Range and precision are enforced here
+because an unparseable value falls through to a LOOSER layer (above). A DELETE of
+an absent rule is a no-op.
+
+Every write takes the organization row lock and writes its audit row FIRST
+(`organization.match_rule_updated` / `organization.match_rule_removed`,
+`{setting, scope, key, old, new}` with each side as the resolver reads it) via
+`record_auth_audit_or_raise`: a row that cannot be written is a 503 with nothing
+saved. A save that changes nothing writes nothing. The generic
+`PATCH /api/organization` refuses any change to `settings.matching` with a 422
+naming this router (`guard_matching_block`) and passes an unchanged copy.
+
+The screen lists both rule kinds with the organization setting and built-in
+beside them, marks a rule whose own tolerance is wider than the organization's
+(more of that vendor's invoices pass unflagged), and removes a rule only on a
+second click. Coverage: `backend/tests/test_organization_match_rules.py`,
+`frontend/src/lib/types/matchRules.test.ts`,
+`frontend/tests-e2e/organization/match-rules.spec.ts`.
+
 ### Where an inspection is entered (the UI)
 
 `/goods-receipts` is the entry surface, because an inspection is tied to a
