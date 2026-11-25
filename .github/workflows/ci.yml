@@ -1007,6 +1007,12 @@ jobs:
           # is a vanity host", which would make `tenant/vanity-host.spec.ts`
           # assert the opposite of what it asserts locally.
           PUBLIC_PLATFORM_DOMAINS: localhost
+          # The apex, as a deploy build declares it (vm-deploy.yml) and
+          # `.env.development` does for `pnpm dev`. Unset, links that point at
+          # the apex (the sign-in page's "email me my workspace address",
+          # decisions §518) are withheld, so specs would test a build no
+          # deployment ships.
+          PUBLIC_SITE_URL: http://localhost:7777
         # Pre-build so `vite preview` (started by playwright.config.ts's
         # webServer block) has a `build/` directory to serve. Skipping
         # this falls back to `pnpm dev`, which pays HMR + transform
@@ -1239,6 +1245,7 @@ jobs:
           PUBLIC_API_URL: http://localhost:8000
           # See the e2e-shard job's Build step for why this is here.
           PUBLIC_PLATFORM_DOMAINS: localhost
+          PUBLIC_SITE_URL: http://localhost:7777
         run: pnpm build
 
       - name: Cache Playwright browsers
@@ -1463,6 +1470,7 @@ jobs:
           PUBLIC_API_URL: http://localhost:8000
           # See the e2e-shard job's Build step for why this is here.
           PUBLIC_PLATFORM_DOMAINS: localhost
+          PUBLIC_SITE_URL: http://localhost:7777
         run: pnpm build
 
       - name: Cache Playwright browsers
@@ -1600,6 +1608,7 @@ jobs:
           PUBLIC_API_URL: http://localhost:8000
           # See the e2e-shard job's Build step for why this is here.
           PUBLIC_PLATFORM_DOMAINS: localhost
+          PUBLIC_SITE_URL: http://localhost:7777
         run: pnpm build
 
       - name: Cache Playwright browsers
