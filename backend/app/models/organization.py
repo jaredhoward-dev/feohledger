@@ -1,6 +1,6 @@
 import uuid
 
-from sqlalchemy import ForeignKey, Index, String, text
+from sqlalchemy import Boolean, ForeignKey, Index, String, text
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -55,9 +55,9 @@ class Organization(Base, TimestampMixin):
 
     # Reseller / partner hierarchy (white-label). A nullable self-FK: when set,
     # THIS org is a branded CHILD tenant administered by the parent (partner /
-    # reseller) org. NULL = a standalone tenant with no parent. A "partner" org
-    # is simply any org referenced here by >= 1 child — there is no separate
-    # flag, so a partner can't claim children it didn't actually parent. The
+    # reseller) org. NULL = a standalone tenant with no parent. Which orgs may
+    # ACT as a partner is `is_partner` below (operator-granted, §574); the
+    # children an org actually administers are the rows pointing here. The
     # `/api/partner` surface scopes every child query to
     # `parent_org_id == <caller's org id>`, so the partner only ever sees /
     # affects its own children (the JWT org-claim cross-check in
@@ -70,6 +70,18 @@ class Organization(Base, TimestampMixin):
         nullable=True,
         index=True,
         default=None,
+    )
+
+    # The operator-granted partner (reseller) capability — decisions §574,
+    # migration 0151. True lets this org's admins use `/api/partner` (provision,
+    # attach, brand and detach child tenants) and shows the Partner Admin row.
+    # Set ONLY by the operator (`scripts/set_partner_capability.py`); no API
+    # writes it, so no admin can make their own workspace a reseller. Being
+    # ADOPTED needs no capability: any admin may mint the consent link code
+    # (`POST /api/organization/partner-link-code`). The migration backfilled
+    # true for every org that already parented a child.
+    is_partner: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default=text("false"), nullable=False
     )
 
     # Relationships (only users live in control-plane DB alongside orgs)

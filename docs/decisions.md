@@ -29971,65 +29971,6 @@ checked in full (white on `green.shade800`, about 5.1:1).
 the boundary's merged `getSemanticsData()` (what a screen reader is handed),
 not the boundary node alone.
 
-## 576. Sage Accounting and Sage Accounting ZA offer the orphan-bill lookup; their key is our correlation id, so it is not shared (§566 follow-up, round 49)
-
-**Context.** After §566 the orphan-bill lookup (`ErpAdapter.find_posted_bill`,
-§556) covered the mock, QuickBooks, Xero and NetSuite. The followups entry named
-Sage and Sage ZA among the adapters whose push lookup still lived inside
-`post_invoice`.
-
-**Decision.**
-
-- **Sage Accounting (v3.1)** offers it. The push's window (the supplier's
-  purchase invoices dated on the invoice date: `contact_id` +
-  `from_date`/`to_date`) moved into `_supplier_day_invoices`; the push still
-  stops at the first live namesake, as before. The lookup reads the whole
-  window and matches on the marker the push writes, `notes:
-  "FeohLedger <correlation id>"`, as a whole token, so `corr-1` never matches
-  `corr-10`'s notes (the push's own substring test is unchanged). The number,
-  total and currency come from the row; the status from `GET
-  purchase_invoices/{id}?show_payments_allocations=true`, the read
-  `get_invoice_status` makes, and a failed status read leaves a found bill
-  `unknown`, never a miss.
-- **Sage Accounting ZA** offers it on the push's own `_find_existing` window,
-  matched on `Reference == correlation id`, exactly as the push adopts. The
-  status is read from the row as `get_invoice_status` reads the record. The
-  currency is None: API 2.0.0 names a currency only by a numeric id. The bill
-  it names cannot be voided from FeohLedger (API 2.0.0 has no delete, §303),
-  so the lookup's value there is naming the bill for a person in Sage.
-- **Not shared.** Both keys carry the invoice's correlation id
-  (`invoices.correlation_id` is unique), so neither class sets
-  `bill_lookup_key_shared` and `shared_lookup_keys` answers empty with no
-  query; no Sage contact resolution was added to it.
-- **Raise, never "none", when it cannot tell.** Both raise on a payload the
-  push would refuse before any call (no linked supplier, no invoice date, no
-  correlation id), a page not answered 200 (a 401 or transport error in ZA), a
-  window past the page cap, a row with no id, two live bills carrying our
-  marker, and a live bill with the supplier's invoice number but not our
-  marker. That last is stricter than the push, which refuses it as a
-  duplicate: it may be our bill with the marker edited away in Sage, which the
-  lookup cannot tell from someone else's, so "none" would be a guess. The
-  person is told the ERP could not be searched (502 `erp_lookup_failed`) and
-  looks in Sage.
-
-**Verified vs not.** The v3.1 `PurchaseInvoice.currency` field (a `Base` link
-with `id` / `displayed_as` / `$path`) and the list endpoint's `attributes`
-parameter were checked on 2026-11-25 in Sage's published v3.1 Swagger as
-vendored in https://github.com/nook-io/python-sage/blob/HEAD/openapi.json
-(developer.sage.com blocks automated fetches). That the currency link's `id`
-is the ISO code is inferred from the push sending `currency_id` as one; any
-other value reads as None. Neither lookup was run against a live Sage company.
-No fake-erp route was needed: the existing Sage listing and detail routes
-serve both reads.
-
-**Tests.** `test_erp_sage_accounting_adapter.py` and
-`test_erp_sage_accounting_za_adapter.py` (found, read-only, the push's window;
-found past the first page; none; another invoice's bill never named, a
-namesake without our marker raises; two carrying our marker raise; every
-unreadable window raises; a payload the push would refuse raises before any
-call), `test_erp_orphan_bill.py` (both offer the lookup, neither key is shared,
-the served verdict offers it, `shared_lookup_keys` makes no query for Sage).
-
 ## 572. The Xero push adopts a found bill only on a key no other invoice shares; otherwise it refuses `erp_bill_key_shared` (§566 / §569 follow-up, round 49)
 
 **Context.** Xero's pre-create idempotency lookup (`_find_existing_bill`) keys
@@ -30134,6 +30075,60 @@ then recall succeeding, and verdict / door parity over all of them; web
 `codedRefusals.test.ts`; mobile `coded_refusal_messages_test.dart`; e2e
 `recall-approval.spec.ts` (PEPPOL-sent invoice).
 
+## 574. Acting as a partner is an operator-granted capability (`organizations.is_partner`); consenting to be adopted stays open to any admin (§314 follow-up, round 49)
+
+**What was wrong.** §314 left Partner Admin showing to every admin of every
+workspace, because "partner" was derived from having a child and the page was
+also where an org provisioned its first child and minted the code that consents
+to being adopted. So any admin could provision or adopt other workspaces and
+brand them — a reseller's powers — without anyone agreeing they were a reseller.
+
+**What changed.** The operator delegated the product call. A partner is now
+whoever the operator says is one:
+
+- `organizations.is_partner` (migration 0151, control plane, `NOT NULL DEFAULT
+  false`) is the capability. Nothing in the API writes it; the operator grants
+  or revokes it with `scripts/set_partner_capability.py`
+  (`services/partner_capability.py`), which audits
+  `organization.partner_capability_granted` / `_revoked` into the org's own
+  trail before changing anything and refuses a revoke while the org still
+  parents a child (its children would be left with nobody able to reach them).
+- Every `/api/partner` route requires it after the admin role
+  (`partner.require_partner_capability`): an admin without it gets a coded 403
+  `partner_capability_required`; a non-admin still gets the role's plain 403
+  first, so RBAC is otherwise unchanged.
+- `/api/auth/me` reports `is_partner`; `nav.ts` gained a `capability` gate,
+  ANDed on the role gate and hidden when no check is passed, and the Partner
+  Admin row and the `/admin/partner` page both read `auth.hasCapability`, so the
+  row, the page and the API agree (`frontend/CLAUDE.md`).
+- Minting the link code — consent to BE adopted, not a partner act — moved to
+  Organization settings → Join a partner (`POST
+  /api/organization/partner-link-code`, any admin, still audited
+  `partner.link_code_issued`). The old path is gone rather than kept as a
+  second door under different rules.
+
+**Why a column and not a plan entitlement.** Entitlements are what a workspace
+buys: a self-service plan change grants them and their gate answers 402
+"upgrade". Reselling is a commercial agreement, not a tier on the price list,
+and must not be purchasable by changing plan — so it is its own operator-set
+fact on the org row, beside `parent_org_id`.
+
+**Backfill.** The migration sets `is_partner = true` for every org already
+referenced by a `parent_org_id`. That is a fact, not a proxy: an org with
+children already acts as a partner, and taking the page away would strand them.
+Nothing else (plan, name, settings) is read; every other org starts `false`.
+
+**Tests.** `backend/tests/test_partner_admin.py` walks every `/api/partner`
+route for the coded 403, keeps the role 403 for a non-admin, and shows an
+existing partner keeping access until revoked;
+`test_partner_link_provisioning.py` mints as an admin of a non-partner (still
+audited), shows the old path gone and a non-partner unable to redeem;
+`test_partner_capability.py` covers `/me` and the operator writer;
+`test_migration_0151_org_is_partner.py` the column, backfill, re-run, downgrade
+and tenant no-op. `frontend/src/lib/nav.test.ts` pins the capability gate;
+`tests-e2e/admin/partner.spec.ts` the row hidden for a non-partner and shown
+with the capability stubbed on `/me`.
+
 ## 575. An early-payment discount is booked in the ERP as a vendor credit, by the org's opt-in (follow-up of §295 / §386, round 49)
 
 **The gap.** The payment write-back posts exactly what reached the supplier, and
@@ -30216,3 +30211,62 @@ its code, an unlinked account reaches the adapter as unmapped, a void reverses
 the credit before the payment and stops when it cannot, the setting's
 validation); `frontend/src/lib/types/erpConnection.test.ts` (the picker's
 options).
+
+## 576. Sage Accounting and Sage Accounting ZA offer the orphan-bill lookup; their key is our correlation id, so it is not shared (§566 follow-up, round 49)
+
+**Context.** After §566 the orphan-bill lookup (`ErpAdapter.find_posted_bill`,
+§556) covered the mock, QuickBooks, Xero and NetSuite. The followups entry named
+Sage and Sage ZA among the adapters whose push lookup still lived inside
+`post_invoice`.
+
+**Decision.**
+
+- **Sage Accounting (v3.1)** offers it. The push's window (the supplier's
+  purchase invoices dated on the invoice date: `contact_id` +
+  `from_date`/`to_date`) moved into `_supplier_day_invoices`; the push still
+  stops at the first live namesake, as before. The lookup reads the whole
+  window and matches on the marker the push writes, `notes:
+  "FeohLedger <correlation id>"`, as a whole token, so `corr-1` never matches
+  `corr-10`'s notes (the push's own substring test is unchanged). The number,
+  total and currency come from the row; the status from `GET
+  purchase_invoices/{id}?show_payments_allocations=true`, the read
+  `get_invoice_status` makes, and a failed status read leaves a found bill
+  `unknown`, never a miss.
+- **Sage Accounting ZA** offers it on the push's own `_find_existing` window,
+  matched on `Reference == correlation id`, exactly as the push adopts. The
+  status is read from the row as `get_invoice_status` reads the record. The
+  currency is None: API 2.0.0 names a currency only by a numeric id. The bill
+  it names cannot be voided from FeohLedger (API 2.0.0 has no delete, §303),
+  so the lookup's value there is naming the bill for a person in Sage.
+- **Not shared.** Both keys carry the invoice's correlation id
+  (`invoices.correlation_id` is unique), so neither class sets
+  `bill_lookup_key_shared` and `shared_lookup_keys` answers empty with no
+  query; no Sage contact resolution was added to it.
+- **Raise, never "none", when it cannot tell.** Both raise on a payload the
+  push would refuse before any call (no linked supplier, no invoice date, no
+  correlation id), a page not answered 200 (a 401 or transport error in ZA), a
+  window past the page cap, a row with no id, two live bills carrying our
+  marker, and a live bill with the supplier's invoice number but not our
+  marker. That last is stricter than the push, which refuses it as a
+  duplicate: it may be our bill with the marker edited away in Sage, which the
+  lookup cannot tell from someone else's, so "none" would be a guess. The
+  person is told the ERP could not be searched (502 `erp_lookup_failed`) and
+  looks in Sage.
+
+**Verified vs not.** The v3.1 `PurchaseInvoice.currency` field (a `Base` link
+with `id` / `displayed_as` / `$path`) and the list endpoint's `attributes`
+parameter were checked on 2026-11-25 in Sage's published v3.1 Swagger as
+vendored in https://github.com/nook-io/python-sage/blob/HEAD/openapi.json
+(developer.sage.com blocks automated fetches). That the currency link's `id`
+is the ISO code is inferred from the push sending `currency_id` as one; any
+other value reads as None. Neither lookup was run against a live Sage company.
+No fake-erp route was needed: the existing Sage listing and detail routes
+serve both reads.
+
+**Tests.** `test_erp_sage_accounting_adapter.py` and
+`test_erp_sage_accounting_za_adapter.py` (found, read-only, the push's window;
+found past the first page; none; another invoice's bill never named, a
+namesake without our marker raises; two carrying our marker raise; every
+unreadable window raises; a payload the push would refuse raises before any
+call), `test_erp_orphan_bill.py` (both offer the lookup, neither key is shared,
+the served verdict offers it, `shared_lookup_keys` makes no query for Sage).

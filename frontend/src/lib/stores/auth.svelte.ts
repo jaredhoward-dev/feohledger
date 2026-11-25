@@ -4,6 +4,7 @@ import { employeeAcceptanceRefusal } from '#lib/api/acceptanceRefusal.ts';
 import { rememberNextForSso } from '#lib/utils/postLoginRedirect.ts';
 import { ACCEPTED_LEGAL_VERSIONS } from '#lib/legal/acceptance.ts';
 import { performAuthentication, performRegistration } from '#lib/webauthn.ts';
+import type { OrgCapability } from '#lib/nav.ts';
 
 export interface Passkey {
 	id: string;
@@ -83,6 +84,11 @@ interface User {
 	// setting reads to show an upgrade prompt instead of a control the server
 	// would refuse with a 402. Advisory — the server enforces every gate.
 	entitlements?: string[];
+	// The operator granted this WORKSPACE the partner (reseller) capability
+	// (`Organization.is_partner`, decisions §574), which every `/api/partner`
+	// route requires. Drives `hasCapability('partner')`, the Partner Admin
+	// row's and page's gate. Absent (an older response) reads as not granted.
+	is_partner?: boolean;
 	// The account has not accepted the Terms of Service / Privacy Policy
 	// versions in force (`docs/decisions.md` §495). The root layout draws
 	// `layout/LegalAcceptStep` in the app shell's place while it is true, and
@@ -381,6 +387,14 @@ function createAuthStore() {
 		return user?.entitlements?.includes(feature) ?? false;
 	}
 
+	/** True if the operator granted the caller's workspace `capability`
+	 * (`#lib/nav.ts` `OrgCapability`). Mirrors the backend's
+	 * `require_partner_capability` so the Partner Admin row, its page and the
+	 * API agree; absent reads as "not granted", as the server does. */
+	function hasCapability(capability: OrgCapability): boolean {
+		return capability === 'partner' && user?.is_partner === true;
+	}
+
 	return {
 		get user() { return user; },
 		get loggedIn() { return loggedIn; },
@@ -407,6 +421,7 @@ function createAuthStore() {
 		hasAnyRole,
 		can,
 		hasFeature,
+		hasCapability,
 	};
 }
 

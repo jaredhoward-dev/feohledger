@@ -1198,22 +1198,6 @@ scope (§260) — do not fold them into any of these.
       group the closure can poll empty. **Trigger:** the first deployment that
       runs `FEOH_AUDIT_MODE=lambda` and wants self-service closure.
 
-### Surfaced by the sidebar renames (2026-10-21, issue #635 #23, decisions §314)
-
-- [ ] **(c) Partner Admin shows to every admin, partner or not — needs a product
-      call.** #635 asked to hide the row unless the workspace is a partner, but
-      nothing says so: `GET /api/partner`'s `is_partner` is derived from having
-      at least one child, and `/admin/partner` is also where a standalone org
-      provisions or attaches its first child (how it becomes a partner) and
-      mints the link code that consents to being adopted. Gating the row on
-      `is_partner` would strand both and break "the sidebar gate and the page's
-      gate agree" (`frontend/CLAUDE.md`). **Durable fix:** an operator-granted
-      partner capability (plan entitlement, or `organizations.is_partner`) on
-      `/auth/me`, the `/api/partner` routes gated on it, the link-code minting
-      moved to Organization settings (any admin may consent to adoption), and
-      the nav row gated on the capability. **Trigger:** the product decision on
-      who may act as a partner, or the next partner/reseller onboarding.
-
 ### Surfaced by the 2026-10-22 production walkthrough (decisions §317–§318)
 
 The walkthrough found defects the suite could not see because each check

@@ -10,7 +10,7 @@ Letting any partner admin unilaterally adopt an arbitrary org would be a
 cross-tenant takeover. The answer here is **two-sided consent**:
 
   1. The *prospective child's own admin* mints a short-lived link code
-     (``POST /api/partner/link-code``) — proof the child CONSENTS to being
+     (``POST /api/organization/partner-link-code``) — proof the child CONSENTS to being
      adopted. The code binds, under an HMAC-SHA256 signature, exactly:
 
          child_org_id + expiry + jti

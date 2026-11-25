@@ -86,6 +86,7 @@ const ORG_PANELS: [slug: string, heading: string][] = [
 	['exception-agents', 'Exception agents'],
 	['residency', 'Data Residency'],
 	['plan', 'Plan'],
+	['partner-link', 'Join a partner'],
 	['close', 'Close this workspace']
 ];
 

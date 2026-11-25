@@ -703,12 +703,61 @@ self-referential FK on `Organization`: **`parent_org_id`** (migration `0065`,
 control-plane-only). When set, that org is a branded **child** administered by
 its parent; NULL = a standalone tenant.
 
-A "partner" is **derived, not flagged** — it is simply any org referenced as a
-`parent_org_id` by ≥ 1 child. There is no separate `is_partner` column an admin
-could flip to claim children it didn't actually parent. The link is now
-**created in-app** via the provisioning flow below (no raw DB statement needed) —
-see *Provisioning the link* — guarded so a partner can only attach a tenant that
-explicitly consented.
+Which orgs may **act** as a partner is a separate, **operator-granted**
+capability: `organizations.is_partner` (migration `0151`, control-plane-only,
+decisions §574). The children an org administers are still only the rows whose
+`parent_org_id` points at it — the flag lets an org use the partner surface, it
+never makes another tenant its child. The link is **created in-app** via the
+provisioning flow below (no raw DB statement needed) — see *Provisioning the
+link* — guarded so a partner can only attach a tenant that explicitly
+consented.
+
+### The partner capability — who may act as a partner
+
+Reselling — provisioning, adopting and branding other workspaces — is a
+commercial arrangement the operator agrees with a customer. It used to be
+implied: every admin of every workspace saw Partner Admin, and the first child
+it created made the org a partner. Now:
+
+- **`Organization.is_partner`** (Boolean, NOT NULL, default `false`) is the
+  capability. **Nothing in the API writes it** — no admin can make their own
+  workspace a reseller.
+- **Every `/api/partner` route requires it** on top of the admin role
+  (`partner.require_partner_capability`). An admin of a workspace without it
+  gets a coded **403** `partner_capability_required`; a non-admin still gets
+  the plain role 403 first (RBAC unchanged).
+- **`GET /api/auth/me` reports it** as `is_partner`; the SPA's
+  `auth.hasCapability('partner')` gates the Partner Admin row (`nav.ts`
+  `capability: 'partner'`) and the `/admin/partner` page, so the row and the
+  page agree with the API.
+- **Consenting to be adopted needs no capability.** Minting the link code moved
+  to Organization settings → **Join a partner**
+  (`POST /api/organization/partner-link-code`, any admin, audited
+  `partner.link_code_issued` as before).
+- **Why a column, not a plan entitlement.** Plan entitlements are what a
+  workspace buys: a self-service plan change grants them, and their gate
+  answers 402 "upgrade". Being a reseller is neither — it is not a tier on the
+  public price list and must not be purchasable by changing plan — so it is
+  its own operator-set fact on the org row.
+- **Backfill.** Migration 0151 set `is_partner = true` for every org that
+  already parented a child — that is a fact about the hierarchy (it already
+  acts as a partner), not a proxy — so no existing partner lost access. Every
+  other org starts `false`.
+
+**Granting it (operator only).** From `backend/`, against the deployment's
+control plane:
+
+```bash
+python scripts/set_partner_capability.py --slug acme --grant --reason "CTR-42 signed"
+python scripts/set_partner_capability.py --slug acme --revoke --reason "CTR-42 ended"
+```
+
+Each change writes `organization.partner_capability_granted` / `_revoked` to
+the org's own audit trail **before** it is made, and changes nothing if that row
+cannot be written (exit 2). Re-running is a no-op. A **revoke is refused (exit
+3) while the org still parents a child** — the children would be left with no
+one able to reach them; the partner's admin detaches them on Partner Admin
+first. Admins see the change on their next page load (`/api/auth/me`).
 
 The migration is control-plane-only (gated on the `organizations` table
 existing, exactly like `0062`/`0055`) — it does **not** fan out to tenant DBs;
@@ -718,14 +767,15 @@ cascading a delete.
 
 ### Backend — `/api/partner` (`backend/app/api/partner.py`)
 
-Three admin-only (`require_roles(ROLE_ADMIN)`), JWT-gated endpoints on the
-control-plane `organizations` table:
+Three endpoints on the control-plane `organizations` table, each requiring the
+admin role (`require_roles(ROLE_ADMIN)`) **and** the partner capability
+(`require_partner_capability`, above):
 
 `GET /api/partner` — the caller's partner overview: its identity + the child
 tenants it administers (`PartnerOverview` → `is_partner` + `children[]`, each
 carrying id / name / slug / plan / the child's resolved white-label
-`product_name`). A standalone org gets `is_partner: false` + an empty list (a
-state the UI renders, not an error).
+`product_name`). `is_partner` is the capability (always `true` here); a partner
+with no children yet gets an empty list.
 
 `GET /api/partner/children/{child_id}/branding` — read one child's `BrandConfig`
 (reuses `organization._resolve_brand`, tolerant of a missing/malformed block →
@@ -744,11 +794,14 @@ raw value).
 ### Provisioning the link — two-sided consent (attach + detach)
 
 The partner surface now **creates** the parent/child link, not just administers
-an existing one. Three more admin-only endpoints
-(`require_roles(ROLE_ADMIN)`, JWT-gated via `get_tenant`):
+an existing one. The consent side is in Organization settings; the redeem /
+detach / provision side is three more `/api/partner` endpoints (admin role +
+partner capability, JWT-gated via `get_tenant`):
 
-`POST /api/partner/link-code` — mint a **single-use link code** FOR the caller's
-**own** org. Handing that code to a prospective partner IS the act of consenting
+`POST /api/organization/partner-link-code`
+(`backend/app/api/organization_partner_link.py`; any admin, **no** partner
+capability — it was `POST /api/partner/link-code` until decisions §574) — mint a
+**single-use link code** FOR the caller's **own** org. Handing that code to a prospective partner IS the act of consenting
 to be adopted. Returns `{link_code, expires_in_minutes}`. The code is an HMAC-
 signed token (`backend/app/services/partner_link_token.py`, pure, modelled on the
 email-action token) over the caller's org id only — **no name/slug/PII** — with a
@@ -841,18 +894,17 @@ whose `parent_org_id` is A are reachable. Branding pushed to a child is audited 
 ### Frontend — `/admin/partner`
 
 The **Partner Admin** page (`frontend/src/routes/admin/partner/+page.svelte`,
-under the Settings nav group, admin-gated — non-admins redirect to `/`, the
-backend 403s them regardless). Lists the partner's child tenants (`DataTable`,
+under the Settings nav group, shown only to an admin of a workspace holding the
+partner capability — anyone else is redirected to `/`, and the backend 403s
+them regardless). Lists the partner's child tenants (`DataTable`,
 clickable rows) and opens a `Modal` to view/edit a child's brand (product name,
 logo URL, two accent colors, support + legal URLs) with the same client-side
 hex/URL validation as the org's own Branding panel, saving via `PUT
-/api/partner/children/{id}/branding`. A standalone org sees the children table
-with its empty row worded as the "not a partner" state (decisions §501). API client: `frontend/src/lib/api/partner.ts` (types in
+/api/partner/children/{id}/branding`. A partner with no children yet sees the
+table's empty row (decisions §501). API client: `frontend/src/lib/api/partner.ts` (types in
 `frontend/src/lib/types/partner.ts`). Built from the shared `ui/` components.
 
-The page also carries the **provisioning** affordances: a **Generate link code**
-panel ("Join a partner" — this workspace consenting to *be* a child; copies the
-minted code), a **+ Create child tenant** toolbar button opening a `Modal` to
+The page also carries the **provisioning** affordances: a **+ Create child tenant** toolbar button opening a `Modal` to
 provision a brand-new tenant under this partner (name / slug / admin email →
 `POST /api/partner/children/provision`; the result view reveals the one-time temp
 password with a copy button, shown only once), an **+ Attach child** toolbar
@@ -860,11 +912,20 @@ button opening a `Modal` to paste a child-issued code (`POST /api/partner/childr
 and an armed two-click **Detach** `RowAction` per child row
 (`DELETE /api/partner/children/{id}`).
 
+The consent side — **Generate link code**, this workspace consenting to *be* a
+child, with a copy button — is the **Join a partner** panel in Organization
+settings (`/organization?section=partner-link`,
+`frontend/src/lib/components/organization/PartnerLinkPanel.svelte`), open to any
+admin whether or not the workspace is a partner.
+
 ### Tests
 
 - Backend: `backend/tests/test_partner_admin.py` (realdb) — overview lists ONLY
-  the caller's own children; a standalone org is `is_partner:false` + empty;
-  admin-only (403 for a manager) + 401 unauth; read + push a child's branding;
+  the caller's own children; a partner with no children is empty;
+  admin-only (403 for a manager) + 401 unauth; **every `/api/partner` route**
+  (walked off the router) is the coded 403 for an admin of a non-partner, a
+  non-admin still gets the role 403, and an existing partner keeps access until
+  the capability is revoked; read + push a child's branding;
   push persists to the child's row, audits the child's trail PII-free
   (`via:partner`, raw value never echoed), and preserves the child's
   `custom_domains`; **the isolation headline** — a non-child org id is an opaque
@@ -872,7 +933,9 @@ and an armed two-click **Detach** `RowAction` per child row
 - Backend (provisioning): `backend/tests/test_partner_link_token.py` (pure —
   build/verify round-trip, fail-closed on empty key, forgery/tamper rejection,
   purpose binding, expiry) + `backend/tests/test_partner_link_provisioning.py`
-  (realdb — mint admin-only/fail-closed; attach with a consenting code links +
+  (realdb — mint admin-only/fail-closed at its Organization-settings path, by
+  an admin of a non-partner, still audited; the old path is gone; a non-partner
+  cannot redeem a code; attach with a consenting code links +
   audits both trails PII-free; **the authorization headline**: attach with no /
   garbage / cross-key-forged code is rejected and NO link is created; single-use
   replay → 409; re-parent guard → 409 with same-partner idempotent no-op; detach
@@ -886,11 +949,19 @@ and an armed two-click **Detach** `RowAction` per child row
   database exists; admin-only (403) + 401 unauth; slug collision → clean
   409 with the existing tenant undisturbed; invalid slug / email → 422. Each test
   drops the provisioned DB + control rows in a `finally`).
-- Frontend: `frontend/tests-e2e/admin/partner.spec.ts` (branding admin surface) +
-  `frontend/tests-e2e/admin/partner-provisioning.spec.ts` — admin sees the
-  attach + link-code affordances and mints a code; the authorization boundary
-  (a garbage code is an opaque 400, no link created; a self-mint can't self-
-  attach); a clerk is 403'd on mint + attach.
+- Backend (capability): `backend/tests/test_partner_capability.py` (realdb —
+  `/api/auth/me` reports it; the operator script / service grant + revoke
+  audited first, idempotent, refused with no audit row, revoke refused while a
+  child is linked, exit codes) + `backend/tests/test_migration_0151_org_is_partner.py`
+  (the column, the backfill from the hierarchy, re-run, downgrade, tenant no-op).
+- Frontend: `frontend/src/lib/nav.test.ts` (the capability is ANDed on the
+  role gate and fails closed; Partner Admin only for an admin of a partner) +
+  `frontend/tests-e2e/admin/partner.spec.ts` (an admin of a non-partner: no
+  row, the page bounces, the API's coded 403; with the capability stubbed on
+  `/me`: the row shows and the page opens) +
+  `frontend/tests-e2e/admin/partner-provisioning.spec.ts` (an admin mints a
+  code from Organization → Join a partner; a non-partner cannot redeem one; a
+  clerk is 403'd on mint + attach).
 
 ## Deferred to later slices
 

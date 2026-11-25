@@ -4,7 +4,13 @@ import { fileURLToPath } from 'node:url';
 
 import AxeBuilder from '@axe-core/playwright';
 
-import { API_BASE, authedTenantHeaders, expect, test } from '../fixtures/helpers';
+import {
+	API_BASE,
+	authedTenantHeaders,
+	expect,
+	stubPartnerCapability,
+	test
+} from '../fixtures/helpers';
 import { formatViolations } from './axe-helper';
 
 /**
@@ -307,8 +313,10 @@ test.describe("reflow at 320px — /organization's panels (WCAG 1.4.10)", () => 
 });
 
 /**
- * /admin/partner for a workspace that is not a partner. Its whole explanation
- * is the children table's empty row (decisions §501), and the route sweep above
+ * /admin/partner for a partner with no children yet (a workspace that is not
+ * a partner never reaches the page — decisions §574, so the capability is
+ * stubbed on `/api/auth/me`). Its whole content is the children table's empty
+ * row (decisions §501), and the route sweep above
  * cannot see whether that sentence fits: the table scrolls inside its own
  * region, so the DOCUMENT never overflows even while the sentence sits centred
  * in a 1000px-wide table, mostly off a 320px screen. The table's width floor
@@ -318,8 +326,9 @@ test.describe("reflow at 320px — /organization's panels (WCAG 1.4.10)", () => 
  * viewport. The overview is answered here so the state does not depend
  * on whether the worker tenant happens to administer a child.
  */
-test.describe('reflow at 320px — /admin/partner when the workspace is not a partner', () => {
-	test('the not-a-partner sentence fits the screen', async ({ page }) => {
+test.describe('reflow at 320px — /admin/partner when the partner has no children', () => {
+	test('the empty-row sentence fits the screen', async ({ page }) => {
+		await stubPartnerCapability(page);
 		await page.route(
 			(url) => url.pathname === '/api/partner',
 			(route) =>
@@ -328,7 +337,7 @@ test.describe('reflow at 320px — /admin/partner when the workspace is not a pa
 							json: {
 								organization_id: '00000000-0000-4000-8000-000000000440',
 								name: 'Reflow Fixture Workspace',
-								is_partner: false,
+								is_partner: true,
 								children: []
 							}
 						})
@@ -340,14 +349,14 @@ test.describe('reflow at 320px — /admin/partner when the workspace is not a pa
 		await expect(page.locator('aside.sidebar').first()).toBeVisible();
 		await expect(page).not.toHaveURL(/\/login/);
 		const empty = page.locator('.partner-table').getByTestId('table-empty');
-		await expect(empty).toContainText('partner');
+		await expect(empty).toContainText('No child tenants');
 
 		const box = await empty.boundingBox();
 		expect(box, 'the empty row is not laid out').not.toBeNull();
 		expect(box!.x).toBeGreaterThanOrEqual(0);
 		expect(
 			box!.x + box!.width,
-			'the not-a-partner sentence runs off a 320px screen'
+			'the empty-row sentence runs off a 320px screen'
 		).toBeLessThanOrEqual(320);
 
 		const overflow = await page.evaluate(

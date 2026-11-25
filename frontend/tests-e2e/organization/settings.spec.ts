@@ -93,13 +93,15 @@ const PANELS = [
 	['exception-agents', 'Exception agents'],
 	['residency', 'Data Residency'],
 	['plan', 'Plan'],
+	['partner-link', 'Join a partner'],
 	['close', 'Close this workspace']
 ] as const;
 
 /**
  * The panels with no non-admin data at all — the six whose settings block
  * `org_settings_view.NON_ADMIN_SETTINGS` withholds, plus Single Sign-On, whose
- * only read (`GET /api/organization/sso`) is admin-only — slug, heading, and the
+ * only read (`GET /api/organization/sso`) is admin-only, and Join a partner,
+ * whose one action (minting the consent code) is admin-only — slug, heading, and the
  * testid of the admin-only hint that replaces their body for a non-admin.
  *
  * Shared by the admin case (none of these hints may appear) and the clerk cases
@@ -115,6 +117,8 @@ const ADMIN_ONLY_PANELS = [
 	['security', 'Security', 'security-admin-only'],
 	['sso', 'Single Sign-On', 'sso-admin-only'],
 	['fraud', 'Fraud Detection', 'fraud-admin-only'],
+	// Consenting to be adopted by a partner (decisions §574): any admin, no one else.
+	['partner-link', 'Join a partner', 'partner-link-admin-only'],
 	// Closing the workspace is an admin act, so the panel is the hint alone.
 	['close', 'Close this workspace', 'close-workspace-admin-only']
 ] as const;
@@ -130,7 +134,9 @@ const ADMIN_ONLY_PANELS = [
  * refuses. The form branch is held, stubbed, by `close-workspace.spec.ts`.
  */
 const ADMIN_BODY: Partial<Record<(typeof ADMIN_ONLY_PANELS)[number][0], string>> = {
-	close: '[data-testid="close-workspace-blocked"]'
+	close: '[data-testid="close-workspace-blocked"]',
+	// The mint button: the panel is one action, not a form.
+	'partner-link': 'button'
 };
 
 /** The `section.card` carrying `heading`. */

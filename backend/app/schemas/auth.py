@@ -111,6 +111,11 @@ class UserResponse(BaseModel):
     # admin sees "available on Growth / Scale" instead of a control that 402s.
     # Advisory only — every gate is enforced server-side (decisions §258).
     entitlements: list[str] = []
+    # The operator has granted the caller's ORGANIZATION the partner (reseller)
+    # capability (`Organization.is_partner`, decisions §574). Every
+    # `/api/partner` route requires it; the SPA gates the Partner Admin row and
+    # page on it so the row and the page agree. Never set through the API.
+    is_partner: bool = False
     # Account-level email-language preference (NULL = English fallback). Drives
     # outbound email copy only — NOT in-app UI (the frontend's per-device locale
     # picker owns that). See docs/notifications.md § Localized email.

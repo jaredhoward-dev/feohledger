@@ -1,7 +1,9 @@
 // Typed helpers for the partner / reseller multi-tenant admin surface. Routes
 // through the shared `api` client (Bearer + X-Tenant-Slug + 401-bounce) — never
-// raw fetch. Backend: `backend/app/api/partner.py` (admin + JWT gated, scoped to
-// the caller's own child tenants). See `docs/white-label.md` § Partner admin.
+// raw fetch. Backend: `backend/app/api/partner.py` (admin + the operator-granted
+// partner capability, scoped to the caller's own child tenants — decisions §574).
+// The link-code mint is NOT a partner act and lives in Organization settings
+// (`backend/app/api/organization_partner_link.py`). See `docs/white-label.md`.
 import { api } from '#lib/api.ts';
 import type {
 	ChildBranding,
@@ -33,10 +35,11 @@ export function updateChildBranding(
 
 /** Mint a single-use link code FOR the caller's own org, so it can be attached
  *  as a child by a partner. Handing the code to a partner is the consent step —
- *  the partner can do nothing with it until then. Admin-only; 503 if the feature
- *  is not configured (no signing key). */
+ *  the partner can do nothing with it until then. Any admin, partner or not
+ *  (Organization settings, decisions §574); 503 if the feature is not
+ *  configured (no signing key). */
 export function mintLinkCode(): Promise<LinkCode> {
-	return api.post<LinkCode>('/api/partner/link-code', {});
+	return api.post<LinkCode>('/api/organization/partner-link-code', {});
 }
 
 /** Attach a consenting child to the caller's partner org by redeeming a code the

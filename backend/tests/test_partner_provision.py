@@ -39,7 +39,16 @@ from app.models.organization import Organization
 from app.models.user import User, UserRole
 from app.models.workflow import AuditLog
 from app.services.tenant_provisioning import _parse_maintenance_dsn
+from tests.partner_capability_helpers import granted_partner
 from tests.set_password_mail import capture_outbox, link_mode, link_token, set_password_link
+
+
+@pytest.fixture(autouse=True)
+async def _a_is_partner(realdb):
+    """Tenant "a" is the partner in this module: the operator granted it the
+    capability every `/api/partner` route requires (decisions §574)."""
+    async with granted_partner(realdb, "a"):
+        yield
 
 
 def _unique_slug(prefix: str = "pchild") -> str:

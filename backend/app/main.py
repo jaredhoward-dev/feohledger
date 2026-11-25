@@ -53,6 +53,7 @@ from app.api import (
     organization_controls,
     organization_credentials,
     organization_match_rules,
+    organization_partner_link,
     organization_sso,
     partner,
     payments,
@@ -680,6 +681,10 @@ app.include_router(organization_match_rules.router, prefix="/api")
 # Hangs off /api/organization/close — an administrator closing an unused
 # workspace (services/workspace_closure, decisions §306).
 app.include_router(organization_close.router, prefix="/api")
+# Hangs off /api/organization/partner-link-code — any admin consenting to be
+# adopted by a partner; no partner capability needed (decisions §574).
+app.include_router(organization_partner_link.router, prefix="/api")
+# Every route requires the operator-granted partner capability (§574).
 app.include_router(partner.router, prefix="/api")
 app.include_router(payments.router, prefix="/api")
 app.include_router(signup.router, prefix="/api")

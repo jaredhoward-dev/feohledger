@@ -10,7 +10,14 @@
 	// role can't see are dropped.
 	let group = $derived(groupForPath(page.url.pathname));
 	let tabs = $derived(
-		group ? visibleChildren(group, auth.hasAnyRole.bind(auth), auth.can.bind(auth)) : []
+		group
+			? visibleChildren(
+					group,
+					auth.hasAnyRole.bind(auth),
+					auth.can.bind(auth),
+					auth.hasCapability.bind(auth)
+				)
+			: []
 	);
 	let activeIndex = $derived(tabs.findIndex((t) => sectionTabActive(t, tabs, page.url)));
 

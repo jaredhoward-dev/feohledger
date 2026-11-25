@@ -237,6 +237,8 @@ export const messages = {
 	'audit.action.organization.scim_token_minted': "Token SCIM emitido",
 	'audit.action.organization.scim_token_revoked': "Token SCIM revogado",
 	'audit.action.organization.sso_only_lifted': "Login exclusivo por SSO suspenso",
+	'audit.action.organization.partner_capability_granted': "Capacidade de parceiro concedida",
+	'audit.action.organization.partner_capability_revoked': "Capacidade de parceiro revogada",
 	'audit.action.organization.sso_updated': "Configurações de SSO atualizadas",
 	'audit.action.partner.child_attached': "Espaço de cliente vinculado",
 	'audit.action.partner.child_detached': "Espaço de cliente desvinculado",

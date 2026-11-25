@@ -240,6 +240,8 @@ export const enAudit = {
 	'audit.action.organization.scim_token_minted': "SCIM token issued",
 	'audit.action.organization.scim_token_revoked': "SCIM token revoked",
 	'audit.action.organization.sso_only_lifted': "SSO-only sign-in lifted",
+	'audit.action.organization.partner_capability_granted': "Partner capability granted",
+	'audit.action.organization.partner_capability_revoked': "Partner capability revoked",
 	'audit.action.organization.sso_updated': "SSO settings updated",
 	'audit.action.partner.child_attached': "Client workspace attached",
 	'audit.action.partner.child_detached': "Client workspace detached",
