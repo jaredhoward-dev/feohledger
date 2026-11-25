@@ -19,7 +19,6 @@
 		type ProviderCredentialStatus
 	} from '#lib/types/providerCredentials.ts';
 	import SettingsRail from '#lib/components/ui/SettingsRail.svelte';
-	import CurrencyInput from '#lib/components/ui/CurrencyInput.svelte';
 	import { normalizeCurrencyCode, currencyCodeProblem } from '#lib/utils/currencyCode.ts';
 	import { m, currentLocale } from '#lib/i18n/store.svelte.ts';
 	import { planCodeLabel } from '#lib/types/planFeatures.ts';
@@ -62,7 +61,11 @@
 	import MatchRulesPanel from '#lib/components/organization/MatchRulesPanel.svelte';
 	import AgentAutonomyPanel from '#lib/components/organization/AgentAutonomyPanel.svelte';
 	import CompanyProfilePanel from '#lib/components/organization/CompanyProfilePanel.svelte';
-	import type { CompanyFields } from '#lib/components/organization/panelState.ts';
+	import InvoiceDefaultsPanel from '#lib/components/organization/InvoiceDefaultsPanel.svelte';
+	import type {
+		CompanyFields,
+		InvoiceDefaultsFields
+	} from '#lib/components/organization/panelState.ts';
 	import { withoutOwnedFraudKeys } from '#lib/types/orgControls.ts';
 	import type { StoredErpConfig } from '#lib/types/erpConnection.ts';
 	import {
@@ -154,40 +157,14 @@
 		vatNumber: '',
 		companiesHouseNumber: ''
 	});
-	let currency = $state('USD');
-	// The stored default is the user's choice, never re-seeded; marking it
-	// touched once loaded also shows a malformed stored code as an error.
-	let currencyTouched = $state(false);
-	let paymentTerms = $state('Net 30');
-	// The stored value is the English term the backend and the ERP exports
-	// read, so it stays the option's `value`; only the label is localized.
-	const PAYMENT_TERMS = [
-		'Due on Receipt',
-		'Net 10',
-		'Net 15',
-		'Net 30',
-		'Net 45',
-		'Net 60',
-		'Net 90',
-		'2/10 Net 30'
-	] as const;
-	// A term saved through the API (or before this list) that is not one of the
-	// presets is still offered, so the select shows what is actually stored
-	// rather than a blank box that silently overwrites it on the next save.
-	const paymentTermOptions = $derived(
-		(PAYMENT_TERMS as readonly string[]).includes(paymentTerms)
-			? [...PAYMENT_TERMS]
-			: [...PAYMENT_TERMS, paymentTerms]
-	);
-	function paymentTermLabel(term: string): string {
-		if (term === 'Due on Receipt') return m('org.defaults.terms.dueOnReceipt');
-		if (term === '2/10 Net 30') return m('org.defaults.terms.twoTenNet30');
-		const net = /^Net (\d+)$/.exec(term);
-		return net ? m('org.defaults.terms.net', { days: Number(net[1]) }) : term;
-	}
-	let numberPrefix = $state('INV-');
-	let defaultGl = $state('');
-	let defaultCostCenter = $state('');
+	let invoiceDefaults = $state<InvoiceDefaultsFields>({
+		currency: 'USD',
+		currencyTouched: false,
+		paymentTerms: 'Net 30',
+		numberPrefix: 'INV-',
+		defaultGl: '',
+		defaultCostCenter: ''
+	});
 	// Provider credentials are write-only (`/api/organization/credentials`). Each
 	// secret input on the payments, cards and extraction panels (the ERP panel keeps its own,
 	// `ErpConnectionPanel`) starts EMPTY and holds
@@ -612,12 +589,14 @@
 				vatNumber: data.settings.company.vat_registration_number ?? '',
 				companiesHouseNumber: data.settings.company.companies_house_number ?? ''
 			};
-			currency = data.settings.invoice_defaults.currency;
-			currencyTouched = true;
-			paymentTerms = data.settings.invoice_defaults.payment_terms;
-			numberPrefix = data.settings.invoice_defaults.number_prefix;
-			defaultGl = data.settings.invoice_defaults.default_gl_account;
-			defaultCostCenter = data.settings.invoice_defaults.default_cost_center;
+			invoiceDefaults = {
+				currency: data.settings.invoice_defaults.currency,
+				currencyTouched: true,
+				paymentTerms: data.settings.invoice_defaults.payment_terms,
+				numberPrefix: data.settings.invoice_defaults.number_prefix,
+				defaultGl: data.settings.invoice_defaults.default_gl_account,
+				defaultCostCenter: data.settings.invoice_defaults.default_cost_center
+			};
 			// Cards
 			const cards = (data.settings as unknown as Record<string, unknown>).cards as Record<string, unknown> | undefined;
 			if (cards) {
@@ -922,27 +901,27 @@
 	async function saveDefaults() {
 		// The section has no <form>, so the field's own validity cannot block
 		// the save: refuse here with the same words the field shows.
-		const code = normalizeCurrencyCode(currency);
+		const code = normalizeCurrencyCode(invoiceDefaults.currency);
 		if (code === null) {
-			currencyTouched = true;
+			invoiceDefaults.currencyTouched = true;
 			toast(
-				currencyCodeProblem(currency) === 'required'
+				currencyCodeProblem(invoiceDefaults.currency) === 'required'
 					? m('common.currencyCode.required')
-					: m('common.currencyCode.invalid', { value: currency.trim() }),
+					: m('common.currencyCode.invalid', { value: invoiceDefaults.currency.trim() }),
 				'error'
 			);
 			return;
 		}
-		currency = code;
+		invoiceDefaults.currency = code;
 		savingDefaults = true;
 		try {
 			await patchSettings(m('org.section.defaultsSaved'), {
 				invoice_defaults: {
-					currency,
-					payment_terms: paymentTerms,
-					number_prefix: numberPrefix,
-					default_gl_account: defaultGl,
-					default_cost_center: defaultCostCenter,
+					currency: invoiceDefaults.currency,
+					payment_terms: invoiceDefaults.paymentTerms,
+					number_prefix: invoiceDefaults.numberPrefix,
+					default_gl_account: invoiceDefaults.defaultGl,
+					default_cost_center: invoiceDefaults.defaultCostCenter,
 				},
 			});
 			// `invoice_defaults.currency` is a rung of the reporting-currency
@@ -2028,48 +2007,7 @@
 				{/if}
 
 				{#if section === 'defaults'}
-					<section class="card" id="org-defaults">
-						<h2>{m('org.section.defaults')}</h2>
-						<p class="card-hint">{m('org.defaults.hint')} <HelpTip term="reporting-currency" /></p>
-						<div class="form-grid">
-							<label>
-								<span>{m('org.defaults.currency')}</span>
-								<!-- Any ISO 4217 code: six hardcoded options left a PLN or
-								     ZAR organization unable to set its own default, which is
-								     also a rung of the reporting currency (decisions §381). -->
-								<CurrencyInput
-									bind:value={currency}
-									bind:touched={currencyTouched}
-									testid="org-default-currency"
-								/>
-							</label>
-							<label>
-								<span>{m('org.defaults.paymentTerms')}</span>
-								<select bind:value={paymentTerms}>
-									{#each paymentTermOptions as term (term)}
-										<option value={term}>{paymentTermLabel(term)}</option>
-									{/each}
-								</select>
-							</label>
-							<label>
-								<span>{m('org.defaults.numberPrefix')}</span>
-								<input type="text" bind:value={numberPrefix} placeholder={'INV-'} />
-							</label>
-							<label>
-								<span>{m('org.defaults.defaultGl')}</span>
-								<input type="text" bind:value={defaultGl} placeholder={m('org.defaults.defaultGlPlaceholder')} />
-							</label>
-							<label>
-								<span>{m('org.defaults.defaultCostCenter')}</span>
-								<input type="text" bind:value={defaultCostCenter} placeholder={m('org.defaults.defaultCostCenterPlaceholder')} />
-							</label>
-						</div>
-						<div class="section-footer">
-							<button class="btn-save-section" disabled={savingDefaults} onclick={saveDefaults}>
-								{savingDefaults ? m('org.common.saving') : m('org.defaults.save')}
-							</button>
-						</div>
-					</section>
+					<InvoiceDefaultsPanel bind:fields={invoiceDefaults} saving={savingDefaults} onsave={saveDefaults} />
 				{/if}
 
 				{#if section === 'branding'}
