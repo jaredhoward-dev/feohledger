@@ -1,4 +1,4 @@
-import { createHmac, randomUUID } from 'node:crypto';
+import { randomUUID } from 'node:crypto';
 
 import type { APIRequestContext } from '@playwright/test';
 
@@ -9,21 +9,26 @@ import {
 	tenantPsql,
 	test
 } from '../fixtures/helpers';
+import { lithicHeaders, lithicSecret, niumHeaders } from '../fixtures/cardWebhook';
 
 /**
  * Card-webhook invariant coverage (project invariant #9): every inbound
- * webhook verifies the provider HMAC over the raw body and dedupes by
- * event id, and every rejection path returns 204 silently (a distinct
- * 4xx would let an attacker enumerate card tokens / tenant slugs).
+ * webhook is verified the way its provider really authenticates it (Lithic's
+ * Standard-Webhooks HMAC + timestamp window, Nium's `x-partner-key`;
+ * decisions §555) and deduped on the provider's delivery id, and every
+ * rejection path returns 204 silently (a distinct 4xx would let an
+ * attacker enumerate card tokens / tenant slugs).
  *
  * The webhook is unauthenticated (it's a provider callback) and resolves
  * the owning tenant by `provider_card_id`, so these tests seed a card row
  * directly with a unique token, set the tenant's
- * `cards.webhook_signing_secret`, and POST raw bodies with hand-computed
- * signatures. No UI is involved — this is the money-state mutation path.
+ * `cards.webhook_signing_secret`, and POST raw bodies signed the provider's
+ * way (`fixtures/cardWebhook.ts`). No UI is involved — this is the
+ * money-state mutation path.
  */
 
-const SECRET = 'wh_secret_for_e2e_card_tests_0001';
+// Lithic's `whsec_<base64>` shape; Nium is sent the same value as its partner key.
+const SECRET = lithicSecret('wh_secret_for_e2e_card_tests_0001');
 // Unique per spec-run so concurrent workers (each in their own tenant DB,
 // but the webhook scans *every* tenant) never collide on the token.
 const TOKEN = `e2e-wh-${randomUUID()}`;
@@ -62,18 +67,16 @@ function purge(cardId: string): void {
 	tenantPsql(`DELETE FROM virtual_cards WHERE id = '${cardId}'`);
 }
 
-/** Lithic's real card event (decisions §549): `card_transaction.updated`,
- *  whose body is the transaction itself and whose `status` says what
- *  happened — `PENDING` is an approved authorization. Lithic sends no
- *  `authorization.*` / `transaction.*` types, and the handler maps only the
- *  documented names, so an invented name is (correctly) inert. */
+/** Lithic's real card event (decisions §549, §555): `card_transaction.updated`,
+ *  whose body is the Transaction plus a top-level `event_type`, and whose
+ *  `status` says what happened — `PENDING` is an approved authorization. The
+ *  delivery id travels in the signed `webhook-id` header, not the body. */
 function lithicTxnBody(eventId: string, status: string, cardToken = TOKEN): string {
 	return JSON.stringify({
-		type: 'card_transaction.updated',
+		event_type: 'card_transaction.updated',
 		token: `txn-${eventId}`,
 		card_token: cardToken,
 		status,
-		event_id: eventId,
 		amount: 100000, // cents → $1000.00
 		merchant: { descriptor: 'ACME VENDOR' }
 	});
@@ -89,11 +92,12 @@ function declineBody(eventId: string): string {
 	return lithicTxnBody(eventId, 'DECLINED');
 }
 
-function sign(rawBody: string, secret = SECRET): string {
-	return createHmac('sha256', secret).update(rawBody).digest('hex');
+/** Lithic's headers for ``rawBody``, signed with the tenant's secret. */
+function signed(rawBody: string, id: string = randomUUID(), timestamp?: number) {
+	return lithicHeaders(SECRET, rawBody, { id, timestamp });
 }
 
-test.describe('card webhook HMAC + dedup', () => {
+test.describe('card webhook signature + dedup', () => {
 	test.beforeEach(({ request }) => setSigningSecret(request, SECRET));
 	test.afterEach(({ request }) => clearSigningSecret(request));
 
@@ -102,7 +106,7 @@ test.describe('card webhook HMAC + dedup', () => {
 		try {
 			const body = chargeBody(randomUUID());
 			const resp = await request.post(`${API_BASE}/api/cards/webhook/lithic`, {
-				headers: { 'Content-Type': 'application/json', 'Webhook-Signature': 'deadbeef' },
+				headers: { ...signed(body), 'webhook-signature': 'v1,ZGVhZGJlZWY=' },
 				data: body
 			});
 			// Silent 204 regardless — never an enumerable 4xx.
@@ -113,6 +117,24 @@ test.describe('card webhook HMAC + dedup', () => {
 				`SELECT count(*) FROM card_rebates WHERE virtual_card_id = '${cardId}'`
 			).trim();
 			expect(rebates).toBe('0');
+		} finally {
+			purge(cardId);
+		}
+	});
+
+	test('a correctly signed but stale delivery is rejected (204): replay window', async ({
+		request
+	}) => {
+		const cardId = seedCard();
+		try {
+			const body = chargeBody(randomUUID());
+			const tenMinutesAgo = Math.floor(Date.now() / 1000) - 600;
+			const resp = await request.post(`${API_BASE}/api/cards/webhook/lithic`, {
+				headers: signed(body, randomUUID(), tenMinutesAgo),
+				data: body
+			});
+			expect(resp.status()).toBe(204);
+			expect(cardStatus(cardId)).toBe('active');
 		} finally {
 			purge(cardId);
 		}
@@ -139,7 +161,7 @@ test.describe('card webhook HMAC + dedup', () => {
 			const eventId = randomUUID();
 			const body = chargeBody(eventId);
 			const resp = await request.post(`${API_BASE}/api/cards/webhook/lithic`, {
-				headers: { 'Content-Type': 'application/json', 'Webhook-Signature': sign(body) },
+				headers: signed(body),
 				data: body
 			});
 			expect(resp.status()).toBe(204);
@@ -178,7 +200,7 @@ test.describe('card webhook HMAC + dedup', () => {
 		try {
 			const body = declineBody(randomUUID());
 			const resp = await request.post(`${API_BASE}/api/cards/webhook/lithic`, {
-				headers: { 'Content-Type': 'application/json', 'Webhook-Signature': sign(body) },
+				headers: signed(body),
 				data: body
 			});
 			// Valid signature, but a decline is neither a charge nor a settlement.
@@ -217,12 +239,12 @@ test.describe('card webhook HMAC + dedup', () => {
 				// in `template` and carries `transactionAmount` (decisions §549).
 				template: 'CARD_POS_APPROVED_WEBHOOK',
 				cardHashId: niumToken,
-				webhookId: randomUUID(),
 				transactionAmount: 50.5, // MAJOR units → $50.50
 				merchantName: 'ACME VENDOR'
 			});
+			// Nium signs nothing; it sends the agreed partner key (decisions §555).
 			const resp = await request.post(`${API_BASE}/api/cards/webhook/nium`, {
-				headers: { 'Content-Type': 'application/json', 'Webhook-Signature': sign(body) },
+				headers: niumHeaders(SECRET, randomUUID()),
 				data: body
 			});
 			expect(resp.status()).toBe(204);
@@ -243,11 +265,12 @@ test.describe('card webhook HMAC + dedup', () => {
 		try {
 			const eventId = randomUUID();
 			const body = chargeBody(eventId);
-			const sig = sign(body);
+			// Lithic's retry resends the same delivery: same id, same signature.
+			const headers = signed(body, eventId);
 
 			// First delivery — applies the charge.
 			const first = await request.post(`${API_BASE}/api/cards/webhook/lithic`, {
-				headers: { 'Content-Type': 'application/json', 'Webhook-Signature': sig },
+				headers,
 				data: body
 			});
 			expect(first.status()).toBe(204);
@@ -262,7 +285,7 @@ test.describe('card webhook HMAC + dedup', () => {
 			);
 
 			const replay = await request.post(`${API_BASE}/api/cards/webhook/lithic`, {
-				headers: { 'Content-Type': 'application/json', 'Webhook-Signature': sig },
+				headers,
 				data: body
 			});
 			expect(replay.status()).toBe(204);
@@ -276,7 +299,7 @@ test.describe('card webhook HMAC + dedup', () => {
 	test('unknown card token is a silent 204 (no enumeration)', async ({ request }) => {
 		const body = lithicTxnBody(randomUUID(), 'PENDING', `no-such-card-${randomUUID()}`);
 		const resp = await request.post(`${API_BASE}/api/cards/webhook/lithic`, {
-			headers: { 'Content-Type': 'application/json', 'Webhook-Signature': sign(body) },
+			headers: signed(body),
 			data: body
 		});
 		expect(resp.status()).toBe(204);
