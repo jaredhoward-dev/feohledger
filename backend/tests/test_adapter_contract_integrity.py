@@ -134,6 +134,18 @@ SKELETON_METHODS: dict[tuple[str, str, str], str] = {
 }
 
 
+#: ``(family, method)`` → the class flag that offers it. An optional method
+#: whose callers read the flag first and never call it on an adapter without
+#: it, so raising there is the base's fail-closed default, not a skeleton: the
+#: orphan-bill lookup (decisions §556, §566) answers ``erp_lookup_unsupported``
+#: from ``supports_bill_lookup`` before it builds an adapter. Only an adapter
+#: that does NOT set the flag is exempt; one that sets it and still cannot
+#: return is flagged like any skeleton.
+CAPABILITY_GATED_METHODS: dict[tuple[str, str], str] = {
+    ("erp_adapters", "find_posted_bill"): "supports_bill_lookup",
+}
+
+
 # ---------------------------------------------------------------------------
 # Discovery
 # ---------------------------------------------------------------------------
@@ -218,6 +230,9 @@ def _discover_skeletons() -> dict[tuple[str, str, str], object]:
     for family in sorted(FAMILY_REGISTRIES):
         for provider, target in sorted(_load_registry(family).items()):
             for method_name, func in _public_callables(target).items():
+                flag = CAPABILITY_GATED_METHODS.get((family, method_name))
+                if flag is not None and getattr(target, flag, False) is not True:
+                    continue
                 if _never_returns(func):
                     found[(family, provider, method_name)] = target
     return found
@@ -326,3 +341,15 @@ def test_every_recorded_consequence_says_something():
         f"SKELETON_METHODS entries with no useful consequence recorded: {thin}. "
         "Say what the caller gets when this method is reached."
     )
+
+
+def test_a_capability_gated_method_is_offered_by_some_adapter():
+    """The exemption above names a flag at least one registered adapter sets,
+    so a renamed flag cannot quietly exempt every adapter."""
+    for (family, method), flag in CAPABILITY_GATED_METHODS.items():
+        offering = [
+            provider
+            for provider, target in _load_registry(family).items()
+            if getattr(target, flag, False) is True
+        ]
+        assert offering, f"no {family} adapter sets {flag}; {method} is never offered"
