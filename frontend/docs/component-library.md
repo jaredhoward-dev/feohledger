@@ -385,6 +385,14 @@ a definition as JSON). All wrap the shared `ui/Modal.svelte` and call the
   in its titled shape with Log out as its `actions`; this component owns only the
   brand frame, the loading line and keeping the panel up through a retry. `<AccountLoadState status={auth.userStatus} onretry onlogout />`.
   `docs/authentication.md` § When the account cannot be loaded.
+- `LegalAcceptStep.svelte` — the blocking Terms / Privacy re-prompt the root
+  layout draws in the shell's place while `auth.user.legal_acceptance_required`
+  (decisions §497): `auth/LegalAcceptCheckbox`, *Accept and continue*, *Log
+  out*, focus on its `<h1>`. A full page, not a modal, so nothing behind it
+  mounts and the URL survives; a 422 on a ticked box shows the box's
+  documents-changed reload state, anything else (the 429) an alert.
+  `<LegalAcceptStep onaccept={() => auth.acceptLegal()} onlogout={() => auth.logout()} />`.
+  `docs/authentication.md` § Terms and Privacy acceptance.
 - `NotificationBell.svelte` — bell + unread badge in the sidebar header with a
   recent-notifications popover (replaced the old Notifications nav row; the full
   `/notifications` page is the "View all" link). The popover is a `role="dialog"`

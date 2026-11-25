@@ -342,18 +342,36 @@ included, is a `422` coded `legal_acceptance_required`.
 Each recorded acceptance writes `auth.legal.accepted` to the tenant's auth
 trail (`{versions, source, ip}`).
 
-**The re-prompt is backend-only so far.** `GET /api/auth/me` returns
-`legal_acceptance_required` (the user has not accepted the versions in force)
-and `POST /api/auth/legal-acceptance` records it (source `reprompt`; 10/min per
-account; audited only on a first acceptance). But the flag is **advisory**:
-nothing in the web app or the mobile app reads it, and no server-side gate
-refuses an unaccepted user. So these are **not yet prompted or gated**:
-existing users (nothing is backfilled), SSO / SCIM users (no password, never
-meet a set-password link), anyone after a version bump, a forgot-password reset
-of a password account, mobile users and API callers. The server gate waits for
-the accept screen on purpose: without one it would lock those users out with no
-way to accept. The screen, then mobile and the supplier portal, then the gate:
+**The re-prompt: web today, not yet mobile, the portal or a server gate.**
+`GET /api/auth/me` returns `legal_acceptance_required` (the user has not
+accepted the versions in force) and `POST /api/auth/legal-acceptance` records
+it (source `reprompt`; 10/min per account; audited only on a first
+acceptance). The **web app** reads the flag (decisions §497): while it is true
+the root layout draws `layout/LegalAcceptStep` in place of the app shell — the
+shared `auth/LegalAcceptCheckbox`, *Accept and continue* and *Log out*, focus
+on its heading — so no page behind it mounts or fetches, and the URL is left
+as asked. `auth.acceptLegal()` posts the versions the build carries
+(`lib/legal/acceptance.ts`) and takes the account the endpoint answers with,
+so the page the user was going to renders at once. A 422 on a ticked box (the
+versions changed since the bundle loaded) switches the box to its "documents
+changed — reload" state; a 429 or any other failure is stated in an alert
+above the buttons. It runs after the forced password change, which keeps its
+own route. So on the web every signed-in employee is asked: existing users,
+SSO / SCIM users, anyone after a version bump, a forgot-password reset of a
+password account.
+
+Still **not prompted or gated**: mobile users, supplier-portal users and API
+callers, because the flag stays advisory server-side — no gate refuses an
+unaccepted user, and a web user who never opens the web app is never asked.
+The server gate waits for the mobile and portal screens on purpose: without
+them it would lock those users out with no way to accept. Order:
 `docs/followups.md`.
+
+The seed (`scripts/seed.py`) records acceptance of the versions in force for
+every account it creates (source `seed` — no person ticked a box for a
+fixture), and `tests-e2e`'s `createUserWithKnownPassword` does the same for an
+account a spec creates (`acceptLegal: false` opts out), so neither the demo
+logins nor the e2e suite meet the step. After a version bump, re-run the seed.
 
 The rows survive a DSAR erasure and a workspace deletion (evidence of the
 contract; no foreign keys), and the DSAR export carries them.

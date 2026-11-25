@@ -1510,35 +1510,27 @@ the runbook, no acceptance record on signup).
       app (the Intuit channel first: its 24-hour clock already applies), and
       every six months for the rows already filled in.
 
-- [ ] **(c) The in-app Terms / Privacy re-prompt has no screen yet, and nothing gates an unaccepted user.**
-      Acceptance is now required and recorded on signup and on a set-password
-      link (`legal_acceptances`, decisions §495), and the backend half of the
-      re-prompt is in place: `GET /api/auth/me` returns
-      `legal_acceptance_required` (true when the signed-in user has not
-      accepted the versions in `services/legal_acceptance.CURRENT_LEGAL_VERSIONS`)
-      and `POST /api/auth/legal-acceptance` records it. The flag is advisory:
-      nothing in the web app or the mobile app reads it, and no server-side
-      check refuses an unaccepted user. So four groups are never asked: SSO /
-      SCIM users (no password, never meet a set-password link), every account
-      that existed before §495, everyone after a version bump, and mobile and
-      API callers. **Durable fix, in this order:**
-      1. A blocking accept step in the web app's authenticated layout (reuse
-         `lib/components/auth/LegalAcceptCheckbox.svelte`; on submit post
-         `ACCEPTED_LEGAL_VERSIONS` and refresh the auth store from the
-         response). The e2e seed must record acceptance for the seeded role
-         users first (`scripts/seed.py` and the e2e tenant seeding), or every
-         spec meets the blocker.
-      2. The same accept step in the mobile app, and the supplier portal's own
+- [ ] **(c) The Terms / Privacy re-prompt exists on the web only, and nothing gates an unaccepted user.**
+      Acceptance is required and recorded on signup and on a set-password
+      link (`legal_acceptances`, decisions §495). `GET /api/auth/me` returns
+      `legal_acceptance_required` and `POST /api/auth/legal-acceptance`
+      records it; the web app now draws a blocking accept step in place of
+      the app shell while the flag is true (`layout/LegalAcceptStep`,
+      decisions §497), and the seed and the e2e user helper record acceptance
+      for the accounts they create. Still open: the flag is advisory
+      server-side, so mobile users, supplier-portal users and API callers are
+      never asked. **Durable fix, in this order:**
+      1. The same accept step in the mobile app, and the supplier portal's own
          sign-in (a `VendorUser` has no control-plane user id today, so it needs
          its own record shape — decide that first).
-      3. Only once both screens exist: a server-side gate that refuses an
+      2. Only once both screens exist: a server-side gate that refuses an
          unaccepted user (a coded `legal_acceptance_required`) on everything but
          `/me`, `/auth/legal-acceptance`, sign-out and the legal pages. A gate
          before the screens would lock mobile, SSO and API users out with no
          way to accept (§495). Decide there whether `/api/v1` API-key callers
          are in scope (the key's creator accepted; a key is not a person).
       **Trigger:** step 1 before the first version bump of either document and
-      before the Xero app goes to production; steps 2–3 follow it.
+      before the Xero app goes to production; step 2 follows it.
 - [ ] **(c) No retention horizon is set for `legal_acceptances`.** The rows are
       kept through a DSAR erasure and a workspace deletion as the evidence a
       contract was formed (decisions §495, GDPR Art. 17(3)(e)), but nothing
