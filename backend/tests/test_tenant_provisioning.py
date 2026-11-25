@@ -75,6 +75,7 @@ def test_control_tables_are_the_expected_control_plane_set():
             "provider_credentials",
             "workspace_closures",
             "subprocessor_notices",
+            "legal_acceptances",
         }
     )
 
