@@ -29236,3 +29236,36 @@ not what is typed into the form. `docs/sub-processors.md` § 21 says the same.
   The §498 rule still holds: a mobile build older than the bump can only sign
   out until it is updated, so this ships with or after a mobile release that
   carries it.
+
+## 560. Whether to offer the orphan-bill lookup is a served verdict, and an orphan void identifies the bill before it accepts "already gone" (§556 follow-up, round 47)
+
+**Context.** §556's pages restated the lookup's rule loosely: the invoice modal
+offered it on any `failed` invoice to a holder of `payment.void`, and the
+exception dialog whenever the flag's void was refused `erp_void_no_bill`, which
+most flags on a never-pushed invoice are. So most duplicate-flag dialogs said
+the bill might be in the ERP and offered a search the server refuses
+`erp_lookup_not_failed`. Separately, the orphan void ran its re-identification
+(the adapter's lookup, run again) only when the bill was not already gone, so a
+client-supplied id the ERP reported cancelled or deleted was recorded as this
+invoice's voided bill without ever being shown to be it.
+
+**Decision.** `erp_bill_void.orphan_lookup_verdict` is what `GET
+/erp-orphan-bill` answers before it opens a credential: `role_not_permitted`,
+`erp_lookup_not_failed`, then `erp_lookup_unsupported` from the adapter class,
+else `null`. The endpoint raises from it. `orphan_lookup_verdicts` serves it as
+`erp_orphan_lookup_refusal` on `GET /review-actions` and on a `duplicate` /
+`fraud_flag` row, **only** when the invoice is a failed push that may have left
+a bill (the workflow instance is read for those rows alone, with no ERP call).
+Absent means nothing is offered. The pages show the panel on `isOffered` and
+disable Find with the refusal otherwise; `orphanLookupOffered` and the
+`erp_void_no_bill` check are gone. The orphan void now runs the lookup straight
+after the status read, before the already-gone answer: an id the lookup does
+not name is 409 `erp_void_not_found` and nothing is recorded. The cost is that a
+void whose commit was lost, retried after the ERP has removed the bill from the
+lookup, is refused rather than converging. That is the honest answer, since
+nothing then shows the bill was ours. The flag's own void keeps converging,
+because its id is the invoice's recorded `erp_document_id`, not the client's.
+Also: the panel's result chain is one always-mounted `role="status"` region;
+hosts key it on the invoice id; Escape on a stacked dialog closes only the
+topmost (`focusTrap.ownsEscape`); and the keep hint names Retry ERP Send by its
+own label, or links to the invoice where there is no such button.
