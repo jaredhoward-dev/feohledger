@@ -63,7 +63,9 @@ label in `**bold**` instead.
 
 Rendered by `components/help/RichText.svelte` as elements — never `{@html}`.
 A guide's sections go through `components/help/GuideSections.svelte`, which both
-guide pages (`/help/guides/[id]`, `/portal/help/[id]`) share.
+guide pages (`/help/guides/[id]`, `/portal/help/[id]`) share, as they share its
+"On this page" list (`GuideToc`), its terms (`GuideTerms`) and its related
+guides (`GuideRelated`) — each taking the page's `audience` where it links out.
 
 Blocks: `p`, `steps` (numbered things to do), `list`, `note` (`tip` / `caution`
 — a control that will stop you, saying *why* it exists / `role` — who may do

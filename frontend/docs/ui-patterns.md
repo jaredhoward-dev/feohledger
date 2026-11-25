@@ -1085,6 +1085,7 @@ Where each verdict lives (backend gate → field):
 | Expense card transactions | `actions.{match,create_expense,unmatch,ignore}` | `services/expense_controls.card_txn_{link,unmatch,ignore}_refusal` |
 | Intake | `actions.{submit,approve,reject,convert,cancel,reopen,delete}` | `services/procurement_controls.intake_transition_refusal` / `.intake_convert_refusal` / `.intake_delete_refusal`. Every refusal hides the control; a row that already names its requisition shows the link instead of Convert (which would only replay it) |
 | Requisitions | `actions.{submit,approve,reject,convert,cancel,reopen,delete}` | `services/procurement_controls.requisition_{transition,approve,convert,delete}_refusal`. `requisition_approval_segregation` shows Approve disabled with its reason above it (`RowAction reason`, `approve-refusal-<id>`); every other refusal hides the control; a converted row with its PO hides Convert |
+| Contracts (detail modal + bulk bar) | `actions.{activate,terminate,cancel,renew,create_po,delete}` | `services/contract_controls` (decisions §507). Every contract refusal is a status or role one, so each hides its control; when all five lifecycle verdicts refuse, the modal renders no lifecycle block at all (no empty divider) |
 
 Each is pinned by a backend parity test that, for every seeded role and row
 state, asks both sides — the verdict and the real POST — and fails unless they
@@ -1093,7 +1094,7 @@ agree (`tests/test_payment_action_verdicts.py`,
 `tests/test_payment_queue_blocked.py`, `tests/test_expense_action_verdicts.py`,
 `tests/test_offer_experiment_suggestion_verdicts.py`,
 `tests/test_procurement_action_verdicts.py`, `tests/test_sanctions_adjudication_verdicts.py`,
-`tests/test_vendor_erp_manual_link.py`).
+`tests/test_vendor_erp_manual_link.py`, `tests/test_contract_action_verdicts.py`).
 A new verdict ships with one.
 
 Which refusals a page *explains* beside a disabled control, rather than hiding
@@ -1101,6 +1102,22 @@ the control, is a presentation choice keyed on the verdict's `code` — never a
 restated rule. The expenses page explains only `expense_cfo_required` (Approve
 stays visible, disabled, naming the CFO gate) and hides every other refusal,
 the reader's own report included.
+
+**A bulk bar reads the same verdicts.** Which actions a bulk bar offers comes
+from the selected rows' own verdicts, tallied by
+`actionVerdicts.ts::tallyBulkVerdicts(selected, loadedRows, verdictOf)` into
+`{allowed, refused, unknown}` — `unknown` being selected ids beyond the loaded
+pages ("select all N matching"), which only the server can judge.
+`offersBulk(tally)` is true when some row allows the action or some is unknown;
+an action it refuses is **not listed** in the bar's select (never a disabled
+option), and a selection no action fits says so in place of the select. The
+bar states up front how many the server will skip (`refused`), in **one
+persistent `role="status"` live region** the select's `aria-describedby`
+points at (a status node created at the moment its text appears is often not
+announced). While `unknown > 0` that count is a floor, so it reads "at least N
+will be skipped" (`contracts.bulk.willSkipAtLeast`), never an exact number.
+/contracts is the reference (`routes/contracts/+page.svelte`, pinned in
+`tests-e2e/contracts/action-verdicts.spec.ts`).
 
 One documented mirror stands in for a missing verdict: the expense list ships no
 per-line refusal, so `/expenses` reads line ownership (decisions §434) through
