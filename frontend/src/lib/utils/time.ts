@@ -190,3 +190,16 @@ export function formatMonth(key: string, style: 'short' | 'long' = 'short'): str
 	if (!d) return key;
 	return d.toLocaleDateString(getActiveFormatLocale(), { month: style, year: 'numeric' });
 }
+
+/**
+ * A reporting-period key spelled out for a sentence or an accessible name: a
+ * `YYYY-MM` month key as {@link formatMonth} ("Jun 2026"), a `YYYY-MM-DD`
+ * day/week key as {@link formatDate} ("Jun 20, 2026"). The rule: a dense chart
+ * axis takes {@link formatPeriod}; prose, an `aria-label` or an SVG `<title>`
+ * takes this, because "Jun 26" in a sentence reads as the 26th of June.
+ * Returns the raw key unchanged if it isn't a parseable date.
+ */
+export function formatPeriodLong(p: string): string {
+	if (/^\d{4}-\d{2}$/.test(p)) return formatMonth(p);
+	return formatDate(p, p);
+}

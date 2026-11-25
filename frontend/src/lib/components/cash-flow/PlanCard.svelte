@@ -2,7 +2,7 @@
 	import Money from '#lib/components/ui/Money.svelte';
 	import HelpTip from '#lib/components/help/HelpTip.svelte';
 	import { formatMoney } from '#lib/utils/money.ts';
-	import { formatDate, formatPeriod } from '#lib/utils/time.ts';
+	import { formatDate, formatPeriod, formatPeriodLong } from '#lib/utils/time.ts';
 	import { m } from '#lib/i18n/store.svelte.ts';
 	import { ApiError } from '#lib/api.ts';
 	import { auth } from '#lib/stores/auth.svelte.ts';
@@ -173,7 +173,7 @@
 			{#if result.first_shortfall_period}
 				<span class="breach-when"
 					>{m('cashFlow.chart.firstShortfall', {
-						period: formatPeriod(result.first_shortfall_period)
+						period: formatPeriodLong(result.first_shortfall_period)
 					})}</span
 				>
 			{/if}

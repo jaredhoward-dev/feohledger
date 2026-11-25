@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { formatDate, formatDueIn, formatMonth, formatPeriod, timeAgo } from './time';
+import { formatDate, formatDueIn, formatMonth, formatPeriod, formatPeriodLong, timeAgo } from './time';
 import { setActiveFormatLocale } from '#lib/i18n/formatLocale.ts';
 
 // The date helpers drive their locale off the active in-app i18n locale
@@ -267,6 +267,23 @@ describe('formatMonth', () => {
 	it('returns anything that is not a YYYY-MM key unchanged', () => {
 		expect(formatMonth('2026-11-05')).toBe('2026-11-05');
 		expect(formatMonth('garbage')).toBe('garbage');
+	});
+});
+
+// The prose / accessible-name counterpart of formatPeriod (decisions §534).
+describe('formatPeriodLong', () => {
+	it('spells a month key with its full year, so it never reads as a day', () => {
+		setActiveFormatLocale('en-US');
+		expect(formatPeriodLong('2026-06')).toBe('Jun 2026');
+	});
+
+	it('spells a day/week key as a full date', () => {
+		setActiveFormatLocale('en-US');
+		expect(formatPeriodLong('2026-06-20')).toBe('Jun 20, 2026');
+	});
+
+	it('returns an unparseable key unchanged', () => {
+		expect(formatPeriodLong('garbage')).toBe('garbage');
 	});
 });
 
