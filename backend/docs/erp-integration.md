@@ -2562,7 +2562,9 @@ void is finished as above and the marker cleared; after a refusal from (2) the
 marker is just cleared.
 
 While the marker is live (younger than `PENDING_STALE_AFTER_S`, 300 s; step 2
-is bounded at 105 s):
+is bounded as a whole at `CALL_ERP_TIMEOUT_S`, 150 s, the credential unseal
+included, and the KMS client itself at a 5 s connect, 10 s read and three
+attempts; decisions §550):
 
 - a second click answers 409 `erp_void_in_progress`, and the queue's verdict
   says the same;
@@ -2578,6 +2580,15 @@ nothing, and the next click takes it over: the read finds the bill gone and
 converges (§542), or finds it open and voids it. No sweep is needed: a stale
 marker blocks nothing, and while it is live the open flag keeps every money
 path closed.
+
+**A void that cannot be recorded is recorded as orphaned (decisions §550).**
+If (3) finds the marker taken over or the invoice moved on (the flag dismissed
+once the marker was stale, a run scheduling it) after (2) sent the void, or
+(2) ended `erp_void_unconfirmed` that way, nothing on the invoice is changed,
+but an append-only `exception.erp_bill_void_orphaned` row names the bill, the
+actor, the attempt and the invoice's status now; and if the invoice no longer
+holds the bill and is payable, a payment-blocking `payment_reconciliation` row
+(`erp_report.kind` `void_orphaned`, deduped by kind) holds it for a person.
 
 ## The invoice names its bill in the ERP
 

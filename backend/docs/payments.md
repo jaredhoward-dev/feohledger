@@ -551,7 +551,10 @@ dismissed. That open flag is what every payment path already refuses
 (`payment_runs.blocking_exception_types`: run creation, card mint, mark-paid,
 retry-failed, the queue), so no path here reads the marker itself. A crashed
 attempt's marker stops counting after 300 s and the next void click resumes
-it; while it counts, the flag stays open and the invoice stays unpayable.
+it; while it counts, the flag stays open and the invoice stays unpayable. The
+ERP step gives up at 150 s, so it never outlives its marker; a void it sent but
+could not record (the invoice moved on) opens a blocking
+`payment_reconciliation` row (decisions §550).
 
 ### Bounded wait for the invoice lock
 

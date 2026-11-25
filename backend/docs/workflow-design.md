@@ -962,6 +962,8 @@ Each entry records:
 | `invoice.resubmitted`         | Re-entered review after edits   |
 | `invoice.approval_recalled`   | Approval recalled back to review |
 | `invoice.erp_bill_voided`     | Bill voided in the ERP from a flag; back to `approved` (§539) |
+| `exception.erp_bill_voided`   | The same void, on the flag's own trail (§539) |
+| `exception.erp_bill_void_orphaned` | A void sent to the ERP that could not be recorded here: its marker taken over, or the invoice moved on (§550) |
 | `invoice.voided_return_to_approved` | Payment voided; back to `approved` |
 | `invoice.erp_submitted`       | ERP push initiated              |
 | `invoice.erp_confirmed`       | ERP confirmed receipt           |
