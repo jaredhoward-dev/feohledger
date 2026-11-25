@@ -97,6 +97,7 @@ export const messages = {
 	'shell.privacyAck.failed': 'Sua confirmação não foi salva. Tente novamente.',
 
 	// Common buttons / states
+	'common.dueDate.rescheduledFrom': 'reprogramada de {date}',
 	'common.save': 'Salvar',
 	'common.saving': 'Salvando…',
 	'common.cancel': 'Cancelar',

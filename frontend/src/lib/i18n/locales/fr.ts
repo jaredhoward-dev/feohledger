@@ -96,6 +96,7 @@ export const messages = {
 	'shell.privacyAck.failed': 'Votre confirmation n\'a pas été enregistrée. Réessayez.',
 
 	// Common buttons / states
+	'common.dueDate.rescheduledFrom': 'reportée du {date}',
 	'common.save': 'Enregistrer',
 	'common.saving': 'Enregistrement…',
 	'common.cancel': 'Annuler',

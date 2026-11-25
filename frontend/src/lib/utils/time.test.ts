@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { formatDate, formatDueIn, formatMonth, formatPeriod, formatPeriodLong, timeAgo } from './time';
+import { formatDate, formatDueIn, formatMonth, formatPeriod, formatPeriodLong, rescheduledFrom, timeAgo } from './time';
 import { setActiveFormatLocale } from '#lib/i18n/formatLocale.ts';
 
 // The date helpers drive their locale off the active in-app i18n locale
@@ -311,5 +311,23 @@ describe('formatDueIn', () => {
 		expect(formatDueIn(fromNow(3 * HOUR + 60_000))).toBe('in 3 Std.');
 		setActiveFormatLocale('ja');
 		expect(formatDueIn(fromNow(3 * HOUR + 60_000))).toBe('3 時間後');
+	});
+});
+
+describe('rescheduledFrom', () => {
+	it('returns the own date when the schedule moved it, either way', () => {
+		expect(rescheduledFrom('2026-12-12', '2026-12-01')).toBe('2026-12-01');
+		expect(rescheduledFrom('2026-11-20', '2026-12-01')).toBe('2026-12-01');
+	});
+
+	it('says nothing when the dates match, a timestamp suffix included', () => {
+		expect(rescheduledFrom('2026-12-01', '2026-12-01')).toBeNull();
+		expect(rescheduledFrom('2026-12-01', '2026-12-01T00:00:00Z')).toBeNull();
+	});
+
+	it('says nothing when either date is missing', () => {
+		expect(rescheduledFrom(null, '2026-12-01')).toBeNull();
+		expect(rescheduledFrom('2026-12-01', null)).toBeNull();
+		expect(rescheduledFrom(undefined, undefined)).toBeNull();
 	});
 });

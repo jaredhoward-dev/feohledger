@@ -99,6 +99,7 @@ export const messages = {
 	'shell.privacyAck.failed': '確認を保存できませんでした。もう一度お試しください。',
 
 	// Common buttons / states
+	'common.dueDate.rescheduledFrom': '{date} から変更',
 	'common.save': '保存',
 	'common.saving': '保存中…',
 	'common.cancel': 'キャンセル',
