@@ -70,8 +70,11 @@ So:
   everything below it down. Give its scroll region a fixed `height` (about
   five rows) with `overflow-y: auto` and DataTable's `stickyHeader`, under a
   page wrapper: `/admin/webhooks`' subscriptions (above the deliveries) and
-  the `/audit` trail (above signature verification). The last table on a
-  page needs none — nothing below it moves.
+  the `/audit` trail (above signature verification). A table whose rows are
+  a fixed set takes a `min-height` sized to them instead, with no inner
+  scroll: `/admin?tab=roles`' system roles (the four `SYSTEM_ROLES`, above
+  the custom roles). The last table on a page needs none — nothing below it
+  moves.
 - **Don't put data-sized controls inline beside fixed ones on a wrapping row.**
   `/invoices`' status chips depend on the active workflow and their width on
   the tallies; inline beside the search box the row fitted on one line at
@@ -262,11 +265,11 @@ grid page instead of hand-rolling `<div class="grid-container"><table>`:
   /payments, /exceptions, /vendors, /purchase-orders, /gl-accounts, the
   screening queue, bank changes, /requisitions, /intake, /catalogs, /budgets,
   /recurring, /vendor-statements, /positive-pay, /experiments, /workflows,
-  the users directory, /admin/entities, /admin/api-keys,
-  /admin/access-review, /admin/webhooks (both tables), the /audit trail and
-  both /goods-receipts tabs are converted,
-  /admin/entities, /admin/api-keys, /admin/access-review and the
-  inspections tab by mounting the table from first paint with DataTable's own loading row rather than swapping a
+  the users directory, both Roles tables, /admin/entities, /admin/api-keys,
+  /admin/access-review, /admin/webhooks (both tables), the /audit trail,
+  /adaptive's suggestions and both /goods-receipts tabs are converted,
+  /admin/entities, /admin/api-keys, /admin/access-review, the Roles tab and
+  the inspections tab by mounting the table from first paint with DataTable's own loading row rather than swapping a
   separate loading block for it. Size each fixed column to the widest string
   in any of the six locales, not the English one; `tests-e2e/reactivity/layout-stability.spec.ts` holds each to a
   cumulative layout shift under 0.1 with production-like API latency and
