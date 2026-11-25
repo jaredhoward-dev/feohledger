@@ -134,6 +134,10 @@ async function setPasswordFromLink(page: Page, link: string, email: string, pass
 	await expect(fresh.first()).toBeVisible();
 	await fresh.first().fill(password);
 	await fresh.last().fill(password);
+	// A first password carries acceptance of the Terms / Privacy (decisions §495);
+	// a signup admin accepted on the signup form and is not asked again.
+	const accept = page.getByRole('checkbox', { name: /I agree to the Terms of Service/ });
+	if (await accept.isVisible()) await accept.check();
 	const redeemed = page.waitForResponse(
 		(r) => r.url().endsWith('/api/auth/reset-password') && r.request().method() === 'POST'
 	);

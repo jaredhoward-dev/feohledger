@@ -34,6 +34,7 @@ from app.api.permissions import (
     effective_permissions,
 )
 from app.models.workflow import AuditLog
+from tests.set_password_mail import ACCEPT_CURRENT
 
 
 def _sys_role(name: str) -> SimpleNamespace:
@@ -299,7 +300,7 @@ async def test_admin_reset_link_sets_a_new_password_and_the_old_one_is_dead(real
 
             done = await anon.post(
                 "/api/auth/reset-password",
-                json={"token": token, "new_password": "OwnerChosen-Pass9"},
+                json={"token": token, "new_password": "OwnerChosen-Pass9", **ACCEPT_CURRENT},
             )
             assert done.status_code == 200, done.text
             replay = await anon.post(
@@ -345,7 +346,11 @@ async def test_admin_reset_supersedes_earlier_links_and_a_redemption_kills_sibli
                 assert stale.status_code == 400
                 done = await anon.post(
                     "/api/auth/reset-password",
-                    json={"token": reset_token, "new_password": "Fresh-Link-Pass9"},
+                    json={
+                        "token": reset_token,
+                        "new_password": "Fresh-Link-Pass9",
+                        **ACCEPT_CURRENT,
+                    },
                 )
                 assert done.status_code == 200, done.text
                 gone = await anon.post("/api/auth/reset-password/check", json={"token": sibling})

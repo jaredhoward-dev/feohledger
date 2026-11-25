@@ -24,6 +24,7 @@ export const messages = {
 	'audit.action.auth.mfa.verify.success': "Vérification MFA réussie",
 	'audit.action.auth.password.changed': "Mot de passe modifié",
 	'audit.action.auth.password_reset.completed': "Réinitialisation du mot de passe terminée",
+	'audit.action.auth.legal.accepted': "Conditions et politique de confidentialité acceptées",
 	'audit.action.auth.password_reset.requested': "Réinitialisation du mot de passe demandée",
 	'audit.action.auth.saml.login.failure': "Échec de connexion SAML",
 	'audit.action.auth.saml.login.success': "Connexion SAML réussie",

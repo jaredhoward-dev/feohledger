@@ -67,6 +67,7 @@ from app.api.deps import (
 from app.api.portal_deps import get_current_vendor_user
 from app.api.scim import get_scim_tenant
 from app.main import app
+from app.services.legal_acceptance import CURRENT_LEGAL_VERSIONS
 from tests.permission_gates import iter_dependants as _iter_dependants
 from tests.permission_gates import permission_gate_sets
 
@@ -263,6 +264,8 @@ PUBLIC_BY_DESIGN: tuple[PublicProbe, ...] = (
             "slug": "Not A Valid Slug",
             "admin_name": "Probe Admin",
             "admin_email": "probe@example.invalid",
+            "accepted_terms_version": CURRENT_LEGAL_VERSIONS["terms"],
+            "accepted_privacy_version": CURRENT_LEGAL_VERSIONS["privacy"],
         },
         needs_db=True,
     ),

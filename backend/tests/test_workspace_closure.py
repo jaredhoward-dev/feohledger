@@ -53,6 +53,7 @@ from app.models.workspace_closure import (
     WorkspaceClosure,
 )
 from app.services import tenant_deletion, workspace_closure
+from app.services.legal_acceptance import CURRENT_LEGAL_VERSIONS
 from app.services.tenant_provisioning import CONTROL_TABLES, provision_tenant
 from tests.conftest import TenantInfo
 
@@ -1615,6 +1616,8 @@ async def test_the_same_address_can_sign_up_again_after_the_closure(realdb, tria
                 "admin_name": "Trial Owner",
                 "admin_email": trial["email"],
                 "captcha_token": "x",
+                "accepted_terms_version": CURRENT_LEGAL_VERSIONS["terms"],
+                "accepted_privacy_version": CURRENT_LEGAL_VERSIONS["privacy"],
             },
         )
     assert started.status_code in (200, 202), started.text

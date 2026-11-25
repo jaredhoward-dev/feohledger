@@ -24,6 +24,7 @@ export const messages = {
 	'audit.action.auth.mfa.verify.success': "MFA確認成功",
 	'audit.action.auth.password.changed': "パスワード変更",
 	'audit.action.auth.password_reset.completed': "パスワード再設定完了",
+	'audit.action.auth.legal.accepted': "利用規約とプライバシーポリシーに同意",
 	'audit.action.auth.password_reset.requested': "パスワード再設定を要求",
 	'audit.action.auth.saml.login.failure': "SAMLサインイン失敗",
 	'audit.action.auth.saml.login.success': "SAMLでサインイン",

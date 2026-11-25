@@ -37,6 +37,11 @@ is handled:
     A credential row is authenticator material, not a financial record — there
     is nothing in it the money trail needs and every byte of it is a handle to
     the erased person's device.
+  * **Terms / Privacy acceptances.** ``legal_acceptances`` rows are KEPT
+    (decisions §495). They are the evidence a contract was formed — retained
+    for the establishment or defence of legal claims (GDPR Art. 17(3)(e)) —
+    and hold only the user id, organisation id, document, version, time and
+    control, so once the user row is redacted they identify no one.
   * **Live sessions.** Access already stops on the next request (``is_active``
     is re-read by ``get_current_user``), but the issued JTI stays valid in Redis
     until its TTL. Erasure calls the EXISTING revocation path,

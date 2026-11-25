@@ -82,6 +82,7 @@ from app.models.data_subject_request import (
 )
 from app.models.expense import Expense, ExpenseReport
 from app.models.invoice import Invoice
+from app.models.legal_acceptance import LegalAcceptance
 from app.models.notification import Notification
 from app.models.payment import Payment
 from app.models.supplier_chat import SupplierChatMessage, SupplierChatThread
@@ -135,6 +136,7 @@ DSAR_COUNTED_SECTIONS: tuple[str, ...] = (
     "roles",
     "push_devices",
     "passkeys",
+    "legal_acceptances",
     "audit_events",
     "notifications",
     "expense_reports",
@@ -499,6 +501,18 @@ async def _plan_user(
         .all()
     )
 
+    acceptances = (
+        (
+            await control_db.execute(
+                select(LegalAcceptance)
+                .where(LegalAcceptance.user_id == subject_id)
+                .order_by(LegalAcceptance.accepted_at, LegalAcceptance.document)
+            )
+        )
+        .scalars()
+        .all()
+    )
+
     documents = await collect_subject_documents(
         subject_type=SUBJECT_USER,
         subject_id=subject_id,
@@ -554,6 +568,17 @@ async def _plan_user(
                 "_note": "credential_id / public_key withheld (authenticator material)",
             }
             for c in passkeys
+        ],
+        # Which versions of our Terms of Service and Privacy Policy the subject
+        # accepted, when, and through which control (decisions §495).
+        "legal_acceptances": [
+            {
+                "document": a.document,
+                "version": a.version,
+                "accepted_at": _jsonable(a.accepted_at),
+                "source": a.source,
+            }
+            for a in acceptances
         ],
     }
 

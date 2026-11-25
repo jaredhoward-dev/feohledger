@@ -3545,7 +3545,9 @@ export const messages = {
 	'auth.signup.email': 'E-mail',
 	'auth.signup.submit': 'Enviar e-mail de verificação',
 	'auth.signup.submitting': 'Enviando verificação…',
-	'auth.signup.legalConsent': 'Ao criar um espaço de trabalho, você concorda com os {terms} e a {privacy}, incluindo o {dpa} que rege os dados de fornecedores e faturas que você carregar nele.',
+	'auth.signup.legalConsent': 'Concordo com os {terms} e a {privacy}, incluindo o {dpa} que rege os dados de fornecedores e faturas que eu carregar no espaço de trabalho.',
+	'auth.legal.acceptLabel': 'Concordo com os {terms} e a {privacy}.',
+	'auth.legal.acceptRequired': 'Marque a caixa para aceitar os termos de serviço e a política de privacidade.',
 	'auth.signup.footerPre': 'Já tem um espaço de trabalho? Acesse ',
 	'auth.signup.footerPost': ' para entrar.',
 	// Auth shell brand panel (lib/components/auth/AuthShell.svelte) — signup's

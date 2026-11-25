@@ -1,6 +1,7 @@
 import { API_BASE, expect, test } from '../fixtures/helpers';
 import { SERVICES, skipUnlessReachable } from '../fixtures/services';
 import type { Page } from '@playwright/test';
+import { PRIVACY_VERSION, TERMS_VERSION } from '#lib/legal/legalVersions.generated.ts';
 
 /**
  * Outbound email end-to-end through the real Mailpit sink.
@@ -67,7 +68,10 @@ test.describe('Outbound email via Mailpit (signup)', () => {
 				company_name: 'Mailpit E2E Co',
 				slug,
 				admin_name: 'Mailpit Admin',
-				admin_email: email
+				admin_email: email,
+				// Signup refuses without the versions in force (decisions §495).
+				accepted_terms_version: TERMS_VERSION,
+				accepted_privacy_version: PRIVACY_VERSION
 			}
 		});
 		expect(start.status(), await start.text()).toBe(200);

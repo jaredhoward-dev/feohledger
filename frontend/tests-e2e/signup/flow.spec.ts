@@ -10,7 +10,7 @@ import {
 	test
 } from '../fixtures/helpers';
 import { SERVICES, skipUnlessReachable } from '../fixtures/services';
-import { captchaEvent, stubCaptcha } from './captchaStub';
+import { acceptSignupTerms, captchaEvent, stubCaptcha } from './captchaStub';
 
 /**
  * The palette the page is actually showing, read the way the app resolves it
@@ -153,6 +153,7 @@ test.describe('/signup — form', () => {
 		await page.getByPlaceholder('acme').fill(slug);
 		await page.getByLabel('Your name').fill(name);
 		await page.getByLabel('Email').fill(email);
+		await acceptSignupTerms(page);
 	}
 
 	test('"what happens next" promises a set-password link, not a temporary password', async ({

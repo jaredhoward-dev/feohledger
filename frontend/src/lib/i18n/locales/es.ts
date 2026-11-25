@@ -3542,7 +3542,9 @@ export const messages = {
 	'auth.signup.email': 'Correo electrónico',
 	'auth.signup.submit': 'Enviar correo de verificación',
 	'auth.signup.submitting': 'Enviando verificación…',
-	'auth.signup.legalConsent': 'Al crear un espacio de trabajo, aceptas los {terms} y la {privacy}, incluido el {dpa} que rige los datos de proveedores y facturas que cargues en él.',
+	'auth.signup.legalConsent': 'Acepto los {terms} y la {privacy}, incluido el {dpa} que rige los datos de proveedores y facturas que cargue en el espacio de trabajo.',
+	'auth.legal.acceptLabel': 'Acepto los {terms} y la {privacy}.',
+	'auth.legal.acceptRequired': 'Marca la casilla para aceptar los términos del servicio y la política de privacidad.',
 	'auth.signup.footerPre': '¿Ya tienes un espacio de trabajo? Visita ',
 	'auth.signup.footerPost': ' para iniciar sesión.',
 	// Auth shell brand panel (lib/components/auth/AuthShell.svelte) — signup's

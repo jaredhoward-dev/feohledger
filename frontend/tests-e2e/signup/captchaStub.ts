@@ -11,6 +11,9 @@ export interface StartBody {
 	captcha_token: string | null;
 	/** The visitor's UI locale: the emails are written in it. */
 	locale?: string;
+	/** The Terms / Privacy versions the accept box named (decisions §495). */
+	accepted_terms_version?: string;
+	accepted_privacy_version?: string;
 }
 
 export interface CaptchaStubOptions {
@@ -129,7 +132,7 @@ export async function captchaEvent(
 	);
 }
 
-/** Fill the four signup fields. */
+/** Fill the four signup fields and tick the accept box. */
 export async function fillSignupForm(
 	page: Page,
 	{ company, slug, name, email }: { company: string; slug: string; name: string; email: string }
@@ -138,4 +141,14 @@ export async function fillSignupForm(
 	await page.getByLabel('Workspace URL').fill(slug);
 	await page.getByLabel('Your name').fill(name);
 	await page.getByLabel('Email').fill(email);
+	await acceptSignupTerms(page);
+}
+
+/**
+ * Tick the signup form's required Terms / Privacy accept box (decisions §495).
+ * By id, so a spec running the page in another locale can use it too: every
+ * path that submits the form goes through here rather than its own click.
+ */
+export async function acceptSignupTerms(page: Page): Promise<void> {
+	await page.locator('#signup-legal-accept').check();
 }

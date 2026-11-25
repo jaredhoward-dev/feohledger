@@ -72,7 +72,9 @@ records). Per subject type:
   notification_prefs, locale), `roles`, `activity` counts (kept for
   compatibility), and then the actual content: `audit_events` (the rows this
   user authored), `notifications`, `expense_reports` + `expenses`, `passkeys`
-  (metadata only), `push_devices` (one entry per registered mobile platform with
+  (metadata only), `legal_acceptances` (which Terms / Privacy versions the
+  user accepted, when and through which control — kept by erasure as contract
+  evidence, decisions §495), `push_devices` (one entry per registered mobile platform with
   its registration time — the push token itself is withheld, like a passkey's
   credential id) and `documents`.
 - **vendor_user** — `profile` + the parent `vendor_id`, the `chat_messages` they

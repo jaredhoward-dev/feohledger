@@ -139,6 +139,7 @@ export const enRefusal = {
 	'refusal.signupLinkInvalid': "This verification link is invalid or has expired. Sign up again.",
 	'refusal.signupUnavailable': "Workspace creation is temporarily unavailable. Try again later.",
 	'refusal.signupProvisioningFailed': "Something went wrong while creating your workspace. Contact support.",
+	'refusal.legalAcceptanceRequired': "Please accept the current Terms of Service and Privacy Policy to continue.",
 	// The shared limiter's 429 (`services/rate_limit.py`, `rate_limited`): the wait,
 	// rounded up to the largest whole unit, never which limit tripped.
 	'refusal.rateLimitedSeconds': "Too many attempts. Wait {n, plural, one {# second} other {# seconds}} and try again.",

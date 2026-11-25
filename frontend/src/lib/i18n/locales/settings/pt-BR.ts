@@ -1348,6 +1348,7 @@ export const messages = {
 	'admin.privacy.count.roles': "{n, plural, one {# função} other {# funções}}",
 	'admin.privacy.count.pushDevices': "{n, plural, one {# dispositivo de notificações push} other {# dispositivos de notificações push}}",
 	'admin.privacy.count.passkeys': "{n, plural, one {# chave de acesso} other {# chaves de acesso}}",
+	'admin.privacy.count.legalAcceptances': "{n, plural, one {# aceite de termos ou privacidade} other {# aceites de termos ou privacidade}}",
 	'admin.privacy.count.auditEvents': "{n, plural, one {# ação auditada} other {# ações auditadas}}",
 	'admin.privacy.count.notifications': "{n, plural, one {# notificação} other {# notificações}}",
 	'admin.privacy.count.expenseReports': "{n, plural, one {# relatório de despesas} other {# relatórios de despesas}}",

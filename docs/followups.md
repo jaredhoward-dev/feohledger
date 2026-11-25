@@ -1495,17 +1495,24 @@ the runbook, no acceptance record on signup).
       app (the Intuit channel first: its 24-hour clock already applies), and
       every six months for the rows already filled in.
 
-- [ ] **(c) Signup records no acceptance of our Terms or Privacy Policy.** The
-      Xero terms require an app to have its own terms and privacy policy *and*
-      require users to agree to them; `/legal/terms` itself says acceptance
-      happens "by clicking an accept" control. Self-service signup has no such
-      control and stores nothing — no accepted-at timestamp, no version of the
-      document accepted — so there is no evidence any customer agreed.
-      **Durable fix:** a required accept checkbox on signup (and on the
-      set-password step for admin-created users, decisions §283), persisting
-      who accepted which Terms/Privacy version and when on the control plane,
-      and re-prompting when the published version changes. **Trigger:** before
-      the Xero app goes to production, and in any case before customer #2.
+- [ ] **(c) The in-app Terms / Privacy re-prompt has no frontend yet.**
+      Acceptance is now required and recorded on signup and on a set-password
+      link (`legal_acceptances`, decisions §495), and the backend half of the
+      re-prompt is in place: `GET /api/auth/me` returns
+      `legal_acceptance_required` (true when the signed-in user has not
+      accepted the versions in `services/legal_acceptance.CURRENT_LEGAL_VERSIONS`)
+      and `POST /api/auth/legal-acceptance` records it. Nothing in the SPA
+      reads the flag, so three groups are never asked: SSO / SCIM users (no
+      password, never meet a set-password link), every account that existed
+      before §495, and everyone after a version bump. **Durable fix:** a
+      blocking accept step in the authenticated layout (reuse
+      `lib/components/auth/LegalAcceptCheckbox.svelte`; on submit post
+      `ACCEPTED_LEGAL_VERSIONS` and refresh the auth store from the response),
+      plus the same screen in the mobile app. The e2e seed must record
+      acceptance for the seeded role users first (`scripts/seed.py` and the
+      e2e tenant seeding), or every spec meets the blocker. **Trigger:**
+      before the first version bump of either document, and before the Xero
+      app goes to production.
 
 ## (a) Blocked on external credentials, accounts, or hardware
 

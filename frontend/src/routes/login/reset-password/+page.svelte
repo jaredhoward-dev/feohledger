@@ -2,6 +2,7 @@
 	import AuthCard from '#lib/components/auth/AuthCard.svelte';
 	import SetPasswordLink from '#lib/components/auth/SetPasswordLink.svelte';
 	import { api } from '#lib/api.ts';
+	import { ACCEPTED_LEGAL_VERSIONS } from '#lib/legal/acceptance.ts';
 	import { m } from '#lib/i18n/store.svelte.ts';
 	import { brand } from '#lib/stores/brand.svelte.ts';
 	import { signInHref } from '#lib/utils/prefillEmail.ts';
@@ -28,8 +29,18 @@
 
 <SetPasswordLink
 	bind:setMode
-	check={(token) => api.post<{ email: string }>('/api/auth/reset-password/check', { token })}
-	redeem={(token, new_password) => api.post('/api/auth/reset-password', { token, new_password })}
+	check={(token) =>
+		api.post<{ email: string; legal_acceptance_required: boolean }>(
+			'/api/auth/reset-password/check',
+			{ token }
+		)}
+	redeem={(token, new_password, accepted) =>
+		api.post('/api/auth/reset-password', {
+			token,
+			new_password,
+			// The versions the accept box named, once ticked (decisions §495).
+			...(accepted ? ACCEPTED_LEGAL_VERSIONS : {})
+		})}
 	{signInHref}
 	expiredHint={setMode ? m('auth.resetPassword.setExpiredHint') : undefined}
 >

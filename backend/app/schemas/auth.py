@@ -22,6 +22,19 @@ class ForgotPasswordResponse(BaseModel):
 class ResetPasswordRequest(BaseModel):
     token: str = Field(..., min_length=1)
     new_password: str = Field(..., max_length=128)
+    # The Terms / Privacy versions the page showed beside its accept checkbox.
+    # Required (the versions in force, exactly) when the check response said
+    # `legal_acceptance_required` — an admin-created user's first password, or
+    # anyone who has not accepted the current versions (decisions §495).
+    accepted_terms_version: str | None = Field(default=None, max_length=32)
+    accepted_privacy_version: str | None = Field(default=None, max_length=32)
+
+
+class LegalAcceptanceRequest(BaseModel):
+    """The versions the accept step showed; only the versions in force pass."""
+
+    accepted_terms_version: str | None = Field(default=None, max_length=32)
+    accepted_privacy_version: str | None = Field(default=None, max_length=32)
 
 
 class ResetPasswordCheckRequest(BaseModel):
@@ -35,6 +48,10 @@ class ResetPasswordCheckResponse(BaseModel):
     and the sign-in link the page offers afterwards."""
 
     email: str
+    # True when this account has not accepted the Terms of Service and Privacy
+    # Policy versions in force: the page then shows the required accept
+    # checkbox, and redeeming without it is refused (decisions §495).
+    legal_acceptance_required: bool = False
 
 
 class ResetPasswordResponse(BaseModel):
@@ -98,6 +115,11 @@ class UserResponse(BaseModel):
     # outbound email copy only — NOT in-app UI (the frontend's per-device locale
     # picker owns that). See docs/notifications.md § Localized email.
     locale: str | None = None
+    # The caller has not accepted the Terms of Service / Privacy Policy versions
+    # in force (`services/legal_acceptance.CURRENT_LEGAL_VERSIONS`): the SPA
+    # shows its blocking accept step until `POST /api/auth/legal-acceptance`
+    # records it (decisions §495).
+    legal_acceptance_required: bool = False
 
     model_config = {"from_attributes": True}
 

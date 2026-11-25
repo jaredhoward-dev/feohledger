@@ -103,6 +103,10 @@ CONTROL_TABLES: frozenset[str] = frozenset(
         # (see app/models/subprocessor_notice.py). Keyed by org id, outlives a
         # closed workspace on purpose. Control-plane only.
         "subprocessor_notices",
+        # Who accepted which Terms / Privacy version, and when (see app/models/
+        # legal_acceptance.py). Keyed by user id, outlives an erased user or a
+        # deleted workspace on purpose (decisions §495). Control-plane only.
+        "legal_acceptances",
     }
 )
 

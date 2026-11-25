@@ -586,9 +586,12 @@ test.describe('legal pages', () => {
 
 	test('signup presents the terms it forms a contract under', async ({ page }) => {
 		// Clicking that button creates a tenant and binds an organisation. The
-		// terms have to be presented at the point of assent, not only from a
-		// footer on another page.
+		// terms have to be presented at the point of assent, as a required box
+		// the visitor ticks (decisions §495), not only from a footer elsewhere.
 		await page.goto(`${WEB_ORIGIN}/signup`);
+		const box = page.getByRole('checkbox', { name: /I agree to the Terms of Service/ });
+		await expect(box).not.toBeChecked();
+		await expect(box).toHaveAttribute('required', '');
 		const consent = page.locator('.legal-consent');
 		await expect(consent.getByRole('link', { name: 'Terms of Service' })).toHaveAttribute(
 			'href',
@@ -611,9 +614,8 @@ test.describe('legal pages', () => {
 		// assertions above would pass, and still a mangled consent line.
 		const sentence = (await consent.innerText()).replace(/\s+/g, ' ').trim();
 		expect(sentence).toBe(
-			'By creating a workspace you agree to the Terms of Service and the Privacy Policy, ' +
-				'including the Data Processing Addendum that governs supplier and invoice data you ' +
-				'load into it.'
+			'I agree to the Terms of Service and the Privacy Policy, including the Data ' +
+				'Processing Addendum that governs supplier and invoice data I load into the workspace.'
 		);
 	});
 

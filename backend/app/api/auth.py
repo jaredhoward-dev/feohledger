@@ -35,6 +35,7 @@ from app.schemas.auth import (
     ChangePasswordRequest,
     ForgotPasswordRequest,
     ForgotPasswordResponse,
+    LegalAcceptanceRequest,
     LoginRequest,
     MFAChallengeResponse,
     MFADisableRequest,
@@ -60,7 +61,7 @@ from app.schemas.auth import (
     WebAuthnRegisterStartResponse,
     WebAuthnStepUpStartRequest,
 )
-from app.services import mfa, password_reset, webauthn, webauthn_rp
+from app.services import legal_acceptance, mfa, password_reset, webauthn, webauthn_rp
 from app.services.audit_dispatch import dispatch_auth_audit, queue_auth_audit
 from app.services.billing.entitlements import get_entitlements, has_entitlement
 from app.services.billing.plan_catalog import ALL_FEATURES
@@ -312,6 +313,7 @@ async def _user_response(
         # extended with keys that mean nothing to the client.
         entitlements=sorted(f for f in ALL_FEATURES if has_entitlement(entitlements, f)),
         locale=user.locale,
+        legal_acceptance_required=bool(await legal_acceptance.missing_documents(db, user.id)),
     )
 
 
@@ -844,7 +846,25 @@ async def check_reset_token(
         user = (await db.execute(select(User).where(User.id == user_id))).scalar_one_or_none()
     if user is None or not user.is_active:
         raise HTTPException(status_code=400, detail="Invalid or expired reset link.")
-    return ResetPasswordCheckResponse(email=user.email)
+    return ResetPasswordCheckResponse(
+        email=user.email,
+        legal_acceptance_required=await _set_password_needs_acceptance(db, user),
+    )
+
+
+async def _set_password_needs_acceptance(db: AsyncSession, user: User) -> bool:
+    """Does redeeming this link have to carry acceptance of our Terms / Privacy?
+
+    Only a SET-password — an account with no password yet: an admin-created
+    user, or one an admin reset — whose owner has not accepted the versions in
+    force (decisions §283, §495). That link is the account's front door, so the
+    accept control sits on it. A forgot-password reset of an account that
+    already has a password is not held up: its owner meets the in-app re-prompt
+    (`UserResponse.legal_acceptance_required`) on the sign-in that follows.
+    """
+    if user.hashed_password is not None:
+        return False
+    return bool(await legal_acceptance.missing_documents(db, user.id))
 
 
 @router.post("/reset-password", response_model=ResetPasswordResponse)
@@ -868,6 +888,22 @@ async def reset_password(
     except PasswordError as exc:
         raise HTTPException(status_code=422, detail=password_refusal(exc)) from exc
 
+    # A set-password link must carry acceptance of the Terms / Privacy versions
+    # in force (`_set_password_needs_acceptance`). Checked BEFORE the token is
+    # consumed, against the account the token names, so a refusal leaves the
+    # link usable once the box is ticked (decisions §495). The peek answers
+    # nothing the redemption below would not.
+    accepted = legal_acceptance.accepts_current(
+        body.accepted_terms_version, body.accepted_privacy_version
+    )
+    if not accepted:
+        peeked = await password_reset.peek_reset_token(body.token)
+        holder = None
+        if peeked is not None:
+            holder = (await db.execute(select(User).where(User.id == peeked))).scalar_one_or_none()
+        if holder is not None and await _set_password_needs_acceptance(db, holder):
+            raise HTTPException(status_code=422, detail=legal_acceptance.acceptance_refusal())
+
     user_id = await password_reset.consume_reset_token(body.token)
     if user_id is None:
         raise HTTPException(status_code=400, detail="Invalid or expired reset link.")
@@ -879,7 +915,28 @@ async def reset_password(
 
     user.hashed_password = await hash_password(body.new_password)
     user.must_change_password = False
+    if accepted:
+        await legal_acceptance.record_acceptances(
+            db,
+            user_id=user.id,
+            organization_id=user.organization_id,
+            versions=legal_acceptance.CURRENT_LEGAL_VERSIONS,
+            source=legal_acceptance.SOURCE_SET_PASSWORD,
+        )
     await db.commit()
+
+    if accepted:
+        await dispatch_auth_audit(
+            organization_id=user.organization_id,
+            actor_id=user.id,
+            action="auth.legal.accepted",
+            entity_id=user.id,
+            details={
+                "versions": dict(legal_acceptance.CURRENT_LEGAL_VERSIONS),
+                "source": legal_acceptance.SOURCE_SET_PASSWORD,
+                "ip": _client_ip(request),
+            },
+        )
 
     # Force logout of every existing session — same posture as the
     # admin-triggered password reset (`api/admin.py::update_user`) and exactly
@@ -2036,6 +2093,51 @@ async def get_me(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_control_db),
 ):
+    org = await _load_user_org(db, user.organization_id)
+    return await _user_response(db, user, org)
+
+
+@router.post("/legal-acceptance", response_model=UserResponse)
+async def accept_legal_documents(
+    body: LegalAcceptanceRequest,
+    request: Request,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_control_db),
+):
+    """Record the caller's acceptance of the Terms / Privacy versions in force.
+
+    The SPA's blocking re-prompt (`legal_acceptance_required` on `/me`) posts
+    here — a user who signed in through SSO or SCIM, one whose account predates
+    acceptance being collected, or anyone after a version bump. Only the
+    versions in force are accepted (422 `legal_acceptance_required` otherwise),
+    and re-accepting is harmless: the record is append-only and keeps its first
+    `accepted_at` (decisions §495).
+    """
+    if not legal_acceptance.accepts_current(
+        body.accepted_terms_version, body.accepted_privacy_version
+    ):
+        raise HTTPException(status_code=422, detail=legal_acceptance.acceptance_refusal())
+    missing = await legal_acceptance.missing_documents(db, user.id)
+    await legal_acceptance.record_acceptances(
+        db,
+        user_id=user.id,
+        organization_id=user.organization_id,
+        versions=legal_acceptance.CURRENT_LEGAL_VERSIONS,
+        source=legal_acceptance.SOURCE_REPROMPT,
+    )
+    await db.commit()
+    if missing:
+        await dispatch_auth_audit(
+            organization_id=user.organization_id,
+            actor_id=user.id,
+            action="auth.legal.accepted",
+            entity_id=user.id,
+            details={
+                "versions": dict(legal_acceptance.CURRENT_LEGAL_VERSIONS),
+                "source": legal_acceptance.SOURCE_REPROMPT,
+                "ip": _client_ip(request),
+            },
+        )
     org = await _load_user_org(db, user.organization_id)
     return await _user_response(db, user, org)
 

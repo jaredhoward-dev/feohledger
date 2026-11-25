@@ -825,6 +825,9 @@ const BUILDERS: Record<string, Builder> = {
 	signup_link_invalid: fixed('refusal.signupLinkInvalid'),
 	signup_unavailable: fixed('refusal.signupUnavailable'),
 	signup_provisioning_failed: fixed('refusal.signupProvisioningFailed'),
+	// `services/legal_acceptance.acceptance_refusal` — signup, a set-password
+	// link and the re-prompt, without the Terms / Privacy versions in force.
+	legal_acceptance_required: fixed('refusal.legalAcceptanceRequired'),
 	// `api/payments.py::_refuse_record_only` — every dispatching endpoint on a
 	// tenant whose payments are recorded, never sent. `params.reason` says why
 	// the mode resolved so; the sentence is the same for every reason.

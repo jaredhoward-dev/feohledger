@@ -945,7 +945,8 @@ describe('the self-service signup refusals (issue #635 finding 18)', () => {
 		['signup_email_send_failed', 'refusal.signupEmailSendFailed'],
 		['signup_link_invalid', 'refusal.signupLinkInvalid'],
 		['signup_unavailable', 'refusal.signupUnavailable'],
-		['signup_provisioning_failed', 'refusal.signupProvisioningFailed']
+		['signup_provisioning_failed', 'refusal.signupProvisioningFailed'],
+		['legal_acceptance_required', 'refusal.legalAcceptanceRequired']
 	];
 
 	it.each(FIXED)('%s is stated in the reader\'s language', (code, key) => {
