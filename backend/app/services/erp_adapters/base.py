@@ -939,6 +939,16 @@ class ErpAdapter:
     def __init__(self, config: dict):
         self.config = config
 
+    def status_sync_on(self) -> bool:
+        """Does THIS tenant's connection sync bills back and take write-backs?
+
+        ``supports_status_sync`` says the adapter can; this says the tenant's
+        configuration lets it. The default is the capability itself. An adapter
+        whose status-sync calls are not yet proven against the real ERP makes
+        it an explicit per-tenant opt-in instead (NetSuite, decisions §541).
+        Read through :func:`reports_status_back`, never the class constant."""
+        return self.supports_status_sync is True
+
     async def revoke_stored_access(self) -> str | None:
         """End, at the provider, the access this adapter's stored credentials
         hold, once a tenant is being deleted (decisions §400).
@@ -1052,7 +1062,7 @@ class ErpAdapter:
 
     # -- status sync-back + payment write-back (decisions §295) -------------
     #
-    # Every caller checks ``supports_status_sync`` first, and an adapter without
+    # Every caller checks :func:`reports_status_back` first, and an adapter without
     # it keeps the old behaviour (the push closes the invoice at ``done``;
     # ``payment_erp_sync`` writes nothing back). The defaults below are
     # therefore the honest answer of an ERP that does not report back, and each
@@ -1097,3 +1107,23 @@ class ErpAdapter:
         applied to it — the change-data-capture backstop for lost webhooks.
         Raises rather than return a partial list. Default: none reported."""
         return []
+
+
+def reports_status_back(adapter: object | None) -> bool:
+    """The one effective status-sync predicate (decisions §295, §541).
+
+    True only for an adapter whose class supports status sync AND whose
+    tenant's configuration turns it on (:meth:`ErpAdapter.status_sync_on`).
+    Every reader that decides whether a push stays payable at
+    ``posted_in_erp``, whether the sweep reads a tenant's bills, whether a
+    payment is written back, or whether the poll sweep leaves a tenant to the
+    status-sync path goes through this, so an adapter the tenant has not opted
+    in behaves exactly as one without the capability. A stand-in that is not an
+    :class:`ErpAdapter` (a test double) is read by its capability flag alone.
+    """
+    if adapter is None:
+        return False
+    method = getattr(adapter, "status_sync_on", None)
+    if callable(method):
+        return method() is True
+    return getattr(adapter, "supports_status_sync", False) is True

@@ -91,6 +91,7 @@ pnpm gen:marketing            # re-render the landing page's Blender tally ornam
 pnpm test:icons               # proves check:icons fails on a deliberately broken copy of the icon set (same CI job)
 pnpm check:followups          # docs/followups.md's headline count must match the file — re-derive it as the LAST step of any change that adds or prunes an entry (CI's Frontend job)
 pnpm migrate:all              # alembic upgrade head + migrate_all_tenants.py
+pnpm simulate:card -- --tenant acme --card <id>  # charge a MOCK virtual card through the real signed card webhook (local only; --settle, --amount)
 
 # Frontend (from frontend/)
 pnpm i                       # install

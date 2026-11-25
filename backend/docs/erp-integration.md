@@ -417,8 +417,9 @@ source's unseal budget was spent (§408, §525) — with the same silent 204 as 
 forgery, so the ERP never redelivers it. The `erp-status-poll` sweep
 (`services/erp_status_poll_sweep`, `FEOH_ERP_STATUS_POLL_SWEEP_ENABLED`, off by
 default) is the backstop. For every tenant whose adapter is not Merge.dev and
-has no status sync of its own (QuickBooks Online, Xero and NetSuite have
-theirs, § QuickBooks / Xero / NetSuite status sync-back), it calls
+has no status sync of its own for that tenant (QuickBooks Online and Xero
+have theirs, and NetSuite only with the tenant's opt-in, §541; § QuickBooks /
+Xero / NetSuite status sync-back), it calls
 `get_invoice_status(erp_document_id)` for invoices at `approved`,
 `sent_to_erp`, `posted_in_erp` or `payment_scheduled` that carry an ERP
 document id, least recently polled first and at most
@@ -709,9 +710,22 @@ rows), and `test_erp_oauth.py` § status sync on request. Fake surface:
 
 Decisions §536 extends §295 to NetSuite (`NetSuiteAdapter.supports_status_sync`),
 the first ERP reached with stored credentials rather than an OAuth consent.
-With `FEOH_ERP_STATUS_SYNC_ENABLED` on, a confirmed NetSuite push lands at
-`posted_in_erp`, and §296's dispatch-time read, §309's live-claim refusals and
-§386's recorded-cash rule apply unchanged.
+With `FEOH_ERP_STATUS_SYNC_ENABLED` on **and the tenant opted in**, a confirmed
+NetSuite push lands at `posted_in_erp`, and §296's dispatch-time read, §309's
+live-claim refusals and §386's recorded-cash rule apply unchanged.
+
+- **Per-tenant opt-in, off by default (decisions §541).** The calls below are
+  not yet proven against a real NetSuite account (#654), so the deployment
+  switch alone does not turn them on: the tenant's
+  `settings.erp.netsuite_status_sync` must be `"on"` (or `true`). An admin sets
+  it on Organization → ERP connection → NetSuite → **Payment status sync**,
+  whose help text says to pass a sandbox account first. Without it a NetSuite
+  tenant behaves exactly as before §536: a push closes at `done`, the
+  status-sync sweep skips it, nothing is written back, the dispatch-time read
+  does not apply, and the §528 poll sweep keeps polling it. Every reader goes
+  through one predicate, `erp_adapters.base.reports_status_back(adapter)`
+  (`ErpAdapter.status_sync_on`, which NetSuite overrides), never the class
+  constant; `dispatcher.status_sync_adapter_keys()` is only the candidate set.
 
 - **Matching.** The bill's `externalId` is the invoice's correlation id (the
   push's idempotency key), so a report carries it as `correlation_id` and is

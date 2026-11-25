@@ -325,6 +325,34 @@ Both halves shipped, because they protect different tenants:
 Guard: `tests/test_card_provider_local_first.py` (both halves, including a source
 scan over `seed.py`'s `cards` blocks).
 
+### Charging a mock card locally
+
+A run's card leg is paid only once its card is charged (decisions §537), and
+the charge arrives as the issuer's webhook. The mock issuer sends none, so on a
+laptop a card-paid invoice would wait at `payment_scheduled` for good. Send the
+charge yourself (decisions §541):
+
+```bash
+pnpm simulate:card -- --tenant acme --card <card id or mock_card_… token>
+pnpm simulate:card -- --tenant acme --card <id> --amount 90.00 --settle
+```
+
+`scripts/simulate_card_charge.py` → `services/mock_card_simulator` builds the
+issuer's `authorization` (and with `--settle` its `settlement`) for that card,
+amount in major units as a decimal string (default: the card's limit), signs it
+with the tenant's `webhook_signing_secret` (or, when it set none,
+`mock_adapter.MOCK_WEBHOOK_LOCAL_SECRET`) and POSTs it in process to
+`/api/cards/webhook/mock`. So the real handler verifies the signature, dedupes
+the event id, records the charge through `record_card_spend` and re-dispatches
+the run's payment sync: a full charge reaches `paid`, a short one the
+settled-short hold. No running backend is needed; core services are.
+
+The webhook's `mock` branch exists only while `FEOH_ENVIRONMENT` is not a
+deployed one; deployed, `mock` is an unknown provider (silent 204). The
+simulator also refuses (exit 3, the code printed) a tenant whose card provider
+is not `mock` and a card that is not a mock card. Guard:
+`tests/test_mock_card_simulator.py`.
+
 ### Stripe Issuing (Alternative)
 
 **Why**: Best documentation, good if you already use Stripe. However, Stripe does not share interchange by default — requires negotiation at scale.
@@ -496,7 +524,7 @@ If the supplier portal is implemented, vendors can:
 | `GET` | `/api/cards/{id}/details` | Get full card number + CVV (admin/ap_manager/cfo, audit logged — see § Security) |
 | `POST` | `/api/cards/generate` | Generate cards for selected invoices (`payment.execute`). `items` / `total` = cards this request minted; `skipped` names every other invoice and the gate that stopped it — see § Why an invoice got no card. A tenant whose `cards.enabled` is off gets 400 with the coded detail `cards_not_enabled`. The web caller is the payments Cards tab's **Generate card** dialog (`frontend/docs/routes-api-map.md` § `/payments`) |
 | `POST` | `/api/cards/{id}/cancel` | Cancel an unused card (`require_permission(payment.void)` — admin/cfo by default, **not** `ap_manager`; see § Cancel → The gate is `payment.void`) |
-| `POST` | `/api/cards/webhook/{provider}` | Receive charge/settlement webhooks (public-by-design, HMAC-gated) |
+| `POST` | `/api/cards/webhook/{provider}` | Receive charge/settlement webhooks (public-by-design, HMAC-gated). `lithic`, `nium`, and `mock` outside a deployed environment only (the local charge, § Charging a mock card locally) |
 | `GET` | `/api/cards/rebates` | List rebates (paginated `page` / `page_size`, optional `period`) — see § The rebate list is paginated |
 | `POST` | `/api/cards/rebates/{id}/confirm` | Advance a rebate `pending` → `confirmed` (admin/ap_manager/cfo) — see § Rebate status lifecycle |
 | `POST` | `/api/cards/rebates/{id}/mark-paid` | Advance a rebate `confirmed` → `paid_out` (admin/ap_manager/cfo) — see § Rebate status lifecycle |

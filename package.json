@@ -76,12 +76,13 @@
 		"services:logs": "cd backend && docker compose --profile idp --profile aws --profile ai --profile payments --profile mail --profile erp --profile commerce logs -f",
 		"services:reset": "cd backend && docker compose --profile idp --profile aws --profile ai --profile payments --profile mail --profile erp --profile commerce down -v && docker compose --profile idp --profile aws --profile ai --profile payments --profile mail --profile erp --profile commerce up -d",
 
-		"//-- seed & migrate --": "Demo data + Alembic migrations. Need core services up (db:up) and the backend venv activated. seed creates 2 demo tenants; migrate:all = control plane + every per-tenant feoh_<slug> DB. Docs: backend/docs/database.md.",
+		"//-- seed & migrate --": "Demo data + Alembic migrations. Need core services up (db:up) and the backend venv activated. seed creates 2 demo tenants; migrate:all = control plane + every per-tenant feoh_<slug> DB. simulate:card -- --tenant acme --card <id|token> [--amount 90.00] [--settle] charges a MOCK virtual card through the real signed card webhook (the issuer's charge, which a card-paid run waits for since decisions §537), refused deployed or off the mock provider (§541; backend/docs/virtual-cards.md). Docs: backend/docs/database.md.",
 		"seed": "cd backend && python scripts/seed.py",
 		"seed:lean": "cd backend && python scripts/seed.py --lean",
 		"migrate": "cd backend && alembic upgrade head",
 		"migrate:tenants": "cd backend && python scripts/migrate_all_tenants.py",
 		"migrate:all": "pnpm run migrate && pnpm run migrate:tenants",
+		"simulate:card": "cd backend && python scripts/simulate_card_charge.py",
 
 		"//-- build --": "Production builds. Frontend is adapter-static (S3 + CloudFront) — no SSR. check:build:dev-accounts runs AFTER build:frontend and fails if the login page's dev-only seeded-account panel (frontend/src/lib/dev/) reached frontend/build; it runs in CI's Frontend job right after Build, and test:build:dev-accounts covers the guard itself. check:build:bundle also runs AFTER build:frontend: it is the web bundle budget (app shell + heaviest route + one locale catalogue of each kind, against MAX_TOTAL_KB / MAX_LARGEST_CHUNK_KB read from .github/workflows/web-bundle-budget.yml, which runs it in CI); test:build:bundle covers its measurement.",
 		"build:frontend": "cd frontend && pnpm build",

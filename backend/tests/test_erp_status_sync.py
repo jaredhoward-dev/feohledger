@@ -343,13 +343,19 @@ async def test_the_sweep_reads_changed_bills_and_applies_them(realdb, monkeypatc
 
 
 async def _configure_netsuite(realdb, key: str, account: str, **extra) -> str:
-    """A tenant on NetSuite: stored credentials, no OAuth connection block.
+    """A tenant on NetSuite: stored credentials, no OAuth connection block,
+    opted in to status sync (decisions §541) unless ``extra`` says otherwise.
     Returns the connection realm its pushes record."""
     async with realdb.control_sessionmaker()() as s:
         org = await s.get(Organization, realdb.info(key).org_id)
         org.settings = {
             **{k: v for k, v in (org.settings or {}).items() if k != "erp_status_sync"},
-            "erp": {"type": "netsuite", "integration_method": "direct", "account_id": account}
+            "erp": {
+                "type": "netsuite",
+                "integration_method": "direct",
+                "account_id": account,
+                "netsuite_status_sync": "on",
+            }
             | extra,
         }
         await s.commit()
@@ -458,6 +464,49 @@ async def test_a_netsuite_type_left_under_merge_is_not_swept(realdb, monkeypatch
     with patch.object(erp_status_sync, "sync_org", probe):
         await erp_status_sync.run_status_sync_once()
     assert all(c.args[0].id != realdb.info("a").org_id for c in probe.await_args_list)
+
+
+@pytest.mark.parametrize("opt_in", [None, "off"])
+async def test_a_netsuite_tenant_without_the_opt_in_is_not_swept(realdb, monkeypatch, opt_in):
+    """NetSuite's status sync is a per-tenant opt-in (decisions §541): with the
+    deployment's switch on, a tenant that has not opted in is never read, its
+    pushes keep closing at ``done``, and nothing is written back to it."""
+    from app.config import settings
+    from app.services.erp_adapters.netsuite import NetSuiteAdapter
+    from app.services.erp_payment_writeback import SKIPPED, write_back_payment
+
+    await _configure_netsuite(realdb, "a", f"OFF{uuid.uuid4().hex[:6].upper()}")
+    async with realdb.control_sessionmaker()() as s:
+        org = await s.get(Organization, realdb.info("a").org_id)
+        erp = dict(org.settings["erp"])
+        if opt_in is None:
+            erp.pop("netsuite_status_sync")
+        else:
+            erp["netsuite_status_sync"] = opt_in
+        org.settings = {**org.settings, "erp": erp}
+        await s.commit()
+    monkeypatch.setattr(settings, "erp_status_sync_enabled", True)
+    probe = AsyncMock()
+    with patch.object(erp_status_sync, "sync_org", probe):
+        result = await erp_status_sync.run_status_sync_once()
+    assert all(c.args[0].id != realdb.info("a").org_id for c in probe.await_args_list)
+    org = await _org(realdb)
+    assert erp_status_sync.status_sync_active(org.settings["erp"]) is False
+    assert await erp_status_sync.sync_bills(org, ["NS-1"], event_id=None) == 0
+    # The write-back refuses before reading anything: no payment, no ERP call.
+    adapter = NetSuiteAdapter(org.settings["erp"])
+    adapter.post_payment = AsyncMock()
+    outcome = await write_back_payment(
+        None,
+        adapter=adapter,
+        erp_config=org.settings["erp"],
+        payment=None,
+        invoice=None,
+        state_data={},
+    )
+    assert outcome == SKIPPED
+    adapter.post_payment.assert_not_awaited()
+    assert result.failures == 0
 
 
 async def test_the_sweep_is_off_by_default(monkeypatch):

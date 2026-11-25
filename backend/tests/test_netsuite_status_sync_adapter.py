@@ -78,6 +78,32 @@ def test_netsuite_reports_its_bills_back():
     assert "netsuite" in status_sync_adapter_keys()
 
 
+@pytest.mark.parametrize(
+    ("value", "on"),
+    [
+        (None, False),
+        ("off", False),
+        ("", False),
+        ("ON", False),
+        ("true", False),
+        (1, False),
+        ("on", True),
+        (True, True),
+    ],
+)
+def test_status_sync_is_on_only_for_a_tenant_that_opted_in(value, on):
+    """The capability is the class's; whether a tenant's connection uses it is
+    its own opt-in (decisions §541), read by the one effective predicate."""
+    from app.services.erp_adapters.base import reports_status_back
+
+    config = {"account_id": "1234567"}
+    if value is not None:
+        config["netsuite_status_sync"] = value
+    adapter = NetSuiteAdapter(config)
+    assert adapter.status_sync_on() is on
+    assert reports_status_back(adapter) is on
+
+
 def test_an_open_bill_reads_open_with_our_marker(fake):
     bill = _push(fake)
     report = _report(bill)

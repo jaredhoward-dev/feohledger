@@ -979,6 +979,54 @@ def test_adapters_with_their_own_status_path_are_not_polled():
     assert not sweep.pollable_adapter(None, "netsuite")
 
 
+def test_a_netsuite_tenant_is_polled_unless_it_opted_in_to_status_sync():
+    """NetSuite's status sync is a per-tenant opt-in (decisions §541): without
+    it the tenant is polled exactly as before §536; with it the status-sync
+    sweep reads its bills instead, so this sweep leaves it alone."""
+    from app.services.erp_adapters.netsuite import NetSuiteAdapter
+
+    base = {"type": "netsuite", "integration_method": "direct", "account_id": "1234567"}
+    assert sweep.pollable_adapter(NetSuiteAdapter(base), "netsuite")
+    assert sweep.pollable_adapter(
+        NetSuiteAdapter({**base, "netsuite_status_sync": "off"}), "netsuite"
+    )
+    assert not sweep.pollable_adapter(
+        NetSuiteAdapter({**base, "netsuite_status_sync": "on"}), "netsuite"
+    )
+
+
+@pytest.mark.parametrize(("opt_in", "polled"), [(None, True), ("off", True), ("on", False)])
+async def test_the_sweep_polls_a_netsuite_tenant_only_without_the_opt_in(
+    realdb, monkeypatch, opt_in, polled
+):
+    """End to end through the sweep (decisions §541): a NetSuite tenant that
+    has not opted in to status sync is polled as before §536; one that has is
+    left to the status-sync sweep."""
+    from app.services.erp_adapters.netsuite import NetSuiteAdapter
+
+    asked: list[str] = []
+
+    async def _read(self, erp_document_id):
+        asked.append(erp_document_id)
+        return ErpInvoiceStatus.open
+
+    monkeypatch.setattr(NetSuiteAdapter, "get_invoice_status", _read)
+    erp = {"type": "netsuite", "integration_method": "direct", "account_id": "1234567"}
+    if opt_in is not None:
+        erp["netsuite_status_sync"] = opt_in
+    await _write_erp(realdb, erp)
+    inv_id = await _seed(realdb, InvoiceStatus.sent_to_erp, realm="netsuite:1234567")
+
+    result = await sweep.run_status_poll_sweep_once()
+
+    if polled:
+        assert asked == [await _doc(realdb, inv_id)]
+        assert await _status(realdb, inv_id) == InvoiceStatus.posted_in_erp
+    else:
+        assert asked == [] and result.tenants_scanned == 0
+        assert await _status(realdb, inv_id) == InvoiceStatus.sent_to_erp
+
+
 # ---------------------------------------------------------------------------
 # off by default
 # ---------------------------------------------------------------------------

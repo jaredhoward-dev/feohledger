@@ -1037,7 +1037,10 @@ scope (§260) — do not fold them into any of these.
       FeohLedger.** Status sync-back (§295) covers adapters with
       `supports_status_sync`: QuickBooks, Xero since §386, and NetSuite since
       §536 (a SuiteQL keyset poll; its REST shapes are not yet verified
-      against an account, #654, and it has no webhook or on-request pass).
+      against an account, #654, and it has no webhook or on-request pass; so
+      since §541 it applies only to a tenant that opted in with
+      `settings.erp.netsuite_status_sync`, off by default — a sandbox pass
+      under #654 is what makes switching it on safe).
       Business Central, Sage Accounting (and its ZA edition), Sage Intacct,
       SYSPRO and Blackbaud remain; the sweep now selects an OAuth tenant by
       its connection and a credentials-based one by `settings.erp.type`, so

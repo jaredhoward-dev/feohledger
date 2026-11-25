@@ -157,7 +157,9 @@ const OPTION_LABEL_KEYS: Record<string, MessageKey> = {
 	Approved: 'org.erp.option.Approved',
 	other: 'org.erp.option.other',
 	oauth2_m2m: 'org.erp.option.oauth2_m2m',
-	tba: 'org.erp.option.tba'
+	tba: 'org.erp.option.tba',
+	off: 'org.erp.option.off',
+	on: 'org.erp.option.on'
 };
 
 export function optionLabelKey(option: string): MessageKey | null {

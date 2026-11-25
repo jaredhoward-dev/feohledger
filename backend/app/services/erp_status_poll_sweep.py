@@ -13,8 +13,10 @@ carried it.
 
 **Which tenants.** Every tenant whose ERP block selects an adapter that is not
 Merge.dev (its deliveries go to its own route, and its read-back is separate)
-and does not report status itself (``supports_status_sync``: QuickBooks Online
-and Xero, which have the ``erp-status-sync`` sweep), and whose connection names
+and does not report status itself for this tenant
+(``erp_adapters.base.reports_status_back``: QuickBooks Online and Xero, and
+NetSuite only with its per-tenant opt-in, §541; those have the
+``erp-status-sync`` sweep), and whose connection names
 a company (below). The mock adapter's bills name its own company
 (``erp_link_realm.MOCK_BILL_REALM``, §538), so a laptop tenant on it polls the
 bills it pushed; the sweep is off by default (guard rail 7).
@@ -86,7 +88,12 @@ from app.database import control_session_factory, get_tenant_engine
 from app.models.invoice import Invoice, InvoiceStatus
 from app.models.organization import Organization
 from app.models.workflow import AuditLog, WorkflowInstance
-from app.services.erp_adapters.base import ErpAdapter, ErpCallBudgetExhausted, ErpInvoiceStatus
+from app.services.erp_adapters.base import (
+    ErpAdapter,
+    ErpCallBudgetExhausted,
+    ErpInvoiceStatus,
+    reports_status_back,
+)
 from app.services.erp_auto_send_sweep import _connected_at
 from app.services.erp_status_report import (
     ERP_STATUS_MAP,
@@ -172,12 +179,14 @@ class _Candidate:
 
 
 def pollable_adapter(adapter: ErpAdapter | None, adapter_key: str) -> bool:
-    """Is this tenant's adapter one the sweep polls?"""
+    """Is this tenant's adapter one the sweep polls? Not one whose bills
+    report back through status sync for this tenant (:func:`reports_status_back`
+    — so a NetSuite tenant without the §541 opt-in is still polled)."""
     from app.services.erp_adapters.dispatcher import MERGE_DEV_ADAPTER_KEY
 
     if adapter is None or adapter_key == MERGE_DEV_ADAPTER_KEY:
         return False
-    return not adapter.supports_status_sync
+    return not reports_status_back(adapter)
 
 
 def _latest_instance():
