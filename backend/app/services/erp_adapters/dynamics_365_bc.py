@@ -47,6 +47,7 @@ import httpx
 
 from app.config import settings
 from app.services.erp_adapters.base import (
+    BILL_VOID_DRAFT_ONLY,
     POSTED_TOTAL_MISMATCH,
     POSTED_TOTAL_UNCONFIRMED,
     VENDOR_NOT_LINKED,
@@ -169,6 +170,9 @@ class BusinessCentralAdapter(ErpAdapter):
     """
 
     erp_type = "dynamics_365_bc"
+    #: ``void_invoice`` deletes a purchaseInvoice only while it is a draft; a
+    #: posted one is reversed by a corrective credit memo in BC (decisions §542).
+    bill_void_scope = BILL_VOID_DRAFT_ONLY
     # Nothing to revoke (decisions §407): Microsoft publishes no revocation
     # endpoint for a client-credentials token, and ending the client secret or
     # the BC record needs rights our BC-scoped token does not carry. Deleting

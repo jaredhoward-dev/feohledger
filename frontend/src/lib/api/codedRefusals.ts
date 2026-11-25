@@ -428,6 +428,9 @@ const BUILDERS: Record<string, Builder> = {
 	erp_void_unsupported: fixed('refusal.erpVoidUnsupported'),
 	erp_void_rejected: fixed('refusal.erpVoidRejected'),
 	erp_void_failed: fixed('refusal.erpVoidFailed'),
+	erp_void_unconfirmed: fixed('refusal.erpVoidUnconfirmed'),
+	erp_void_bill_settled: fixed('refusal.erpVoidBillSettled'),
+	erp_void_draft_only: fixed('refusal.erpVoidDraftOnly'),
 	invoice_recall_claimed: (params, t) => {
 		const claim = str(params, 'claim');
 		if (claim === 'payment') return t('refusal.paymentBlocksRecall');

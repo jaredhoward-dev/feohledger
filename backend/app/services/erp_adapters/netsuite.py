@@ -36,6 +36,7 @@ from app.config import settings
 from app.services.erp_adapters.base import (
     BILL_NOT_IN_ERP,
     BILL_PAYMENT_VOIDED,
+    BILL_VOID_DRAFT_ONLY,
     PAYMENT_ACCOUNT_NOT_MAPPED,
     PAYMENT_EXCEEDS_BALANCE,
     POSTED_TOTAL_MISMATCH,
@@ -390,6 +391,9 @@ class NetSuiteAdapter(ErpAdapter):
     #: A bill carries our marker (its ``externalId`` is the invoice's
     #: correlation id), so it is matched by that, as QuickBooks' are.
     supports_status_sync = True
+    #: ``void_invoice`` deletes a bill only while it is pending approval; REST
+    #: has no void for an approved one (decisions §542).
+    bill_void_scope = BILL_VOID_DRAFT_ONLY
 
     def _auth_method(self) -> str:
         """The configured sign-in method. Absent is TBA; anything else that is
