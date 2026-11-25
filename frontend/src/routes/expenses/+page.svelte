@@ -1143,12 +1143,10 @@
 	]);
 
 	// The KPI row counts the WHOLE card feed, from the server's own `total` for
-	// each reconciliation status. The two status cards used to count the LOADED
-	// page (50 rows) while "Transactions" beside them was the server's total, so
-	// a feed of 300 unmatched charges read "Unmatched 50"; and under the Matched
-	// chip "Unmatched" read 0 because no unmatched row was loaded. `null` until
-	// the counts land (or if they fail): `KpiCard` draws its dash, never a zero
-	// nobody counted.
+	// each reconciliation status, not the loaded page. `null` until the counts
+	// land (or if they fail): `KpiCard` draws its dash, never a zero nobody
+	// counted. Three `page_size=1` reads until a counts endpoint exists
+	// (docs/followups.md).
 	let cardCounts = $state<{ all: number; unmatched: number; matched: number } | null>(null);
 	const cardCountsSequence = createRequestSequencer();
 
@@ -1862,10 +1860,12 @@
 		{/if}
 	{:else if tab === 'cards'}
 		<!-- ===================== Cards tab (WF4) ===================== -->
+		<!-- The three cards count the whole feed while the table follows the
+		     reconciliation chip, so each says so in its sub line. -->
 		<div class="kpi-row">
-			<KpiCard value={unmatchedCount} label={m('expenses.cards.kpi.unmatched')} highlight={unmatchedCount ? 'red' : null} />
-			<KpiCard value={matchedCount} label={m('expenses.cards.kpi.matched')} highlight={matchedCount ? 'green' : null} />
-			<KpiCard value={cardCounts?.all ?? null} label={m('expenses.cards.kpi.transactions')} />
+			<KpiCard value={unmatchedCount} label={m('expenses.cards.kpi.unmatched')} sub={m('expenses.cards.kpi.scope')} highlight={unmatchedCount ? 'red' : null} />
+			<KpiCard value={matchedCount} label={m('expenses.cards.kpi.matched')} sub={m('expenses.cards.kpi.scope')} highlight={matchedCount ? 'green' : null} />
+			<KpiCard value={cardCounts?.all ?? null} label={m('expenses.cards.kpi.transactions')} sub={m('expenses.cards.kpi.scope')} />
 		</div>
 
 		{#if cardImportResult}

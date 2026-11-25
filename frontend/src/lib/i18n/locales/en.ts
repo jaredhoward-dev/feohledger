@@ -2433,6 +2433,7 @@ export const en = {
 	'expenses.cards.kpi.unmatched': 'Unmatched',
 	'expenses.cards.kpi.matched': 'Matched',
 	'expenses.cards.kpi.transactions': 'Transactions',
+	'expenses.cards.kpi.scope': 'All transactions',
 	'expenses.cards.col.date': 'Date',
 	'expenses.cards.col.merchant': 'Merchant',
 	'expenses.cards.col.card': 'Card',

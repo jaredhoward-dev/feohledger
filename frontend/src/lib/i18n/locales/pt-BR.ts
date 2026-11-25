@@ -2278,6 +2278,7 @@ export const messages = {
 	'expenses.cards.kpi.unmatched': 'Não conciliadas',
 	'expenses.cards.kpi.matched': 'Conciliadas',
 	'expenses.cards.kpi.transactions': 'Transações',
+	'expenses.cards.kpi.scope': 'Todas as transações',
 	'expenses.cards.col.date': 'Data',
 	'expenses.cards.col.merchant': 'Estabelecimento',
 	'expenses.cards.col.card': 'Cartão',

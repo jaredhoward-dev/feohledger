@@ -2234,6 +2234,7 @@ export const messages = {
 	'expenses.cards.kpi.unmatched': '未照合',
 	'expenses.cards.kpi.matched': '照合済み',
 	'expenses.cards.kpi.transactions': '取引',
+	'expenses.cards.kpi.scope': '全取引',
 	'expenses.cards.col.date': '日付',
 	'expenses.cards.col.merchant': '加盟店',
 	'expenses.cards.col.card': 'カード',

@@ -648,6 +648,16 @@ One entry remains of what round 29 could not close in the slice that found it.
       `status_actions` from `/verify` and `/reject` and patch the row.
       **Trigger:** the next change to the `/vendors` row actions.
 
+- [ ] **(c) The `/expenses` Cards KPIs cost three list reads.**
+      `loadCardCounts` calls `GET /api/corporate-card-transactions` three times
+      with `page_size=1` (all, `unmatched`, `matched`) only to read each
+      `total`, and the cards count the whole feed, not the table's filters (the
+      label says "All transactions"). **Durable fix:** a `GET
+      /api/corporate-card-transactions/counts` returning `{total, by_status}`
+      in one grouped query (the `/api/purchase-orders/counts` shape), entity-
+      scoped like the list. **Trigger:** the next change to the Cards tab's
+      KPIs or to the list endpoint's filters.
+
 ### Surfaced by the round-30 batch (2026-09-11)
 
 One of the eight entries this round opened remains — a finding that could not

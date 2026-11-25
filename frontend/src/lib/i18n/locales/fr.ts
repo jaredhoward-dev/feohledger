@@ -2277,6 +2277,7 @@ export const messages = {
 	'expenses.cards.kpi.unmatched': 'Non rapprochées',
 	'expenses.cards.kpi.matched': 'Rapprochées',
 	'expenses.cards.kpi.transactions': 'Transactions',
+	'expenses.cards.kpi.scope': 'Toutes les transactions',
 	'expenses.cards.col.date': 'Date',
 	'expenses.cards.col.merchant': 'Commerçant',
 	'expenses.cards.col.card': 'Carte',

@@ -2277,6 +2277,7 @@ export const messages = {
 	'expenses.cards.kpi.unmatched': 'Nicht zugeordnet',
 	'expenses.cards.kpi.matched': 'Zugeordnet',
 	'expenses.cards.kpi.transactions': 'Transaktionen',
+	'expenses.cards.kpi.scope': 'Alle Transaktionen',
 	'expenses.cards.col.date': 'Datum',
 	'expenses.cards.col.merchant': 'Händler',
 	'expenses.cards.col.card': 'Karte',
