@@ -39,6 +39,10 @@ export const messages = {
 	'refusal.recallMirrorUnsigned': 'Diese Rechnung wurde konzernintern weitergeleitet, und ihre Spiegelrechnung bei der anderen Einheit hat die genehmigten Beträge übernommen. Löschen Sie die Spiegelrechnung (sie ist noch nicht genehmigt), nehmen Sie dann diese Genehmigung zurück und leiten Sie die Rechnung nach der erneuten Genehmigung wieder weiter.',
 	'refusal.recallMirrorProgressed': 'Diese Rechnung wurde konzernintern weitergeleitet, und ihre Spiegelrechnung bei der anderen Einheit ist dort bereits genehmigt oder wird bezahlt. Korrigieren Sie beide Seiten mit je einer Gutschrift; diese Genehmigung kann nicht zurückgenommen werden.',
 	'refusal.recallIsMirror': 'Diese Rechnung ist eine konzerninterne Spiegelrechnung: Ihre Beträge stammen aus der Ursprungsrechnung der anderen Einheit. Löschen Sie diese Spiegelrechnung, korrigieren Sie die Ursprungsrechnung und leiten Sie sie erneut weiter.',
+	'refusal.partnerCapabilityRequired':
+		'Dieser Arbeitsbereich ist nicht als Partner eingerichtet. Die Partner-Verwaltung wird von FeohLedger auf Anfrage freigeschaltet — wenden Sie sich an den Support, wenn Sie andere Arbeitsbereiche weiterverkaufen oder verwalten.',
+	'refusal.partnerLinkingDisabled':
+		'Die Partner-Verknüpfung ist auf dieser Plattform noch nicht aktiviert, daher kann kein Verknüpfungscode erstellt werden. Wenden Sie sich an den Support.',
 	'refusal.erpVoidNotFlagged': "Nur eine offene Duplikat- oder Betrugsmarkierung einer Rechnung kann deren Beleg im ERP stornieren.",
 	'refusal.erpVoidNoBill': "FeohLedger kennt für diese Rechnung keinen Beleg im ERP, der storniert werden könnte.",
 	'refusal.erpVoidClaimed': "FeohLedger bezahlt diese Rechnung bereits. Stornieren Sie zuerst diese Zahlung oder Karte.",

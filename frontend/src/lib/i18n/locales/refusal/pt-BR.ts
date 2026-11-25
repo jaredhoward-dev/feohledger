@@ -39,6 +39,10 @@ export const messages = {
 	'refusal.recallMirrorUnsigned': 'Esta fatura foi roteada entre empresas do grupo, e sua fatura espelho na outra entidade copiou os valores aprovados. Exclua a fatura espelho (ela ainda não foi aprovada), depois revogue esta aprovação e roteie a fatura novamente quando for reaprovada.',
 	'refusal.recallMirrorProgressed': 'Esta fatura foi roteada entre empresas do grupo, e sua fatura espelho na outra entidade já foi aprovada ou está sendo paga lá. Corrija os dois lados com uma nota de crédito em cada um; esta aprovação não pode ser revogada.',
 	'refusal.recallIsMirror': 'Esta fatura é uma fatura espelho entre empresas do grupo: seus valores foram copiados da fatura de origem da outra entidade. Exclua esta fatura espelho e corrija a fatura original; depois roteie-a novamente.',
+	'refusal.partnerCapabilityRequired':
+		'Este espaço de trabalho não está configurado como parceiro. A FeohLedger habilita a Administração de parceiros mediante solicitação — entre em contato com o suporte se você revende ou gerencia outros espaços de trabalho.',
+	'refusal.partnerLinkingDisabled':
+		'A vinculação com parceiros ainda não está habilitada nesta plataforma, então nenhum código de vínculo pode ser gerado. Entre em contato com o suporte.',
 	'refusal.erpVoidNotFlagged': "Somente um alerta aberto de duplicidade ou fraude pode anular a conta a pagar no ERP.",
 	'refusal.erpVoidNoBill': "O FeohLedger não tem conta a pagar no ERP para anular nesta fatura.",
 	'refusal.erpVoidClaimed': "O FeohLedger já está pagando esta fatura. Anule primeiro esse pagamento ou cartão.",

@@ -54,6 +54,7 @@
 		type ExceptionDescriptionText
 	} from '#lib/api/exceptionDescription.ts';
 	import {
+		discountCreditNote,
 		erpPaymentParts,
 		erpPrefill,
 		erpRefusalNote,
@@ -699,6 +700,13 @@
 	 *  clear it. Null on every other row. */
 	function rematchNote(exc: ExceptionItem): string | null {
 		return poRematchNote(exc.erp_report, erpName(exc), m, (day) => formatDate(day));
+	}
+
+	/** A bill left open because the org's discount credit (decisions §575)
+	 *  was attempted and did not book: that it was tried, and why when the
+	 *  ERP's code can be stated. Null on every other row. */
+	function creditNote(exc: ExceptionItem): string | null {
+		return discountCreditNote(exc.erp_report, erpName(exc), exc.erp_name ?? null, m);
 	}
 
 	/** Why the ERP refused a payment write-back, in the reader's words, for the
@@ -1402,6 +1410,9 @@
 						{#if rematchNote(exc)}
 							<span class="type-detail rematch-note" title={rematchNote(exc)} data-testid="exception-rematch-note">{rematchNote(exc)}</span>
 						{/if}
+						{#if creditNote(exc)}
+							<span class="type-detail" title={creditNote(exc)} data-testid="exception-discount-credit-note">{creditNote(exc)}</span>
+						{/if}
 					</td>
 					<td>
 						<span
@@ -1501,6 +1512,11 @@
 		{#if rematchNote(resolveTarget)}
 			<p class="modal-hint rematch-note" data-testid="exception-rematch-note-detail">
 				{rematchNote(resolveTarget)}
+			</p>
+		{/if}
+		{#if creditNote(resolveTarget)}
+			<p class="modal-hint" data-testid="exception-discount-credit-detail">
+				{creditNote(resolveTarget)}
 			</p>
 		{/if}
 		{#if refusalNote(resolveTarget)}

@@ -216,6 +216,8 @@
   "codedRefusalRecallMirrorUnsigned": "Esta fatura foi encaminhada entre empresas do grupo, e sua fatura espelho na outra entidade copiou os valores aprovados. Elimine a fatura espelho (ela ainda não foi aprovada), depois revogue esta aprovação e encaminhe a fatura novamente quando for reaprovada.",
   "codedRefusalRecallMirrorProgressed": "Esta fatura foi encaminhada entre empresas do grupo, e sua fatura espelho na outra entidade já foi aprovada ou está a ser paga lá. Corrija os dois lados com uma nota de crédito em cada um; esta aprovação não pode ser revogada.",
   "codedRefusalRecallIsMirror": "Esta fatura é uma fatura espelho entre empresas do grupo: seus valores foram copiados da fatura de origem da outra entidade. Elimine esta fatura espelho e corrija a fatura original; depois encaminhe-a novamente.",
+  "codedRefusalPartnerCapabilityRequired": "Este espaço de trabalho não está configurado como parceiro. A FeohLedger ativa a Administração de parceiros mediante pedido — contacte o suporte se revende ou gere outros espaços de trabalho.",
+  "codedRefusalPartnerLinkingDisabled": "A ligação a parceiros ainda não está ativada nesta plataforma, pelo que não é possível gerar um código de ligação. Contacte o suporte.",
   "invoicesBulkRejectTitle": "Rejeitar {count, plural, one {{count} fatura} other {{count} faturas}}",
   "commonDelete": "Excluir",
   "bulkSelectedCount": "{count, plural, one {{count} item selecionado} other {{count} itens selecionados}}",

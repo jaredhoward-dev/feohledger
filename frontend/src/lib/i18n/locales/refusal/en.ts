@@ -36,6 +36,10 @@ export const enRefusal = {
 	'refusal.recallMirrorUnsigned': "This invoice has been routed inter-company, and its mirror under the other entity copied the approved figures. Delete the mirror (it hasn't been approved yet), then recall this approval, and route the invoice again once it is re-approved.",
 	'refusal.recallMirrorProgressed': "This invoice has been routed inter-company, and its mirror under the other entity has already been approved or is being paid there. Correct the pair with a credit memo on each side; this approval can't be recalled.",
 	'refusal.recallIsMirror': 'This invoice is an inter-company mirror: its figures are copied from the originating invoice under the other entity. Delete this mirror and correct the original invoice, then route it again.',
+	'refusal.partnerCapabilityRequired':
+		'This workspace is not set up as a partner. Partner Admin is enabled by FeohLedger on request — contact support if you resell or manage other workspaces.',
+	'refusal.partnerLinkingDisabled':
+		'Partner linking is not enabled on this platform yet, so no link code can be generated. Contact support.',
 	'refusal.erpVoidNotFlagged': "Only an open duplicate or fraud flag on an invoice can void its bill in the ERP.",
 	'refusal.erpVoidNoBill': "FeohLedger has no bill in the ERP for this invoice to void.",
 	'refusal.erpVoidClaimed': "FeohLedger is already paying this invoice. Void that payment or card first.",

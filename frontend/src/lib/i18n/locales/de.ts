@@ -1517,6 +1517,7 @@ export const messages = {
 	'exceptions.poRematch.note': "Bestellung {po} wurde am {date} in {erp} geändert; eine erneute Prüfung stimmt jetzt überein. Prüfen Sie sie, um die Sperre aufzuheben.",
 	'exceptions.poRematch.noteNoDate': "Bestellung {po} wurde in {erp} geändert; eine erneute Prüfung stimmt jetzt überein. Prüfen Sie sie, um die Sperre aufzuheben.",
 	'exceptions.poRematch.noteNoPo': "Die Bestellung wurde in {erp} geändert; eine erneute Prüfung stimmt jetzt überein. Prüfen Sie sie, um die Sperre aufzuheben.",
+	'exceptions.discountCredit.failed': "Das Skonto wurde in {erp} nicht als Lieferantengutschrift gebucht, obwohl die Skontogutschrift aktiviert ist; die Rechnung bleibt dort um das Skonto offen, bis jemand es bucht.",
 	'exceptions.erpVoid.title': "Beleg in {erp} stornieren",
 	'exceptions.erpVoid.intro': "Der Beleg dieser Rechnung liegt bereits in {erp} und kann dort noch bezahlt werden. Ist die Markierung berechtigt, stornieren Sie ihn dort. Die Markierung bleibt offen, bis Sie entscheiden.",
 	'exceptions.erpVoid.open': "Beleg stornieren…",

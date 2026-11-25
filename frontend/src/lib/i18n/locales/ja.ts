@@ -1495,6 +1495,7 @@ export const messages = {
 	'exceptions.poRematch.note': "発注書 {po} は {date} に {erp} で変更され、再照合で一致するようになりました。確認して保留を解除してください。",
 	'exceptions.poRematch.noteNoDate': "発注書 {po} は {erp} で変更され、再照合で一致するようになりました。確認して保留を解除してください。",
 	'exceptions.poRematch.noteNoPo': "発注書が {erp} で変更され、再照合で一致するようになりました。確認して保留を解除してください。",
+	'exceptions.discountCredit.failed': "割引クレジットが有効ですが、{erp} で早期支払割引を仕入先クレジットとして計上できませんでした。誰かが計上するまで、請求書は割引分だけ未決済のままです。",
 	'exceptions.erpVoid.title': "{erp}で請求書を無効化",
 	'exceptions.erpVoid.intro': "この請求書は{erp}に登録済みで、まだ支払われる可能性があります。フラグが正しければ、そこで無効化してください。フラグはあなたが判断するまで未解決のままです。",
 	'exceptions.erpVoid.open': "請求書を無効化…",

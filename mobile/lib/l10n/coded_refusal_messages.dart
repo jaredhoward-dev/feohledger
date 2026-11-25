@@ -244,6 +244,8 @@ const codedRefusalCodes = <String>{
   'invoice_recall_mirror_unsigned',
   'invoice_recall_mirror_progressed',
   'invoice_recall_is_mirror',
+  'partner_capability_required',
+  'partner_linking_disabled',
   'invoice_not_in_review',
   'invoice_bulk_not_found',
   'invoice_status_immutable',
@@ -342,6 +344,12 @@ String? localizeCodedRefusal(AppLocalizations l, Object? detail) {
       return l.codedRefusalRecallMirrorProgressed;
     case 'invoice_recall_is_mirror':
       return l.codedRefusalRecallIsMirror;
+    // Partner Admin, and the link-code mint while partner linking is off
+    // (backend decisions §574).
+    case 'partner_capability_required':
+      return l.codedRefusalPartnerCapabilityRequired;
+    case 'partner_linking_disabled':
+      return l.codedRefusalPartnerLinkingDisabled;
     case 'invoice_recall_claimed':
       return switch (_str(params, 'claim')) {
         'payment' => l.codedRefusalPaymentBlocksRecall,

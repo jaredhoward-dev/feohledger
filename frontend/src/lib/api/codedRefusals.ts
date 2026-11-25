@@ -425,6 +425,12 @@ const BUILDERS: Record<string, Builder> = {
 	invoice_recall_mirror_unsigned: fixed('refusal.recallMirrorUnsigned'),
 	invoice_recall_mirror_progressed: fixed('refusal.recallMirrorProgressed'),
 	invoice_recall_is_mirror: fixed('refusal.recallIsMirror'),
+	// Partner Admin (decisions §574): an admin of a workspace the operator has
+	// not made a partner, on any `/api/partner` route; and the link-code mint
+	// (`POST /api/organization/partner-link-code`) while the platform has no
+	// signing key configured (503).
+	partner_capability_required: fixed('refusal.partnerCapabilityRequired'),
+	partner_linking_disabled: fixed('refusal.partnerLinkingDisabled'),
 	// `services/erp_bill_void` — `POST /api/exceptions/{id}/void-erp-bill` and
 	// the queue's `void_erp_bill_refusal` verdict (decisions §539).
 	erp_void_not_flagged: fixed('refusal.erpVoidNotFlagged'),

@@ -1515,6 +1515,7 @@ export const messages = {
 	'exceptions.poRematch.note': "La OC {po} cambió en {erp} el {date} y una nueva comprobación ya coincide. Revísela para liberar la retención.",
 	'exceptions.poRematch.noteNoDate': "La OC {po} cambió en {erp} y una nueva comprobación ya coincide. Revísela para liberar la retención.",
 	'exceptions.poRematch.noteNoPo': "La orden de compra cambió en {erp} y una nueva comprobación ya coincide. Revísela para liberar la retención.",
+	'exceptions.discountCredit.failed': "El descuento por pronto pago no se registró en {erp} como crédito de proveedor, aunque el crédito por descuento está activado, así que la factura sigue abierta allí por el descuento hasta que alguien lo registre.",
 	'exceptions.erpVoid.title': "Anular la factura en {erp}",
 	'exceptions.erpVoid.intro': "La factura de proveedor ya está en {erp}, que aún puede pagarla. Si la alerta es real, anúlela allí. La alerta sigue abierta hasta que la decida.",
 	'exceptions.erpVoid.open': "Anular la factura…",

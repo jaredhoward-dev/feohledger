@@ -1416,6 +1416,18 @@ abstract class AppLocalizations {
   /// **'This invoice is an inter-company mirror: its figures are copied from the originating invoice under the other entity. Delete this mirror and correct the original invoice, then route it again.'**
   String get codedRefusalRecallIsMirror;
 
+  /// Coded refusal `partner_capability_required`: an admin of a workspace the operator has not made a partner opened a Partner Admin action.
+  ///
+  /// In en, this message translates to:
+  /// **'This workspace is not set up as a partner. Partner Admin is enabled by FeohLedger on request — contact support if you resell or manage other workspaces.'**
+  String get codedRefusalPartnerCapabilityRequired;
+
+  /// Coded refusal `partner_linking_disabled`: the link-code mint is off because the platform has no signing key configured.
+  ///
+  /// In en, this message translates to:
+  /// **'Partner linking is not enabled on this platform yet, so no link code can be generated. Contact support.'**
+  String get codedRefusalPartnerLinkingDisabled;
+
   /// Title of the reason prompt shown before bulk-rejecting the selected invoices.
   ///
   /// In en, this message translates to:

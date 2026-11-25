@@ -53,6 +53,12 @@ export interface ErpReport {
 	 *  without one. Also `payment_id` / `payment_run_id` there and on
 	 *  `payment_sync_back_failed` — machine detail, never shown as prose. */
 	refusal?: unknown;
+	/** `payment_writeback_balance_open`, when the org's discount-credit opt-in
+	 *  tried to book the discount and it did not (decisions §575): the ERP
+	 *  refusal's code (an `ERP_REFUSAL_CODES` member), or
+	 *  `erp_discount_credit_failed` when the call failed without one. Only the
+	 *  code is kept, not its params. */
+	discount_credit_failure?: string | null;
 	payment_id?: string | null;
 	payment_run_id?: string | null;
 }
@@ -142,6 +148,36 @@ export function erpRefusalNote(
 ): string | null {
 	if (!report || !WRITEBACK_REFUSAL_KINDS.has(report.kind ?? '')) return null;
 	return erpRefusalText(report.refusal, t);
+}
+
+/** `erp_report.kind` of the row the payment write-back opens when the bill
+ *  stays open after our payment (`erp_payment_writeback_balance_open`). */
+export const ERP_REPORT_WRITEBACK_BALANCE_OPEN = 'payment_writeback_balance_open';
+
+/**
+ * On a balance-open row, that the discount credit was attempted and did not
+ * book (decisions §575), and why when this build can say it — or `null` on
+ * any other row, or when no credit was attempted (the opt-in off).
+ *
+ * `erp` names the ERP in the lead sentence (its product name, or the reader's
+ * "your ERP"); `provider` is the product name alone, which every ERP refusal
+ * sentence names — without one, or for a code whose sentence needs params the
+ * row does not keep (`account_not_linked`'s accounts), the reason is left out
+ * rather than guessed, and the lead still says the credit failed.
+ */
+export function discountCreditNote(
+	report: ErpReport | null | undefined,
+	erp: string,
+	provider: string | null,
+	t: Translate
+): string | null {
+	if (!report || report.kind !== ERP_REPORT_WRITEBACK_BALANCE_OPEN) return null;
+	const failure = report.discount_credit_failure;
+	const code = typeof failure === 'string' ? failure.trim() : '';
+	if (!code) return null;
+	const lead = t('exceptions.discountCredit.failed', { erp });
+	const reason = erpRefusalText({ code, params: provider ? { provider } : {} }, t);
+	return reason ? `${lead} ${reason}` : lead;
 }
 
 /** What a "record this payment" form starts from. `method` is `''` when the ERP

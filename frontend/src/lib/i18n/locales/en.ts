@@ -1653,6 +1653,7 @@ export const en = {
 	'exceptions.poRematch.note': "PO {po} changed in {erp} on {date}, and a re-check now matches. Review it to clear the hold.",
 	'exceptions.poRematch.noteNoDate': "PO {po} changed in {erp}, and a re-check now matches. Review it to clear the hold.",
 	'exceptions.poRematch.noteNoPo': "The purchase order changed in {erp}, and a re-check now matches. Review it to clear the hold.",
+	'exceptions.discountCredit.failed': "The early-payment discount was not booked in {erp} as a vendor credit, though the discount credit is on, so the bill stays open there by the discount until someone books it.",
 	'exceptions.erpVoid.title': "Void the bill in {erp}",
 	'exceptions.erpVoid.intro': "This invoice's bill is already in {erp}, which can still pay it. If the flag is real, void the bill there. The flag stays open until you decide it.",
 	'exceptions.erpVoid.open': "Void the bill…",

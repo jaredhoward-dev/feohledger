@@ -10,15 +10,23 @@
 	 * Consenting to BE adopted is not a partner act, so this lives here and is
 	 * open to any admin — the Partner Admin page itself now needs the
 	 * operator-granted partner capability. The mint is audited server-side
-	 * (`partner.link_code_issued`). The code is shown once and kept only in
-	 * this panel's state; it is never stored or put in a URL.
+	 * (`partner.link_code_issued`). The code is shown once, in the shared
+	 * `ui/SecretReveal` dialog (focus moves into it, the copy is acknowledged,
+	 * focus returns to Generate on close), and kept only while that dialog is
+	 * open; it is never stored or put in a URL. Losing it costs a new mint.
+	 *
+	 * A refused mint (the platform has no signing key: 503
+	 * `partner_linking_disabled`) is stated in the reader's language from its
+	 * code, in place beside the button; anything uncoded reads the generic
+	 * failure, never the server's raw English.
 	 *
 	 * Admin-only end to end: `readOnly` renders the notice and makes no call.
 	 */
-	import { toast } from '#lib/components/ui/Toast.svelte';
+	import SecretReveal from '#lib/components/ui/SecretReveal.svelte';
 	import { mintLinkCode } from '#lib/api/partner.ts';
+	import { ApiError } from '#lib/api.ts';
+	import { localizeApiDetail } from '#lib/api/codedRefusals.ts';
 	import { m } from '#lib/i18n/store.svelte.ts';
-	import { errorMessage } from '#lib/utils/apiError.ts';
 
 	let {
 		readOnly
@@ -27,30 +35,26 @@
 		readOnly: boolean;
 	} = $props();
 
-	let mintedCode = $state<string | null>(null);
-	let mintExpiry = $state<number | null>(null);
+	let minted = $state<{ code: string; expiresInMinutes: number } | null>(null);
 	let minting = $state(false);
+	let failure = $state<string | null>(null);
 
 	async function mintCode() {
+		// `aria-disabled`, not `disabled`, while minting: a disabled button
+		// throws focus to <body>, and the dialog would then hand it back there
+		// on close instead of to this button (WCAG 2.4.3).
+		if (minting) return;
 		minting = true;
+		failure = null;
 		try {
 			const res = await mintLinkCode();
-			mintedCode = res.link_code;
-			mintExpiry = res.expires_in_minutes;
+			minted = { code: res.link_code, expiresInMinutes: res.expires_in_minutes };
 		} catch (e) {
-			toast(errorMessage(e, m('org.partnerLink.mintFailed')), 'error');
+			failure =
+				(e instanceof ApiError ? localizeApiDetail(e.detail, m) : null) ??
+				m('org.partnerLink.mintFailed');
 		} finally {
 			minting = false;
-		}
-	}
-
-	async function copyCode() {
-		if (!mintedCode) return;
-		try {
-			await navigator.clipboard.writeText(mintedCode);
-			toast(m('org.partnerLink.codeCopied'), 'success');
-		} catch {
-			toast(m('org.partnerLink.copyFailed'), 'error');
 		}
 	}
 </script>
@@ -64,24 +68,47 @@
 			{m('org.readOnly.sectionAdminOnly')}
 		</p>
 	{:else}
+		{#if failure}
+			<p class="mint-failure" id="partner-link-failure" role="alert" data-testid="partner-link-failure">
+				{failure}
+			</p>
+		{/if}
 		<div class="link-code-actions">
-			<button type="button" class="btn-cancel" onclick={mintCode} disabled={minting}>
+			<button
+				type="button"
+				class="btn-cancel"
+				onclick={mintCode}
+				aria-disabled={minting}
+				aria-describedby={failure ? 'partner-link-failure' : undefined}
+			>
 				{minting ? m('org.partnerLink.generating') : m('org.partnerLink.generate')}
 			</button>
 		</div>
-		{#if mintedCode}
-			<div class="minted" data-testid="minted-link-code">
-				<code class="code-value">{mintedCode}</code>
-				<button type="button" class="btn-cancel copy-btn" onclick={copyCode}>
-					{m('org.partnerLink.copy')}
-				</button>
-				{#if mintExpiry !== null}
-					<span class="expiry">{m('org.partnerLink.expiresIn', { minutes: mintExpiry })}</span>
-				{/if}
-			</div>
-		{/if}
 	{/if}
 </section>
+
+{#snippet expiryNote()}
+	{#if minted}
+		<p class="expiry">{m('org.partnerLink.expiresIn', { minutes: minted.expiresInMinutes })}</p>
+	{/if}
+{/snippet}
+
+<SecretReveal
+	open={minted !== null}
+	ariaLabel={m('org.partnerLink.reveal.aria')}
+	heading={m('org.partnerLink.reveal.heading')}
+	warningStrong={m('org.partnerLink.reveal.warningStrong')}
+	warning={m('org.partnerLink.reveal.warning')}
+	secret={minted?.code ?? ''}
+	testId="minted-link-code"
+	copyLabel={m('org.partnerLink.copy')}
+	copiedLabel={m('org.partnerLink.reveal.copied')}
+	copiedToast={m('org.partnerLink.codeCopied')}
+	copyFailedToast={m('org.partnerLink.copyFailed')}
+	doneLabel={m('org.partnerLink.reveal.done')}
+	note={expiryNote}
+	onclose={() => (minted = null)}
+/>
 
 <style>
 	.link-code-actions {
@@ -89,31 +116,14 @@
 		gap: 0.5rem;
 	}
 
-	.minted {
-		display: flex;
-		align-items: center;
-		gap: 0.75rem;
-		margin-top: 0.75rem;
-		flex-wrap: wrap;
-	}
-
-	.code-value {
-		font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-		font-size: 0.78rem;
-		background: var(--bg);
-		border: 1px solid var(--border);
-		border-radius: 6px;
-		padding: 0.4rem 0.6rem;
-		max-width: 100%;
-		overflow-wrap: anywhere;
+	.mint-failure {
+		color: var(--danger);
+		font-size: 0.85rem;
+		margin: 0 0 0.5rem;
 	}
 
 	.expiry {
 		color: var(--text-muted);
 		font-size: 0.78rem;
-	}
-
-	.copy-btn {
-		flex: none;
 	}
 </style>

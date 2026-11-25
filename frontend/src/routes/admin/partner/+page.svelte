@@ -471,7 +471,7 @@
 		}}
 	>
 		<p class="modal-hint">
-			{m('admin.partner.attach.hint')}
+			{m('admin.partner.attach.hint', { panel: m('org.partnerLink.heading') })}
 		</p>
 		<label>
 			<span>{m('admin.partner.attach.linkCode')} <em class="required">*</em></span>

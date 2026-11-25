@@ -39,6 +39,10 @@ export const messages = {
 	'refusal.recallMirrorUnsigned': 'Esta factura se enrutó entre empresas del grupo y su factura espejo en la otra entidad copió los importes aprobados. Elimine la factura espejo (aún no está aprobada), retire después esta aprobación y vuelva a enrutar la factura cuando se apruebe de nuevo.',
 	'refusal.recallMirrorProgressed': 'Esta factura se enrutó entre empresas del grupo y su factura espejo en la otra entidad ya está aprobada o se está pagando allí. Corrija ambos lados con una nota de crédito en cada uno; esta aprobación no se puede retirar.',
 	'refusal.recallIsMirror': 'Esta factura es una factura espejo entre empresas del grupo: sus importes se copiaron de la factura de origen de la otra entidad. Elimine esta factura espejo y corrija la factura original; después vuelva a enrutarla.',
+	'refusal.partnerCapabilityRequired':
+		'Este espacio de trabajo no está configurado como socio. FeohLedger habilita la Administración de socios bajo solicitud — contacta con soporte si revendes o gestionas otros espacios de trabajo.',
+	'refusal.partnerLinkingDisabled':
+		'La vinculación con socios aún no está habilitada en esta plataforma, así que no se puede generar un código de vinculación. Contacta con soporte.',
 	'refusal.erpVoidNotFlagged': "Solo una alerta abierta de duplicado o fraude puede anular la factura de proveedor en el ERP.",
 	'refusal.erpVoidNoBill': "FeohLedger no tiene ninguna factura de proveedor en el ERP que anular para esta factura.",
 	'refusal.erpVoidClaimed': "FeohLedger ya está pagando esta factura. Anule primero ese pago o esa tarjeta.",

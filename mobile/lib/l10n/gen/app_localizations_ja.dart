@@ -813,6 +813,14 @@ class AppLocalizationsJa extends AppLocalizations {
       'この請求書はグループ会社間のミラー請求書です。金額は相手先エンティティの元の請求書からコピーされています。このミラー請求書を削除し、元の請求書を訂正してから再度振り替えてください。';
 
   @override
+  String get codedRefusalPartnerCapabilityRequired =>
+      'このワークスペースはパートナーとして設定されていません。パートナー管理は FeohLedger が申請に応じて有効にします — 他のワークスペースを再販または管理する場合はサポートにお問い合わせください。';
+
+  @override
+  String get codedRefusalPartnerLinkingDisabled =>
+      'このプラットフォームではパートナー連携がまだ有効になっていないため、リンクコードを生成できません。サポートにお問い合わせください。';
+
+  @override
   String invoicesBulkRejectTitle(int count) {
     return '$count件の請求書を却下';
   }

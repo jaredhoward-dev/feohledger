@@ -14,7 +14,7 @@
 	import { auth } from '#lib/stores/auth.svelte.ts';
 	import { brand } from '#lib/stores/brand.svelte.ts';
 	import { m, currentLocale } from '#lib/i18n/store.svelte.ts';
-	import { canSee } from '#lib/nav.ts';
+	import { canSee, type OrgCapability } from '#lib/nav.ts';
 	import { ROLE_LABEL_KEYS } from '#lib/types/admin.ts';
 	import {
 		GUIDE_KIND_KEYS,
@@ -39,10 +39,12 @@
 
 	const has = (...roles: string[]) => auth.hasAnyRole(...roles);
 	const can = (perm: string) => auth.can(perm);
+	const hasCapability = (c: OrgCapability) => auth.hasCapability(c);
 	const target = $derived.by(() => {
 		if (!guide?.route) return undefined;
 		const nav = navPageFor(guide.route);
-		if (nav && !canSee(nav.roles, has, nav.permissions, can)) return undefined;
+		if (nav && !canSee(nav.roles, has, nav.permissions, can, nav.capability, hasCapability))
+			return undefined;
 		return { href: guide.route, label: nav ? m(nav.labelKey) : undefined };
 	});
 	const terms = $derived((guide?.terms ?? []).filter((id) => termFor(id)));
