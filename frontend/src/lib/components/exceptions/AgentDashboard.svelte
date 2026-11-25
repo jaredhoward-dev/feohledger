@@ -39,6 +39,16 @@
 	import LoadError from '#lib/components/ui/LoadError.svelte';
 
 	const PAGE_SIZE = 20;
+	/** The exact instant behind a date cell, for its tooltip — formatted in the
+	 *  reader's locale, as the queue's Age / Due cells do, never the raw ISO
+	 *  string off the wire. */
+	const DATETIME_OPTS: Intl.DateTimeFormatOptions = {
+		month: 'short',
+		day: 'numeric',
+		year: 'numeric',
+		hour: 'numeric',
+		minute: '2-digit'
+	};
 
 	let stats = $state<AgentStats | null>(null);
 	let decisions = $state<AgentDecision[]>([]);
@@ -405,7 +415,7 @@
 			{#snippet body()}
 				{#each candidates as exc (exc.id)}
 					<tr>
-						<td class="muted-cell" title={exc.created_at}>{formatDate(exc.created_at)}</td>
+						<td class="muted-cell" title={formatDate(exc.created_at, '', DATETIME_OPTS)}>{formatDate(exc.created_at)}</td>
 						<td>{typeLabel(exc.exception_type, exc.type_label)}</td>
 						<td class="mono">{exc.invoice_number ?? '—'}</td>
 						<td class="muted-cell">{exc.vendor_name ?? '—'}</td>
@@ -475,7 +485,7 @@
 			{#snippet body()}
 				{#each decisions as d (d.id)}
 					<tr>
-						<td class="muted-cell" title={d.created_at}>{formatDate(d.created_at)}</td>
+						<td class="muted-cell" title={formatDate(d.created_at, '', DATETIME_OPTS)}>{formatDate(d.created_at)}</td>
 						<td class="mono">{d.agent_type}</td>
 						<td class="muted-cell">{typeLabel(d.exception_type)}</td>
 						<td>

@@ -89,6 +89,11 @@ test.describe('/exceptions AI Agents — decision-log load states', () => {
 		await failed.getByRole('button', { name: 'Retry' }).click();
 		await expect(log.getByText('RECOVERED-AGENT')).toBeVisible();
 		await expect(failed).toHaveCount(0);
+
+		// The date cell's tooltip is the formatted instant, not the wire's ISO.
+		const dateCell = log.getByRole('row').filter({ hasText: 'RECOVERED-AGENT' }).locator('td').first();
+		await expect(dateCell).toHaveAttribute('title', /\S/);
+		await expect(dateCell).not.toHaveAttribute('title', /\d{4}-\d{2}-\d{2}T/);
 	});
 
 	test("a FAILED chip change drops the previous chip's rows", async ({ page }) => {
