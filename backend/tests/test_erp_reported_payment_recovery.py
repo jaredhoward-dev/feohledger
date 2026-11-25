@@ -300,14 +300,19 @@ async def test_a_blocker_still_open_keeps_refusing_and_the_reason_is_refreshed(r
     assert len(await _payments(mk, inv_id)) == 1
 
 
-async def test_a_feohledger_payment_in_a_run_still_refuses_the_retry(realdb):
+@pytest.mark.parametrize("blocker_type", ["duplicate", "payment_reconciliation"])
+async def test_a_feohledger_payment_in_a_run_still_refuses_the_retry(realdb, blocker_type):
     """The double-pay guard is re-run, not remembered: a run booked for the
     invoice after the first refusal makes the re-attempt a double payment, so
-    it is refused and the BLOCKING reconciliation opens to stop the run."""
+    it is refused and the BLOCKING reconciliation opens to stop the run.
+
+    `payment_reconciliation`: the blocker being cleared is of the very type
+    the refusal opens; the new blocker opens all the same, since no row of
+    another kind stands in for it (decisions §535)."""
     info = realdb.info(TENANT)
     mk = realdb.sessionmaker(TENANT)
-    inv_id = await _seed_invoice(mk, info.org_id, number="ERP-RETRY-3")
-    blocker_id = await _blocker(mk, info.org_id, inv_id, exception_type="duplicate")
+    inv_id = await _seed_invoice(mk, info.org_id, number=f"ERP-RETRY-3-{blocker_type}")
+    blocker_id = await _blocker(mk, info.org_id, inv_id, exception_type=blocker_type)
     await _report_paid(realdb, inv_id)
     async with mk() as s:
         run = PaymentRun(

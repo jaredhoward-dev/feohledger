@@ -27166,9 +27166,9 @@ the generic webhook too.
    settlement-coverage hold only over a completed payment, and with none it
    transitioned. But this route and the sweep serve adapters
    `payment_erp_sync` writes nothing back to, so an ERP `paid` while our own
-   payment is still pending or processing (or a live virtual card, which books
-   no `Payment`, holds the invoice) means someone paid the bill in the ERP
-   while our rail pays it too. Moving to `paid` hid the double payment, fired
+   payment is still pending or processing may mean someone paid the bill in
+   the ERP while our rail pays it too (wording corrected by §535: this route
+   cannot tell that from a bookkeeper recording our own payment). Moving to `paid` hid the double payment, fired
    the `payment.settled` webhook, and let a later short settlement walk around
    the coverage hold. `tests/test_erp_status_poll_sweep.py` pinned the bug: it
    seeded no `Payment` and expected `paid`.
@@ -27202,9 +27202,9 @@ the generic webhook too.
    (outcome `held_paid_while_scheduled`). A completed covering payment still
    moves to `paid`; a completed short one still takes the settled-short hold.
    This is the shared service, so the **generic webhook changes too**: its
-   test of an ERP `paid` with no payment on file now expects the hold. A live
-   card on a `payment_scheduled` invoice books no `Payment`, so it falls in the
-   same refusal (pinned in both new test files).
+   test of an ERP `paid` with no payment on file now expects the hold. (An
+   earlier draft said a live card falls in the same hold; neither real card
+   shape reaches it — corrected in §535.)
 2. **One realm rule, one function.** `erp_link_realm.bill_realm_clause` states
    §417 / §423 once — the current realm, NULL only under
    `legacy_links_trusted`, `None` (nothing matches) for a connection naming no
@@ -27249,7 +27249,8 @@ second realm rule, the one §423 retired.
 
 **Guard.** `tests/test_erp_status_report.py` (new) pins the service directly:
 each status → edge, the poll's audit marker, no-change and terminal no-ops, a
-paid with no completed payment (none, pending, processing, live card) held and
+paid with no completed payment (none, pending, processing, an active card row
+with no `Payment` — which pins only that the row changes nothing, §535) held and
 blocking, covering → `paid`, short → held, kind dedupe on every flag including
 an unrelated live row of the same type, and the §319 withdrawal.
 `tests/test_erp_status_poll_sweep.py`: the three `paid` cases, the void and
@@ -27296,3 +27297,97 @@ labelled with no raw token ever in the DOM. `time.test.ts` pins
 separately*: two fetches of one endpoint for one modal. *Adding the apostrophe
 back for prose ("Jun ’26")*: §531 already rejected producing it; the full year
 is what a reader expects in a sentence.
+
+## 535. Every ERP reconciliation flag dedupes by kind; the generic route's in-flight sentence never says void; `approved` is polled (§533 follow-up, round 44)
+
+**Problem.** The money-path re-review of §533 found three gaps and one
+overstated claim.
+
+1. **§533's kind dedupe stopped at the generic route.** Every other caller of
+   `open_erp_reconciliation_exception` kept the per-type default, and their
+   reports do not come again either: the QuickBooks payment write-back's
+   failure and open-balance flags and its void write-back failure fire once
+   per payment, and the status sync's `erp_paid_twice` once per change. A live
+   unrelated `erp_reconciliation` — say a leftover
+   `payment_void_writeback_failed` — made a new `payment_writeback_failed`
+   open nothing: QuickBooks still showed the bill open and nobody was told.
+   `payment_erp_sync._flag_sync_failure` had its own inline per-type check
+   with the same flaw.
+2. **The in-flight hold told people to void.** §533 reused QuickBooks'
+   `erp_paid_while_scheduled` ("paid by a payment FeohLedger did not make …
+   Stop or void one of them"). QuickBooks raises it only when the bill's
+   balance shows a payment from outside us (`reduced_outside`). The generic
+   route and the sweep know only that the ERP says `paid`; the usual cause is
+   a bookkeeper recording our own in-flight ACH there, and voiding could void
+   the only real payment.
+3. **`approved` was not polled.** A payment void returns the invoice to
+   `approved` with its `erp_document_id` and realm intact, and the generic
+   route has no §296 pre-dispatch bill check. A dropped ERP `paid` was then
+   never read, and the next run paid the bill again.
+4. **§533's card claim was overstated.** Its `live_card` test case held with
+   or without the card: the hold keys on "no completed `Payment`", and a card
+   row books none. Neither real card shape reaches that branch.
+
+**Decision.**
+
+1. **Kind is the only dedupe rule.** `open_erp_reconciliation_exception`
+   loses `same_kind`; `erp_report` (with a `kind`) is now required, and a row
+   is skipped only while a live row of the same type AND `erp_report.kind`
+   exists (`live_erp_report_of_kind`, also called by the sync-back's
+   `_flag_sync_failure`, kind `payment_sync_back_failed`). Every caller
+   already stated a distinct kind (`payment_writeback_failed`,
+   `payment_writeback_balance_open`, `payment_void_writeback_failed`,
+   `bill_state`, `dispatch_stopped`, `bill_unlinked`, `erp_payment_voided`,
+   and §533's five). No caller needed per-type: the reports that do repeat
+   (a sweep re-read, a retried leg, a redelivery) repeat their own kind. The
+   one internal per-type check, in `_keep_erp_paid_report` (a new double-pay
+   refusal stood down when any blocker of that type was live), goes too: a
+   double-pay refusal always opens its own blocking `paid_not_recorded` row
+   and supersedes the non-blocking one. A second blocking row beside an
+   unrelated one is a second fact, as §533 already argued.
+2. **A sentence of its own for the generic route.**
+   `exception.erp_paid_while_payment_in_flight`: "The ERP shows this bill paid
+   while FeohLedger's payment for it has not completed. Confirm whether that
+   entry is FeohLedger's payment or a second one before voiding anything." The
+   webhook and the sweep use it; `erp_report.kind` stays
+   `paid_while_scheduled`. QuickBooks keeps `erp_paid_while_scheduled`, which
+   it can justify. Web (six locales) and mobile (seven ARBs, `pt` and
+   `pt_BR` included) carry it; the generated catalogues are regenerated.
+3. **`approved` joins `POLLED_STATUSES`**, still only for invoices with an
+   `erp_document_id` under the webhook's realm rule. A `paid` there goes
+   through `record_erp_reported_payment` and every double-pay refusal (a live
+   card, a run holding it), so it is booked as the ERP's payment or refused
+   behind a blocking row; either way no run pays it. `open` has no edge from
+   `approved` (a no-op), and `cancelled` opens the "voided after posting"
+   review row as it does at the other forbidden statuses.
+4. **The card claim, stated correctly.** A `/cards/generate` card leaves the
+   invoice `approved` / `posted_in_erp`; an ERP `paid` there is refused
+   `external_payment_card_live` and kept as a blocking `paid_not_recorded`
+   row. A run's card leg books a `completed` `Payment` with a NULL
+   `settled_amount`, which `settlement_coverage` reads as covering
+   (fail-open), so an ERP `paid` moves the invoice to `paid`. The tests that
+   seeded a card row are renamed `card_row_no_payment` and say they pin only
+   that the row changes nothing. The run-card-leg case — minted but unspent,
+   counted as paid everywhere, so a card can still be charged after the ERP
+   was paid outside — is a pre-existing gap tracked in `docs/followups.md`.
+
+**Rejected.** *Keeping per-type as an opt-in for the "same fact, different
+reporter" case* (a dispatch-stopped row beside a QuickBooks bill-state row):
+the run is refused while either is live, and resolving two rows is the price
+of never losing one. *Reusing `erp_paid_while_scheduled` with softer wording
+for everyone*: QuickBooks does know the payment came from outside, and its
+instruction is right there. *Polling `approved` invoices with no ERP
+document*: there is no bill to read.
+
+**Guard.** `tests/test_erp_payment_writeback.py`: a failed write-back, an
+open balance and a failed void write-back each open beside an unrelated live
+row of the same type, and a repeat of the same failure opens one.
+`tests/test_payment_erp_sync.py`: the sync-back strand beside an unrelated
+live row. `tests/test_erp_status_sync.py`: `erp_paid_twice` beside an
+unrelated row, once per kind on a re-read.
+`tests/test_erp_reported_payment_recovery.py`: the run-held retry with the
+cleared blocker of the refusal's own type. `tests/test_erp_status_poll_sweep.py`:
+a voided-back `approved` invoice whose ERP shows `paid` is recorded and
+leaves the run nothing to pay; with a live card it is refused behind a
+blocking row; an `approved` invoice with no document is never read. The three
+in-flight hold tests assert the new code.

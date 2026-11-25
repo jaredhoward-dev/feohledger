@@ -169,8 +169,10 @@ async def apply_erp_status_report(
     # back to, so the bill was paid in the ERP while our own rail payment (or a
     # live virtual card, which books no `Payment`) is still in flight. Moving
     # to `paid` would hide the double payment and walk around the coverage
-    # hold above. Hold instead, behind a payment-blocking exception, exactly
-    # as the QuickBooks sync does (`apply_bill_report`, decisions §533).
+    # hold above. Hold instead, behind a payment-blocking exception, as the
+    # QuickBooks sync does (`apply_bill_report`, decisions §533) — but in words
+    # of its own: this route cannot tell an outside payment from a bookkeeper
+    # recording our own in-flight one, so it never says to void one (§535).
     if target_status is InvoiceStatus.paid and current == InvoiceStatus.payment_scheduled:
         settling = (
             await db.execute(
@@ -198,9 +200,8 @@ async def apply_erp_status_report(
                 invoice,
                 org_id=org_id,
                 exception_type=PAYMENT_RECONCILIATION_EXCEPTION_TYPE,
-                finding=exception_finding("erp_paid_while_scheduled"),
+                finding=exception_finding("erp_paid_while_payment_in_flight"),
                 erp_report=report,
-                same_kind=True,
             )
             return HELD_PAID_WHILE_SCHEDULED if opened else NOOP
         coverage = settlement_coverage(
@@ -229,7 +230,6 @@ async def apply_erp_status_report(
                         str(coverage.shortfall) if coverage.shortfall is not None else None
                     ),
                 },
-                same_kind=True,
             )
             return HELD_SETTLED_SHORT if opened else NOOP
 
@@ -288,5 +288,4 @@ async def raise_erp_reconciliation_exception(
             "event_id": str(event_id) if event_id else None,
             "invoice_status": invoice.status.value,
         },
-        same_kind=True,
     )

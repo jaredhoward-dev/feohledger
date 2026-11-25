@@ -3835,6 +3835,10 @@ class AppLocalizationsEn extends AppLocalizations {
       'The ERP shows this bill paid by a payment FeohLedger did not make, while a FeohLedger payment is scheduled for it. Stop or void one of them before both reach the supplier.';
 
   @override
+  String get exceptionDescriptionErpPaidWhilePaymentInFlight =>
+      'The ERP shows this bill paid while FeohLedger\'s payment for it has not completed. Confirm whether that entry is FeohLedger\'s payment or a second one before voiding anything.';
+
+  @override
   String get exceptionDescriptionErpPaidTwice =>
       'FeohLedger paid this invoice, and the ERP shows the bill also paid by a payment FeohLedger did not make — the supplier may have been paid twice. Recover one of the payments.';
 

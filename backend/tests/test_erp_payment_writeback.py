@@ -393,3 +393,97 @@ async def test_an_accepted_short_settlement_writes_back_what_was_settled(realdb)
     assert outcome == erp_payment_writeback.WROTE
     (payload,) = adapter.post_payment.await_args.args
     assert payload.amount == Decimal("95.00")  # what reached the supplier
+
+
+# ---------------------------------------------------------------------------
+# a write-back flag is deduplicated by its kind, never by its type (§535)
+# ---------------------------------------------------------------------------
+
+
+async def _live_row(realdb, inv_id, kind: str) -> uuid.UUID:
+    """A live `erp_reconciliation` on the invoice that some OTHER report opened."""
+    exc_id = uuid.uuid4()
+    async with realdb.sessionmaker("a")() as s:
+        s.add(
+            APException(
+                id=exc_id,
+                organization_id=realdb.info("a").org_id,
+                invoice_id=inv_id,
+                exception_type="erp_reconciliation",
+                severity="error",
+                status="open",
+                description="Another report.",
+                erp_report={"kind": kind, "erp_type": "quickbooks_online"},
+            )
+        )
+        await s.commit()
+    return exc_id
+
+
+def _kinds(rows) -> list[str]:
+    return sorted(r.erp_report["kind"] for r in rows)
+
+
+async def test_a_failed_write_back_is_not_swallowed_by_an_unrelated_live_row(realdb):
+    """A failed write-back fires once per payment: swallowed by a leftover
+    void write-back flag, QuickBooks would still show the bill open and nobody
+    would be told."""
+    await _configure(realdb)
+    run_id, inv_id, _ = await _seed(realdb)
+    await _live_row(realdb, inv_id, "payment_void_writeback_failed")
+
+    await _sync(realdb, run_id, FakeQbo(ErpPostResult(success=False, message="x")))
+
+    assert _kinds(await _rows(realdb, APException, invoice_id=inv_id)) == [
+        "payment_void_writeback_failed",
+        "payment_writeback_failed",
+    ]
+
+
+async def test_a_repeated_write_back_failure_is_flagged_once(realdb):
+    await _configure(realdb)
+    run_id, inv_id, _ = await _seed(realdb)
+    adapter = FakeQbo(ErpPostResult(success=False, message="x", retryable=True))
+
+    await _sync(realdb, run_id, adapter)
+    await _sync(realdb, run_id, adapter)
+
+    assert adapter.post_payment.await_count == 2
+    assert _kinds(await _rows(realdb, APException, invoice_id=inv_id)) == [
+        "payment_writeback_failed"
+    ]
+
+
+async def test_a_bill_left_open_is_not_swallowed_by_an_unrelated_live_row(realdb):
+    await _configure(realdb)
+    run_id, inv_id, _ = await _seed(realdb)
+    await _live_row(realdb, inv_id, "bill_state")
+    left = ErpPostResult(success=True, erp_document_id="BP-9", bill_balance_after=Decimal("2.00"))
+
+    await _sync(realdb, run_id, FakeQbo(left))
+
+    assert _kinds(await _rows(realdb, APException, invoice_id=inv_id)) == [
+        "bill_state",
+        "payment_writeback_balance_open",
+    ]
+
+
+async def test_a_failed_void_write_back_is_not_swallowed_by_an_unrelated_live_row(realdb):
+    await _configure(realdb)
+    run_id, inv_id, pay_id = await _seed(realdb)
+    adapter = FakeQbo()
+    await _sync(realdb, run_id, adapter)
+    await _live_row(realdb, inv_id, "payment_writeback_balance_open")
+    adapter.void_payment.return_value = ErpPostResult(success=False, message="x", retryable=True)
+
+    for _ in range(2):  # a repeat of the same failure is flagged once
+        with patch("app.services.erp_adapters.get_erp_adapter", return_value=adapter):
+            outcome = await erp_payment_writeback.void_written_payment(
+                realdb.info("a").org_id, pay_id
+            )
+        assert outcome == erp_payment_writeback.FAILED
+
+    assert _kinds(await _rows(realdb, APException, invoice_id=inv_id)) == [
+        "payment_void_writeback_failed",
+        "payment_writeback_balance_open",
+    ]

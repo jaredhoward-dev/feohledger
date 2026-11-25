@@ -293,16 +293,21 @@ it was sent on, and the QuickBooks status sync-back / pre-dispatch check cases
 (credit settlement, paid while scheduled, paid twice, part-paid outside, bill
 deleted, a bill this connection cannot read, the payment stopped by bill state,
 an ERP-reported payment voided here). The generic webhook and the status
-polling sweep reuse two of those QuickBooks sentences for the same facts —
-`erp_paid_while_scheduled` (a `paid` report while our payment has not
-completed) and, poll-sourced, `erp_partly_paid_outside` (a `partially_paid`
-read) — and the sweep adds one of its own, `erp_settled_no_payment`
-(poll-sourced only: a `settled_no_payment` read, nothing owing and no payment
-behind it — a credit or a write-off, decisions §303, §532). All three open the
-payment-blocking `payment_reconciliation`, unnamed (no `{erp}` twin; the adapter
-is in `erp_report`), with `erp_report.kind` `paid_while_scheduled` /
-`partly_paid` / `settled_no_payment` and `source: poll` when the sweep read it
-(decisions §533). The payment write-back
+polling sweep reuse one of those QuickBooks sentences for the same fact —
+poll-sourced, `erp_partly_paid_outside` (a `partially_paid` read) — and have
+two of their own: `erp_paid_while_payment_in_flight` (a `paid` report while
+our payment has not completed; not QuickBooks' `erp_paid_while_scheduled`,
+which says the payment came from outside us and to stop or void one — this
+route cannot tell, and the usual cause is a bookkeeper recording our own
+in-flight payment, so its sentence asks a person to confirm which payment the
+ERP entry is before voiding anything, decisions §535) and
+`erp_settled_no_payment` (poll-sourced only: a `settled_no_payment` read,
+nothing owing and no payment behind it — a credit or a write-off, decisions
+§303, §532). All three open the payment-blocking `payment_reconciliation`,
+unnamed (no `{erp}` twin; the adapter is in `erp_report`), with
+`erp_report.kind` `paid_while_scheduled` / `partly_paid` /
+`settled_no_payment` and `source: poll` when the sweep read it (decisions
+§533). The payment write-back
 (`services/erp_payment_writeback`) and `services/payment_erp_sync`'s failed leg
 use the same family: `erp_payment_writeback_failed`,
 `erp_payment_writeback_balance_open` (`amount` money + `currency`),

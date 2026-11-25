@@ -108,7 +108,13 @@ from app.services.sweep_health import SWEEP_ERP_STATUS_POLL, run_sweep_loop
 logger = logging.getLogger(__name__)
 
 #: Statuses at which a generic webhook could still move the invoice.
+#: ``approved`` is the one a payment void returns an invoice to with its ERP
+#: bill and realm intact (§535): a dropped ERP ``paid`` there must still be
+#: read, or the next run pays the bill a second time. Its ``paid`` goes through
+#: ``record_erp_reported_payment`` and its double-pay refusals; ``open`` and
+#: ``cancelled`` have no legal edge from it (a cancel opens a review flag).
 POLLED_STATUSES = (
+    InvoiceStatus.approved,
     InvoiceStatus.sent_to_erp,
     InvoiceStatus.posted_in_erp,
     InvoiceStatus.payment_scheduled,
@@ -324,7 +330,7 @@ async def _flag_read(
     exception for a person to say what is still owed, and leave the invoice
     where it is — FeohLedger paid nothing, so no transition and no payment is
     recorded. Skipped while one of the same KIND is live, never because an
-    unrelated row of that type is (``same_kind``, §533).
+    unrelated row of that type is (§533, §535).
 
     Neither read is a bill paid in full, so a payment the ERP reported earlier
     that FeohLedger could not record is withdrawn first, as every non-``Paid``
@@ -348,7 +354,6 @@ async def _flag_read(
             "source": POLL_SOURCE,
             "invoice_status": invoice.status.value,
         },
-        same_kind=True,
     )
     if opened:
         return EXCEPTION_OPENED
