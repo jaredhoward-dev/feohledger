@@ -99,6 +99,11 @@
 	.terms > div:target {
 		background: var(--muted-tint);
 	}
+	/* Tint → on-tint pairing: --text-muted is not rated on --muted-tint;
+	   --muted-on-tint is (app.css). */
+	.terms > div:target dd {
+		color: var(--muted-on-tint);
+	}
 	.terms dt {
 		font-weight: 600;
 	}
