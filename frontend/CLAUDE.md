@@ -237,6 +237,7 @@ Two things hold for every route, and a diff that breaks either is a bug:
 All data fetching goes through this module. Never call `fetch()` directly for API requests.
 
 - Auto-adds `Authorization: Bearer <token>` from localStorage
+- **Browser storage goes through `#lib/utils/safeStorage.ts`** (`storageGet` / `storageSet` / `storageRemove`, `storageArea`, `storageAvailable`), never a bare `localStorage` / `sessionStorage`: where a browser blocks site data the property READ itself throws, and one unguarded read at boot blanked the whole app. Blocked storage reads as empty — signed out — and both sign-in pages say why (decisions §514). Pass the key as a literal or a hoisted `*_KEY` const so `legal/storageInventory.test.ts` still sees it
 - Auto-adds `X-Tenant-Slug` header from subdomain
 - A 401, or a 403 coded `token_tenant_mismatch` (a token for another workspace), clears the token and redirects to `/login` (`endSessionIfRejected`; the second adds `?reason=other_workspace`, decisions §288), with `?next=` naming the page the user was on. **Any `next` is read and written only through `#lib/utils/postLoginRedirect.ts`** — it is the open-redirect gate (`docs/authentication.md` § Sign-in returns to the page asked for). Every raw-`fetch` path that bypasses `request()` calls the same helper
 - Methods: `api.get<T>()`, `api.post<T>()`, `api.patch<T>()`, `api.put<T>()`, `api.delete()`, `api.upload<T>()`

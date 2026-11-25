@@ -182,7 +182,9 @@ with asymmetric algorithms only (`.claude/hooks/security-patterns.sh` rule
 4. Frontend POSTs `{ email, password }` to `/api/auth/login`
 5. Backend validates credentials against the **control-plane DB** (where users live)
 6. Backend returns `{ access_token, token_type }` (JWT with a unique `jti` claim)
-7. Frontend stores the JWT in `localStorage`
+7. Frontend stores the JWT in `localStorage` (through `#lib/utils/safeStorage.ts`;
+   where the browser blocks site storage the app reads as signed out and
+   `/login` says a sign-in cannot last there — decisions §514)
 8. All subsequent requests include both:
    - `Authorization: Bearer <token>` header
    - `X-Tenant-Slug: <slug>` header

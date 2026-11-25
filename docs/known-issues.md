@@ -5,9 +5,8 @@ names the root cause, the evidence, blast radius, and a recommended fix
 approach — this is a staging area for real problems, not a place to let them
 go stale. See root `CLAUDE.md` guard rail 6 (no dangling deferred findings).
 
-**Eight entries are open**: the run builder reading
-a missing invoice currency as USD (found 2026-10-21), the app rendering nothing when browser
-storage is blocked (found 2026-10-20),
+**Seven entries are open**: the run builder reading
+a missing invoice currency as USD (found 2026-10-21),
 the expense-report Attach dead end found while
 writing the help centre, the `all`-mode approval-chain segregation deadlock,
 an out-of-office delegation that cannot stand in on an `all`-mode level (found
@@ -19,7 +18,9 @@ floor approving an invoice whose PO was never matched, found and struck on
 calling an endpoint Merge does not publish, found and struck on 2026-10-26, sits
 struck at the top. The payment mock tests that failed locally in one pytest
 process, found and struck on 2026-10-31, sit struck above the run-builder
-entry. The remove-tenant backup deletion the VM's IAM role refused, found
+entry. The app rendering nothing when browser storage is blocked, found
+2026-10-20, was struck on 2026-11-25 (decisions §514) and sits struck in
+place. The remove-tenant backup deletion the VM's IAM role refused, found
 2026-10-18, was struck on 2026-11-24 (#757, decisions §490) and sits struck in
 place. The paid-plan features no
 route enforced and the direct ERP adapters posting bills without the ERP's
@@ -36,10 +37,11 @@ this note has now warned about twice. Two defects were **fixed on 2026-09-17**:
 the `/organization` 320px reflow defect (issue #432), along with six more routes
 that failed the same criterion and had no entry at all because nothing measured
 them; and the local-e2e `alembic` drift, which now has a pre-run guard that
-refuses to start against a stale database. Twenty-two of the thirty `##`
+refuses to start against a stale database. Twenty-four of the thirty-one `##`
 entries are now `~~struck-through~~` resolved stubs. (This line said "the other
 fifteen" while the file held fifteen struck in total, the two above included,
-and later "seventeen of the twenty-four" while nineteen were struck.)
+later "seventeen of the twenty-four" while nineteen were struck, and later
+"twenty-two of the thirty" while twenty-three of thirty-one were.)
 They are kept because the *diagnosis* is the
 expensive part and is worth not re-deriving. Add a new entry at the top when a
 defect is diagnosed but can't be fixed in the same session.
@@ -232,7 +234,20 @@ invoice's own currency.
 refuse the run, naming the invoice, until the currency is set), with a pytest
 beside `tests/test_payment_run_flow.py`'s mixed-currency case.
 
-## The app renders nothing when the browser blocks site storage
+## ~~The app renders nothing when the browser blocks site storage~~ — FIXED 2026-11-25
+
+**Resolution (`docs/decisions.md` §514).** Every storage access now goes
+through `frontend/src/lib/utils/safeStorage.ts`: blocked storage reads as empty
+(signed out, consolidated entity, default locale) and a write that cannot land
+is dropped. `/login` and the supplier portal's `/portal/login` show a localized
+notice that the browser is blocking site storage, so a sign-in cannot last.
+Guarded by `src/lib/utils/safeStorage.test.ts`, `src/lib/tokenStorage.test.ts`
+and `tests-e2e/auth/storage-blocked.spec.ts`. The diagnosis below was right
+about the three token / entity modules but missed one: `ConsentBanner.svelte`'s
+`getConsent()` was NOT wrapped — `typeof localStorage` runs the throwing
+getter — and it runs in the root layout. It also missed the login page's MFA
+challenge write and `api/expenses.ts`'s own token read. The original
+diagnosis stands below.
 
 **Found 2026-10-20**, building the light theme (decisions §289), whose own
 storage access is wrapped and was being tested for exactly this case.
