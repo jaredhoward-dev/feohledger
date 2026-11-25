@@ -62,6 +62,9 @@ export interface ExpenseListParams {
 	 *  three declares a `sort` leg, so it's a silent no-op on them. */
 	sort?: string;
 	order?: 'asc' | 'desc';
+	/** List only — the caller's loose draft lines an attach by them accepts
+	 *  (`GET /api/expenses?attachable=true`, decisions §515). */
+	attachable?: boolean;
 	page?: number;
 	page_size?: number;
 }
@@ -92,6 +95,7 @@ function expenseQuery(params: ExpenseListParams): URLSearchParams {
 	if (params.report_id) qs.set('report_id', params.report_id);
 	if (params.sort) qs.set('sort', params.sort);
 	if (params.order) qs.set('order', params.order);
+	if (params.attachable) qs.set('attachable', 'true');
 	return qs;
 }
 
@@ -131,6 +135,27 @@ export function getExpenseIds(params: ExpenseListParams = {}): Promise<MatchingI
 	return api.get<MatchingIdsResponse>(`/api/expenses/ids${query ? `?${query}` : ''}`);
 }
 
+/**
+ * One page of the lines the caller can put on their own draft report — the
+ * report attach picker's source (`ui/ExpensePicker`). The server applies the
+ * attach gate's rule (their own or unrecorded creator, on no report, draft),
+ * so the picker never offers a line the attach would refuse as foreign.
+ */
+export function searchAttachableExpenses(query: {
+	search: string;
+	page: number;
+	page_size: number;
+}): Promise<ExpenseListResponse> {
+	return listExpenses({
+		attachable: true,
+		search: query.search || undefined,
+		sort: 'expense_date',
+		order: 'desc',
+		page: query.page,
+		page_size: query.page_size
+	});
+}
+
 export function getExpense(id: string): Promise<Expense> {
 	return api.get<Expense>(`/api/expenses/${id}`);
 }
@@ -161,10 +186,18 @@ export function receiptUrl(fileKey: string): Promise<string> {
 // --- Reports ---
 
 export function listExpenseReports(
-	params: { status?: string; page?: number; page_size?: number } = {}
+	params: {
+		status?: string;
+		/** Only reports the caller owns (`employee_user_id`) — the only ones
+		 *  they may compose. */
+		mine?: boolean;
+		page?: number;
+		page_size?: number;
+	} = {}
 ): Promise<ExpenseReportListResponse> {
 	const qs = new URLSearchParams();
 	if (params.status) qs.set('status', params.status);
+	if (params.mine) qs.set('mine', 'true');
 	qs.set('page', String(params.page ?? 1));
 	qs.set('page_size', String(params.page_size ?? 20));
 	return api.get<ExpenseReportListResponse>(`/api/expense-reports?${qs}`);
