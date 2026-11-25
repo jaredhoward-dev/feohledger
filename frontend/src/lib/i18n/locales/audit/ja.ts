@@ -106,6 +106,7 @@ export const messages = {
 	'audit.action.entity.updated': "法人を更新",
 	'audit.action.exception.assigned': "例外を割り当て",
 	'audit.action.exception.dismissed': "例外を却下",
+	'audit.action.exception.erp_bill_void_orphaned': "ERPに無効化を送信しましたが、ここには記録されていません",
 	'audit.action.exception.erp_bill_voided': "フラグからERPの請求書を無効化しました",
 	'audit.action.exception.escalated': "例外をエスカレーション",
 	'audit.action.exception.raised': "例外が発生",

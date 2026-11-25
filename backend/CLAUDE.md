@@ -1095,3 +1095,5 @@ AWS_PROFILE=feohledger sops feohledger/prod.sops.yaml   # decrypts → $EDITOR �
 - **No dotenv in Lambda paths** — `main.py` imports dotenv for local dev; Lambda entry points must not.
 - **Tenant isolation** — always resolve tenant via dependency injection (`get_tenant_db()`), never hardcode DB names.
 - **Row locking** — use `get_invoice_for_update()` for any status transition to prevent race conditions.
+- **No row lock held across a third-party call.** Lock, write a committed marker, call with no lock, re-lock and check the marker is still yours (the ERP bill void, decisions §545, §550; `services/post_commit.py` for best-effort legs).
+- **Every change within the public contract (`/api/v1`, its OpenAPI, the webhook events) gets an entry in `app/api/v1_changelog.py::PUBLIC_API_CHANGES`** in the same change; `info.version` is not bumped (decisions §548).

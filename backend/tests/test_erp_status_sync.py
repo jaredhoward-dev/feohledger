@@ -2306,6 +2306,49 @@ async def test_an_on_request_pass_runs_for_an_opted_in_netsuite_tenant(realdb, m
     assert row.details["invoices_changed"] == 1
 
 
+async def test_the_on_request_audit_names_the_resolved_erp_not_a_leftover_oauth_block(
+    realdb, monkeypatch
+):
+    """An OAuth block survives a switch of ERP (§270): a NetSuite tenant that
+    once connected QuickBooks keeps that block. The audit names the adapter the
+    configuration resolves to, as the refusal selects it (decisions §550)."""
+    from app.config import settings
+    from app.models.workflow import AuditLog
+
+    await _configure_netsuite(
+        realdb,
+        "a",
+        f"SW{uuid.uuid4().hex[:6].upper()}",
+        oauth={"provider": "quickbooks_online", "external_tenant_id": "123"},
+    )
+    monkeypatch.setattr(settings, "erp_status_sync_enabled", True)
+    org = await _org(realdb)
+    assert erp_status_sync.status_sync_provider(org) == "netsuite"
+
+    org_id = realdb.info("a").org_id
+    erp_status_sync._now_running.add(org_id)
+    with patch.object(erp_status_sync, "sync_org_now", AsyncMock(side_effect=RuntimeError)):
+        await erp_status_sync._sync_org_now_task(org_id, None)
+    async with realdb.sessionmaker("a")() as s:
+        [row] = (
+            (
+                await s.execute(
+                    select(AuditLog).where(AuditLog.action == "organization.erp_status_synced")
+                )
+            )
+            .scalars()
+            .all()
+        )
+    assert row.details["provider"] == "netsuite"
+
+
+def test_the_on_request_audit_names_no_erp_when_none_is_configured():
+    from types import SimpleNamespace
+
+    assert erp_status_sync.status_sync_provider(SimpleNamespace(settings={})) is None
+    assert erp_status_sync.status_sync_provider(SimpleNamespace(settings={"erp": "x"})) is None
+
+
 @pytest.mark.parametrize("opt_in", [None, "off", "yes"])
 async def test_an_on_request_pass_is_refused_for_netsuite_without_the_opt_in(
     realdb, monkeypatch, opt_in

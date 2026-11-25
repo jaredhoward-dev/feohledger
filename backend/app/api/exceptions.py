@@ -1073,9 +1073,24 @@ async def void_erp_bill(
             refusal = refused
 
         # 3. The same locks again: finish, or clear the marker.
+        # An attempt that sent its void but can no longer record it leaves an
+        # orphan record (decisions §550).
+        erp_type = ebv.configured_erp_type(org.settings)
         row, invoice, instance = await _lock()
         try:
             if refusal is not None:
+                if refusal.code == ebv.ERP_VOID_UNCONFIRMED and ebv.lost_its_invoice(
+                    invoice, started
+                ):
+                    await ebv.record_orphaned_void(
+                        db,
+                        attempt=started,
+                        exception=row,
+                        invoice=invoice,
+                        user=user,
+                        void_result="unconfirmed",
+                        erp_type=erp_type,
+                    )
                 ebv.abandon_void(invoice, started)
                 raise refusal
             outcome = await ebv.finish_void(
@@ -1087,6 +1102,7 @@ async def void_erp_bill(
                 instance=instance,
                 user=user,
                 reason=reason,
+                erp_type=erp_type,
             )
         except ebv.VoidRefused as refused:
             await db.commit()

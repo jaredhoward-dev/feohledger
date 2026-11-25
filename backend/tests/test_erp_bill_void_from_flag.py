@@ -291,6 +291,19 @@ async def _audit(mk, entity_id, action):
         return list(rows.scalars())
 
 
+async def _marker_is_sql_null(mk, inv_id) -> bool:
+    """SQL NULL, not a JSON ``null`` (the column is ``none_as_null``): a JSON
+    null would still read as "a marker" to anything querying ``IS NOT NULL``."""
+    from sqlalchemy import text
+
+    async with mk() as s:
+        return (
+            await s.execute(
+                text("SELECT erp_void_pending IS NULL FROM invoices WHERE id = :i"), {"i": inv_id}
+            )
+        ).scalar_one()
+
+
 async def test_admin_voids_the_bill_once_and_a_replay_calls_nothing(realdb):
     info = realdb.info(TENANT)
     mk = realdb.sessionmaker(TENANT)
@@ -334,6 +347,9 @@ async def test_admin_voids_the_bill_once_and_a_replay_calls_nothing(realdb):
     assert rows[0].details["old_status"] == "posted_in_erp"
     assert rows[0].details["new_status"] == "approved"
     assert len(await _audit(mk, exc_id, "exception.erp_bill_voided")) == 1
+    # The normal path leaves no orphan record (§550), and the marker is SQL NULL.
+    assert await _audit(mk, exc_id, "exception.erp_bill_void_orphaned") == []
+    assert await _marker_is_sql_null(mk, inv_id)
 
 
 async def test_ap_manager_without_payment_void_is_refused(realdb):
@@ -386,7 +402,10 @@ async def test_the_erp_refusals_change_nothing(realdb, adapter, status_code, cod
         assert inv.erp_document_id == "BILL-9"
         # The attempt is over: its marker holds nothing (§545).
         assert inv.erp_void_pending is None
+    assert await _marker_is_sql_null(mk, inv_id)
     assert await _audit(mk, inv_id, "invoice.erp_bill_voided") == []
+    # Nothing moved under the attempt, so nothing is orphaned (§550).
+    assert await _audit(mk, exc_id, "exception.erp_bill_void_orphaned") == []
     if code not in ("erp_void_rejected", "erp_void_unsupported", "erp_void_unconfirmed"):
         assert adapter.void_calls == 0
 
@@ -840,3 +859,221 @@ def test_live_pending_reads_age_and_shape():
     assert live_pending(inv(None), now=now) is None
     assert live_pending(inv({"started_at": "garbage"}), now=now) is None
     assert live_pending(inv({"started_at": "2026-11-25T00:00:00"}), now=now) is None
+
+
+# ---------------------------------------------------------------------------
+# decisions §550: step 2 bounded as a whole; an orphaned void is recorded
+# ---------------------------------------------------------------------------
+
+
+def _attempt():
+    from app.services import erp_bill_void as ebv
+
+    return ebv.VoidAttempt(
+        attempt_id=str(uuid.uuid4()),
+        document_id="BILL-9",
+        invoice_status=InvoiceStatus.posted_in_erp,
+    )
+
+
+def test_the_whole_erp_step_is_bounded_well_inside_the_staleness_window():
+    from app.services import erp_bill_void as ebv
+
+    assert ebv.CALL_ERP_TIMEOUT_S * 2 <= ebv.PENDING_STALE_AFTER_S
+    # The per-call bounds fit inside it, so they still decide a slow ERP call.
+    assert ebv.STATUS_READ_TIMEOUT_S * 2 + ebv.VOID_CALL_TIMEOUT_S < ebv.CALL_ERP_TIMEOUT_S
+
+
+@pytest.mark.parametrize(
+    ("slow", "code", "void_calls"),
+    [
+        # A stalled credential unseal: no adapter is used, nothing is sent.
+        ("unseal", "erp_void_failed", 0),
+        # A stalled status read (per-call bound not reached first).
+        ("read", "erp_void_failed", 0),
+        # Out of time after the void call started: the ERP may have voided it.
+        ("void", "erp_void_unconfirmed", 1),
+    ],
+)
+async def test_the_erp_step_times_out_as_a_whole(monkeypatch, slow, code, void_calls):
+    from app.services import erp_bill_void as ebv
+
+    monkeypatch.setattr(ebv, "CALL_ERP_TIMEOUT_S", 0.2)
+    adapter = _Adapter(delay=5 if slow == "void" else 0.0)
+    if slow == "read":
+
+        async def _slow_read(doc):
+            await asyncio.sleep(5)
+            return ErpInvoiceStatus.open
+
+        adapter.get_invoice_status = _slow_read
+
+    async def _config(org, kind):
+        if slow == "unseal":
+            await asyncio.sleep(5)
+        return {"type": "mock", "integration_method": "direct"}
+
+    with (
+        patch("app.services.provider_credentials.provider_config", _config),
+        _adapter(adapter),
+        pytest.raises(ebv.VoidRefused) as refused,
+    ):
+        await ebv.call_erp(SimpleNamespace(settings={}), _attempt())
+    assert refused.value.code == code
+    assert adapter.void_calls == void_calls
+    assert adapter.voided == []
+
+
+async def _orphans(mk, exc_id):
+    return await _audit(mk, exc_id, "exception.erp_bill_void_orphaned")
+
+
+async def _reconciliations(mk, inv_id):
+    async with mk() as s:
+        rows = await s.execute(
+            select(APException).where(
+                APException.invoice_id == inv_id,
+                APException.exception_type == "payment_reconciliation",
+            )
+        )
+        return list(rows.scalars())
+
+
+async def test_a_void_sent_after_the_marker_was_taken_over_is_recorded_as_orphaned(realdb):
+    """The first attempt's marker went stale and a newer attempt took it over
+    while the first was still voiding: the first's void succeeded in the ERP but
+    is not its to finish. It writes the orphan row; the invoice still holds the
+    bill (the newer attempt converges on it), so no reconciliation row."""
+    info = realdb.info(TENANT)
+    mk = realdb.sessionmaker(TENANT)
+    inv_id = await _seed(mk, info.org_id, number="VOID-O1")
+    exc_id = await _flag(mk, info.org_id, inv_id)
+
+    async def _taken_over(doc):
+        await _set_marker(mk, inv_id, exc_id, age_s=0)
+
+    adapter = _Adapter(on_void=_taken_over)
+    with _adapter(adapter):
+        async with realdb.client(key=TENANT, role="admin") as c:
+            res = await c.post(f"/api/exceptions/{exc_id}/void-erp-bill", json={"reason": "dup"})
+    assert res.status_code == 409, res.text
+    assert res.json()["detail"]["code"] == "erp_void_in_progress"
+    assert adapter.voided == ["BILL-9"]
+
+    (row,) = await _orphans(mk, exc_id)
+    assert row.details["erp_document_id"] == "BILL-9"
+    assert row.details["void_result"] == "voided"
+    assert row.details["invoice_status"] == "posted_in_erp"
+    assert row.details["marker_taken_over"] is True
+    assert row.details["attempt_id"]
+    assert row.details["actor_id"] == str(row.actor_id)
+    assert await _reconciliations(mk, inv_id) == []
+    async with mk() as s:
+        inv = await s.get(Invoice, inv_id)
+        # The newer attempt's marker is left for it.
+        assert inv.erp_void_pending is not None
+        assert inv.erp_document_id == "BILL-9"
+
+
+async def _move_on(mk, inv_id, exc_id):
+    """While the void is in the ERP: the flag dismissed (its marker had gone
+    stale) and a run scheduled the invoice."""
+    from sqlalchemy import update
+
+    async with mk() as s:
+        await s.execute(
+            update(Invoice)
+            .where(Invoice.id == inv_id)
+            .values(status=InvoiceStatus.payment_scheduled)
+        )
+        await s.execute(
+            update(APException).where(APException.id == exc_id).values(status="dismissed")
+        )
+        await s.commit()
+
+
+async def test_a_void_sent_after_the_invoice_moved_on_is_orphaned_and_blocks_payment(realdb):
+    """The invoice changed mid-call: the void is recorded as orphaned, and since
+    the invoice is payable here a payment-blocking reconciliation row opens
+    (once: a second orphan of the same kind dedupes). The marker is SQL NULL."""
+    info = realdb.info(TENANT)
+    mk = realdb.sessionmaker(TENANT)
+    inv_id = await _seed(mk, info.org_id, number="VOID-O2")
+    exc_id = await _flag(mk, info.org_id, inv_id)
+
+    async def _moved(doc):
+        await _move_on(mk, inv_id, exc_id)
+
+    adapter = _Adapter(on_void=_moved)
+    with _adapter(adapter):
+        async with realdb.client(key=TENANT, role="admin") as c:
+            res = await c.post(f"/api/exceptions/{exc_id}/void-erp-bill", json={"reason": "dup"})
+    assert res.status_code == 409, res.text
+    assert res.json()["detail"]["code"] == "erp_void_no_bill"
+
+    (row,) = await _orphans(mk, exc_id)
+    assert row.details["invoice_status"] == "payment_scheduled"
+    assert row.details["void_result"] == "voided"
+    assert row.details["marker_taken_over"] is False
+    (recon,) = await _reconciliations(mk, inv_id)
+    assert recon.status == "open"
+    assert recon.erp_report["kind"] == "void_orphaned"
+    assert recon.erp_report["erp_document_id"] == "BILL-9"
+    assert await _marker_is_sql_null(mk, inv_id)
+    async with mk() as s:
+        inv = await s.get(Invoice, inv_id)
+        # Nothing on the invoice is rewritten: what happened since is a person's.
+        assert inv.status == InvoiceStatus.payment_scheduled
+        assert inv.erp_document_id == "BILL-9"
+
+
+async def test_an_unconfirmed_void_after_the_invoice_moved_on_is_orphaned(realdb):
+    info = realdb.info(TENANT)
+    mk = realdb.sessionmaker(TENANT)
+    inv_id = await _seed(mk, info.org_id, number="VOID-O3")
+    exc_id = await _flag(mk, info.org_id, inv_id)
+
+    async def _moved(doc):
+        await _move_on(mk, inv_id, exc_id)
+
+    adapter = _Adapter(on_void=_moved, void_raises=RuntimeError("reset"))
+    with _adapter(adapter):
+        async with realdb.client(key=TENANT, role="admin") as c:
+            res = await c.post(f"/api/exceptions/{exc_id}/void-erp-bill", json={"reason": "dup"})
+    assert res.status_code == 502, res.text
+    assert res.json()["detail"]["code"] == "erp_void_unconfirmed"
+    (row,) = await _orphans(mk, exc_id)
+    assert row.details["void_result"] == "unconfirmed"
+    assert len(await _reconciliations(mk, inv_id)) == 1
+    assert await _marker_is_sql_null(mk, inv_id)
+
+
+async def test_a_bill_found_already_gone_is_never_orphaned(realdb):
+    """No void was sent, so there is nothing to orphan, whatever moved."""
+    info = realdb.info(TENANT)
+    mk = realdb.sessionmaker(TENANT)
+    inv_id = await _seed(mk, info.org_id, number="VOID-O4")
+    exc_id = await _flag(mk, info.org_id, inv_id)
+    attempt = _attempt()
+    from app.services import erp_bill_void as ebv
+
+    async with mk() as s:
+        inv = await s.get(Invoice, inv_id)
+        exc = await s.get(APException, exc_id)
+        inv.status = InvoiceStatus.payment_scheduled
+        inv.erp_void_pending = {"attempt_id": attempt.attempt_id}
+        with pytest.raises(ebv.VoidRefused):
+            await ebv.finish_void(
+                s,
+                attempt=attempt,
+                answer=ebv.ErpAnswer(read="cancelled", already_gone=True),
+                exception=exc,
+                invoice=inv,
+                instance=None,
+                user=SimpleNamespace(id=uuid.uuid4()),
+                reason="x",
+            )
+        await s.commit()
+    assert await _orphans(mk, exc_id) == []
+    assert await _reconciliations(mk, inv_id) == []
+    assert await _marker_is_sql_null(mk, inv_id)

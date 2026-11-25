@@ -109,6 +109,7 @@ export const enAudit = {
 	'audit.action.entity.updated': "Entity updated",
 	'audit.action.exception.assigned': "Exception assigned",
 	'audit.action.exception.dismissed': "Exception dismissed",
+	'audit.action.exception.erp_bill_void_orphaned': "ERP void sent but not recorded here",
 	'audit.action.exception.erp_bill_voided': "Bill voided in the ERP from the flag",
 	'audit.action.exception.escalated': "Exception escalated",
 	'audit.action.exception.raised': "Exception raised",

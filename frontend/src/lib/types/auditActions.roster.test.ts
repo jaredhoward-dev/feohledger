@@ -97,7 +97,9 @@ function harvest(files: Record<string, string>) {
 	};
 
 	for (const src of Object.values(files)) {
-		for (const m of src.matchAll(/\b(?:action(?:_name)?|[A-Z_]*ACTION[A-Z_]*)\s*=\s*/g)) {
+		// `ACTION` as a whole word of the constant's name: `_LITHIC_TRANSACTION_EVENT`
+		// (api/cards.py) holds Lithic's event type, not an audit action.
+		for (const m of src.matchAll(/\b(?:action(?:_name)?|(?:[A-Z_]*_)?ACTIONS?(?:_[A-Z_]*)?)\s*=\s*/g)) {
 			const at = m.index + m[0].length;
 			take(src[at] === '(' ? src.slice(at, balancedEnd(src, at)) : src.slice(at, src.indexOf('\n', at)));
 		}

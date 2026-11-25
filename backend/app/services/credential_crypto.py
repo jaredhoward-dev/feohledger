@@ -148,6 +148,27 @@ _dek_cache_lock = threading.Lock()
 _kms_client_instance = None
 _kms_client_lock = threading.Lock()
 
+#: Bounds on every KMS call (decisions §550). boto's defaults are a 60 s
+#: connect, a 60 s read and up to five legacy-mode attempts, so one stalled
+#: unseal could hold a request for minutes. Every caller is a request or a
+#: sweep unsealing one tenant's provider credential, where KMS answers in
+#: milliseconds; a call that has not answered in these bounds is failing, and
+#: each caller already maps `CredentialCryptoError` to its own refusal.
+KMS_CONNECT_TIMEOUT_S = 5
+KMS_READ_TIMEOUT_S = 10
+#: Attempts in all, the first included (botocore's `total_max_attempts`).
+KMS_MAX_ATTEMPTS = 3
+
+
+def _kms_client_config():
+    from botocore.config import Config
+
+    return Config(
+        connect_timeout=KMS_CONNECT_TIMEOUT_S,
+        read_timeout=KMS_READ_TIMEOUT_S,
+        retries={"mode": "standard", "total_max_attempts": KMS_MAX_ATTEMPTS},
+    )
+
 
 def _kms_client():
     """One KMS client per process, built once under a lock.
@@ -164,7 +185,9 @@ def _kms_client():
             import boto3
 
             _kms_client_instance = boto3.session.Session().client(
-                "kms", endpoint_url=settings.aws_endpoint_url or None
+                "kms",
+                endpoint_url=settings.aws_endpoint_url or None,
+                config=_kms_client_config(),
             )
         return _kms_client_instance
 
