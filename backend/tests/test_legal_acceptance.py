@@ -30,6 +30,10 @@ from app.services.tenant_deletion import CONTROL_DELETIONS, CONTROL_TABLES_EXEMP
 from app.services.tenant_provisioning import CONTROL_TABLES, ProvisioningResult
 from tests.set_password_mail import ACCEPT_CURRENT
 
+# Its users and portal users start with nothing on record: this file tests the
+# unaccepted path itself (conftest `_test_users_accept_the_legal_versions`).
+pytestmark = pytest.mark.legal_unaccepted
+
 
 def _gen_module():
     path = Path(__file__).resolve().parent.parent / "scripts" / "gen_legal_versions.py"

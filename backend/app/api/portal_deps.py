@@ -18,11 +18,15 @@ from app.redis import is_token_blocked
 from app.tenant import get_tenant, get_tenant_db
 
 
-async def get_current_vendor_user(
+async def get_authenticated_vendor_user(
     authorization: str | None = Header(default=None),
     tenant: Organization = Depends(get_tenant),
     db: AsyncSession = Depends(get_tenant_db),
 ) -> VendorUser:
+    """Resolve the portal token to its vendor user, WITHOUT the Privacy Policy
+    gate. Only `PORTAL_LEGAL_GATE_EXEMPT_ROUTES` depend on this directly;
+    every other portal route goes through `get_current_vendor_user`
+    (decisions §505)."""
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Not authenticated")
 
@@ -57,4 +61,40 @@ async def get_current_vendor_user(
     # mismatch is a hard 401 (opaque "User not found" — no enumeration).
     if vu.organization_id is not None and vu.organization_id != tenant.id:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found")
+    return vu
+
+
+#: (method, path) of the portal routes an un-acknowledged supplier can still
+#: reach — the minimum the portal's acknowledgement step needs (decisions
+#: §505). `/portal/auth/logout` reads the token itself and is never gated.
+#: Pinned against the app's routes by `tests/test_legal_acceptance_gate.py`.
+PORTAL_LEGAL_GATE_EXEMPT_ROUTES: frozenset[tuple[str, str]] = frozenset(
+    {
+        # The portal layout reads the flag here.
+        ("GET", "/api/portal/auth/me"),
+        # The acknowledgement step's own write.
+        ("POST", "/api/portal/auth/legal-acknowledgement"),
+        # The forced password change runs before the step (§500).
+        ("POST", "/api/portal/auth/change-password"),
+    }
+)
+
+
+async def get_current_vendor_user(
+    vu: VendorUser = Depends(get_authenticated_vendor_user),
+    db: AsyncSession = Depends(get_tenant_db),
+) -> VendorUser:
+    """The authenticated vendor user, refused with a 403 coded
+    `privacy_acknowledgement_required` while they have not acknowledged the
+    Privacy Policy version in force (decisions §505). The portal layout answers
+    that code with its acknowledgement step (§500)."""
+    # Local import: the service imports the tenant models; keep this module's
+    # import graph as it was for the routers that import it.
+    from app.services import portal_legal_acceptance
+
+    if await portal_legal_acceptance.missing_documents(db, vu.id):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=portal_legal_acceptance.acknowledgement_refusal(),
+        )
     return vu

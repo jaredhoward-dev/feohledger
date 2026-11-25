@@ -178,6 +178,7 @@ async def test_forgot_password_happy_path_and_old_password_stops_working(
 
 
 @pytest.mark.asyncio
+@pytest.mark.legal_unaccepted  # the set-password link must carry acceptance (§495)
 async def test_a_passwordless_sso_user_can_set_a_password_once_the_plan_drops_sso(
     realdb, fake_redis, monkeypatch
 ):

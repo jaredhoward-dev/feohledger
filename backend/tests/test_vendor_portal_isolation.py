@@ -215,7 +215,7 @@ async def test_vendor_user_dep_rejects_org_mismatch():
     from fastapi import HTTPException
 
     from app.api.deps import create_vendor_access_token
-    from app.api.portal_deps import get_current_vendor_user
+    from app.api.portal_deps import get_authenticated_vendor_user
 
     vu_id = uuid.uuid4()
     row_org = uuid.uuid4()
@@ -232,7 +232,9 @@ async def test_vendor_user_dep_rejects_org_mismatch():
 
     with patch("app.api.portal_deps.is_token_blocked", AsyncMock(return_value=False)):
         with pytest.raises(HTTPException) as exc:
-            await get_current_vendor_user(authorization=f"Bearer {token}", tenant=tenant, db=db)
+            await get_authenticated_vendor_user(
+                authorization=f"Bearer {token}", tenant=tenant, db=db
+            )
     assert exc.value.status_code == 401
 
 
@@ -245,7 +247,7 @@ async def test_vendor_user_dep_accepts_matching_org():
     from unittest.mock import AsyncMock, MagicMock, patch
 
     from app.api.deps import create_vendor_access_token
-    from app.api.portal_deps import get_current_vendor_user
+    from app.api.portal_deps import get_authenticated_vendor_user
 
     vu_id = uuid.uuid4()
     org_id = uuid.uuid4()
@@ -259,7 +261,9 @@ async def test_vendor_user_dep_accepts_matching_org():
     token = create_vendor_access_token(vu_id, vu.vendor_id)
 
     with patch("app.api.portal_deps.is_token_blocked", AsyncMock(return_value=False)):
-        got = await get_current_vendor_user(authorization=f"Bearer {token}", tenant=tenant, db=db)
+        got = await get_authenticated_vendor_user(
+            authorization=f"Bearer {token}", tenant=tenant, db=db
+        )
     assert got is vu
 
 
@@ -273,7 +277,7 @@ async def test_vendor_user_dep_tolerates_null_org_for_legacy_rows():
     from unittest.mock import AsyncMock, MagicMock, patch
 
     from app.api.deps import create_vendor_access_token
-    from app.api.portal_deps import get_current_vendor_user
+    from app.api.portal_deps import get_authenticated_vendor_user
 
     vu_id = uuid.uuid4()
     vu = SimpleNamespace(id=vu_id, vendor_id=uuid.uuid4(), is_active=True, organization_id=None)
@@ -286,7 +290,9 @@ async def test_vendor_user_dep_tolerates_null_org_for_legacy_rows():
     token = create_vendor_access_token(vu_id, vu.vendor_id)
 
     with patch("app.api.portal_deps.is_token_blocked", AsyncMock(return_value=False)):
-        got = await get_current_vendor_user(authorization=f"Bearer {token}", tenant=tenant, db=db)
+        got = await get_authenticated_vendor_user(
+            authorization=f"Bearer {token}", tenant=tenant, db=db
+        )
     assert got is vu
 
 

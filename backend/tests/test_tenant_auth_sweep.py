@@ -35,7 +35,11 @@ import pytest
 from fastapi import Request
 from fastapi.routing import APIRoute
 
-from app.api.deps import create_vendor_access_token, get_current_user
+from app.api.deps import (
+    create_vendor_access_token,
+    get_authenticated_user,
+    get_current_user,
+)
 from app.main import app
 from app.tenant import get_tenant
 from app.utils import jwt_hs256
@@ -76,7 +80,7 @@ def _employee_tenant_routes() -> list[tuple[str, str]]:
     return [
         (method, path)
         for method, path, route in _iter_api_routes()
-        if {get_tenant, get_current_user} <= _calls(route)
+        if {get_tenant, get_authenticated_user} <= _calls(route)
     ]
 
 
@@ -84,7 +88,7 @@ def _employee_routes() -> list[tuple[str, str]]:
     return [
         (method, path)
         for method, path, route in _iter_api_routes()
-        if get_current_user in _calls(route)
+        if get_authenticated_user in _calls(route)
     ]
 
 
@@ -96,7 +100,7 @@ def _control_plane_get_routes() -> list[str]:
         for method, path, route in _iter_api_routes()
         if method == "GET"
         and "{" not in path
-        and get_current_user in _calls(route)
+        and get_authenticated_user in _calls(route)
         and get_tenant not in _calls(route)
     ]
 
@@ -162,16 +166,19 @@ def _production_chain_client(
             outcomes.tenant_slug = org.slug
             return org
 
-        async def _recording_get_current_user(
+        # The resolver under the Terms / Privacy gate (§505): recording here
+        # sees the caller on gated and exempt routes alike, and the real
+        # `get_current_user` still runs the gate on top of it.
+        async def _recording_get_authenticated_user(
             authorization: str | None = Header(default=None),
             db: AsyncSession = Depends(get_control_db),
         ):
-            user = await get_current_user(authorization=authorization, db=db)
+            user = await get_authenticated_user(authorization=authorization, db=db)
             outcomes.user_id = user.id
             return user
 
         app.dependency_overrides[get_tenant] = _recording_get_tenant
-        app.dependency_overrides[get_current_user] = _recording_get_current_user
+        app.dependency_overrides[get_authenticated_user] = _recording_get_authenticated_user
     return httpx.AsyncClient(
         # A 5xx is a finding to report by route, not an exception that stops
         # the sweep at the first one.
@@ -358,7 +365,13 @@ def test_v1_routes_resolve_their_tenant_from_the_key_only():
 
     routes = _v1_data_routes()
     assert routes, "no API-key routes found — the selection below has gone blind"
-    header_chosen = {get_tenant, get_tenant_db, get_tenant_slug, get_current_user}
+    header_chosen = {
+        get_tenant,
+        get_tenant_db,
+        get_tenant_slug,
+        get_authenticated_user,
+        get_current_user,
+    }
     wrong = [f"{m} {p}" for m, p, r in routes if _calls(r) & header_chosen]
     assert not wrong, f"v1 routes that resolve a tenant from a header/JWT: {wrong}"
 

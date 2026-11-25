@@ -15,6 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.deps import (
     create_access_token_with_jti,
     decode_token,
+    get_authenticated_user,
     get_current_user,
 )
 from app.api.permissions import effective_permissions
@@ -860,8 +861,8 @@ async def _set_password_needs_acceptance(db: AsyncSession, user: User) -> bool:
     force (decisions §283, §495). That link is the account's front door, so the
     accept control sits on it. A forgot-password reset of an account that
     already has a password is not held up: its owner is left to the in-app
-    re-prompt (`UserResponse.legal_acceptance_required`), whose screen is not
-    built yet (`docs/followups.md`).
+    accept step after sign-in (`UserResponse.legal_acceptance_required`,
+    §497, §498), which the server-side gate holds them at (§505).
     """
     if user.hashed_password is not None:
         return False
@@ -2091,7 +2092,7 @@ async def revoke_my_other_sessions(user: User = Depends(get_current_user)):
 
 @router.get("/me", response_model=UserResponse)
 async def get_me(
-    user: User = Depends(get_current_user),
+    user: User = Depends(get_authenticated_user),  # legal gate exempt (§505)
     db: AsyncSession = Depends(get_control_db),
 ):
     org = await _load_user_org(db, user.organization_id)
@@ -2106,16 +2107,17 @@ LEGAL_ACCEPTANCE_RATE_LIMIT_PER_MINUTE = 10
 async def accept_legal_documents(
     body: LegalAcceptanceRequest,
     request: Request,
-    user: User = Depends(get_current_user),
+    user: User = Depends(get_authenticated_user),  # legal gate exempt (§505)
     db: AsyncSession = Depends(get_control_db),
 ):
     """Record the caller's acceptance of the Terms / Privacy versions in force.
 
     The backend of the re-prompt (`legal_acceptance_required` on `/me`) for a
     user who signed in through SSO or SCIM, one whose account predates
-    acceptance being collected, or anyone after a version bump. No client
-    screen posts here yet and nothing refuses an unaccepted user: the flag is
-    advisory until the accept screen exists (decisions §495, `docs/followups.md`).
+    acceptance being collected, or anyone after a version bump: the web and
+    mobile accept steps post here (§497, §498). Exempt from the server-side
+    gate that refuses an unaccepted user everywhere else (§505), since it is
+    how the gate is cleared.
     Only the versions in force are accepted (422 `legal_acceptance_required`
     otherwise), and re-accepting is harmless: the record is append-only and
     keeps its first `accepted_at`.
@@ -2286,7 +2288,7 @@ async def update_me(
 @router.post("/change-password", response_model=UserResponse)
 async def change_password(
     body: ChangePasswordRequest,
-    user: User = Depends(get_current_user),
+    user: User = Depends(get_authenticated_user),  # legal gate exempt (§505)
     db: AsyncSession = Depends(get_control_db),
 ):
     """Change password for the authenticated user.
