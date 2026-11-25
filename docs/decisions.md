@@ -28741,8 +28741,10 @@ first settlement was never written onto the card or the run's payment.
   Not a column on `virtual_cards`: a card may see more than one transaction
   (a declined retry, a multi-use provider) and more than one clearing.
 * *Transaction id* (`_card_transaction_id`): Lithic's transaction `token`
-  (the same on every update of it); Nium's `authCode` ("authorization code of
-  the transaction"), else `rhaTransactionId`
+  (the same on every update of it); Nium's `rhaTransactionId` ("unique
+  transaction ID" for Delegated Model clients), else `authCode` ("authorization
+  code of the transaction" — short and issuer-assigned, not unique, hence only
+  the fallback)
   (<https://docs.nium.com/docs/developers/notifications-and-webhooks/issuing-and-card-events/transaction-reversal>,
   checked 2026-11-25); the mock's `transaction_id`.
 * *An early lapse* (reversal / expiry on `created` / `sent` / `active`) is
@@ -28750,7 +28752,11 @@ first settlement was never written onto the card or the run's payment.
   yet. *The authorization of the same transaction* is then applied as lapsed:
   the card stays (or returns to) `active` with no figure, the run leg stays
   `in_flight`, nothing is re-dispatched, and one `card.authorization_lapsed` row
-  carries `out_of_order: true`. **`first_authorized_at` is stamped**, because
+  carries `out_of_order: true`. The lapse row is then used up (kind
+  `lapse_applied`, `consume_lapse`), so it never lapses a later authorization
+  that happens to carry the same id — a false match would leave a live hold on
+  a card every reader treats as unspent, which a void could close and another
+  rail pay, the unsafe direction. **`first_authorized_at` is stamped**, because
   the provider did authorize: a Lithic `SINGLE_USE` card closes "upon first
   successful authorization" whatever happens to the hold, which is what §549's
   `card_authorized_before` refusal exists for. A lapse never followed by an
@@ -28764,8 +28770,11 @@ first settlement was never written onto the card or the run's payment.
   and the mock. The first settlement records its clearing too, so its replay on
   the now-`completed` card is a no-op even past the Redis dedupe.
 * *A further clearing on a `completed` card* (`_record_further_clearing`):
-  Lithic reports the transaction's cumulative settled figure (`amount`), so it
-  adds `reported − amount_charged`; the mock reports each clearing's own
+  Lithic reports the transaction's cumulative settled figure (`settled_amount`,
+  else the deprecated `amount`, which is the settled figure "once the
+  transaction has settled" but may still read the authorization on a partly
+  cleared one; both settlement branches read the former), so it adds
+  `reported − amount_charged`; the mock reports each clearing's own
   figure. An increase is added to `amount_charged` (exact Decimal),
   `record_card_spend` writes the total onto the run payment's `settled_amount`,
   a still-`pending` rebate is re-based on the total at its own rate (a
@@ -28780,7 +28789,11 @@ first settlement was never written onto the card or the run's payment.
   `settlement_amount_over` finding, deduped by `erp_report.kind`
   `card_over_settled` (§535). The figure is still recorded — the money moved —
   and over-settlement reads `covered` by design, so the flag is what tells a
-  person. Reusing the existing finding needed no new locale strings.
+  person. Reusing the existing finding needed no new locale strings. While the
+  flag is open a further clearing neither opens another nor rewrites its
+  figure; the newest total is on the card, the payment and the
+  `card.clearing_added` rows. The payment's `settled_amount` changes with no
+  audit row of its own; `card.clearing_added` is that record.
 * *A decrease is refused.* A further clearing that does not raise the total (a
   Lithic `RETURN` lowering the cumulative figure, a negative mock clearing) is a
   refund, a different flow, as a reversal after settlement is (§544): the card,
@@ -28812,11 +28825,13 @@ unaudited, and the late authorization is lapsed (`out_of_order: true`,
 `first_authorized_at` set, `card_authorized_before`, leg `in_flight`, no
 dispatch); a lapse alone stamps nothing; another transaction's lapse does not
 lapse this one; an early partial reversal leaves the authorization charged; a
-repeated early lapse is one row. `tests/test_card_money_path_regression.py`: a
+repeated early lapse is one row; an applied lapse is used up (a later
+authorization with the same Nium auth code charges the card). `tests/test_card_money_path_regression.py`: a
 Lithic incremental capture adds the difference to the card and the run payment
 (rebate re-based, one `card.clearing_added`, two dispatches, its redelivery a
 no-op); a Lithic clearing with no `events` keyed by its total; clearings past
 the payment amount open one `card_over_settled` flag; a decrease and a further
-Nium settlement are refused with `card.clearing_refused`.
+Nium settlement are refused with `card.clearing_refused`; a partly cleared
+Lithic transaction is read by `settled_amount`.
 `tests/test_migration_0148_card_transaction_events.py`: create, unique key,
 cascade, idempotent, reversible, control plane untouched.

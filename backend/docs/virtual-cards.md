@@ -1154,9 +1154,12 @@ expired (a force post), and money moved. `card.settled`'s `from` records which.
 order, a reversal or expiry finds an unspent card and no hold to release. It
 is remembered in `card_transaction_events` (kind `lapse`, migration 0148)
 under the provider's transaction id (`_card_transaction_id`: Lithic's
-transaction `token`, Nium's `authCode` else `rhaTransactionId`, the mock's
+transaction `token`, Nium's `rhaTransactionId` else `authCode` — an auth
+code is not unique per transaction, so it is the fallback — the mock's
 `transaction_id`); nothing on the card changes and no audit row is written
-yet. When the authorization of that same transaction arrives it is applied as
+yet. A remembered lapse is used up by the one authorization it is applied to
+(`consume_lapse`, kind `lapse_applied`): a later authorization carrying the
+same id is a live hold and charges the card. When the authorization of that same transaction arrives it is applied as
 already lapsed: the card stays (or returns to) `active` with no figure, the
 run leg stays `in_flight`, and one `card.authorization_lapsed` row is written
 with `out_of_order: true`. The provider **did** authorize, so
@@ -1179,7 +1182,7 @@ once even past the Redis dedupe. On a `completed` card
 
 | Clearing | Result |
 |---|---|
-| Lithic, cumulative figure above `amount_charged` | the difference is added; `record_card_spend` writes the total onto the run payment; a `pending` rebate is re-based on the total at its rate; `card.clearing_added` (`cleared_amount`, `amount_charged`, `currency`, `rebate_amount`, string Decimals); the payment sync is re-dispatched once |
+| Lithic, cumulative settled figure (`settled_amount`, else the deprecated `amount`) above `amount_charged` | the difference is added; `record_card_spend` writes the total onto the run payment; a `pending` rebate is re-based on the total at its rate; `card.clearing_added` (`cleared_amount`, `amount_charged`, `currency`, `rebate_amount`, string Decimals); the payment sync is re-dispatched once |
 | mock, positive figure | the same, the figure being this clearing's own |
 | a figure that does not raise the total (a Lithic `RETURN`, a negative mock clearing) | **refused**: card, payment and rebate stand; `card.clearing_refused` (`reason` `not_an_increase`) for the refund flow, as a reversal after settlement is |
 | Nium | **refused** (`provider_single_settlement`): Nium's documented card webhooks describe one `CARD_SETTLEMENT_DEBIT_WEBHOOK` per authorization and no incremental capture, so a second one cannot be told from a redelivery under a new id |
@@ -1191,7 +1194,12 @@ pays — the run payment's amount, else the invoice's, judged by
 exception (`exception.settlement_amount_over`, deduped by `erp_report.kind`
 `card_over_settled`; `payment_settlement_record.flag_card_over_settlement`).
 The money moved, so the figure is recorded; the flag is how a person learns of
-the overcharge, since over-settlement reads `covered`. **Not verified:** that
+the overcharge, since over-settlement reads `covered`. While that flag is
+open, a further clearing does not open another or rewrite its figure: the
+newest total is on the card, the payment and the `card.clearing_added` rows.
+The `total:` clearing key (Lithic without `events`) is a convenience, not an
+identity: the delta is always `reported − amount_charged`, so a repeat or a
+return to an earlier total never adds twice. **Not verified:** that
 Lithic sends a `card_transaction.updated` per clearing (its docs say a webhook
 is sent "at each step in the transaction lifecycle"), and that its delivery
 carries an `event_id`: without one, `_lithic_event_id` keys an update on

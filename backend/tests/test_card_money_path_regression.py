@@ -1811,3 +1811,29 @@ async def test_a_further_clearing_that_cannot_be_applied_is_refused_explicitly(
     (row,) = await _card_audits(realdb, card_id, "card.clearing_refused")
     assert row.details["reason"] == reason
     assert row.details["amount_charged"] == "100.00"
+
+
+async def test_a_lithic_partly_cleared_transaction_is_read_by_its_settled_amount(realdb):
+    """A multi-completion transaction: authorized 500.00, cleared 200.00 then
+    300.00. Lithic's deprecated `amount` may still read the whole 500.00 while
+    `settled_amount` reads what cleared, so the settled figure is the one
+    recorded: 200.00 at the first clearing, 500.00 after the second."""
+    from tests.test_card_authorization_lapse import _body, _leg_with_card, _post
+
+    card_id, pay_id, token = await _leg_with_card(realdb, "lithic", amount=Decimal("500.00"))
+
+    def _settled(settled: int, events):
+        body = json.loads(_body("lithic", token, "settlement", amount="500.00", events=events))
+        body["settled_amount"] = settled  # minor units
+        return json.dumps(body).encode("utf-8")
+
+    with patch("app.services.payment_erp_sync.dispatch_payment_sync", new=AsyncMock()):
+        assert await _post(realdb, "lithic", _settled(20000, _lithic_events("c1"))) == 204
+        payment, state = await _leg(realdb, pay_id)
+        assert payment.settled_amount == Decimal("200.00") and state == "short"
+        assert await _post(realdb, "lithic", _settled(50000, _lithic_events("c1", "c2"))) == 204
+
+    payment, state = await _leg(realdb, pay_id)
+    assert payment.settled_amount == Decimal("500.00") and state == "covered"
+    (row,) = await _card_audits(realdb, card_id, "card.clearing_added")
+    assert row.details["cleared_amount"] == "300.00"

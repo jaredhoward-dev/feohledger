@@ -613,5 +613,30 @@ async def test_a_replayed_early_lapse_is_remembered_once(realdb):
             .scalars()
             .all()
         )
-    assert [(r.kind, r.lapse) for r in rows] == [("lapse", "reversal")]
+    assert [(r.kind, r.lapse) for r in rows] == [("lapse_applied", "reversal")]
+    assert len(await _audits(realdb, card_id, "card.authorization_lapsed")) == 1
+
+
+async def test_an_applied_early_lapse_is_used_up(realdb):
+    """A remembered lapse lapses ONE authorization. A later authorization that
+    carries the same id (a Nium auth code is not unique per transaction) is a
+    live hold and charges the card."""
+    card_id, _pay_id, token = await _leg_with_card(realdb, "nium")
+    with patch("app.services.payment_erp_sync.dispatch_payment_sync", new=AsyncMock()):
+        assert await _post(realdb, "nium", _body("nium", token, "reversal", txn="114723")) == 204
+        assert (
+            await _post(
+                realdb, "nium", _body("nium", token, "authorization", amount="100.00", txn="114723")
+            )
+            == 204
+        )
+        assert (await _card(realdb, card_id)).status == "active"
+        assert (
+            await _post(
+                realdb, "nium", _body("nium", token, "authorization", amount="90.00", txn="114723")
+            )
+            == 204
+        )
+    card = await _card(realdb, card_id)
+    assert card.status == "charged" and card.amount_charged == Decimal("90.00")
     assert len(await _audits(realdb, card_id, "card.authorization_lapsed")) == 1

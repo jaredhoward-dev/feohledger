@@ -30,6 +30,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.virtual_card import CardTransactionEvent, VirtualCard
 
 KIND_LAPSE = "lapse"
+#: A lapse already applied to its authorization (:func:`consume_lapse`).
+KIND_LAPSE_APPLIED = "lapse_applied"
 KIND_CLEARING = "clearing"
 
 #: Column width of ``event_key`` / ``provider_transaction_id``.
@@ -92,6 +94,18 @@ async def lapse_for(
             )
         )
     ).scalar_one_or_none()
+
+
+async def consume_lapse(db: AsyncSession, row: CardTransactionEvent) -> None:
+    """Mark a remembered lapse as applied, so it matches the one authorization
+    it lapsed and never a later one carrying the same transaction id (a Nium
+    auth code is not unique per transaction). Kept, not deleted: the row is the
+    record of why that authorization left the card unspent."""
+    row.kind = KIND_LAPSE_APPLIED
+    # Suffixed with the row's own id, so a second applied lapse of a reused id
+    # never collides with this one on the per-card unique key.
+    row.event_key = f"{row.event_key}@{row.id}"[:_KEY_MAX]
+    await db.flush()
 
 
 async def clearing_seen(db: AsyncSession, card: VirtualCard, clearing_key: str) -> bool:

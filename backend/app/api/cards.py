@@ -1247,10 +1247,13 @@ def _card_transaction_id(provider: str, body: dict) -> str | None:
 
     * Lithic: a `card_transaction.updated` body IS the transaction; its
       `token` is the same on every update (https://docs.lithic.com/docs/transactions).
-    * Nium: `authCode` ("authorization code of the transaction") on the
-      authorization and reversal webhooks, else `rhaTransactionId` (the
-      Delegated Model transaction id). Not verified against a live Nium
-      program that the reversal repeats its authorization's `authCode`.
+    * Nium: `rhaTransactionId` (the "unique transaction ID" for Delegated
+      Model clients), else `authCode` ("authorization code of the
+      transaction"). An auth code is short and issuer-assigned, not unique
+      per transaction, so it is the fallback only, and a remembered lapse is
+      used up by the one authorization it is applied to
+      (`card_transaction_memory.consume_lapse`). Not verified against a live
+      Nium program that the reversal repeats its authorization's ids.
     * Mock: the simulator's `transaction_id`.
     """
     if provider == "lithic":
@@ -1258,7 +1261,7 @@ def _card_transaction_id(provider: str, body: dict) -> str | None:
             return None
         value = body.get("token")
     elif provider == "nium":
-        value = body.get("authCode") or body.get("rhaTransactionId")
+        value = body.get("rhaTransactionId") or body.get("authCode")
     else:
         value = body.get("transaction_id")
     return str(value) if value else None
@@ -1678,6 +1681,17 @@ async def card_webhook(provider: str, request: Request):
 
                 # The run payment this charge pays, once written (§537).
                 spent_payment = None
+                # What a settlement says cleared. Lithic's transaction carries
+                # `settled_amount` beside the deprecated `amount` (the settled
+                # figure "once the transaction has settled",
+                # https://docs.lithic.com/docs/transactions); a partly cleared
+                # multi-completion transaction is read by the former (§554).
+                settled_reported = _normalize_charge_amount(
+                    provider,
+                    (body.get("settled_amount") if provider == "lithic" else None) or amount,
+                    None,
+                    card.currency,
+                )
                 txn_id = _card_transaction_id(provider, body)
                 # A lapse of this same transaction that arrived FIRST (§554):
                 # the authorization is applied as already lapsed. A partial
@@ -1707,6 +1721,9 @@ async def card_webhook(provider: str, request: Request):
                     # so the card stays (or returns to) unspent and nothing is
                     # written onto the run's card leg.
                     prior_status = card.status
+                    # Used up: the lapse matches this one authorization, never
+                    # a later one that happens to carry the same id.
+                    await card_memory.consume_lapse(db, early_lapse)
                     if card.first_authorized_at is None:
                         card.first_authorized_at = datetime.now(UTC)
                     card.status = CARD_LAPSED_STATUS
@@ -1873,7 +1890,7 @@ async def card_webhook(provider: str, request: Request):
                     # `card.amount_charged`, stamped by the AUTH event above and
                     # never updated at settlement, while the settlement event's
                     # own `amount` sat unused in scope.
-                    settled_amount = _normalize_charge_amount(provider, amount, None, card.currency)
+                    settled_amount = settled_reported
                     if settled_amount is not None:
                         # Persist it: `amount_charged` is what the card detail,
                         # the spend rollups and the corporate-card feed all read,
@@ -1958,13 +1975,9 @@ async def card_webhook(provider: str, request: Request):
                         db,
                         provider=provider,
                         card=card,
-                        reported=_normalize_charge_amount(provider, amount, None, card.currency),
+                        reported=settled_reported,
                         clearing_key=_clearing_key(
-                            provider,
-                            body,
-                            txn_id,
-                            event_id,
-                            _normalize_charge_amount(provider, amount, None, card.currency),
+                            provider, body, txn_id, event_id, settled_reported
                         ),
                         transaction_id=txn_id,
                     )
