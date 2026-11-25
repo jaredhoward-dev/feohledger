@@ -76,3 +76,14 @@ export const SSO_PROVIDER_LABELS: Record<string, string> = {
 	adfs: 'ADFS',
 	onelogin: 'OneLogin'
 };
+
+/**
+ * `POST /api/organization/sso/scim-token`. `token` is the plaintext bearer
+ * token, served ONCE: hand it straight to the one-time reveal and drop it on
+ * close — never store, log or put it in a URL. `bearer_hash_prefix` is the
+ * first 8 hex chars of its digest, a non-secret label the audit row carries.
+ */
+export interface ScimTokenMinted {
+	token: string;
+	bearer_hash_prefix: string;
+}

@@ -56,6 +56,7 @@
 	import type { OnboardingResponse } from '#lib/types/analytics.ts';
 	import ErpConnectionPanel from '#lib/components/organization/ErpConnectionPanel.svelte';
 	import CommerceConnectionPanel from '#lib/components/organization/CommerceConnectionPanel.svelte';
+	import ScimTokenPanel from '#lib/components/organization/ScimTokenPanel.svelte';
 	import CloseWorkspacePanel from '#lib/components/organization/CloseWorkspacePanel.svelte';
 	import LineTotalCheckPanel from '#lib/components/organization/LineTotalCheckPanel.svelte';
 	import AgentAutonomyPanel from '#lib/components/organization/AgentAutonomyPanel.svelte';
@@ -442,6 +443,7 @@
 			items: [
 				{ slug: 'security', labelKey: 'org.section.security' },
 				{ slug: 'sso', labelKey: 'orgSso.title' },
+				{ slug: 'scim', labelKey: 'org.section.scim' },
 				{ slug: 'fraud', labelKey: 'org.section.fraud' },
 				// Their own audited writers (decisions §502).
 				{ slug: 'line-total-check', labelKey: 'org.section.lineTotal' },
@@ -3384,6 +3386,10 @@
 							</div>
 						{/if}
 					</section>
+				{/if}
+
+				{#if section === 'scim'}
+					<ScimTokenPanel {readOnly} {userLoaded} />
 				{/if}
 
 				{#if section === 'fraud'}

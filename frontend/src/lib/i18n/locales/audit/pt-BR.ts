@@ -219,6 +219,7 @@ export const messages = {
 	'audit.action.organization.provider_config_updated': "Configurações do provedor atualizadas",
 	'audit.action.organization.residency_updated': "Residência de dados atualizada",
 	'audit.action.organization.scim_token_minted': "Token SCIM emitido",
+	'audit.action.organization.scim_token_revoked': "Token SCIM revogado",
 	'audit.action.organization.sso_only_lifted': "Login exclusivo por SSO suspenso",
 	'audit.action.organization.sso_updated': "Configurações de SSO atualizadas",
 	'audit.action.partner.child_attached': "Espaço de cliente vinculado",

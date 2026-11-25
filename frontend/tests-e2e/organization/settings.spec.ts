@@ -85,6 +85,7 @@ const PANELS = [
 	['cards', 'Virtual Cards'],
 	['security', 'Security'],
 	['sso', 'Single Sign-On'],
+	['scim', 'SCIM provisioning'],
 	['fraud', 'Fraud Detection'],
 	// Their admin-only body for a clerk is held by org-controls.spec.ts.
 	['line-total-check', 'Line-total check'],

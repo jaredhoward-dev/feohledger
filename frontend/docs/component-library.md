@@ -462,6 +462,11 @@ a definition as JSON). All wrap the shared `ui/Modal.svelte` and call the
   `loadFailed`, `loadFailedMessage`, `onretry`, and an optional `footer` snippet for the save row,
   whose button is the global `.btn-primary`. The multi-step connection panels (ERP, Commerce) keep
   their own frames.
+- `ScimTokenPanel.svelte` — the Organization → SCIM provisioning panel (decisions §510), on the
+  `OrgSettingPanel` frame. Props: `readOnly`, `userLoaded`. Shows whether a SCIM bearer token is set
+  and the SCIM base URL (`utils/scim.scimBaseUrl`); Generate / Rotate / Revoke (`utils/scim.scimActions`
+  decides which, by token state and the `scim` plan feature) with a confirm `ui/Modal` before Rotate and
+  Revoke. The minted plaintext is shown once through `ui/SecretReveal` and dropped on close.
 - `ErpConnectionPanel.svelte` — the Organization → ERP panel, rendered entirely from the backend ERP
   catalogue (`GET /api/organization/erp/providers`). Props: `stored` (`settings.erp` as
   `GET /api/organization` serves it — configuration only), `readOnly`, `userLoaded`, `entitled` (the

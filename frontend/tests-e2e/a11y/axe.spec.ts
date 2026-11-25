@@ -3,6 +3,8 @@ import type { Page } from '@playwright/test';
 import type { EligibleInvoice } from '#lib/types/creditMemo.ts';
 import {
 	acceptConsent,
+	API_BASE,
+	authedTenantHeaders,
 	expect,
 	invoicePicker,
 	NO_TENANT_BASE,
@@ -77,6 +79,7 @@ const ORG_PANELS: [slug: string, heading: string][] = [
 	['cards', 'Virtual Cards'],
 	['security', 'Security'],
 	['sso', 'Single Sign-On'],
+	['scim', 'SCIM provisioning'],
 	['fraud', 'Fraud Detection'],
 	['line-total-check', 'Line-total check'],
 	['exception-agents', 'Exception agents'],
@@ -192,6 +195,24 @@ test.describe('accessibility — authenticated app (WCAG 2.2 AA)', () => {
 			await expectNoA11yViolations(page);
 		});
 	}
+
+	// The SCIM panel's loaded body (its status line) and its one-time reveal
+	// dialog, whose token must be readable and copyable by keyboard.
+	test('organization settings → scim, loaded and with the token dialog open, has no axe violations', async ({
+		page
+	}) => {
+		// Start from no token, so the panel offers Generate.
+		const cleared = await page.request.delete(`${API_BASE}/api/organization/sso/scim-token`, {
+			headers: await authedTenantHeaders(page)
+		});
+		expect(cleared.status()).toBe(204);
+		await page.goto('/organization?section=scim');
+		await expect(page.getByTestId('scim-status')).toBeVisible();
+		await expectNoA11yViolations(page);
+		await page.getByTestId('scim-generate').click();
+		await expect(page.getByTestId('scim-token-value')).toBeVisible();
+		await expectNoA11yViolations(page);
+	});
 
 	test('vendor-statement create modal (open state) has no axe violations', async ({ page }) => {
 		// The modal, not the list, is where this surface's interactive controls

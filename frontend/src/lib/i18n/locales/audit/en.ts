@@ -222,6 +222,7 @@ export const enAudit = {
 	'audit.action.organization.provider_config_updated': "Provider settings updated",
 	'audit.action.organization.residency_updated': "Data residency updated",
 	'audit.action.organization.scim_token_minted': "SCIM token issued",
+	'audit.action.organization.scim_token_revoked': "SCIM token revoked",
 	'audit.action.organization.sso_only_lifted': "SSO-only sign-in lifted",
 	'audit.action.organization.sso_updated': "SSO settings updated",
 	'audit.action.partner.child_attached': "Client workspace attached",

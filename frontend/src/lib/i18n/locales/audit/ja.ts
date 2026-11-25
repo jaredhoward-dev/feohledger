@@ -219,6 +219,7 @@ export const messages = {
 	'audit.action.organization.provider_config_updated': "プロバイダー設定を更新",
 	'audit.action.organization.residency_updated': "データ所在地を更新",
 	'audit.action.organization.scim_token_minted': "SCIMトークンを発行",
+	'audit.action.organization.scim_token_revoked': "SCIMトークンを取り消し",
 	'audit.action.organization.sso_only_lifted': "SSO限定サインインを解除",
 	'audit.action.organization.sso_updated': "SSO設定を更新",
 	'audit.action.partner.child_attached': "顧客ワークスペースを接続",

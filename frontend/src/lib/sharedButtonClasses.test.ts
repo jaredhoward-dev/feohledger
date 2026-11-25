@@ -50,6 +50,7 @@ const COVERED = [
 	'lib/components/organization/CloseWorkspacePanel.svelte',
 	'lib/components/organization/LineTotalCheckPanel.svelte',
 	'lib/components/organization/OrgSettingPanel.svelte',
+	'lib/components/organization/ScimTokenPanel.svelte',
 	'lib/components/reports/ResultTable.svelte',
 	'lib/components/ui/BulkBar.svelte',
 	'lib/components/ui/BulkDeleteButton.svelte',
