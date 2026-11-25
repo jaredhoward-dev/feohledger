@@ -1528,9 +1528,13 @@ the runbook, no acceptance record on signup).
          response). The e2e seed must record acceptance for the seeded role
          users first (`scripts/seed.py` and the e2e tenant seeding), or every
          spec meets the blocker.
-      2. The same accept step in the mobile app, and the supplier portal's own
-         sign-in (a `VendorUser` has no control-plane user id today, so it needs
-         its own record shape — decide that first).
+      2. The same accept step in the mobile app. The supplier portal's set-password
+         link already asks (decisions §499: the Privacy Policy alone, recorded in
+         the tenant `vendor_user_legal_acceptances`); what the portal still lacks
+         is a re-prompt after sign-in for portal users who set a password before
+         §499 or meet a Privacy Policy version bump — a portal `/me` flag from
+         `services/portal_legal_acceptance.missing_documents` and a blocking box
+         in the portal layout.
       3. Only once both screens exist: a server-side gate that refuses an
          unaccepted user (a coded `legal_acceptance_required`) on everything but
          `/me`, `/auth/legal-acceptance`, sign-out and the legal pages. A gate
@@ -1539,6 +1543,24 @@ the runbook, no acceptance record on signup).
          are in scope (the key's creator accepted; a key is not a person).
       **Trigger:** step 1 before the first version bump of either document and
       before the Xero app goes to production; steps 2–3 follow it.
+- [ ] **(c) Counsel: are supplier-portal users bound by any terms of use, and is a Privacy Policy acknowledgement the right record?**
+      The published Terms bind only the customer organisation ("a Supplier User
+      is not our customer", `/legal/terms` §2; the customer answers for them,
+      §3.4), and §1 makes an individual who accepts with no organisation named
+      the Customer — so the portal does not present the Terms, and a supplier
+      only acknowledges the Privacy Policy, whose section 3 is written for them
+      (decisions §499). Two questions are left to counsel, not decided in code:
+      whether the portal needs its own short terms of use binding Supplier
+      Users directly (the acceptable-use and fraud clauses of Terms §6,
+      credential sharing), and whether the acknowledgement wording ("I have read the
+      Privacy Policy") and the kept-through-erasure posture fit a processor
+      that is not the supplier's controller (Privacy Policy §2). **Durable fix:**
+      if counsel wants portal terms, publish them under `/legal/`, add a
+      `portal_terms` version to `CURRENT_LEGAL_VERSIONS`, and add it to
+      `portal_legal_acceptance.PORTAL_LEGAL_DOCUMENTS` (the table already keys
+      on `document`); record counsel's answer in decisions. **Trigger:** the
+      counsel review of the legal set, or the first customer onboarding
+      suppliers to the portal in production, whichever comes first.
 - [ ] **(c) No retention horizon is set for `legal_acceptances`.** The rows are
       kept through a DSAR erasure and a workspace deletion as the evidence a
       contract was formed (decisions §495, GDPR Art. 17(3)(e)), but nothing
