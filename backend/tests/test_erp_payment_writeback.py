@@ -637,6 +637,7 @@ async def test_a_refused_credit_is_coded_and_leaves_the_flag_for_a_person(realdb
     assert flag.erp_report["discount_credit_failure"] == "currency_mismatch"
     # Refused before any write: no credit can exist, so a person books it.
     assert "discount_credit_pending" not in flag.erp_report
+    assert flag.description_code == "exception.erp_payment_writeback_balance_open"
     [instance] = await _rows(realdb, WorkflowInstance, invoice_id=inv_id)
     assert erp_payment_writeback.PENDING_CREDITS_KEY not in instance.state_data
 
@@ -662,6 +663,16 @@ async def test_a_credit_created_but_not_applied_is_recorded_and_applied_by_the_s
     [flag] = await _rows(realdb, APException, invoice_id=inv_id)
     assert flag.erp_report["discount_credit_pending"] is True
     assert flag.erp_report["discount_credit_document_id"] == "VC-7"
+    # The sentence names our credit and says not to book another — never
+    # "close the difference", which invites a second credit (decisions §585).
+    assert flag.description_code == "exception.erp_discount_credit_pending"
+    assert flag.description_params == {
+        "erp": "QuickBooks Online",
+        "amount": "2.00",
+        "currency": "USD",
+        "credit": "VC-7",
+    }
+    assert "VC-7" in flag.description and "Close the difference" not in flag.description
     [instance] = await _rows(realdb, WorkflowInstance, invoice_id=inv_id)
     marker = instance.state_data[erp_payment_writeback.PENDING_CREDITS_KEY][str(pay_id)]
     assert marker["credit_id"] == "VC-7" and marker["amount"] == "2.00"
@@ -879,6 +890,73 @@ async def test_a_write_back_rerun_applies_the_recorded_credit_and_books_no_secon
     assert retry.credit_id == "VC-7" and retry.amount == Decimal("2.00")
     assert retry.discount_account_erp_id == "88"
     assert await _record(realdb, inv_id, pay_id) is None
+
+
+async def _open_balance_flag(realdb, inv_id) -> APException:
+    [flag] = [
+        r
+        for r in await _rows(realdb, APException, invoice_id=inv_id)
+        if r.erp_report["kind"] == erp_payment_writeback.ERP_REPORT_WRITEBACK_BALANCE_OPEN
+    ]
+    return flag
+
+
+async def _drop_flags(realdb, inv_id) -> None:
+    async with realdb.sessionmaker("a")() as s:
+        for row in (
+            await s.execute(select(APException).where(APException.invoice_id == inv_id))
+        ).scalars():
+            await s.delete(row)
+        await s.commit()
+
+
+async def test_an_unidentified_credit_makes_the_open_balance_name_the_marker(realdb):
+    """The create's answer was lost (§579): a credit may stand that we cannot
+    name, so the open-balance sentence tells the bookkeeper what to look for
+    before booking one, never to just close the difference (decisions §585)."""
+    run_id, inv_id, pay_id = await _discounted(realdb, **DISCOUNT_ON)
+    await _sync(realdb, run_id, FakeQboWithCredit(credit=_unapplied(None)))
+    flag = await _open_balance_flag(realdb, inv_id)
+    assert flag.description_code == "exception.erp_discount_credit_pending_unidentified"
+    assert flag.description_params == {
+        "erp": "QuickBooks Online",
+        "amount": "2.00",
+        "currency": "USD",
+        "marker": f"FeohLedger discount {pay_id}",
+    }
+    assert flag.erp_report["discount_credit_pending"] is True
+    assert flag.erp_report["discount_credit_document_id"] is None
+
+
+async def test_an_exhausted_credit_is_not_promised_to_be_applied(realdb):
+    """Past the cap nothing applies the credit (§579): the sentence may not say
+    FeohLedger will apply it, so it reads the check-for-the-marker variant."""
+    run_id, inv_id, pay_id = await _discounted(realdb, **DISCOUNT_ON)
+    adapter = FakeQboWithCredit(credit=_unapplied())
+    await _sync(realdb, run_id, adapter)
+    await _set_record(realdb, inv_id, pay_id, exhausted=True)
+    await _drop_flags(realdb, inv_id)
+    await _rerun(realdb, pay_id, adapter)  # no credit call; the record is read
+    flag = await _open_balance_flag(realdb, inv_id)
+    assert flag.description_code == "exception.erp_discount_credit_pending_unidentified"
+    assert flag.description_params["marker"] == f"FeohLedger discount {pay_id}"
+    assert flag.erp_report["discount_credit_document_id"] == "VC-7"
+
+
+async def test_a_credit_claimed_elsewhere_still_names_the_pending_credit(realdb):
+    """This attempt made no credit call (another process holds the claim), but
+    the record says VC-7 stands: the flag must not invite a second booking."""
+    run_id, inv_id, pay_id = await _discounted(realdb, **DISCOUNT_ON)
+    adapter = FakeQboWithCredit(credit=_unapplied())
+    await _sync(realdb, run_id, adapter)
+    await _set_record(realdb, inv_id, pay_id, claimed_until=_future())
+    await _drop_flags(realdb, inv_id)
+    adapter.post_discount_credit.reset_mock()
+    await _rerun(realdb, pay_id, adapter)
+    adapter.post_discount_credit.assert_not_awaited()
+    flag = await _open_balance_flag(realdb, inv_id)
+    assert flag.description_code == "exception.erp_discount_credit_pending"
+    assert flag.description_params["credit"] == "VC-7"
 
 
 async def test_a_pre_write_refusal_on_a_rerun_keeps_the_record(realdb):
@@ -1679,3 +1757,45 @@ async def test_saving_the_opt_in_with_an_account_the_write_back_cannot_resolve_i
     assert resp.status_code == 422, resp.text
     assert "organization-wide GL account linked" in resp.json()["detail"]
     assert await _stored_discount_flag(realdb) is None
+
+
+@pytest.mark.parametrize(
+    ("standing", "code", "extra"),
+    [
+        (None, "erp_payment_writeback_balance_open", {}),
+        ({"credit_id": "VC-7", "outcome": "x"}, "erp_discount_credit_pending", {"credit": "VC-7"}),
+        ({"credit_id": None}, "erp_discount_credit_pending_unidentified", {"marker": None}),
+        (
+            {"credit_id": "VC-7", "exhausted": True},
+            "erp_discount_credit_pending_unidentified",
+            {"marker": None},
+        ),
+        (
+            {
+                "credit_id": "VC-9",
+                "outcome": "quickbooks_online post failed: discount_credit_not_ours",
+            },
+            "erp_discount_credit_pending_unidentified",
+            {"marker": None},
+        ),
+    ],
+)
+def test_the_open_balance_sentence_is_chosen_by_what_credit_may_stand(standing, code, extra):
+    """Decisions §585: the open balance asks a person to close it only when no
+    credit of ours can exist; one we will finish is named, one we cannot is
+    found by its marker."""
+    pay_id = uuid.uuid4()
+    finding = erp_payment_writeback._balance_open_finding(
+        "quickbooks_online", pay_id, standing, Decimal("2.00"), "USD"
+    )
+    assert finding["code"] == "exception." + code
+    params = {"erp": "QuickBooks Online", "amount": "2.00", "currency": "USD", **extra}
+    if "marker" in extra:
+        params["marker"] = f"FeohLedger discount {pay_id}"
+    assert finding["params"] == params
+    # The unnamed twin for an ERP with no product name.
+    unnamed = erp_payment_writeback._balance_open_finding(
+        None, pay_id, standing, Decimal("2.00"), "USD"
+    )
+    assert unnamed["code"] == "exception." + code + "_unnamed"
+    assert "erp" not in unnamed["params"]
