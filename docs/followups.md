@@ -1467,22 +1467,17 @@ as oversights.
       Refinitiv adapters are fail-closed skeletons awaiting keys. `mock` is the
       local-first default and the screening path itself is shipped and tested.
       Ref: [vendor-risk-screening.md](../backend/docs/vendor-risk-screening.md).
-- [ ] **Stripe Billing** — a provisioned Stripe account to verify the live
-      `stripe_billing` path end to end. All the code is shipped, including the
-      Stripe subscription behind a plan change (create / amend / cancel, card
-      required, decisions §480) and Stripe Elements card entry on `/billing`;
-      until the provider is switched on, a deployed API refuses paid plans.
-      What is left is the operator's configuration (restricted key — with
-      **Invoices: Write** for the plan-change price preview, `POST
-      /v1/invoices/create_preview`, decisions §482; confirm in the key's request
-      log that the first test-mode preview is not refused — webhook
-      endpoint + events, publishable key, the env switches), a test-mode run of
-      the four moves (checking each first invoice against the review's "today"
-      figure), one behaviour to observe (whether swapping a meter-backed
-      price mid-period invoices the accrued usage at the old price), and moving
-      any org already on a paid tier onto a Stripe subscription.
-      **Trigger:** before `FEOH_BILLING_PROVIDER=stripe_billing` is set in
-      production.
+- [ ] **Stripe Billing: the live checks left.** Production bills through
+      live Stripe since 2026-11-22 (v0.6.0): account, restricted keys, webhook
+      endpoint and the env switches are done, and the test-mode run of the
+      plan moves passed. Two checks remain: a real-card upgrade on a fresh
+      signup, refunded in the Dashboard and moved back to Free, and a local
+      Stripe test-clock run of the scheduled move to Free at period end
+      (`backend/docs/billing.md`, #756), which needs the Stripe sandbox key in
+      `backend/.env`. Also open: whether swapping a meter-backed price
+      mid-period invoices the accrued usage at the old price.
+      **Trigger:** before the first real customer reaches checkout. Steps:
+      #446 § Live Stripe billing.
       Ref: [billing.md](../backend/docs/billing.md) § What the operator
       configures in Stripe.
 - [ ] **Mobile push (FCM + APNs)** — a Firebase project,
@@ -1677,18 +1672,15 @@ as oversights.
       **Trigger:** the deploy that ships PR #670, if any tenant has synced
       Merge.dev POs.
 
-- [ ] **Turn on the sub-processor notice sweep in production.** Built
-      (decisions §321): the published DPA now says every sub-processor change
-      that needs the 30-day notice is emailed to each customer's
-      administrators, and `FEOH_SUBPROCESSOR_NOTICES_ENABLED` (off by default)
-      is what sends it. Set `FEOH_SUBPROCESSOR_NOTICES_ENABLED: "true"` in
-      `infra-secrets/feohledger/prod.sops.yaml` (never in this repo), deploy,
-      and confirm `subprocessor-notices` is running on `GET /api/health/sweeps`;
-      until it is set `deploy/decrypt-env.sh` refuses the file and the API
-      refuses to boot (`FEOH_ENVIRONMENT=production`). SES must
-      be out of its sandbox for the email to reach a customer.
-      **Trigger:** before the deploy that publishes the 2026-10-26 legal text,
-      and in any case before customer #1.
+- [ ] **Confirm the sub-processor notice sweep runs in production.** Built
+      (decisions §321): the published DPA says every sub-processor change that
+      needs the 30-day notice is emailed to each customer's administrators,
+      and `FEOH_SUBPROCESSOR_NOTICES_ENABLED` sends it. The switch was set in
+      `infra-secrets/feohledger/prod.sops.yaml` on 2026-10-26; what is left is
+      to confirm `subprocessor-notices` shows as running on
+      `GET /api/health/sweeps` (`/admin/health`). SES must be out of its
+      sandbox for the email to reach a customer.
+      **Trigger:** before customer #1 (#446 § 3).
 
 - [ ] **Make the first recording of real QuickBooks payment shapes.** Built
       (decisions §318): `backend/tests/test_qbo_recorded_replay.py` replays
