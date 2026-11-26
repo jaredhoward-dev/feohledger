@@ -1025,7 +1025,7 @@ plain JSONB under RDS storage encryption until that migration.
 
 `backend/app/services/erp_adapters/catalog.py` is the single source of truth for
 the Organization → ERP form, served at `GET /api/organization/erp/providers`
-(admin). Each entry carries `key`, `label`, `regions` (ISO codes; the picker groups `US` and `ZA`, and lists any other region — `GB` for Sage Accounting — under "Other"), `auth`
+(admin). Each entry carries `key`, `label`, `regions` (ISO codes; the picker leads with one "Popular in …" group per region in `frontend/src/lib/types/erpConnection.ts::ERP_REGION_GROUPS`, in that order — `US`, `ZA`, `GB` — and lists a provider with no grouped region under "Other"; a provider in two regions appears under both), `auth`
 (`credentials` | `oauth`), `fields` (`name`, `label_key` — a frontend i18n
 `MessageKey`, `secret`, `required`, optional `placeholder` / `help_key` /
 `options`) and `docs_url`; the endpoint adds `available` (adapter registered in
@@ -1038,7 +1038,7 @@ included, under `erp_integrations`, §281).
 |---|---|---|---|
 | `quickbooks_online` | QuickBooks Online | US | OAuth (optional BYO app; `environment`) |
 | `xero` | Xero | US, ZA | OAuth (optional BYO app; `bill_status`, `default_tax_type`) |
-| `sage_accounting` | Sage Business Cloud Accounting (v3.1: UK, IE, CA, DE, ES, FR; the US product was retired 2024-12-31) | GB (listed under "Other") | OAuth (optional BYO app) |
+| `sage_accounting` | Sage Business Cloud Accounting (v3.1: UK, IE, CA, DE, ES, FR; the US product was retired 2024-12-31) | GB | OAuth (optional BYO app) |
 | `sage_accounting_za` | Sage Business Cloud Accounting (South Africa) | ZA | API key + Sage login + company |
 | `blackbaud_fe_nxt` | Blackbaud Financial Edge NXT | US | OAuth (optional BYO app + SKY API subscription key) |
 | `sage_intacct` | Sage Intacct | US, ZA | REST API client credentials + company / user |

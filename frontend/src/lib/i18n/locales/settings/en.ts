@@ -286,6 +286,7 @@ export const enSettings = {
 	'org.erp.choose': 'Choose your ERP',
 	'org.erp.group.us': 'Popular in the United States',
 	'org.erp.group.za': 'Popular in South Africa',
+	'org.erp.group.gb': 'Popular in the United Kingdom',
 	'org.erp.group.other': 'Other ERPs',
 	'org.erp.provider.mergeDev': 'Other ERP via Merge.dev',
 	'org.erp.comingSoon': '{erp} (coming soon)',

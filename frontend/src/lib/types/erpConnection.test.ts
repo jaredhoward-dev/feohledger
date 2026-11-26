@@ -136,18 +136,33 @@ const storedNetsuite = {
 	account_id: '123'
 };
 
+const sage: ErpProvider = {
+	...qbo,
+	key: 'sage_accounting',
+	label: 'Sage Business Cloud Accounting',
+	regions: ['GB']
+};
+
 describe('groupProviders', () => {
-	it('leads with the US and ZA groups, then the rest, Merge.dev last', () => {
-		const groups = groupProviders([netsuite, qbo, syspro, merge]);
+	it('leads with the US, ZA and GB groups, then the rest, Merge.dev last', () => {
+		const groups = groupProviders([netsuite, qbo, sage, syspro, merge]);
 		expect(groups.map((g) => g.labelKey)).toEqual([
 			'org.erp.group.us',
 			'org.erp.group.za',
+			'org.erp.group.gb',
 			'org.erp.group.other'
 		]);
 		expect(groups[0].providers.map((p) => p.key)).toEqual(['netsuite', 'quickbooks_online']);
 		// An ERP popular in both regions appears under both.
 		expect(groups[1].providers.map((p) => p.key)).toEqual(['netsuite', 'syspro']);
-		expect(groups[2].providers.map((p) => p.key)).toEqual(['merge_dev']);
+		// A `regions: ["GB"]` catalogue entry leads the UK group, not "Other".
+		expect(groups[2].providers.map((p) => p.key)).toEqual(['sage_accounting']);
+		expect(groups[3].providers.map((p) => p.key)).toEqual(['merge_dev']);
+	});
+
+	it('renders no group for a region with no provider', () => {
+		const groups = groupProviders([qbo, merge]);
+		expect(groups.map((g) => g.labelKey)).toEqual(['org.erp.group.us', 'org.erp.group.other']);
 	});
 });
 
