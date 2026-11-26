@@ -54,6 +54,22 @@ variable "backups_bucket_name" {
   type        = string
 }
 
+variable "secrets_bucket_name" {
+  description = "Dedicated S3 bucket holding the sops CIPHERTEXT of the production secrets file, uploaded by infra-secrets' CI and fetched by deploy.sh (secrets_delivery.tf, docs/decisions.md §591). Globally unique; typically '<project>-secrets-<env>-<random>'. Kept in the private prod.tfvars.sops, like every bucket name."
+  type        = string
+}
+
+variable "infra_secrets_oidc_sub_prefix" {
+  description = "The OIDC subject prefix the private infra-secrets repo presents to AWS (repo:<owner>@<id>/<repo>@<id> on GitHub's immutable subject claims). The secrets-upload role (secrets_delivery.tf) trusts exactly <prefix>:ref:refs/heads/main. Read it, never build it from the slug. Set it in the private prod.tfvars.sops. Defaults to null only so that an unset value fails with the validation message below."
+  type        = string
+  default     = null
+
+  validation {
+    condition     = var.infra_secrets_oidc_sub_prefix != null && can(regex("^repo:[^:/[:space:]]+/[^:/[:space:]]+$", var.infra_secrets_oidc_sub_prefix))
+    error_message = "Set infra_secrets_oidc_sub_prefix (in prod.tfvars.sops) to the bare repo:<owner>/<repo> subject prefix of the infra-secrets repo, no trailing colon and no :ref: suffix. Read it with: gh api repos/<owner>/infra-secrets/actions/oidc/customization/sub --jq .sub_claim_prefix. README.md § Secrets delivery."
+  }
+}
+
 variable "backup_retention_days" {
   description = "Lifecycle expiration (days) for nightly database dumps in the backups bucket. A full dump of every DB lands every night, so this window is the entire storage bill — 90d is a generous restore horizon at pilot volume."
   type        = number

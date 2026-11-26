@@ -23,6 +23,16 @@ output "backups_bucket" {
   value       = aws_s3_bucket.backups.bucket
 }
 
+output "secrets_bucket" {
+  description = "Name of the bucket holding the production secrets ciphertext (secrets_delivery.tf). Write it to deploy/secrets-bucket on the VM, and set it as the FEOHLEDGER_SECRETS_BUCKET variable in infra-secrets (README.md § Secrets delivery)."
+  value       = aws_s3_bucket.secrets.bucket
+}
+
+output "secrets_upload_role_arn" {
+  description = "Role infra-secrets' CI assumes to upload the ciphertext — its FEOHLEDGER_SECRETS_UPLOAD_ROLE_ARN variable (README.md § Secrets delivery)."
+  value       = aws_iam_role.secrets_upload.arn
+}
+
 output "platform_certificate_arn" {
   description = "ARN of the validated us-east-1 ACM certificate for the platform domain and its wildcard — for the CloudFront distribution (or an ALB listener) when the workload stack lands. Taken from the validation resource, so it only resolves once the certificate is ISSUED."
   value       = aws_acm_certificate_validation.platform.certificate_arn

@@ -20,6 +20,8 @@ invoice_files_bucket_name = "feohledger-invoices-prod-REPLACE"
 audit_logs_bucket_name    = "feohledger-audit-logs-prod-REPLACE"
 access_logs_bucket_name   = "feohledger-access-logs-prod-REPLACE"
 backups_bucket_name       = "feohledger-backups-prod-REPLACE"
+# The production secrets ciphertext (secrets_delivery.tf, docs/decisions.md §591).
+secrets_bucket_name       = "feohledger-secrets-prod-REPLACE"
 
 # --- Object Lock retention --------------------------------------------------
 # Days an object stays locked after it lands. Invoices run in Governance mode
@@ -82,6 +84,12 @@ github_oidc_sub_prefix = "repo:REPLACE@0000000/feohledger@0000000"
 # The heartbeat + overdue alarms. Leave false until BACKUP_ERASURE_ENABLED is set
 # and the workflow's check job has run green once (README.md § Backup erasure step 8).
 # backup_erasure_alarms_enabled = true
+
+# --- Secrets delivery (secrets_delivery.tf, README.md § Secrets delivery) ------
+# The PRIVATE infra-secrets repo's subject prefix — its CI uploads the
+# ciphertext. Read it the same way (it is on immutable subject claims too):
+#   gh api repos/<owner>/infra-secrets/actions/oidc/customization/sub --jq .sub_claim_prefix
+infra_secrets_oidc_sub_prefix = "repo:REPLACE@0000000/infra-secrets@0000000"
 
 # --- Secrets ------------------------------------------------------------------
 # Never in a tfvars. The one secret, the RDS master password, is an ephemeral
