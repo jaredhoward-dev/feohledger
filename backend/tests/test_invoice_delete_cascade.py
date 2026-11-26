@@ -529,25 +529,27 @@ async def test_bulk_delete_skips_an_invoice_with_a_pending_erp_reversal(realdb):
 # ---------------------------------------------------------------------------
 
 
-async def _with_transmission(mk, org_id, invoice_id: str, status: str) -> None:
+async def _with_transmission(
+    mk, org_id, invoice_id: str, status: str, *, direction: str = "outbound"
+) -> uuid.UUID:
     from app.models.peppol_transmission import PeppolTransmission
 
     async with mk() as s:
-        s.add(
-            PeppolTransmission(
-                invoice_id=uuid.UUID(invoice_id),
-                direction="outbound",
-                participant_scheme="9930",
-                participant_value="SUPPLIER123",
-                doc_type_id="doc",
-                process_id="proc",
-                business_message_id=uuid.uuid4().hex,
-                status=status,
-                provider="mock",
-                organization_id=org_id,
-            )
+        row = PeppolTransmission(
+            invoice_id=uuid.UUID(invoice_id),
+            direction=direction,
+            participant_scheme="9930",
+            participant_value="SUPPLIER123",
+            doc_type_id="doc",
+            process_id="proc",
+            business_message_id=uuid.uuid4().hex,
+            status=status,
+            provider="mock",
+            organization_id=org_id,
         )
+        s.add(row)
         await s.commit()
+        return row.id
 
 
 @pytest.mark.asyncio
@@ -616,6 +618,91 @@ async def test_a_live_claim_is_named_before_a_peppol_transmission(realdb):
         resp = await c.delete(f"/api/invoices/{inv_id}")
     assert resp.status_code == 409, resp.text
     assert resp.json()["detail"]["code"] == "invoice_delete_claimed"
+
+
+# ---------------------------------------------------------------------------
+# An INBOUND transmission is the record of an e-invoice a supplier delivered to
+# us. Deleting its invoice (a spam or duplicate document) is allowed, but the
+# row is detached and stamped, never deleted (§586).
+# ---------------------------------------------------------------------------
+
+
+async def _transmission(mk, row_id: uuid.UUID):
+    from app.models.peppol_transmission import PeppolTransmission
+
+    async with mk() as s:
+        return (
+            await s.execute(select(PeppolTransmission).where(PeppolTransmission.id == row_id))
+        ).scalar_one_or_none()
+
+
+@pytest.mark.asyncio
+async def test_delete_keeps_a_received_transmission_detached_and_marked(realdb):
+    mk = realdb.sessionmaker(TENANT)
+    org_id = realdb.info(TENANT).org_id
+    inv_id = await _seed_invoice(mk, org_id, number="DEL-PEPPOL-IN")
+    inbound = await _with_transmission(mk, org_id, inv_id, "delivered", direction="inbound")
+    # A failed outbound attempt on the same invoice never left: still cleared.
+    failed = await _with_transmission(mk, org_id, inv_id, "failed")
+
+    async with realdb.client(key=TENANT, role="admin") as c:
+        resp = await c.delete(f"/api/invoices/{inv_id}")
+    assert resp.status_code == 204, resp.text
+    assert not await _still_there(mk, inv_id)
+
+    row = await _transmission(mk, inbound)
+    assert row is not None, "the record of a received e-invoice must survive the delete"
+    assert row.invoice_id is None
+    assert row.deleted_invoice_id == uuid.UUID(inv_id)
+    assert row.invoice_deleted_at is not None
+    # The stamp names the same person the `invoice.deleted` audit row does.
+    (audit,) = await _deletion_rows(mk, inv_id)
+    assert row.invoice_deleted_by_id == audit.actor_id is not None
+    # Nothing else about the received document changed.
+    assert row.status == "delivered" and row.participant_value == "SUPPLIER123"
+    assert await _transmission(mk, failed) is None
+
+
+@pytest.mark.asyncio
+async def test_bulk_delete_keeps_a_received_transmission_detached(realdb):
+    mk = realdb.sessionmaker(TENANT)
+    org_id = realdb.info(TENANT).org_id
+    inv_id = await _seed_invoice(mk, org_id, number="DEL-PEPPOL-IN-BULK")
+    inbound = await _with_transmission(mk, org_id, inv_id, "delivered", direction="inbound")
+
+    async with realdb.client(key=TENANT, role="admin") as c:
+        resp = await c.post("/api/invoices/bulk/delete", json={"ids": [inv_id]})
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {"deleted": 1, "skipped": []}
+
+    row = await _transmission(mk, inbound)
+    assert row is not None and row.invoice_id is None
+    assert row.deleted_invoice_id == uuid.UUID(inv_id)
+    assert row.invoice_deleted_by_id is not None and row.invoice_deleted_at is not None
+
+
+@pytest.mark.asyncio
+async def test_only_an_inbound_stamped_row_may_lose_its_invoice(realdb):
+    """`ck_peppol_detached_inbound` holds the rule at the data layer."""
+    from sqlalchemy import update
+    from sqlalchemy.exc import IntegrityError
+
+    from app.models.peppol_transmission import PeppolTransmission
+
+    mk = realdb.sessionmaker(TENANT)
+    org_id = realdb.info(TENANT).org_id
+    inv_id = await _seed_invoice(mk, org_id, number="DEL-PEPPOL-CK")
+    outbound = await _with_transmission(mk, org_id, inv_id, "failed")
+    inbound = await _with_transmission(mk, org_id, inv_id, "delivered", direction="inbound")
+
+    for row_id in (outbound, inbound):  # outbound never; inbound not unstamped
+        async with mk() as s:
+            with pytest.raises(IntegrityError, match="ck_peppol_detached_inbound"):
+                await s.execute(
+                    update(PeppolTransmission)
+                    .where(PeppolTransmission.id == row_id)
+                    .values(invoice_id=None)
+                )
 
 
 # ---------------------------------------------------------------------------
