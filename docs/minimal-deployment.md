@@ -128,8 +128,9 @@ Resizing is a change to `app_instance_type` in the tfvars (a stop → change-typ
    per-project KMS key), never committed here. The EC2 instance profile gets
    KMS access to both the sops key and the app key, plus scoped S3 access
    (§ 1 below), so no static AWS keys live on the box;
-   the VM keeps a copy of `infra-secrets/feohledger/prod.sops.yaml` as
-   `deploy/prod.sops.yaml`, and `deploy/decrypt-env.sh` decrypts it host-side
+   infra-secrets' CI uploads the ciphertext of `feohledger/prod.sops.yaml` to a
+   dedicated bucket, `deploy.sh` fetches it as `deploy/prod.sops.yaml` on every
+   deploy (`docs/decisions.md` §591), and `deploy/decrypt-env.sh` decrypts it host-side
    to the gitignored `deploy/.env` on every deploy — the compose file reads it
    via `env_file` + interpolation. The contract is
    `deploy/prod.sops.yaml.example` (`docs/decisions.md` §171).
@@ -186,12 +187,18 @@ Resizing is a change to `app_instance_type` in the tfvars (a stop → change-typ
     two, every invoice upload and every nightly `backup.sh` run is refused even
     with the S3 actions below granted. The key policy delegates to IAM
     (`infra/kms.tf`), so the role policy is all it takes.
-  - `s3:GetObject/PutObject/DeleteObject/AbortMultipartUpload/ListBucket` on the
-    invoice-files, audit-logs, and backups buckets (Delete because replacing or
-    removing a stored document deletes its object — under Object Lock that
-    writes a delete marker and the locked version survives; Abort because
-    `backup.sh` streams multipart — a failed upload must be abortable, and the
-    lifecycle reaper handles stragglers).
+  - `s3:GetObject/PutObject/DeleteObject/AbortMultipartUpload` on the
+    invoice-files bucket (Delete because replacing or removing a stored
+    document deletes its object — under Object Lock that writes a delete
+    marker and the locked version survives); `s3:PutObject/AbortMultipartUpload`
+    only on the audit-logs bucket (append-only); `s3:GetObject/PutObject/AbortMultipartUpload`
+    on the backups bucket — **no delete**, so a compromised VM cannot wipe the
+    backup history (a removed tenant's dumps go through the approval-gated
+    backup-erasure workflow, `docs/decisions.md` §490; Abort because
+    `backup.sh` streams multipart); `s3:ListBucket` on all three.
+  - `s3:GetObject` on the one key of the secrets bucket, and `s3:ListBucket` on
+    it: `deploy.sh` fetches the production secrets ciphertext from there on
+    every deploy (`infra/secrets_delivery.tf`, `docs/decisions.md` §591).
   - `s3:GetBucketObjectLockConfiguration` on the audit-logs bucket, once S3
     audit shipping is turned on: its adapter reads the lock at boot and refuses
     to start without it.
@@ -326,10 +333,10 @@ SES clears.
 
 ### 4. First boot + deploys (`deploy/deploy.sh` — built)
 
-Copy `prod.sops.yaml` onto the VM as `deploy/prod.sops.yaml` (`deploy/decrypt-env.sh`
-checks it without deploying), then run
+Write the secrets bucket's name into `deploy/secrets-bucket` once
+(`deploy/README.md` § Secrets delivery), then run
 `deploy/deploy.sh`: it preflights its own prerequisites and the required env
-keys (clear errors before any work happens), pulls main, decrypts secrets,
+keys (clear errors before any work happens), pulls main, fetches and decrypts secrets,
 builds the backend image, runs
 `sh scripts/deploy_migrate.sh` (`init_control_plane.py`, `alembic upgrade head`, `migrate_all_tenants.py`) **before**
 the new API serves traffic (same ordering contract as the future ECS

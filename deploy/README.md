@@ -13,7 +13,7 @@ The whole flow is four commands on a fresh VM:
 
 ```
 ./bootstrap-vm.sh                     # once: docker, compose, sops, swap, cron, IMDS fix
-# copy infra-secrets' feohledger/prod.sops.yaml in as deploy/prod.sops.yaml, log out/in (docker group), then:
+# write the secrets bucket's name to deploy/secrets-bucket (§ Secrets delivery), log out/in (docker group), then:
 ./deploy.sh                           # first deploy: build the API, migrate, roll, verify (later ones: publish a release, § Deploys)
 ./add-tenant.sh acme --name "Acme" --admin-email admin@acme.com
 ```
@@ -48,9 +48,13 @@ The whole flow is four commands on a fresh VM:
   browsers silently fall back to HTTP/2). Instance profile: `kms:Decrypt` on
   the sops key; `kms:GenerateDataKey` + `kms:Decrypt` on the `infra/` **app**
   key (`app_kms_key_arn` output) — all three buckets encrypt under it, so S3
-  refuses every upload and every backup without it; S3 read/write
-  (`s3:GetObject/PutObject/DeleteObject/AbortMultipartUpload/ListBucket`) on the
-  invoice-files, audit-logs, and backup buckets (plus
+  refuses every upload and every backup without it; on the invoice-files
+  bucket `s3:GetObject/PutObject/DeleteObject/AbortMultipartUpload`, on the
+  audit-logs bucket `s3:PutObject/AbortMultipartUpload` only (append-only), on
+  the backups bucket `s3:GetObject/PutObject/AbortMultipartUpload` — **no
+  delete**: a removed tenant's dumps are erased by the approval-gated
+  backup-erasure workflow (`docs/decisions.md` §490) — and `s3:ListBucket` on
+  all three; `s3:GetObject` on the one key of the secrets bucket (plus
   `s3:GetBucketObjectLockConfiguration` on audit-logs once S3 audit shipping is
   on — full list with reasons: `docs/minimal-deployment.md` § 1); `ses:SendEmail` if using
   SES; ideally `ec2:ModifyInstanceMetadataOptions` so bootstrap can fix the
@@ -69,15 +73,60 @@ The whole flow is four commands on a fresh VM:
   `feohledger/prod.sops.yaml` from `prod.sops.yaml.example` —
   `aws sso login --profile feohledger`, then
   `AWS_PROFILE=feohledger sops feohledger/prod.sops.yaml` (paste, fill, save;
-  sops writes it encrypted) — and commit it there. Copy it onto the VM as
-  `deploy/prod.sops.yaml`; `./decrypt-env.sh` checks it without deploying.
-  Session Manager has no file copy, so carry the (still encrypted) file through
-  the backups bucket, which the instance role can already read: `aws s3 cp` it
-  to `s3://<backups bucket>/transfer/prod.sops.yaml` from your laptop, `aws s3
-  cp` it down on the VM, then delete every version of that key (the bucket is
-  versioned, so a plain delete leaves a copy behind).
+  sops writes it encrypted) — and commit and merge it there. infra-secrets' CI
+  uploads the **ciphertext** to the dedicated secrets bucket
+  (`infra/secrets_delivery.tf`), and every deploy fetches the current version
+  onto the VM as `deploy/prod.sops.yaml` before decrypting it (§ Secrets
+  delivery). Nothing is copied by hand.
   Generate keys in your own terminal. Never commit either file here — this
   repo is public. Pattern: `~/github/project-mgmt/docs/secrets-management.md`.
+
+## Secrets delivery
+
+`docs/decisions.md` §591, issue #735. A merge to infra-secrets' `main` that
+changes `feohledger/prod.sops.yaml` uploads its ciphertext to the secrets
+bucket; the next gated deploy applies it:
+
+- `deploy.sh` fetches the current version under its deploy lock
+  (`lib.sh` `feoh_fetch_secrets`), to a 0600 temp file in `deploy/`, and moves
+  it over `prod.sops.yaml` only once it is sops ciphertext with a readable
+  `lastmodified`. A failed or refused fetch stops the deploy with the old file
+  and `.env` untouched.
+- It logs the S3 version id and the sops `lastmodified`, nothing else — the run
+  log is public.
+- **Replay guard:** a file whose `lastmodified` is older than the one last
+  applied (`deploy/.secrets-applied`) is refused. A deliberate rollback is
+  `./deploy.sh --no-pull --allow-secrets-rollback` from a Session Manager shell.
+- **A secrets-only change** (an emergency rotation too) goes live by running
+  **Deploy to the VM** by hand from the tag of the live release and approving
+  it: the same code redeploys on the new secrets. infra-secrets' CI can only
+  put ciphertext; it never applies anything.
+
+The bucket's name is not in this public repo. Each VM reads it from the
+gitignored `deploy/secrets-bucket` (one line).
+
+### Owner steps (once, in this order, before the next release)
+
+1. Add `secrets_bucket_name` and `infra_secrets_oidc_sub_prefix` to
+   `infra-secrets/feohledger/prod.tfvars.sops` (`../infra/terraform.tfvars.example`
+   shows both; read the prefix with
+   `gh api repos/<owner>/infra-secrets/actions/oidc/customization/sub --jq .sub_claim_prefix`),
+   then plan and apply `infra/` (`../infra/README.md` § Applying).
+2. In infra-secrets, set the repository **variables**
+   `FEOHLEDGER_SECRETS_BUCKET` (`terraform output -raw secrets_bucket`) and
+   `FEOHLEDGER_SECRETS_UPLOAD_ROLE_ARN` (`terraform output -raw secrets_upload_role_arn`),
+   and merge the `feohledger-upload.yml` workflow there.
+3. First upload: run that workflow by hand on `main` (it has
+   `workflow_dispatch`), or merge any change to the file. Check it went green.
+4. On the VM, from a Session Manager shell:
+   `echo '<the secrets_bucket output>' > ~/feohledger/deploy/secrets-bucket`.
+5. Delete every version of the old `transfer/prod.sops.yaml` from the backups
+   bucket, if any are left (the VM role cannot).
+6. In `infra-secrets/feohledger/bootstrap.tfvars`, `deploy_role_can_use_sops =
+   false` is set by the same change: re-apply the account baseline
+   (`templates` `new-project-account.sh feohledger`) so the deploy role loses
+   its grant on the sops key — this repo's CI never decrypts sops.
+7. Release. The deploy log should show `==> secrets: S3 version …`.
 
 ## Deploys
 

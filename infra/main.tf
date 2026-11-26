@@ -19,6 +19,8 @@
 #                   the VM, and the deploy role's grant to run only that
 #   - frontend.tf : the SPA on S3 + CloudFront, and the deploy role's grant to
 #                   publish to that bucket and distribution only
+#   - secrets_delivery.tf : the bucket infra-secrets' CI puts the secrets
+#                   ciphertext in, its write-only upload role, and the VM's read
 #
 # The rest of the scale-up architecture (ECS, ALB) is
 # docs/production-deployment.md and is not built.
