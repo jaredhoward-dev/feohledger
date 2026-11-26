@@ -211,6 +211,7 @@ export const enAudit = {
 	'audit.action.invoice.erp_bill_voided': "Bill voided in the ERP, back to approved",
 	'audit.action.invoice.erp_orphan_bill_looked_up': "Looked up a failed push's bill in the ERP",
 	'audit.action.invoice.erp_bill_confirmed': "Confirmed a bill in the ERP as this invoice's",
+	'audit.action.invoice.erp_bill_confirmation_withdrawn': "Withdrew the confirmation of a bill in the ERP as this invoice's",
 	'audit.action.invoice.erp_orphan_bill_voided': "Failed push's bill voided in the ERP",
 	'audit.action.invoice.erp_orphan_bill_void_orphaned': "ERP void sent but not recorded here",
 	'audit.action.organization.branding_updated': "Branding updated",
