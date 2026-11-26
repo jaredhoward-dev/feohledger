@@ -15,6 +15,7 @@
 	import { invoiceStore } from '#lib/stores/invoices.svelte.ts';
 	import { auth } from '#lib/stores/auth.svelte.ts';
 	import ErpOrphanBill from '#lib/components/erp/ErpOrphanBill.svelte';
+	import ErpBillConfirm from '#lib/components/erp/ErpBillConfirm.svelte';
 	import { adminStore } from '#lib/stores/admin.svelte.ts';
 	import { api, ApiError } from '#lib/api.ts';
 	import {
@@ -2557,6 +2558,21 @@
 									verdict={verdicts?.erp_orphan_lookup_refusal ?? null}
 									idPrefix="invoice-erp-orphan"
 									onvoided={() => loadVerdicts()}
+								/>
+							{/key}
+						{/if}
+						{#if isOffered(verdicts?.erp_bill_confirm_refusal)}
+							<!-- A push refused because another invoice shares this
+							     supplier + number (§572): confirm the bill found there
+							     is this invoice's, which retries the push (§587). From
+							     the server's verdict alone; like Retry ERP Send, a
+							     confirmation closes the modal and the host refetches. -->
+							{#key invoice.id}
+								<ErpBillConfirm
+									invoiceId={invoice.id}
+									verdict={verdicts?.erp_bill_confirm_refusal ?? null}
+									idPrefix="invoice-erp-bill-confirm"
+									onconfirmed={() => onclose()}
 								/>
 							{/key}
 						{/if}

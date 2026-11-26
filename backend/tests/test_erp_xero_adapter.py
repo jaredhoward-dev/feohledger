@@ -601,6 +601,48 @@ def test_existing_bill_on_a_shared_key_is_never_adopted(token, total):
     client.put.assert_not_awaited()
 
 
+@pytest.mark.parametrize(
+    "total, adopted", [(1150.0, True), (99.0, False)], ids=["approved-total", "other-total"]
+)
+def test_the_confirmed_bill_on_a_shared_key_is_adopted_as_any_adoption(token, total, adopted):
+    """A person confirmed this very bill as this invoice's
+    (``payload.confirmed_bill_id``, decisions §587): it is adopted on the
+    shared key, and only at the approved total, as an unshared adoption is."""
+    existing = {"InvoiceID": "inv-mine", "InvoiceNumber": "SUP-1001", "Type": "ACCPAY"}
+    existing["Total"] = total
+    with patch("httpx.AsyncClient") as cm:
+        client = _client(cm)
+        client.get = _get_router(lookup=_resp(200, {"Invoices": [existing]}))
+        client.put = AsyncMock(side_effect=AssertionError("must not create a second bill"))
+        client.post = AsyncMock(side_effect=AssertionError("must not write"))
+        result = _run(
+            _adapter().post_invoice(_payload(bill_key_shared=True, confirmed_bill_id="inv-mine"))
+        )
+    assert result.success is adopted
+    if adopted:
+        assert result.erp_document_id == "inv-mine"
+    else:
+        assert result.refusal_code == "duplicate_document_number"
+    client.put.assert_not_awaited()
+
+
+def test_a_confirmation_of_another_bill_does_not_adopt_this_one(token):
+    """The confirmation names one bill; any other found on the key is still
+    refused ``erp_bill_key_shared`` (§587)."""
+    existing = {"InvoiceID": "inv-other", "InvoiceNumber": "SUP-1001", "Type": "ACCPAY"}
+    existing["Total"] = 1150.0
+    with patch("httpx.AsyncClient") as cm:
+        client = _client(cm)
+        client.get = _get_router(lookup=_resp(200, {"Invoices": [existing]}))
+        client.put = AsyncMock(side_effect=AssertionError("must not create a second bill"))
+        result = _run(
+            _adapter().post_invoice(_payload(bill_key_shared=True, confirmed_bill_id="inv-mine"))
+        )
+    assert result.success is False
+    assert result.refusal_code == "erp_bill_key_shared"
+    client.put.assert_not_awaited()
+
+
 def test_a_shared_key_with_no_bill_on_it_still_creates(token):
     """Refusing adoption is not refusing the push: with nothing on the key
     there is nothing to adopt, so the bill is created as usual (§572)."""

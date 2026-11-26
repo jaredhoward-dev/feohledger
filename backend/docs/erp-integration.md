@@ -3691,8 +3691,32 @@ time Xero refuses the payments listing, and the settings panel shows it
   its total: the bill is not adopted and no second one is created. With no
   bill on the key the push creates as usual, so a number shared with a
   rejected or done invoice blocks nothing until a bill is actually there. A
-  person checks in Xero which invoice the bill is for; FeohLedger has no
-  action yet to confirm "that bill is this invoice's" (followups).
+  person checks in Xero which invoice the bill is for.
+- **A person can confirm the bill on a shared key as this invoice's**
+  (decisions §587, `services/erp_bill_confirm.py`). Every push that lands at
+  `failed` records its coded refusal on the workflow state
+  (`erp_last_refusal_code`; dropped when a new push starts). On a push last
+  refused `erp_bill_key_shared`, `GET /review-actions` serves
+  `erp_bill_confirm_refusal` (`null` = offered; `role_not_permitted` without
+  `payment.void` AND one of admin / ap_manager / cfo — the void's duty and
+  the retry's roles; `erp_bill_confirm_not_offered` otherwise). `GET
+  /api/invoices/{id}/erp-bill-confirmation` names the bill with the adapter's
+  own read-only lookup, without the orphan lookup's shared-key refusal
+  (naming it is the point; only the confirmation may follow). `POST
+  /api/invoices/{id}/confirm-erp-bill` `{erp_document_id, reason}` refuses a
+  bill another invoice holds (`erp_bill_claimed`: its `erp_document_id`, the
+  orphan its own failed push recorded, or its confirmation), re-runs the
+  lookup with no lock held, then under the invoice and instance locks and a
+  per-bill advisory lock re-checks the verdict, that the lookup still names
+  that id (`erp_bill_confirm_not_found`) and the claim, records
+  `erp_confirmed_bill` on the workflow state with an
+  `invoice.erp_bill_confirmed` audit row (actor, reason), and starts the
+  ordinary retry (`invoice.erp_retried`). The push passes the id as
+  `payload.confirmed_bill_id`; Xero adopts a found bill on a shared key only
+  when it is that id, at the approved total (a different total is still
+  `duplicate_document_number`). If a retry gate refuses, the confirmation
+  stands and Retry ERP Send honours it later. The sharer's own push keeps
+  refusing, and its confirmation answers `erp_bill_claimed`.
 - **The posted total is checked, on the bill read back.** After the create the
   adapter `GET`s `Invoices/{id}`. Xero computes `Total` from the lines and
   their tax types; a `Total` other than `amount` voids (AUTHORISED) or deletes

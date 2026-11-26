@@ -329,6 +329,10 @@ _TENANT_MUTATORS_WITHOUT_DIRECT_AUDIT: dict[tuple[str, str], str] = {
         "or record_orphaned_void (invoice.erp_orphan_bill_void_orphaned); a refusal "
         "only clears its own marker (decisions §556)"
     ),
+    ("app.api.workflow", "confirm_erp_bill"): (
+        "audits via erp_bill_confirm.record_confirmation (invoice.erp_bill_confirmed), "
+        "then start_erp_send's transition_invoice row (invoice.erp_retried) (decisions §587)"
+    ),
     ("app.api.goods_receipts", "cancel_receipt"): (
         "audits via services/goods_receipts.cancel_goods_receipt (`goods_receipt.cancelled`)"
     ),

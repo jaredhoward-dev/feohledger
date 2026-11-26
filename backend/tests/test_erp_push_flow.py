@@ -2426,8 +2426,9 @@ async def test_a_push_with_its_retries_spent_fails_coded_without_calling_the_erp
         assert refusal["params"] == {}
         assert "possibly_posted" not in row["details"]
     assert inst.state == "failed"
-    # The record of what may be in the ERP is left for the retry to read.
-    assert inst.state_data == state
+    # The record of what may be in the ERP is left for the retry to read; the
+    # refusal's code is added for the shared-key confirmation's verdict (§587).
+    assert inst.state_data == {**state, "erp_last_refusal_code": ERP_RETRIES_EXHAUSTED}
     db.commit.assert_awaited()
 
 

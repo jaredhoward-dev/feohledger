@@ -124,6 +124,11 @@ class InvoicePayload:
     #: lookup then never adopts a bill it finds on that key as this invoice's:
     #: it could be the other invoice's (decisions §572).
     bill_key_shared: bool = False
+    #: The ERP's id of the bill a person confirmed as this invoice's on that
+    #: shared key (``services/erp_bill_confirm``, decisions §587). The
+    #: adapter adopts a found bill on a shared key only when it is this one,
+    #: and then as any adoption (at the approved total). None: none confirmed.
+    confirmed_bill_id: str | None = None
 
 
 # ---------------------------------------------------------------------------
