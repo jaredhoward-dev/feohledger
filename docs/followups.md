@@ -226,7 +226,7 @@ section carried its own `decisions.md` § reference, so nothing was lost by
 deleting it; that cross-reference is what makes the pruning safe, and writing
 one is what earns a future entry the right to be deleted.
 
-**87 open: 57 (c) · 12 (a) · 18 (b)** — re-derived from the file, never carried
+**86 open: 56 (c) · 12 (a) · 18 (b)** — re-derived from the file, never carried
 forward. The section heading is authoritative; where an entry also carries a
 `(c)`/`(a)`/`(b)` marker, the two agree.
 `grep -c '^- \[ \]' docs/followups.md`.
@@ -734,28 +734,6 @@ reliable part of it.
       limits showing; neither needed the FK yet.
       **Trigger:** the first request to rename or merge a GL account, or any work on
       cross-entity coding.
-
-- [ ] **(c) Breakpoints are ad hoc — the deferred half of [#432](https://github.com/jaredhoward-dev/feohledger/issues/432).**
-      Round 26 closed #432's two engineering parts (the `/organization` 320px failure and a
-      reflow guard widened from 5 routes to 45) and deliberately did **not** make the
-      viewport-floor call, which is a product decision. Measured while there, correcting the
-      issue's own premise that there are "zero width breakpoints". *Re-measured 2026-10-07:*
-      **37 width-based `@media` queries across 17 distinct values** (`400, 420, 520, 600,
-      620, 640, 700, 720, 760, 768, 800, 900, 960, 1100px` and `52rem, 60rem, 72rem`), and
-      zero shared tokens. Container queries now exist, on the help centre only
-      (`@container help-main` in `routes/help/` and `help/diagrams/Diagram.svelte`).
-      **Product call first:** what viewport floor do we support, and what are the two or
-      three named steps? Then: declare them once (CSS custom properties cannot be used in
-      `@media`, so this is documented literals plus a stylesheet guard rejecting unlisted
-      values — the `targetSizeAudit.test.ts` shape — or a preprocessor), migrate 30 call
-      sites (37 now), and decide sidebar behaviour below the floor and whether `/exceptions`' 11
-      columns drop or keep scrolling.
-      Worth weighing: five of round 26's seven reflow fixes needed **no breakpoint at all**
-      — `flex-wrap`, `min-width: 0`, a flex basis, an intrinsic scroller. Tokens are for
-      the cases intrinsic reflow genuinely cannot reach.
-      **The 320px reflow guard does not depend on this** and must not be folded into it:
-      320px is WCAG's own number. A floor decision adds steps above it.
-      **Trigger:** the product call.
 
 ### Surfaced by the follow-up batch (2026-09-22)
 
