@@ -78,3 +78,18 @@ def test_backfill_import_provenance_fails_when_the_database_is_unreachable() -> 
         env={"FEOH_DATABASE_URL": UNREACHABLE_DB},
     )
     assert result.returncode != 0
+
+
+def test_settle_peppol_sending_fails_when_the_control_plane_is_unreachable() -> None:
+    """The settle reads the tenant from the control plane first; unreachable is a
+    non-zero exit, never a 'settled' (decisions §580)."""
+    result = _run(
+        "settle_peppol_sending.py",
+        "--slug",
+        "acme",
+        "--invoice",
+        "00000000-0000-0000-0000-000000000001",
+        env={"FEOH_DATABASE_URL": UNREACHABLE_DB},
+    )
+    assert result.returncode != 0
+    assert "is now" not in result.stdout

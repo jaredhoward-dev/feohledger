@@ -18,7 +18,16 @@ from app.services.erp_adapters import (
     get_erp_adapter,
 )
 from app.services.erp_adapters.base import ACCOUNT_NOT_LINKED, NOT_CONNECTED
+from app.services.erp_adapters.bill_allocation import DUPLICATE_DOCUMENT_NUMBER
 from app.services.erp_adapters.deep_links import erp_document_url
+from app.services.erp_bill_confirm import (
+    CONFIRMED_BILL_KEY,
+    LAST_REFUSAL_CODE_KEY,
+    WITHDRAWN_OTHER_BILL,
+    WITHDRAWN_TOTAL_CHANGED,
+    confirmed_bill_id,
+    withdraw_confirmation,
+)
 from app.services.erp_export_gate import erp_export_refusal
 from app.services.erp_link_realm import bill_realm, connection_realm, legacy_links_trusted
 from app.services.erp_status_sync import status_sync_active
@@ -434,7 +443,11 @@ async def reset_erp_push_budget(db: AsyncSession, invoice_id: uuid.UUID) -> None
     """
     instance = await get_workflow_instance(db, invoice_id)
     if instance:
-        instance.state_data = {**(instance.state_data or {}), "erp_retries": 0}
+        # The last failure's refusal code describes that push only: a new one
+        # drops it, so a failure that records none cannot inherit it (§587).
+        state = {**(instance.state_data or {}), "erp_retries": 0}
+        state.pop(LAST_REFUSAL_CODE_KEY, None)
+        instance.state_data = state
         instance.state = "active"
 
 
@@ -716,6 +729,10 @@ async def send_to_erp_internal(
                         **(instance.state_data or {}),
                         "erp_retries": attempt + 1,
                         "last_error": str(exc),
+                        # What the bill confirmation's verdict reads (§587).
+                        LAST_REFUSAL_CODE_KEY: (_refusal_details(exc).get("refusal") or {}).get(
+                            "code"
+                        ),
                     }
                 await db.commit()
                 return
@@ -774,6 +791,7 @@ async def _fail_push(
     )
     if instance is not None:
         instance.state = "failed"
+        instance.state_data = {**(instance.state_data or {}), LAST_REFUSAL_CODE_KEY: refusal_code}
 
 
 async def fail_interrupted_erp_send(db: AsyncSession, invoice_id: uuid.UUID) -> bool:
@@ -964,6 +982,15 @@ async def _call_erp(
     line_items = await _fetch_line_items(db, invoice.id)
     refs = await _resolve_erp_refs(db, invoice, line_items, config)
     payload = _build_payload(invoice, line_items, refs)
+    # An adapter whose bill key is a supplier + number (Xero) must not adopt a
+    # bill on a key another invoice shares: it may be that invoice's. One rule
+    # with the orphan-bill lookup; no query for any other adapter (§572).
+    from app.services.erp_bill_void import shared_lookup_keys
+
+    payload.bill_key_shared = invoice.id in await shared_lookup_keys(db, {"erp": config}, [invoice])
+    # A person's confirmation that the bill on that shared key is this
+    # invoice's (§587): the adapter adopts that bill, and only that one.
+    payload.confirmed_bill_id = confirmed_bill_id(state)
     payload.pending_job_id = state.get(PENDING_JOB_KEY)
     payload.outcome_unknown_since = prior_unknown_at
     # Strictly `is True`: a row written before the key existed records no
@@ -1051,6 +1078,24 @@ async def _call_erp(
             new_state["erp_realm"] = bill_realm(config)
         if result.pending_job_id != payload.pending_job_id:
             new_state[PENDING_JOB_KEY] = result.pending_job_id
+        # A confirmation (§587) stands only until it is used or refuted: the
+        # bill of record carries the claim from a success on, a success on
+        # another bill refutes it, and a refusal of the confirmed bill at a
+        # changed total means the person confirmed a figure this invoice no
+        # longer has (decisions §588).
+        if result.success or (
+            payload.confirmed_bill_id and result.refusal_code == DUPLICATE_DOCUMENT_NUMBER
+        ):
+            used = result.success and result.erp_document_id == payload.confirmed_bill_id
+            if used:
+                new_state.pop(CONFIRMED_BILL_KEY, None)
+            else:
+                new_state = await withdraw_confirmation(
+                    db,
+                    invoice,
+                    new_state,
+                    reason=WITHDRAWN_OTHER_BILL if result.success else WITHDRAWN_TOTAL_CHANGED,
+                )
         if result.success:
             for key in (
                 *_ORPHAN_KEYS,

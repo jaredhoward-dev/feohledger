@@ -14,7 +14,15 @@ import { describe, expect, it } from 'vitest';
  *
  * What it detects, per `.svelte` file: an element with a literal
  * `role="alert"` containing a `<button>` whose label is a retry — a `m('…')`
- * call on a key ending `.retry` / `common.retry`, or the literal text "Retry".
+ * call on a key ending `.retry` / `common.retry` / `.tryAgain`, or the literal
+ * text "Retry" / "Try again".
+ *
+ * A failed load without `role="alert"` slips past that shape (the profile
+ * page's three retry pairs were plain warnings with a button), so the second
+ * check is on the label instead: `common.tryAgain` is the label of a retried
+ * ACTION, and only the files in {@link TRY_AGAIN_ALLOWED} may use it. A load's
+ * retry reads "Retry", through LoadError — the ERP panel's catalogue failure
+ * said "Try again" and sent a spec clicking a button that did not exist.
  */
 
 const RAW = import.meta.glob('/src/**/*.svelte', {
@@ -39,6 +47,19 @@ const ALLOWED = new Set([
 	'/src/routes/find-workspace/+page.svelte'
 ]);
 
+/**
+ * Where `common.tryAgain` may label a button: each retries an ACTION, not a
+ * load, so LoadError's "Retry" is not the shape.
+ */
+const TRY_AGAIN_ALLOWED = new Set([
+	// Re-sends the one-time verification-link POST after a transient failure.
+	'/src/routes/verify/+page.svelte'
+]);
+
+function usesTryAgain(source: string): boolean {
+	return /m\(\s*['"]common\.tryAgain['"]/.test(source);
+}
+
 type Node = { type: string; [key: string]: unknown };
 
 function isNode(v: unknown): v is Node {
@@ -61,7 +82,7 @@ function walk(node: unknown, visit: (n: Node) => void) {
 function isRetryLabel(button: Node): boolean {
 	let found = false;
 	walk(button.fragment, (n) => {
-		if (n.type === 'Text' && /^\s*Retry\s*$/.test(n.data as string)) found = true;
+		if (n.type === 'Text' && /^\s*(Retry|Try again)\s*$/i.test(n.data as string)) found = true;
 		if (n.type !== 'CallExpression') return;
 		const callee = n.callee as Node;
 		const [arg] = n.arguments as Node[];
@@ -70,7 +91,7 @@ function isRetryLabel(button: Node): boolean {
 			callee.name === 'm' &&
 			arg?.type === 'Literal' &&
 			typeof arg.value === 'string' &&
-			/(^|\.)retry$/.test(arg.value)
+			/(^|\.)(retry|tryAgain)$/.test(arg.value)
 		) {
 			found = true;
 		}
@@ -83,7 +104,7 @@ function handRolledLoadErrors(source: string): number {
 	// tree scan (~250 files: past vitest's 5 s budget under a parallel run).
 	// The shape needs a static role="alert" and a Retry label (text or `…retry` key), so skipping a file without it cannot hide a finding; the inline
 	// self-tests go through this line too.
-	if (!/role\s*=\s*["']?alert\b/.test(source) || !/retry/i.test(source)) return 0;
+	if (!/role\s*=\s*["']?alert\b/.test(source) || !/retry|try ?again/i.test(source)) return 0;
 	const ast = parse(source, { modern: true }) as unknown as Node;
 	let count = 0;
 	walk(ast.fragment, (n) => {
@@ -119,13 +140,31 @@ describe('a failed load with Retry is ui/LoadError', () => {
 				`<p role="alert">{e}<button onclick={go}>{m('payments.void.card.retrying')}</button></p>`
 			)
 		).toBe(0);
+		expect(
+			handRolledLoadErrors(
+				`<div role="alert"><p>{e}</p><button onclick={load}>{m('common.tryAgain')}</button></div>`
+			)
+		).toBe(1);
+		expect(
+			handRolledLoadErrors(`<div role="alert"><button onclick={load}>Try again</button></div>`)
+		).toBe(1);
 		expect(handRolledLoadErrors(`<LoadError message={e} onretry={load} />`)).toBe(0);
+		expect(usesTryAgain(`<button onclick={load}>{m('common.tryAgain')}</button>`)).toBe(true);
+		expect(usesTryAgain(`<LoadError message={e} onretry={load} />`)).toBe(false);
 	});
 
 	it('no component outside the allowlist hand-rolls one', () => {
 		const offenders = Object.entries(RAW)
 			.filter(([path]) => !ALLOWED.has(path))
 			.filter(([, source]) => handRolledLoadErrors(source) > 0)
+			.map(([path]) => path);
+		expect(offenders).toEqual([]);
+	});
+
+	it('no component outside its allowlist labels a button common.tryAgain', () => {
+		const offenders = Object.entries(RAW)
+			.filter(([path]) => !TRY_AGAIN_ALLOWED.has(path))
+			.filter(([, source]) => usesTryAgain(source))
 			.map(([path]) => path);
 		expect(offenders).toEqual([]);
 	});

@@ -117,6 +117,18 @@ class InvoicePayload:
     #: sync waits for a sync after it before re-creating (Merge.dev, decisions
     #: §405). None when no earlier attempt is unknown.
     outcome_unknown_since: datetime | None = None
+    #: Set by ``services/erp`` when the adapter's bill key is not unique to one
+    #: invoice (:attr:`ErpAdapter.bill_lookup_key_shared`) and another invoice
+    #: in the tenant shares this one's (``erp_bill_void.shared_lookup_keys``,
+    #: the rule the orphan-bill lookup applies). The adapter's pre-create
+    #: lookup then never adopts a bill it finds on that key as this invoice's:
+    #: it could be the other invoice's (decisions §572).
+    bill_key_shared: bool = False
+    #: The ERP's id of the bill a person confirmed as this invoice's on that
+    #: shared key (``services/erp_bill_confirm``, decisions §587). The
+    #: adapter adopts a found bill on a shared key only when it is this one,
+    #: and then as any adoption (at the approved total). None: none confirmed.
+    confirmed_bill_id: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -367,6 +379,8 @@ ERP_REFUSAL_CODES: frozenset[str] = frozenset(
         "bill_payment_voided",
         # Xero: a connection consented before `accounting.payments` (§415)
         "payments_scope_missing",
+        # Xero: a bill found on a supplier + number another invoice shares (§572)
+        "erp_bill_key_shared",
     }
 )
 
@@ -610,6 +624,38 @@ class PaymentPayload:
     vendor_erp_id: str | None = None
     #: The remittance reference, when the rail has one (a cheque number).
     reference: str | None = None
+
+
+@dataclass
+class DiscountCreditPayload:
+    """An early-payment discount taken in FeohLedger, booked in the ERP as a
+    vendor credit applied to the bill (decisions §575): QuickBooks
+    ``VendorCredit`` + a $0 BillPayment applying it, Xero an ``ACCPAYCREDIT``
+    credit note allocated to the bill. Opt-in per org
+    (``settings.erp.book_discount_as_credit``)."""
+
+    #: Our ``Payment.id`` — the idempotency key, carried in the credit's marker
+    #: (``"FeohLedger discount <id>"``) and its create's request key.
+    payment_id: str
+    bill_id: str
+    #: The discount taken (``Payment.discount_amount``), exact.
+    amount: Decimal
+    #: The bill's currency as FeohLedger knows it; the ERP's must match.
+    currency: str
+    credit_on: date
+    #: The ERP id of the account the discount is booked to
+    #: (``settings.erp.discount_credit_account``, our GL code, resolved under
+    #: the current realm). None = not mapped or not linked: refused.
+    discount_account_erp_id: str | None = None
+    #: QuickBooks applies the credit through a $0 BillPayment, which still
+    #: names a pay-from account: the payment's own (``PaymentPayload``).
+    pay_from_account_erp_id: str | None = None
+    card: bool = False
+    #: Our credit document already in the ERP, when an earlier attempt created
+    #: it (a create that stood while its application failed, decisions §577):
+    #: the retry applies THIS one, and a void deletes it by id when nothing on
+    #: the bill leads to it any more. None = none known.
+    credit_id: str | None = None
 
 
 @dataclass
@@ -967,6 +1013,13 @@ class ErpAdapter:
     #: names the bill a timed-out push may have left in the ERP (decisions
     #: §556). ``services/erp_bill_void`` reads it from the class.
     supports_bill_lookup: bool = False
+    #: True for an adapter whose :meth:`find_posted_bill` matches on the
+    #: bill's supplier and number alone, with no marker unique to one invoice
+    #: on the bill (Xero: an ACCPAY bill has no field for our correlation id).
+    #: ``services/erp_bill_void`` then refuses the lookup while another
+    #: invoice in the tenant shares that supplier and number, so it can never
+    #: name that invoice's bill (decisions §566).
+    bill_lookup_key_shared: bool = False
 
     def __init__(self, config: dict):
         self.config = config
@@ -1129,6 +1182,27 @@ class ErpAdapter:
         """Reverse what :meth:`post_payment` wrote for ``payload.payment_id``.
         Success when nothing of ours is left on the bill. Default: refused."""
         return self._no_status_sync()
+
+    #: Can book an early-payment discount as a vendor credit applied to the
+    #: bill on write-back (decisions §575). Off for every adapter but the two
+    #: that implement it; the org's opt-in is read by the write-back.
+    supports_discount_credit: bool = False
+
+    async def post_discount_credit(self, payload: DiscountCreditPayload) -> ErpPostResult:
+        """Book ``payload.amount`` as a vendor credit applied to the bill,
+        idempotently on ``payload.payment_id``. Default: refused."""
+        return self._no_status_sync()
+
+    async def void_discount_credit(self, payload: DiscountCreditPayload) -> ErpPostResult:
+        """Reverse the credit :meth:`post_discount_credit` booked. Success when
+        nothing of ours is there. Default: nothing was ever booked."""
+        return ErpPostResult(success=True, message="No discount credit to reverse")
+
+    async def find_discount_credit(self, payload: DiscountCreditPayload) -> str | None:
+        """The ERP id of our live credit for ``payload.payment_id``, or None.
+        Read before a void so the id is recorded before anything is deleted
+        (decisions §577). Raises when the ERP cannot be read. Default: none."""
+        return None
 
     async def bill_report(self, bill_id: str) -> ErpBillReport:
         """Where ``bill_id`` stands now. ``deleted`` only on the ERP's positive

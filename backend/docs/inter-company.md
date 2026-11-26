@@ -119,6 +119,26 @@ idempotent, one statement) gives each exactly what routing gives one today:
 re-open the hole while leaving the audit rows describing a state that no longer
 holds. Reasoning: `docs/decisions.md` §198.
 
+## A paired invoice's approval is not recalled (decisions §573)
+
+The mirror holds a copy of the origin's figures and implicated set, snapshotted
+at routing, so recalling either side and correcting it would leave the pair
+disagreeing. `services/review.recall_refusal` therefore refuses the recall
+while `intercompany_mirror_id` links a live partner, telling the two sides
+apart by the same `role: "mirror"` routing audit row the backfill reads:
+
+| Invoice recalled | Partner state | Code | Way out |
+|---|---|---|---|
+| the mirror | any | `invoice_recall_is_mirror` | delete the mirror, correct the origin, route again |
+| the origin | mirror unsigned — pre-approval, never approved, no live payment / card | `invoice_recall_mirror_unsigned` | delete the mirror (unlinks the origin), recall, route again once re-approved |
+| the origin | mirror approved, past approval, or being paid | `invoice_recall_mirror_progressed` (`params.mirror_status`) | a credit memo on each side |
+
+Re-syncing an unsigned mirror automatically after the origin's re-approval was
+rejected: the counterparty's reviewers act on the mirror meanwhile, so the
+re-sync would race their approval. Delete-and-re-route uses two audited,
+row-locked doors that exist already, and the re-route copies the corrected
+figures and the then-current implicated set (recaller included) afresh.
+
 ## API (`app/api/invoices.py`)
 
 `POST /api/invoices/{id}/route-intercompany`

@@ -1331,6 +1331,54 @@ async function settledSectionTabs(page: Page) {
 }
 
 /**
+ * Answer `GET /api/auth/me` with the real response, except that the workspace
+ * holds (or not) the operator-granted partner capability (`is_partner`,
+ * decisions §574). No e2e tenant is a partner, and granting one would outlive
+ * a crashed test, so the Partner Admin row and page are driven this way — the
+ * same shape `billing/plan-gates.spec.ts` uses for `entitlements`. Register it
+ * before the first navigation.
+ */
+export async function stubPartnerCapability(page: Page, isPartner = true): Promise<void> {
+	await page.route(
+		(url) => url.pathname === '/api/auth/me',
+		async (route) => {
+			if (route.request().method() !== 'GET') return route.fallback();
+			const real = await route.fetch();
+			const body = await real.json();
+			await route.fulfill({ response: real, json: { ...body, is_partner: isPartner } });
+		}
+	);
+}
+
+/**
+ * A partner workspace with no child tenants, for a spec that opens
+ * `/admin/partner` to check the page itself (layout, axe, reflow) rather than
+ * partner behaviour. `stubPartnerCapability` makes the page open; the real
+ * `GET /api/partner` would still 403 (`partner_capability_required`, the
+ * capability is the workspace's, decisions §574), so the overview is answered
+ * too — with no children, so the state does not depend on whether the worker
+ * tenant administers one. Writes fall through to the real backend. Register it
+ * before the first navigation.
+ */
+export async function stubPartnerWorkspace(page: Page, name = 'Partner Fixture Workspace'): Promise<void> {
+	await stubPartnerCapability(page);
+	await page.route(
+		(url) => url.pathname === '/api/partner',
+		(route) =>
+			route.request().method() === 'GET'
+				? route.fulfill({
+						json: {
+							organization_id: '00000000-0000-4000-8000-000000000450',
+							name,
+							is_partner: true,
+							children: []
+						}
+					})
+				: route.fallback()
+	);
+}
+
+/**
  * Every section sub-tab's href for the current route — the visible row PLUS
  * whatever `SectionTabs` moved into its **More** menu.
  *

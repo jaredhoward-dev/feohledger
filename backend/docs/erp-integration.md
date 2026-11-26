@@ -566,7 +566,9 @@ Decisions §295; the phase-by-phase account is
   land on `payment.erp_post_failed` plus an `erp_reconciliation` exception.
   `currency_mismatch` also covers a bill or a payment that states no currency
   (QuickBooks states every bill's, the home one included): fail closed, never
-  posted as a bare number. A payment void voids the BillPayment too.
+  posted as a bare number. A payment void voids the BillPayment too. An
+  early-payment discount is booked only by the org's opt-in (§ Early-payment
+  discount booked as a vendor credit, below).
 - **Checked again at dispatch.** A bill paid in QuickBooks reaches us within
   seconds by webhook, or by the next sweep — too late for a run already
   executing. So every payment re-reads its bill from QuickBooks immediately
@@ -580,6 +582,215 @@ Decisions §295; the phase-by-phase account is
   keeps its signing secrets only in the sealed store, and an adapter without
   them held every payment `erp_bill_unverified`. Credentials that cannot be
   opened hold the item the same way.
+
+### Early-payment discount booked as a vendor credit (opt-in, decisions §575)
+
+Neither ERP's payment carries a discount, so by default the bill stays open
+there by the discount and `payment_writeback_balance_open` asks a person to book
+it. An org can instead turn on `settings.erp.book_discount_as_credit: "on"`
+(QuickBooks Online and Xero; off when absent) and pick
+`settings.erp.discount_credit_account`, a GL code of ours from the synced chart,
+required while on (`PATCH /api/organization` answers 422 otherwise;
+`catalog.discount_credit_refusal`). Then, right after a successful payment
+write-back whose `Payment.discount_amount` is positive, the adapter books that
+discount (`post_discount_credit`, `DiscountCreditPayload`):
+
+| | QuickBooks Online | Xero |
+|---|---|---|
+| Credit | `POST vendorcredit` — `VendorRef` (the bill's), one `AccountBasedExpenseLineDetail` line to the discount account, `CurrencyRef` (the bill's), `PrivateNote: "FeohLedger discount <payment id>"` | `PUT CreditNotes` — `Type: ACCPAYCREDIT`, `Status: AUTHORISED`, the bill's `Contact` and `CurrencyCode`, `LineAmountTypes: NoTax`, one line to the discount `AccountID`, `CreditNoteNumber: "FeohLedger discount <payment id>"` (`Reference` is ACCRECCREDIT-only) |
+| Applied | `POST billpayment`, `TotalAmt: 0`, one line linking the `Bill` and one the `VendorCredit`, same marker, from the payment's own pay-from account | `PUT CreditNotes/{id}/Allocations` — `{Amount, Invoice: {InvoiceID}, Date}` |
+| Idempotent | the bill's BillPayments searched for the marker first; each create carries its own `requestid` (`<payment id>:vc` / `:vca`), so a credit created but not applied is replayed and applied once | credit notes looked up by number first (one found unallocated is allocated, never re-created); `Idempotency-Key` `<payment id>:cn` / `:cna`; one of ours voided or deleted in Xero is refused `bill_payment_voided` (`params.document = discount_credit`) |
+| Void | `POST billpayment?operation=delete`, then `POST vendorcredit?operation=delete` (only while it carries our marker) | `DELETE CreditNotes/{id}/Allocations/{allocation}` for each, then `POST CreditNotes/{id}` `{Status: VOIDED}` |
+
+Refused before any write, on the existing codes: no discount (or, for
+QuickBooks, pay-from) account linked under the current realm →
+`payment_account_not_mapped` with `params.account`; bill gone →
+`bill_not_in_erp`; the bill's currency missing or not the invoice's →
+`currency_mismatch`; more than the bill still has open after our payment →
+`payment_exceeds_balance` with `params.document = discount_credit`. The amount
+is the exact `Decimal` (`dumps_exact_json`). Success writes
+`payment.erp_discount_credit_posted` and the flag is judged on the balance the
+credit left (zero: no flag). A refusal or failure writes
+`payment.erp_discount_credit_failed` (coded) and the balance-open flag is
+opened exactly as without the opt-in, with `erp_report.discount_credit_failure`
+naming the code. A payment void reverses our credit FIRST
+(`void_discount_credit`, whatever the opt-in says now, since it may have been
+booked while on; `payment.erp_discount_credit_reversed`); if that fails the
+payment void is not attempted, `payment.erp_void_failed` carries
+`document: discount_credit`, and the pending marker makes the sweep retry from
+the credit. The one exception is a recorded credit refused
+`discount_credit_not_ours` (edited in the ERP): the payment is voided anyway
+and the credit stays recorded and flagged on its own (decisions §584). QuickBooks' `bill_report` counts our discount application as ours
+(`_discount_marker`), so a bill closed by our payment plus our credit is
+`paid_only_by_us`; Xero's existing rule (a credit no larger than the discount
+our own payment took, beside our write-back) already reads it as ours.
+
+What was checked against a primary source, on 2026-11-25 (decisions §577; the
+two vendors' doc sites render client-side and could not be fetched, so their
+published schemas were read instead):
+
+- **Confirmed.** QuickBooks field names, from Intuit's entity schema
+  (`Finance.xsd` in
+  <https://github.com/intuit/QuickBooks-V3-Java-SDK>, commit 865ec279):
+  VendorCredit's VendorRef / TxnDate / PrivateNote / CurrencyRef / Line with
+  `AccountBasedExpenseLineDetail.AccountRef`, BillPayment's PayType /
+  CheckPayment / CreditCardPayment / TotalAmt / Line[].LinkedTxn, and
+  `VendorCredit` as a LinkedTxn type. Xero, from its OpenAPI spec
+  (<https://github.com/XeroAPI/Xero-OpenAPI/blob/master/xero_accounting.yaml>,
+  v20.1.0): `PUT CreditNotes` with Type `ACCPAYCREDIT`, line `AccountID`,
+  `Reference` ACCRECCREDIT-only, the `Idempotency-Key` header,
+  `PUT CreditNotes/{id}/Allocations`,
+  `DELETE CreditNotes/{id}/Allocations/{AllocationID}`, and `VOIDED` through
+  `POST CreditNotes/{id}`.
+- **Not confirmed (fail closed until a real company proves them).** QuickBooks
+  applying a credit by a TotalAmt-0 BillPayment linking the Bill and the
+  VendorCredit; `requestid` replaying a `vendorcredit` create; the
+  `vendorcredit?operation=delete` route. Xero keeping a supplied
+  `CreditNoteNumber` on an ACCPAYCREDIT, filtering `where` on it, and refusing
+  to void an allocated credit note.
+
+**A credit that may stand unapplied is recorded, not re-booked** (decisions
+§577). A credit failure that may have written leaves
+`state_data.erp_discount_credits_pending[<payment id>]` (the credit's ERP id
+when known, and the payload's ids and amount); the balance-open flag's
+`erp_report` then carries `discount_credit_pending: true` and
+`discount_credit_document_id`, meaning a retry will apply it and nobody should
+book another. Its sentence says so too (decisions §585): while a record names
+the payment the flag reads `erp_discount_credit_pending` ("FeohLedger booked
+credit {credit} and will apply it, so don't book another"), or, when the id was
+never learned, the retries are exhausted or the recorded id is not ours,
+`erp_discount_credit_pending_unidentified` ("check for “FeohLedger discount
+<payment id>” before booking one"). Only with no record, where no credit of ours
+can exist, does it read `erp_payment_writeback_balance_open` and ask the
+bookkeeper to close the difference. An attempt that made no credit call (the
+record claimed by another pass, or exhausted) reads the record as it stands. The
+status-sync sweep (`resume_pending_credits`, after
+`resume_pending_voids`) re-posts with `credit_id`, and QuickBooks applies that
+credit by id rather than relying on `requestid` replay. A void records our
+credit's id in `state_data.erp_discount_credit_voids_pending` before deleting
+anything, so a retry after the application was deleted still deletes the
+credit; the void-failed flag names it as `discount_credit_document_id`.
+
+**A recorded credit is finished, never booked again** (decisions §579). Every
+attempt at it — the sweep, or a write-back re-run (`POST
+/api/payments/runs/{id}/sync-erp`, a webhook re-dispatch) for an already-paid
+invoice — builds its payload from the record (its `credit_id`, amount and
+accounts), never from today's settings. The record is dropped only when the
+credit is applied or ours was refused `bill_payment_voided`; a refusal before
+any write (`payment_exceeds_balance`, `not_posted`) keeps it, since the credit
+it names still stands. A record with **no known id** (the create's answer was
+a 5xx, a network error, or a 200 with no `Id`) is never re-created on the
+providers' unconfirmed `requestid` / `Idempotency-Key` replay: the adapter's
+`find_discount_credit` is asked (QuickBooks: through the bill's applying
+BillPayment, so an unapplied credit is not found; Xero: by our
+`CreditNoteNumber`, matched on our side), and a miss holds the record and opens
+the non-blocking `erp_discount_credit_stalled` flag (`erp_report.kind:
+discount_credit_stalled`, `reason: unidentified`, `discount_credit_marker:
+"FeohLedger discount <payment id>"`) for a person to find it. QuickBooks
+VendorCredit is not queried by `VendorRef` / `TxnDate`: that filter is not in
+the schema §577 confirmed. Xero now honours `credit_id` too (reads that credit
+note by id; voided is `bill_payment_voided`, not ours is held, §582). A void with such a
+record voids our payment but keeps the record, flags it, and reports failure.
+Each attempt is claimed per record (`claimed_until`), its outcome written under
+the instance lock after re-reading the payment — a void that committed during
+the call gets the credit id in `erp_discount_credit_voids_pending` and its void
+re-armed — and the void clears its markers compare-then-clear. The record keeps
+`attempts`, `last_attempt` and `outcome`; an unchanged outcome writes no new
+audit row, and at `MAX_CREDIT_ATTEMPTS` (12) it is `exhausted` and flagged
+(`reason: retries_exhausted`).
+
+**Reserve → call → record, invoice before instance** (decisions §581). A
+first credit attempt commits its record (`credit_id: null`, `attempts: 0`,
+`claimed_until`) under the locks **before** the create, so a crash or a failed
+recording leaves a record the next attempt can only look up, never create
+again. A re-run claims the record under the lock and builds the payload from
+what it claimed; a live claim, an `exhausted` record or one the sweep already
+finished means no ERP call. Every lock this module takes on the workflow
+instance is preceded by `FOR KEY SHARE` on the invoice — the order the void and
+delete doors take — so they serialize instead of deadlocking, and the delete
+door reads the pending maps `FOR UPDATE`. A payment voided while its
+BillPayment was being written is put back in `erp_payment_voids_pending`
+(`payment.erp_posted` carries `void_rearmed: true`), so the sweep voids what
+the void's own pass could not yet see. Xero's `void_discount_credit` reverses
+a recorded `credit_id` by id and refuses (never reports done) one that is not
+ours.
+
+**A booked credit is remembered; a re-armed void survives the void's clear**
+(decisions §582). A credit the write-back applied (`posted`) leaves its id in
+`state_data.erp_discount_credits_booked[<payment id>]`; the void reverses it
+by that id (never by Xero's unconfirmed number lookup) and drops the entry,
+and a write-back re-run books no second credit while it is there. Re-arming a
+void also writes a fresh token to `state_data.erp_payment_void_rearmed`; the
+void reads it before its ERP call and clears the payment only if it is
+unchanged, so a write-back that lands mid-void leaves the void pending for the
+next pass. In both adapters any failure before the create request goes out
+(a 5xx or network error reading the bill, a token refresh) is `not_posted`, so
+the reservation is dropped instead of stalling as `unidentified`; QuickBooks
+also reads a token failure on the create call itself as `not_posted`, since
+the create was never taken (decisions §583). A dropped reservation is **not**
+retried automatically: the sweep (`resume_pending_credits`) walks only
+existing records, so the one retry is a manual write-back re-run (`POST
+/api/payments/runs/{id}/sync-erp`) while the invoice is `paid`. Until then
+the bill shows the discount open, and the `payment_writeback_balance_open` flag
+carries the reason as `discount_credit_failure` (decisions §583). Xero keeps
+a just-created note's id on every later failure. A recorded credit
+that reads back without our marker is refused as `discount_credit_not_ours` by
+both adapters' void and post: the record is held and flagged (`reason:
+discount_credit_not_ours`), never dropped or reported reversed.
+
+**A void reverses only a credit it has an entry for** (decisions §583). Every
+credit of ours is preceded by a committed reservation, so it always has an
+entry in `erp_discount_credits_pending`, `erp_discount_credit_voids_pending`
+or `erp_discount_credits_booked`. A payment void with none of them goes
+straight to `void_payment`: no lookup by number, so an org that never opted
+in never depends on Xero's unconfirmed filter. The void clears the booked
+entry only if it still holds the id it reversed, and a booked id that changed
+during the void's ERP call leaves the void pending. The
+`discount_credit_stalled` flag is kept one per payment and reason, so a live
+`unidentified` flag never hides a later `discount_credit_not_ours` with its
+id, nor another payment's stall on the same invoice.
+
+**The payment write is reserved too; a credit not ours no longer holds the
+void** (decisions §584). Before `post_payment`, the write-back commits
+`state_data.erp_payment_writes_pending[<payment id>]` (`token`, `bill_id`,
+`attempts`, `claimed_until`) under the same locks, and the transaction that
+records the outcome clears it when it still names that attempt's token — on
+success, or on a failure the adapter marks `not_posted` (refused before any
+write). Any other failure's outcome is unknown, since the payment may stand:
+the record is kept with its claim released (`unconfirmed: true`) for the
+sweep, a void that raced the send is re-armed (and then owns the record), and
+the flag is `erp_payment_writeback_unconfirmed` with `erp_report.outcome:
+unconfirmed` (decisions §588). If that transaction rolls back or the process dies, the
+status-sync sweep's `resume_pending_writes` (run before
+`resume_pending_voids`) finds the record once its claim lapses: a payment no
+longer `completed` has its void re-armed (fresh `erp_payment_void_rearmed`
+token) and the record dropped together, so the same pass voids whatever was
+written; a payment still `completed` is written back again, and the adapter's
+own find-by-payment-id (QuickBooks `PrivateNote`, Xero `Reference`, NetSuite
+`externalId`) answers with our earlier BillPayment instead of creating one. A
+live claim or `MAX_WRITE_ATTEMPTS` (12, then `payment.erp_post_failed` with
+`retries_exhausted` and a `payment_writeback_failed` flag with `failure:
+retries_exhausted`, the unconfirmed sentence, its own row) means nothing is
+sent. A record whose `bill_id` is not the bill the invoice points at now is
+kept and flagged (`failure: bill_changed`, `current_bill_id`), never retried
+against either bill. The invoice delete door counts the key as pending.
+A payment void whose credit reverse is refused `discount_credit_not_ours`
+calls `void_payment` anyway: `payment.erp_voided` carries
+`discount_credit_held: <id>`, the credit's entries stay, and the
+`discount_credit_stalled` flag (`reason: discount_credit_not_ours`) names it.
+A void that keeps failing records `erp_payment_void_attempts[<payment id>]`
+(`outcome`, `attempts`); `payment.erp_void_failed` is audited only when the
+outcome changes or `MAX_VOID_ATTEMPTS` (12) is reached, after which no pass
+calls the ERP for it until a write-back re-arms it (which resets the count).
+At the cap the flag says `failure: retries_exhausted` with `attempts`, on its
+own row. A person's **resolve** of either capped flag (write or void) clears
+the cap in the decision's transaction (`rearm_capped_on_resolve`; the
+`exception.resolved` row carries `erp_retry_rearmed` and the payment id); an
+agent's resolve or a dismiss does not (decisions §588).
+
+The code is exercised against `tools/fake-erp` and the adapter doubles only,
+not yet a real company; a read-back that is not what we wrote fails closed
+(`vendor_credit_unconfirmed` / `credit_note_unconfirmed`).
 
 ### Xero status sync-back and payment write-back
 
@@ -684,7 +895,8 @@ differs:
   supplier is posted and the bill stays open by the discount; the write-back's
   `erp_payment_writeback_balance_open` flag (with the discount taken in
   `erp_report.discount_amount`) tells the bookkeeper to record it there, and
-  no credit note is created on their behalf (§295's answer, kept). The credit
+  no credit note is created on their behalf unless the org opts in (§ Early-
+  payment discount booked as a vendor credit, below; decisions §575). The credit
   they then record is not "paid twice" only when our write-back is on the bill
   (`ErpBillReport.our_payment_applied`), nobody else's payment is, and what
   came off beyond our write-back (`reduced_outside_amount`) is no more than the
@@ -2533,10 +2745,52 @@ holder of `payment.void` can name that bill and void it:
 - `GET /api/invoices/{id}/erp-orphan-bill` runs `ErpAdapter.find_posted_bill`,
   the push's own pre-create idempotency match offered on its own and read-only
   (GETs / queries only). Offered by `supports_bill_lookup` on the class: the
-  **mock** (bills it posted this process, by correlation id) and **QuickBooks
-  Online** (`_find_existing`: DocNumber + vendor + our `PrivateNote` marker).
-  Every other adapter answers 409 `erp_lookup_unsupported`; their lookups live
-  inside `post_invoice` with client state and are wired one at a time. Only an
+  **mock** (bills it posted this process, by correlation id), **QuickBooks
+  Online** (`_find_existing`: DocNumber + vendor + our `PrivateNote` marker),
+  **NetSuite** (`GET vendorBill/eid:<correlation id>`, then the currency's ISO
+  code and, for a bill Paid In Full, what was applied to it — the reads
+  `get_invoice_status` makes; not gated on the §541 status-sync opt-in, since
+  it makes no status-sync call) and **Xero** (`_matching_bills`: a live ACCPAY
+  bill on our contact with our invoice number; two on one key, a bill on
+  another contact or at a status the filter did not ask for, raise
+  `XeroBillLookupAmbiguous`, a refused read `XeroRequestError`; both are 502
+  `erp_lookup_failed`) (decisions §566, §569), **Sage Accounting** (the
+  push's window, `_supplier_day_invoices`: the supplier's purchase invoices
+  dated on the invoice date, every page, matched on our
+  `FeohLedger <correlation id>` marker in `notes` as a whole token; the
+  status is read as `get_invoice_status` reads it, and the currency from the
+  invoice's `currency` link) and **Sage Accounting ZA** (the push's
+  `_find_existing` window, matched on `Reference` equal to our correlation id;
+  currency None, since the API names currencies only by numeric id)
+  (decisions §576). Both Sage lookups raise, never answer "none", on a window
+  they cannot read whole, two bills carrying our marker, or a live bill with
+  the supplier's number but not our marker (ours with the marker edited away
+  is not knowable from someone else's). Every other adapter answers 409
+  `erp_lookup_unsupported`; their lookups live inside `post_invoice` with
+  client state and are wired one at a time.
+- **A key that is not unique to one invoice is checked against the tenant.**
+  The mock, QuickBooks, NetSuite, Sage and Sage ZA keys carry the invoice's
+  correlation id
+  (`invoices.correlation_id` is unique), so a found bill is this invoice's
+  push or nothing. Xero's carries nothing of ours (an ACCPAY bill has no field
+  for it), so its class sets `bill_lookup_key_shared` and
+  `erp_bill_void.shared_lookup_keys` refuses the lookup — and the orphan void,
+  whose payload is built by the same `lookup_payload` — with 409
+  `erp_lookup_unsupported` while another invoice in the tenant carries the
+  same number (trimmed, case-folded) from the same vendor or any vendor that
+  could carry the same ERP contact, at any status. The contact is the one the
+  lookup sends (`vendor_erp_links.vendor_erp_ids` in the connected company:
+  the row link when live there, else a kept link) plus the vendor row's own
+  link, matched against every other vendor's row link and every link it keeps
+  under any company (wider than the ERP, so it errs toward refusing). One
+  bounded set of queries for a whole page of candidates, not one per invoice
+  (decisions §569). The served verdict
+  (`erp_orphan_lookup_refusal`) reads the same check, so the page never offers
+  a lookup the server refuses. What it cannot rule out is a bill someone keyed
+  by hand in Xero for the same supplier invoice: the push already adopts such a
+  bill at the approved total, and the lookup shows its number, total and status
+  for the person voiding to judge. The push applies the same check before
+  adopting a bill it finds (`erp_bill_key_shared`, decisions §572). Only an
   invoice at `failed`, naming no bill, whose state is `possibly_posted` is
   looked up (409 `erp_lookup_not_failed`). A lookup that cannot finish is 502
   `erp_lookup_failed`, never "none". Answers `{found, bill: {erp_document_id,
@@ -3096,10 +3350,10 @@ write-error guides (read 2026-11-13). Reasoning: `docs/decisions.md` §399.
   budget is spent for a tenant whose data key is cold, §408 / §525 / §527) is
   lost to Merge, which never redelivers a 204. The `merge-readback` sweep
   (`services/merge_readback_sweep`, `FEOH_MERGE_READBACK_SWEEP_ENABLED`, off by
-  default) is the backstop: per Merge tenant it asks `changed_bills(since)` for
-  the bills Merge changed after the tenant's cursor
-  (`Organization.settings.erp_merge_readback`: `through`, the moment the last
-  listing started, and `pending`, that listing's bills not yet applied; a first
+  default) is the backstop: per Merge tenant it asks `bill_change_feed(since,
+  until)` for the bills Merge changed after the tenant's cursor
+  (`Organization.settings.erp_merge_readback`: `through`, the end of the last
+  completed listing, and `pending`, that listing's bills not yet applied; a first
   pass looks back `FEOH_MERGE_READBACK_SWEEP_LOOKBACK_HOURS`; later passes ask
   from `through` less `FEOH_MERGE_READBACK_SWEEP_OVERLAP_MINUTES`, default 10,
   since `through` is our clock and a bill Merge stamped just before it by skew
@@ -3112,9 +3366,26 @@ write-error guides (read 2026-11-13). Reasoning: `docs/decisions.md` §399.
   A failed read, or the call budget, ends the pass with that bill still
   pending; a failed listing moves nothing. The cursor is written under the org
   row lock only if it is still what the pass read, so two replicas move it
-  once, and applying a bill twice changes nothing. A 404 is not read as gone
-  (the route reads it so only for `Invoice.removed`). Credentials that cannot
+  once, and applying a bill twice changes nothing. Credentials that cannot
   be opened skip the tenant with an error log that carries no exception text.
+- **Deletions and long feeds in the read-back sweep (decisions §567).**
+  Merge documents `remote_was_deleted` on the listing (asked with
+  `include_deleted_data=true`) but not what `GET /invoices/{id}` answers for a
+  record deleted in the ERP. So the feed also returns the bills the invoice
+  listing reports deleted, the sweep keeps them in the cursor (`deleted`), and
+  still reads each first: a 200 is applied as read (a restored bill is not
+  flagged), a 404 for a bill the listing called deleted applies `deleted`, as
+  the route does for a 404 on `Invoice.removed`, and a 404 for any other bill
+  is not read as gone. A listing longer than `SYNC_LISTING_MAX_ROWS`
+  (`ErpListingIncomplete`, truncated) moves nothing but halves the span it
+  asked into the cursor's `window_minutes`; the next tick lists only that
+  window (`modified_before`), a completed window moves `through` to its end
+  and doubles the next, and the one that reaches now drops the bound. Merge
+  documents no page order, so no part of a truncated listing is kept. A past
+  window is re-asked from its end less a second (`listed_at` keeps when it
+  was listed, for the §543 overlap); at one minute the window narrows no
+  further and the tenant fails each tick. Primary sources and dates:
+  decisions §567.
 - **No status sync, and why (decisions §504).** Read against the same spec on
   2026-11-24: Merge's `Payment` is `POST` / `GET` / `PATCH` only (no `DELETE`
   or void), and neither `Payment` nor `PaymentRequest` has a memo or reference
@@ -3449,6 +3720,50 @@ time Xero refuses the payments listing, and the settings panel shows it
   `Reference` is ACCREC-only in Xero, so no bill field can carry our
   correlation id; the create also sends `Idempotency-Key: <correlation_id>`
   (Xero replays the original response).
+- **A found bill is adopted only on a key no other invoice shares** (decisions
+  §572). The key is the supplier's invoice number, not one FeohLedger invoice,
+  so `services/erp._call_erp` asks `erp_bill_void.shared_lookup_keys` — the
+  orphan-bill lookup's own rule (same number trimmed and case-folded, same
+  vendor or a vendor carrying the same contact, any status) — and passes the
+  answer as `payload.bill_key_shared`. When it is set and the lookup finds a
+  live bill, the push refuses `erp_bill_key_shared` (non-retryable, never
+  `not_posted`: an earlier attempt of ours may have made that bill) whatever
+  its total: the bill is not adopted and no second one is created. With no
+  bill on the key the push creates as usual, so a number shared with a
+  rejected or done invoice blocks nothing until a bill is actually there. A
+  person checks in Xero which invoice the bill is for.
+- **A person can confirm the bill on a shared key as this invoice's**
+  (decisions §587, `services/erp_bill_confirm.py`). Every push that lands at
+  `failed` records its coded refusal on the workflow state
+  (`erp_last_refusal_code`; dropped when a new push starts). On a push last
+  refused `erp_bill_key_shared`, `GET /review-actions` serves
+  `erp_bill_confirm_refusal` (`null` = offered; `role_not_permitted` without
+  `payment.void` AND one of admin / ap_manager / cfo — the void's duty and
+  the retry's roles; `erp_bill_confirm_not_offered` otherwise). `GET
+  /api/invoices/{id}/erp-bill-confirmation` names the bill with the adapter's
+  own read-only lookup, without the orphan lookup's shared-key refusal
+  (naming it is the point; only the confirmation may follow). `POST
+  /api/invoices/{id}/confirm-erp-bill` `{erp_document_id, reason}` refuses a
+  bill another invoice holds (`erp_bill_claimed`: its `erp_document_id`, the
+  orphan its own failed push recorded, or its confirmation), re-runs the
+  lookup with no lock held, then under the invoice and instance locks and a
+  per-bill advisory lock re-checks the verdict, that the lookup still names
+  that id (`erp_bill_confirm_not_found`) and the claim, records
+  `erp_confirmed_bill` on the workflow state with an
+  `invoice.erp_bill_confirmed` audit row (actor, reason), and starts the
+  ordinary retry (`invoice.erp_retried`). The push passes the id as
+  `payload.confirmed_bill_id`; Xero adopts a found bill on a shared key only
+  when it is that id, at the approved total and in the payload's currency (a
+  different total is still `duplicate_document_number`; a bill in another
+  currency, or stating none, is `currency_mismatch` for any adoption). If a
+  retry gate refuses, the confirmation
+  stands and Retry ERP Send honours it later. The sharer's own push keeps
+  refusing, and its confirmation answers `erp_bill_claimed`. The confirmation
+  stops standing (decisions §588): a push that adopts it drops it (the bill of
+  record carries the claim); a push that succeeds on another bill, or is
+  refused `duplicate_document_number` with it, and the invoice's transition to
+  `rejected`, withdraw it with an `invoice.erp_bill_confirmation_withdrawn`
+  row (`reason`: `other_bill` / `total_changed` / `invoice_rejected`).
 - **The posted total is checked, on the bill read back.** After the create the
   adapter `GET`s `Invoices/{id}`. Xero computes `Total` from the lines and
   their tax types; a `Total` other than `amount` voids (AUTHORISED) or deletes
@@ -3576,6 +3891,7 @@ complete its consent flow. A ZA Sage adapter is separate work.
 | `list_pos` | — | base default `[]`: the v3.1 Accounting API has no purchase-order resource at all, on any plan |
 | `post_invoice` | `POST purchase_invoices` | below |
 | `get_invoice_status` | `GET purchase_invoices/{id}?show_payments_allocations=true` | DRAFT → draft; UNPAID/DISPUTED → open; PAID → paid only with a `contact_payment` allocation, else `settled_no_payment` (a credit note sets PAID too); PART_PAID → partially_paid on the same test, else open; VOID → cancelled (decisions §303, §390) |
+| `find_posted_bill` | `GET purchase_invoices` (the push's window, every page, `attributes` plus `currency`), then `GET purchase_invoices/{id}` for the status | the orphan-bill lookup (decisions §576): the live invoice carrying our `notes` marker, or none; raises on a window it cannot read whole, two carrying it, or a live namesake without it |
 | `void_invoice` | `DELETE purchase_invoices/{id}` | DRAFT deleted; unpaid UNPAID/DISPUTED voided with `void_reason`; anything with a payment allocated → `False`. The Swagger documents no parameter on the purchase DELETE, so whether Sage honours `void_reason` there is unverified (#654) |
 
 **Plan: Accounting Start cannot post.** The Swagger's Endpoint Availability
@@ -3689,6 +4005,7 @@ made while posting a bill stop at 10 pages.
 |---|---|
 | `post_invoice` | refuse pre-flight without a numeric `vendor_erp_id` (SupplierId) / numeric GL account ids, without an invoice date and a due date (`missing_dates` — both Required in Sage), with an invoice number over 100 characters (`doc_number_too_long`), or in a non-home currency → `SupplierInvoice/Get` idempotency lookup (integers and dates only, every page) → `Supplier/Get/{id}` (`Active`, + `Company/Get/{id}` currency check) → `Account/Get` + `TaxType/Get` → `SupplierInvoice/Save?useSystemDocumentNumber=false` |
 | `get_invoice_status` | `SupplierInvoice/Get/{id}` — `AmountDue` 0 ⇒ paid with Sage's `Paid` flag and a non-zero `Total`, else `settled_no_payment` (decisions §303); below `Total` ⇒ partially paid, else open |
+| `find_posted_bill` | `SupplierInvoice/Get`, the push's window (every page) — the orphan-bill lookup (decisions §576): the invoice whose `Reference` is our correlation id, or none; raises on a window it cannot read whole, a row without an ID, two carrying our Reference, or the supplier's number under another Reference. Status from the row as `get_invoice_status` reads it; currency None. The bill it names cannot be voided from FeohLedger (no delete, below) |
 | `void_invoice` | Always `False`, with no call. API 2.0.0 has **no** `SupplierInvoice/Delete` (the Help method list for SupplierInvoice is Get, Get/{id}, Save, Calculate, Email and Export). Reversing an invoice is a `SupplierReturn` allocated against it, which is an accountant's decision (decisions §303), so it is left to a person in Sage |
 | `list_vendors` / `list_gl_accounts` / `list_pos` | `Supplier/Get` (`Active` → `active`) / `Account/Get` (`Active` → `active`; category → asset/liability/equity/revenue/expense, unknown → unclassified) / `PurchaseOrder/Get` (`currency` left NULL — decisions §197; vendor linked by `SupplierId`, the supplier `ID` `list_vendors` stamps, before `SupplierName`; `Status` read by word since the real strings are unconfirmed (#654): cancel → cancelled, complete / closed / invoiced / processed → closed, draft / approval → unissued (decisions §394), else open) |
 | `test_connection` | `Company/Get` answers *and* lists the configured `company_id` |

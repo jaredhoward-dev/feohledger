@@ -475,6 +475,22 @@ def test_template_summary_names_an_erp_status_report():
     assert "was posted in the ERP, then updated by the ERP." in text
 
 
+def test_template_summary_reads_a_settled_peppol_send_by_its_outcome():
+    """A send whose process died is closed by an operator's settlement
+    (decisions §580). The started row is only the start, and the settled row
+    names the outcome it recorded, so a send settled as failed never reads as
+    a delivery."""
+    events = [
+        AuditEvent("invoice.peppol_send_started", "Tina TechAdmin", None, {"provider": "mock"}),
+        AuditEvent("invoice.peppol_send_settled", None, None, {"status": "failed"}),
+    ]
+    text = build_template_summary(_invoice(), events, None).text
+    assert text.endswith(
+        "was submitted over PEPPOL, then had its stalled PEPPOL send settled (failed)."
+    )
+    assert "sent over PEPPOL" not in text
+
+
 def test_build_prompt_carries_erp_outcome_and_its_meaning():
     """The LLM path sees the failure row with its status, and is told that a
     submission is not an acceptance."""

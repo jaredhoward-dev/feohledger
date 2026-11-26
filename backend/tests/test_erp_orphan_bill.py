@@ -91,12 +91,22 @@ def test_the_served_verdict_is_absent_off_a_candidate_and_coded_on_one():
 
     failed = SimpleNamespace(status=InvoiceStatus.failed, erp_document_id=None)
     unknown = SimpleNamespace(state_data={"erp_outcome_unknown": True})
+    bc = {"erp": {"type": "dynamics_365_bc", "integration_method": "direct"}}
     xero = {"erp": {"type": "xero", "integration_method": "direct"}}
     with patch("app.api.deps.holds_any_permission", return_value=True):
         assert orphan_lookup_verdicts(failed, unknown, _user(), None) == {KEY: None}
-        assert orphan_lookup_verdicts(failed, unknown, _user(), xero)[KEY]["code"] == (
+        assert orphan_lookup_verdicts(failed, unknown, _user(), bc)[KEY]["code"] == (
             "erp_lookup_unsupported"
         )
+        # Xero offers it (§566) unless another invoice shares its key.
+        assert orphan_lookup_verdicts(failed, unknown, _user(), xero) == {KEY: None}
+        assert orphan_lookup_verdicts(failed, unknown, _user(), xero, key_shared=True)[KEY][
+            "code"
+        ] == ("erp_lookup_unsupported")
+        # Both Sage adapters offer it (§576): their key is our correlation id.
+        for sage in ("sage_accounting", "sage_accounting_za"):
+            erp = {"erp": {"type": sage, "integration_method": "direct"}}
+            assert orphan_lookup_verdicts(failed, unknown, _user(), erp) == {KEY: None}
         # Never pushed / pushed cleanly / holds its own bill / no invoice: absent.
         assert orphan_lookup_verdicts(failed, SimpleNamespace(state_data={}), _user(), None) == {}
         assert orphan_lookup_verdicts(failed, None, _user(), None) == {}
@@ -139,7 +149,37 @@ def test_only_adapters_with_a_lookup_offer_it():
         lookup_supported({"erp": {"type": "quickbooks_online", "integration_method": "direct"}})
         is True
     )
-    assert lookup_supported({"erp": {"type": "xero", "integration_method": "direct"}}) is False
+    # Xero and NetSuite offer their push's own match too (decisions §566), and
+    # both Sage adapters (§576).
+    for erp in ("xero", "netsuite", "sage_accounting", "sage_accounting_za"):
+        assert lookup_supported({"erp": {"type": erp, "integration_method": "direct"}}) is True
+    assert (
+        lookup_supported({"erp": {"type": "dynamics_365_bc", "integration_method": "direct"}})
+        is False
+    )
+
+
+def test_only_xeros_key_is_marked_shared():
+    """The key a lookup matches on is unique to one invoice everywhere but
+    Xero (supplier + number); only Xero's is checked against the tenant's
+    other invoices (decisions §566)."""
+    from app.services.erp_adapters.dispatcher import adapter_class
+
+    for key in ("mock", "quickbooks_online", "netsuite", "sage_accounting", "sage_accounting_za"):
+        assert getattr(adapter_class(key), "bill_lookup_key_shared", False) is False, key
+    assert adapter_class("xero").bill_lookup_key_shared is True
+
+
+async def test_a_sage_key_is_never_checked_against_the_tenant():
+    """Both Sage keys carry our correlation id (§576), so no other invoice can
+    share one: `shared_lookup_keys` answers empty without a query."""
+    from app.services.erp_bill_void import shared_lookup_keys
+
+    db = SimpleNamespace(execute=AsyncMock(side_effect=AssertionError("no query")))
+    inv = SimpleNamespace(id=uuid.uuid4(), vendor_id=uuid.uuid4(), invoice_number="INV-1")
+    for sage in ("sage_accounting", "sage_accounting_za"):
+        settings = {"erp": {"type": sage, "integration_method": "direct"}}
+        assert await shared_lookup_keys(db, settings, [inv]) == set()
 
 
 async def test_the_mock_lookup_finds_what_it_posted_until_voided():
@@ -264,7 +304,7 @@ def _adapter(adapter):
     return patch("app.services.erp_adapters.get_erp_adapter", return_value=adapter)
 
 
-async def _seed(mk, org_id, *, number, status=InvoiceStatus.failed, unknown=True):
+async def _seed(mk, org_id, *, number, status=InvoiceStatus.failed, unknown=True, vendor_id=None):
     from app.services.workflow_engine import get_or_create_workflow_definition
 
     inv_id = uuid.uuid4()
@@ -272,6 +312,7 @@ async def _seed(mk, org_id, *, number, status=InvoiceStatus.failed, unknown=True
         inv = Invoice(
             id=inv_id,
             organization_id=org_id,
+            vendor_id=vendor_id,
             invoice_number=number,
             vendor_name="Northwind Supplies",
             amount=Decimal("1234.56"),
@@ -652,3 +693,281 @@ async def test_the_send_door_refuses_while_the_void_is_calling_the_erp(realdb):
     dispatched.assert_not_awaited()
     async with mk() as s:
         assert (await s.get(Invoice, inv_id)).status == InvoiceStatus.approved
+
+
+# ---------------------------------------------------------------------------
+# A lookup key shared with another invoice (Xero's supplier + number, §566)
+# ---------------------------------------------------------------------------
+
+
+class _SharedKeyClass:
+    supports_bill_lookup = True
+    bill_lookup_key_shared = True
+
+
+def _shared_key():
+    return patch(
+        "app.services.erp_bill_void._configured_adapter_class", return_value=_SharedKeyClass
+    )
+
+
+async def _vendor(mk, org_id, *, erp_id=None, realm=None):
+    from app.models.vendor import Vendor
+
+    vendor_id = uuid.uuid4()
+    async with mk() as s:
+        s.add(
+            Vendor(
+                id=vendor_id,
+                organization_id=org_id,
+                name=f"Shared Key Co {vendor_id.hex[:6]}",
+                erp_vendor_id=erp_id,
+                erp_link_realm=realm,
+            )
+        )
+        await s.commit()
+    return vendor_id
+
+
+@pytest.mark.parametrize("other", ["same_vendor", "same_erp_contact", "other_status"])
+async def test_a_key_another_invoice_shares_is_never_looked_up_or_voided(realdb, other):
+    """Xero matches a bill on supplier + number alone, so while another
+    invoice of this tenant carries the same number from the same supplier
+    (the same vendor, or one linked to the same ERP contact; any status;
+    case and spaces aside) the lookup could name THAT invoice's bill. It is
+    refused `erp_lookup_unsupported` before any ERP call, the served verdict
+    says the same, and the void is refused too."""
+    info = realdb.info(TENANT)
+    mk = realdb.sessionmaker(TENANT)
+    contact = f"xero-contact-{uuid.uuid4().hex[:8]}"
+    vendor = await _vendor(mk, info.org_id, erp_id=contact, realm="realm-a")
+    number = f"SK-{uuid.uuid4().hex[:6]}"
+    inv_id = await _seed(mk, info.org_id, number=number, vendor_id=vendor)
+    if other == "same_vendor":
+        await _seed(mk, info.org_id, number=f"  {number.lower()} ", vendor_id=vendor)
+    elif other == "same_erp_contact":
+        twin = await _vendor(mk, info.org_id, erp_id=contact, realm="realm-b")
+        await _seed(mk, info.org_id, number=number, vendor_id=twin)
+    else:
+        await _seed(
+            mk,
+            info.org_id,
+            number=number,
+            vendor_id=vendor,
+            status=InvoiceStatus.done,
+            unknown=False,
+        )
+    adapter = _Adapter()
+    with _adapter(adapter), _shared_key():
+        async with realdb.client(key=TENANT, role="admin") as c:
+            verdicts = (await c.get(f"/api/invoices/{inv_id}/review-actions")).json()
+            res = await c.get(f"/api/invoices/{inv_id}/erp-orphan-bill")
+            void = await c.post(
+                f"/api/invoices/{inv_id}/void-erp-orphan-bill",
+                json={"erp_document_id": "ORPHAN-1", "reason": "duplicate in the ERP"},
+            )
+    assert res.status_code == 409, res.text
+    assert res.json()["detail"]["code"] == "erp_lookup_unsupported"
+    assert verdicts["erp_orphan_lookup_refusal"]["code"] == "erp_lookup_unsupported"
+    assert void.status_code == 409, void.text
+    assert void.json()["detail"]["code"] == "erp_lookup_unsupported"
+    assert adapter.lookups == 0 and adapter.voided == []
+    async with mk() as s:
+        assert (await s.get(Invoice, inv_id)).erp_void_pending is None
+
+
+async def test_a_key_no_other_invoice_shares_is_looked_up(realdb):
+    """Another supplier's invoice with the same number, or this supplier's
+    with another number, shares nothing: the lookup runs."""
+    info = realdb.info(TENANT)
+    mk = realdb.sessionmaker(TENANT)
+    vendor = await _vendor(mk, info.org_id, erp_id=f"xero-contact-{uuid.uuid4().hex[:8]}")
+    stranger = await _vendor(mk, info.org_id, erp_id=f"xero-contact-{uuid.uuid4().hex[:8]}")
+    number = f"SK-{uuid.uuid4().hex[:6]}"
+    inv_id = await _seed(mk, info.org_id, number=number, vendor_id=vendor)
+    await _seed(mk, info.org_id, number=number, vendor_id=stranger)
+    await _seed(mk, info.org_id, number=f"{number}-2", vendor_id=vendor)
+    adapter = _Adapter()
+    with _adapter(adapter), _shared_key():
+        async with realdb.client(key=TENANT, role="admin") as c:
+            verdicts = (await c.get(f"/api/invoices/{inv_id}/review-actions")).json()
+            res = await c.get(f"/api/invoices/{inv_id}/erp-orphan-bill")
+    assert verdicts["erp_orphan_lookup_refusal"] is None
+    assert res.status_code == 200, res.text
+    assert res.json()["found"] is True and adapter.lookups == 1
+
+
+# ---------------------------------------------------------------------------
+# The shared-key check reads the contact the lookup sends (decisions §569)
+# ---------------------------------------------------------------------------
+
+_XERO_SETTINGS = {
+    "erp": {
+        "type": "xero",
+        "integration_method": "direct",
+        "oauth": {"external_tenant_id": "org-x"},
+    }
+}
+
+
+async def _kept(mk, org_id, vendor_id, *, realm, erp_id):
+    from app.models.vendor import VendorErpLink
+
+    async with mk() as s:
+        s.add(
+            VendorErpLink(
+                organization_id=org_id, vendor_id=vendor_id, realm=realm, erp_vendor_id=erp_id
+            )
+        )
+        await s.commit()
+
+
+@pytest.mark.parametrize("sharer", ["row_link", "kept_link"])
+async def test_the_shared_key_follows_the_contact_the_lookup_sends(realdb, sharer):
+    """V1's row link is D in another company, and C is the link kept for the
+    connected one, so the lookup sends ContactIDs=C. Another vendor holding C
+    (as its row link, or kept under any company) with an invoice of the same
+    number shares the key: reading only V1's row link (D) missed it, and the
+    lookup could have named, and the void voided, that invoice's bill."""
+    from app.services.erp_bill_void import shared_lookup_keys
+    from app.services.erp_link_realm import connection_realm
+
+    info = realdb.info(TENANT)
+    mk = realdb.sessionmaker(TENANT)
+    realm = connection_realm(_XERO_SETTINGS["erp"])
+    c_id = f"xero-c-{uuid.uuid4().hex[:8]}"
+    v1 = await _vendor(mk, info.org_id, erp_id=f"xero-d-{uuid.uuid4().hex[:8]}", realm="xero:org-y")
+    await _kept(mk, info.org_id, v1, realm=realm, erp_id=c_id)
+    if sharer == "row_link":
+        v2 = await _vendor(mk, info.org_id, erp_id=c_id, realm=realm)
+    else:
+        v2 = await _vendor(mk, info.org_id, erp_id=f"xero-e-{uuid.uuid4().hex[:8]}", realm=realm)
+        await _kept(mk, info.org_id, v2, realm="xero:org-z", erp_id=c_id)
+    number = f"INV-{uuid.uuid4().hex[:6]}"
+    await _seed(mk, info.org_id, number=number, vendor_id=v2, status=InvoiceStatus.done)
+    mine = await _seed(mk, info.org_id, number=number, vendor_id=v1)
+    lone = await _seed(mk, info.org_id, number=f"{number}-LONE", vendor_id=v1)
+    async with mk() as s:
+        invoices = [await s.get(Invoice, mine), await s.get(Invoice, lone)]
+        assert await shared_lookup_keys(s, _XERO_SETTINGS, invoices) == {mine}
+
+
+async def test_the_shared_key_check_is_a_bounded_number_of_queries(realdb):
+    """A page of exceptions asks for every failed push at once: the check is
+    the same handful of statements for one invoice as for many."""
+    from app.services.erp_bill_void import shared_lookup_keys
+    from tests.query_counter import QueryCounter
+
+    info = realdb.info(TENANT)
+    mk = realdb.sessionmaker(TENANT)
+    ids = []
+    for _ in range(6):
+        vendor = await _vendor(mk, info.org_id, erp_id=f"xero-q-{uuid.uuid4().hex[:8]}")
+        ids.append(
+            await _seed(mk, info.org_id, number=f"QC-{uuid.uuid4().hex[:6]}", vendor_id=vendor)
+        )
+    async with mk() as s:
+        invoices = [await s.get(Invoice, i) for i in ids]
+        with QueryCounter() as one:
+            await shared_lookup_keys(s, _XERO_SETTINGS, invoices[:1])
+        with QueryCounter() as many:
+            await shared_lookup_keys(s, _XERO_SETTINGS, invoices)
+    assert len(many) == len(one) <= 3
+
+
+async def test_the_exception_list_and_detail_carry_the_shared_key_refusal(realdb):
+    """The queue serves the same verdict the lookup gives: a duplicate flag on
+    a failed push whose key another invoice shares says
+    `erp_lookup_unsupported`, on the list row and the detail alike."""
+    from app.services.exception_service import create_exception
+
+    info = realdb.info(TENANT)
+    mk = realdb.sessionmaker(TENANT)
+    vendor = await _vendor(mk, info.org_id, erp_id=f"xero-contact-{uuid.uuid4().hex[:8]}")
+    tag = uuid.uuid4().hex[:6]
+    number = f"ORPH-S-{tag}"
+    failed = await _seed(mk, info.org_id, number=number, vendor_id=vendor)
+    await _seed(mk, info.org_id, number=number, vendor_id=vendor, status=InvoiceStatus.done)
+    async with mk() as s:
+        exc = await create_exception(
+            s,
+            exception_type="duplicate",
+            severity="error",
+            description="detector output",
+            organization_id=info.org_id,
+            invoice=await s.get(Invoice, failed),
+            raised_by_user_id=None,
+        )
+        exc_id = str(exc.id)
+        await s.commit()
+    with _adapter(_Adapter()), _shared_key():
+        async with realdb.client(key=TENANT, role="admin") as c:
+            detail = (await c.get(f"/api/exceptions/{exc_id}")).json()
+            listed = (await c.get("/api/exceptions", params={"search": number})).json()
+    assert detail["erp_orphan_lookup_refusal"]["code"] == "erp_lookup_unsupported"
+    row = next(r for r in listed["items"] if r["id"] == exc_id)
+    assert row["erp_orphan_lookup_refusal"]["code"] == "erp_lookup_unsupported"
+
+
+# ---------------------------------------------------------------------------
+# The push applies the same shared-key rule before adopting a bill (§572)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("shared", [True, False])
+async def test_the_push_tells_the_adapter_when_its_key_is_shared(realdb, shared):
+    """`_call_erp` asks `shared_lookup_keys` (the orphan lookup's own rule) for
+    the configured Xero connection and hands the verdict to the adapter as
+    `payload.bill_key_shared`, which refuses to adopt a bill found on the key.
+    The real Xero class is resolved from the config, not a stand-in, so the
+    flag on `XeroAdapter` is what turns the check on."""
+    from app.services.erp import _call_erp
+    from app.services.erp_adapters.base import ErpPostResult
+
+    info = realdb.info(TENANT)
+    mk = realdb.sessionmaker(TENANT)
+    vendor = await _vendor(mk, info.org_id, erp_id=f"xero-push-{uuid.uuid4().hex[:8]}")
+    number = f"PUSH-{uuid.uuid4().hex[:6]}"
+    mine = await _seed(mk, info.org_id, number=number, vendor_id=vendor)
+    await _seed(
+        mk,
+        info.org_id,
+        number=number if shared else f"{number}-OTHER",
+        vendor_id=vendor,
+        status=InvoiceStatus.rejected,
+        unknown=False,
+    )
+    seen: list[bool] = []
+
+    class _Capture:
+        async def post_invoice(self, payload):
+            seen.append(payload.bill_key_shared)
+            return ErpPostResult(success=True, erp_document_id="XERO-BILL-1")
+
+    async with mk() as s:
+        inv = await s.get(Invoice, mine)
+        inv.status = InvoiceStatus.approved
+        with patch("app.services.erp.get_erp_adapter", return_value=_Capture()):
+            await _call_erp(s, inv, dict(_XERO_SETTINGS["erp"]))
+    assert seen == [shared]
+
+
+async def test_the_push_asks_nothing_for_an_adapter_whose_key_is_its_own(realdb):
+    """Every other adapter's key is unique to one invoice: no shared-key query
+    runs and the flag stays False (§572)."""
+    from app.services.erp_bill_void import shared_lookup_keys
+    from tests.query_counter import QueryCounter
+
+    info = realdb.info(TENANT)
+    mk = realdb.sessionmaker(TENANT)
+    vendor = await _vendor(mk, info.org_id, erp_id=f"qbo-{uuid.uuid4().hex[:8]}")
+    number = f"OWN-{uuid.uuid4().hex[:6]}"
+    mine = await _seed(mk, info.org_id, number=number, vendor_id=vendor)
+    await _seed(mk, info.org_id, number=number, vendor_id=vendor, status=InvoiceStatus.done)
+    async with mk() as s:
+        inv = await s.get(Invoice, mine)
+        with QueryCounter() as queries:
+            found = await shared_lookup_keys(
+                s, {"erp": {"type": "mock", "integration_method": "direct"}}, [inv]
+            )
+    assert found == set() and len(queries) == 0

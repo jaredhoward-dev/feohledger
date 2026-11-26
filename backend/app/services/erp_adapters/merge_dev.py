@@ -65,6 +65,7 @@ Checked against the same spec, read 2026-11-24 (decisions §504):
 
 import logging
 import re
+from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 
@@ -264,6 +265,22 @@ class _LookupUnauthorized(Exception):
 
 class MergeBillNotFound(LookupError):
     """Merge answered 404 for a bill id."""
+
+
+@dataclass(frozen=True)
+class MergeChangeFeed:
+    """One window of Merge's change feed (:meth:`MergeDevAdapter.bill_change_feed`).
+    Ids only."""
+
+    #: Every bill changed in the window, listing order, deduplicated.
+    bills: list[str]
+    #: The bills the invoice listing reports ``remote_was_deleted``.
+    deleted: frozenset[str] = frozenset()
+
+
+def _merge_stamp(moment: datetime) -> str:
+    """A timezone-aware moment as Merge's ``modified_after`` / ``modified_before``."""
+    return moment.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _outcome_unknown(message: str) -> ErpPostResult:
@@ -968,41 +985,72 @@ class MergeDevAdapter(ErpAdapter):
         return report
 
     async def changed_bills(self, since: datetime) -> list[str]:
-        """Bills Merge has changed since ``since``: every ``ACCOUNTS_PAYABLE``
-        invoice ``GET /invoices?modified_after=`` lists, plus each bill a
-        payment ``GET /payments?modified_after=`` lists is applied to, so a
-        payment applied or deleted reads as a change of its bill whether or not
-        the bill's own ``modified_at`` moved (Xero's shape, decisions §386).
-        ``modified_after`` is Merge's own sync time (``modified_at``), so it is
-        a change feed, not the ERP's edit time. ``include_deleted_data`` keeps
-        a bill or payment deleted in the ERP in the listing.
+        """Bills Merge has changed since ``since`` — :meth:`bill_change_feed`'s
+        ``bills``, the base contract. The ``merge-readback`` sweep reads the
+        feed itself, for the deletions it carries and its ``until`` bound."""
+        return (await self.bill_change_feed(since)).bills
+
+    async def bill_change_feed(
+        self, since: datetime, until: datetime | None = None
+    ) -> MergeChangeFeed:
+        """Bills Merge has changed in ``(since, until)``: every
+        ``ACCOUNTS_PAYABLE`` invoice ``GET /invoices?modified_after=`` lists,
+        plus each bill a payment ``GET /payments?modified_after=`` lists is
+        applied to, so a payment applied or deleted reads as a change of its
+        bill whether or not the bill's own ``modified_at`` moved (Xero's shape,
+        decisions §386). ``modified_after`` / ``modified_before`` are Merge's
+        own sync time (``modified_at``: "synced by Merge after / before this
+        date time"), so this is a change feed, not the ERP's edit time; an
+        ``until`` of None asks with no upper bound. ``include_deleted_data``
+        keeps a bill or payment deleted in the ERP in the listing.
+
+        ``deleted`` names the bills the invoice listing itself reports
+        ``remote_was_deleted``. Merge documents that flag on the listing and
+        says nothing of what ``GET /invoices/{id}`` answers for a deleted
+        record, so the listing's word is kept for the sweep: a 404 on the
+        single read is then a deletion Merge stated, not one we inferred
+        (decisions §567).
 
         The whole listing or a raise (:class:`ErpListingIncomplete`): a page
         Merge refuses, an unreadable body, or more than
-        :data:`SYNC_LISTING_MAX_ROWS` rows. Bills only — the reports themselves
-        are read by :meth:`bill_report`. Read by the ``merge-readback`` sweep
+        :data:`SYNC_LISTING_MAX_ROWS` rows (``ListingGap.truncated``, on which
+        the sweep narrows its window). Bills only — the reports themselves are
+        read by :meth:`bill_report`. Read by the ``merge-readback`` sweep
         (``services/merge_readback_sweep``, decisions §540), the backstop for a
         dropped webhook delivery; the status-sync sweep reads only adapters
         with ``supports_status_sync``, which Merge does not have (§504).
 
-        ``since`` must be timezone-aware: ``astimezone`` would read a naive one
-        as the host's local time and shift the window by its UTC offset, so a
-        naive ``since`` is a :class:`ValueError`, not a guess."""
-        if since.tzinfo is None or since.utcoffset() is None:
-            raise ValueError("changed_bills needs a timezone-aware `since`")
-        stamp = since.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
-        common = {"modified_after": stamp, "include_deleted_data": "true", "page_size": "100"}
+        ``since`` and ``until`` must be timezone-aware: ``astimezone`` would
+        read a naive one as the host's local time and shift the window by its
+        UTC offset, so a naive one is a :class:`ValueError`, not a guess."""
+        for moment in (since, until):
+            if moment is not None and (moment.tzinfo is None or moment.utcoffset() is None):
+                raise ValueError("bill_change_feed needs a timezone-aware `since` / `until`")
+        common = {
+            "modified_after": _merge_stamp(since),
+            "include_deleted_data": "true",
+            "page_size": "100",
+        }
+        if until is not None:
+            common["modified_before"] = _merge_stamp(until)
         invoices = await self._list_complete("invoices", {**common, "type": "ACCOUNTS_PAYABLE"})
-        bills = [
-            r.get("id")
-            for r in invoices
+        bills: list = []
+        deleted: set[str] = set()
+        for r in invoices:
             # The filter is Merge's; a receivable it lists anyway is not a bill.
-            if str(r.get("type") or "ACCOUNTS_PAYABLE").upper() == "ACCOUNTS_PAYABLE"
-        ]
+            if str(r.get("type") or "ACCOUNTS_PAYABLE").upper() != "ACCOUNTS_PAYABLE":
+                continue
+            bill_id = r.get("id")
+            bills.append(bill_id)
+            if r.get("remote_was_deleted") is True and isinstance(bill_id, str) and bill_id:
+                deleted.add(bill_id)
         payments = await self._list_complete("payments", {**common, "expand": "applied_to_lines"})
         for payment in payments:
             bills.extend(payment_bill_ids(payment))
-        return list(dict.fromkeys(b for b in bills if isinstance(b, str) and b))
+        return MergeChangeFeed(
+            bills=list(dict.fromkeys(b for b in bills if isinstance(b, str) and b)),
+            deleted=frozenset(deleted),
+        )
 
     async def bills_for_payment(self, payment_id: str) -> list[str]:
         """The bills a Merge Payment is applied to (``GET /payments/{id}``,

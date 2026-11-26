@@ -577,6 +577,20 @@ never 403). Audit rows are `discount_offer.accepted_by_vendor` /
 control-plane user). No migration — the `DiscountOffer` table already exists.
 See `supplier-portal.md` § Early-payment discount offers.
 
+## The discount in the ERP (decisions §575)
+
+A captured discount pays the supplier less, and the payment write-back posts
+exactly what reached them (§295, §386). No ERP payment carries a discount, so
+by default the bill stays open there by `Payment.discount_amount` and the
+`erp_payment_writeback_balance_open` exception asks a person to book it. An org
+on QuickBooks Online or Xero can opt in, in Organization → ERP ("Book
+early-payment discounts as a vendor credit", with the account picked from the
+synced chart): the write-back then books the discount as a vendor credit
+(QuickBooks `VendorCredit`, Xero ACCPAY credit note) to that account and applies
+it to the bill, idempotent on the payment id; a payment void reverses it.
+A credit that cannot be booked leaves the flag, with its code. Detail:
+`erp-integration.md` § Early-payment discount booked as a vendor credit.
+
 ## Config (`FEOH_` env vars)
 
 | Var | Default | Purpose |

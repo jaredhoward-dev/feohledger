@@ -365,10 +365,18 @@ class _PaymentQueueScreenState extends State<PaymentQueueScreen>
     final dueText = item.dueDate != null
         ? l.payQueueDue(formatDate(item.dueDate!))
         : l.payQueueNoDueDate;
+    // `dueDate` is the EFFECTIVE date — what [isOverdue] and the queue's order
+    // read; when a payment schedule moved it, the invoice's own date is said
+    // beside it, in the row and in its announcement (decisions §565).
+    final movedFrom = item.rescheduledFrom;
+    final rescheduledText = movedFrom == null
+        ? null
+        : l.payQueueRescheduledFrom(formatDate(movedFrom));
 
     final subtitleParts = <String>[
       item.invoiceNumber,
       dueText,
+      ?rescheduledText,
       if (item.discountEligible && item.discountAmountDisplay != null)
         l.payQueueDiscount(_money(item.discountAmountDisplay!, item.currency)),
     ];
@@ -449,6 +457,18 @@ class _PaymentQueueScreenState extends State<PaymentQueueScreen>
                     _methodDropdown(item),
                 ],
               ),
+              if (rescheduledText != null)
+                Padding(
+                  padding: const EdgeInsets.only(top: 2),
+                  child: Text(
+                    rescheduledText,
+                    key: ValueKey('pay-queue-rescheduled-${item.id}'),
+                    style: TextStyle(
+                      color: Colors.grey.shade700,
+                      fontSize: 12,
+                    ),
+                  ),
+                ),
               if (reason != null)
                 Padding(
                   padding: const EdgeInsets.only(top: 6),

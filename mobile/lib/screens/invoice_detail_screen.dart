@@ -14,6 +14,7 @@ import 'package:feohledger_mobile/stores/invoice_store.dart';
 import 'package:feohledger_mobile/utils/a11y.dart';
 import 'package:feohledger_mobile/utils/dates.dart';
 import 'package:feohledger_mobile/utils/money.dart';
+import 'package:feohledger_mobile/utils/review_assignment.dart';
 import 'package:feohledger_mobile/widgets/activity_timeline.dart';
 import 'package:feohledger_mobile/widgets/erp_status_panel.dart';
 import 'package:feohledger_mobile/widgets/invoice_edit_sheet.dart';
@@ -737,6 +738,30 @@ class _InvoiceDetailScreenState extends State<InvoiceDetailScreen> {
       if (approveOffered) ?_refusalText(l, _approveVerdict),
       if (rejectOffered) ?_refusalText(l, _rejectVerdict),
     };
+    // Assignment is routing, not authority (decisions §564): the buttons
+    // follow the verdict alone, and a note names the colleague the invoice is
+    // routed to so nobody decides it unawares. Each button's semantics hint
+    // carries the note and that button's own refusal, the twin of the web
+    // modal's `aria-describedby`; MergeSemantics folds the hint into the
+    // button's own node (a bare `Semantics(hint:)` is no boundary, so the hint
+    // would bubble up to the bar instead). The button's own node is merged
+    // INTO that boundary and keeps its flags there, so the boundary states the
+    // enabled state too: it is the node a screen reader lands on, and a
+    // refused button is an inactive control, which WCAG 1.4.3 exempts from
+    // text contrast like every other disabled button here (decisions §571).
+    final assignee = assignedElsewhere(inv, AuthStore.instance.user?.id);
+    final assignedNote = assignee == null
+        ? null
+        : assignee.name == null
+        ? l.invoiceDetailAssignedElsewhereUnnamed
+        : l.invoiceDetailAssignedElsewhere(assignee.name!);
+    String? hintFor(ActionVerdict verdict) {
+      final parts = [?assignedNote, ?_refusalText(l, verdict)];
+      return parts.isEmpty ? null : parts.join(' ');
+    }
+
+    final rejectEnabled = !_submitting && _rejectVerdict.allowed;
+    final approveEnabled = !_submitting && _approveVerdict.allowed;
 
     return SafeArea(
       child: Padding(
@@ -745,6 +770,16 @@ class _InvoiceDetailScreenState extends State<InvoiceDetailScreen> {
           mainAxisSize: MainAxisSize.min,
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
+            if (assignedNote != null) ...[
+              Text(
+                assignedNote,
+                key: const ValueKey('review-assigned-elsewhere'),
+                style: TextStyle(
+                  color: Theme.of(context).colorScheme.onSurfaceVariant,
+                ),
+              ),
+              const SizedBox(height: 8),
+            ],
             if (refusals.isNotEmpty) ...[
               Text(
                 refusals.join(' '),
@@ -759,34 +794,44 @@ class _InvoiceDetailScreenState extends State<InvoiceDetailScreen> {
               children: [
                 if (rejectOffered)
                   Expanded(
-                    child: OutlinedButton.icon(
-                      key: const ValueKey('review-reject'),
-                      onPressed:
-                          _submitting || !_rejectVerdict.allowed ? null : _reject,
-                      icon: const Icon(Icons.close),
-                      label: Text(l.invoiceDetailReject),
-                      style: _rejectStyle(context),
+                    child: MergeSemantics(
+                      key: const ValueKey('review-reject-semantics'),
+                      child: Semantics(
+                        hint: hintFor(_rejectVerdict),
+                        enabled: rejectEnabled,
+                        child: OutlinedButton.icon(
+                          key: const ValueKey('review-reject'),
+                          onPressed: rejectEnabled ? _reject : null,
+                          icon: const Icon(Icons.close),
+                          label: Text(l.invoiceDetailReject),
+                          style: _rejectStyle(context),
+                        ),
+                      ),
                     ),
                   ),
                 if (rejectOffered && approveOffered) const SizedBox(width: 16),
                 if (approveOffered)
                   Expanded(
-                    child: FilledButton.icon(
-                      key: const ValueKey('review-approve'),
-                      onPressed:
-                          _submitting || !_approveVerdict.allowed
-                          ? null
-                          : _approve,
-                      icon: const Icon(Icons.check),
-                      label: Text(l.invoiceDetailApprove),
-                      // green.shade800 under a white label is ~5.1:1; the
-                      // full-saturation green was 2.78:1 (WCAG 1.4.3). Set
-                      // for the enabled state only, so a refused verdict
-                      // keeps the theme's disabled look.
-                      style: FilledButton.styleFrom(
-                        padding: const EdgeInsets.symmetric(vertical: 14),
-                        backgroundColor: Colors.green.shade800,
-                        foregroundColor: Colors.white,
+                    child: MergeSemantics(
+                      key: const ValueKey('review-approve-semantics'),
+                      child: Semantics(
+                        hint: hintFor(_approveVerdict),
+                        enabled: approveEnabled,
+                        child: FilledButton.icon(
+                          key: const ValueKey('review-approve'),
+                          onPressed: approveEnabled ? _approve : null,
+                          icon: const Icon(Icons.check),
+                          label: Text(l.invoiceDetailApprove),
+                          // green.shade800 under a white label is ~5.1:1; the
+                          // full-saturation green was 2.78:1 (WCAG 1.4.3). Set
+                          // for the enabled state only, so a refused verdict
+                          // keeps the theme's disabled look.
+                          style: FilledButton.styleFrom(
+                            padding: const EdgeInsets.symmetric(vertical: 14),
+                            backgroundColor: Colors.green.shade800,
+                            foregroundColor: Colors.white,
+                          ),
+                        ),
                       ),
                     ),
                   ),

@@ -271,6 +271,7 @@ async def open_erp_reconciliation_exception(
     finding: dict,
     exception_type: str = ERP_RECONCILIATION_EXCEPTION_TYPE,
     erp_report: dict,
+    dedupe_on: tuple[str, ...] = (),
 ) -> bool:
     """Open ONE reconciliation exception for human review, PII-free.
 
@@ -285,6 +286,12 @@ async def open_erp_reconciliation_exception(
     one swallowed by an UNRELATED live row of the same type is never repeated —
     once a person resolves that row, nothing would block the run, or tell
     anyone, for the fact this report carried. Every caller states a kind.
+
+    ``dedupe_on`` names further ``erp_report`` keys the live row must also
+    match, for a kind whose one invoice can carry several facts a person
+    resolves apart — the discount-credit stall is keyed by payment and reason
+    (decisions §583), so a live flag for one payment, or for one reason, never
+    swallows another's.
 
     A ``paid_not_recorded`` report goes through :func:`_keep_erp_paid_report`
     instead, which keeps at most ONE live such row per invoice and refreshes it.
@@ -307,7 +314,8 @@ async def open_erp_reconciliation_exception(
             exception_type=exception_type,
             erp_report=erp_report,
         )
-    if await live_erp_report_of_kind(db, invoice.id, exception_type, kind):
+    match = {key: erp_report.get(key) for key in dedupe_on}
+    if await live_erp_report_of_kind(db, invoice.id, exception_type, kind, match=match):
         return False
     await _create_reconciliation(
         db,
@@ -321,19 +329,28 @@ async def open_erp_reconciliation_exception(
 
 
 async def live_erp_report_of_kind(
-    db: AsyncSession, invoice_id: uuid.UUID, exception_type: str, kind: str
+    db: AsyncSession,
+    invoice_id: uuid.UUID,
+    exception_type: str,
+    kind: str,
+    *,
+    match: dict[str, object] | None = None,
 ) -> bool:
     """Is an open or escalated exception of ``exception_type`` AND
     ``erp_report["kind"]`` live on the invoice? The one dedupe rule for ERP
-    reconciliation rows (decisions §533, §535)."""
-    existing = await db.execute(
-        select(func.count()).where(
-            APException.invoice_id == invoice_id,
-            APException.exception_type == exception_type,
-            APException.status.in_(("open", "escalated")),
-            APException.erp_report["kind"].astext == kind,
-        )
-    )
+    reconciliation rows (decisions §533, §535). ``match`` narrows it to a row
+    whose ``erp_report`` also carries each of those values (a None value
+    matches a key absent or null), decisions §583."""
+    conditions = [
+        APException.invoice_id == invoice_id,
+        APException.exception_type == exception_type,
+        APException.status.in_(("open", "escalated")),
+        APException.erp_report["kind"].astext == kind,
+    ]
+    for key, value in (match or {}).items():
+        field = APException.erp_report[key].astext
+        conditions.append(field.is_(None) if value is None else field == str(value))
+    existing = await db.execute(select(func.count()).where(*conditions))
     return (existing.scalar() or 0) > 0
 
 
@@ -2079,7 +2096,11 @@ async def sync_org(org: Organization, *, now: datetime, result: StatusSyncResult
         scope_gaps,
         update_connection_metadata,
     )
-    from app.services.erp_payment_writeback import resume_pending_voids
+    from app.services.erp_payment_writeback import (
+        resume_pending_credits,
+        resume_pending_voids,
+        resume_pending_writes,
+    )
 
     oauth_meta = ((org.settings or {}).get("erp") or {}).get("oauth") or {}
     erp_config = await _resolved_erp(org)
@@ -2129,7 +2150,13 @@ async def sync_org(org: Organization, *, now: datetime, result: StatusSyncResult
     result.bills_read += len(set(bill_ids))
     if bill_ids:
         result.invoices_changed += await sync_bills(org, bill_ids, event_id=None)
+    # A payment write whose outcome went unrecorded (decisions §584) first: a
+    # void it re-arms is then voided in this same pass.
+    await resume_pending_writes(org)
     result.voids_pending += await resume_pending_voids(org)
+    # A discount credit created but not applied (decisions §577) is applied
+    # after the voids, so a voided payment's credit is reversed, never applied.
+    await resume_pending_credits(org)
     if oauth_backed:
         await update_connection_metadata(
             provider, org.id, connection_id, {SYNCED_THROUGH_KEY: now.isoformat()}

@@ -797,6 +797,30 @@ class AppLocalizationsJa extends AppLocalizations {
       'この請求書の支払いにバーチャルカードが発行されています。承認を取り消す前に、カードを取り消してください。';
 
   @override
+  String get codedRefusalRecallPeppolTransmitted =>
+      'この請求書はすでにPEPPOLで送信されており、受信者が承認済みの文書を保持しています。クレジットノートを発行し、訂正した請求書を送信してください。承認を取り消すことはできません。';
+
+  @override
+  String get codedRefusalRecallMirrorUnsigned =>
+      'この請求書はグループ会社間で振り替えられており、相手先エンティティのミラー請求書が承認済みの金額を引き継いでいます。ミラー請求書（まだ承認されていません）を削除してからこの承認を取り消し、再承認後に請求書を再度振り替えてください。';
+
+  @override
+  String get codedRefusalRecallMirrorProgressed =>
+      'この請求書はグループ会社間で振り替えられており、相手先エンティティのミラー請求書はすでに承認済みか支払い中です。双方でクレジットメモを発行して訂正してください。この承認を取り消すことはできません。';
+
+  @override
+  String get codedRefusalRecallIsMirror =>
+      'この請求書はグループ会社間のミラー請求書です。金額は相手先エンティティの元の請求書からコピーされています。このミラー請求書を削除し、元の請求書を訂正してから再度振り替えてください。';
+
+  @override
+  String get codedRefusalPartnerCapabilityRequired =>
+      'このワークスペースはパートナーとして設定されていません。パートナー管理は FeohLedger が申請に応じて有効にします — 他のワークスペースを再販または管理する場合はサポートにお問い合わせください。';
+
+  @override
+  String get codedRefusalPartnerLinkingDisabled =>
+      'このプラットフォームではパートナー連携がまだ有効になっていないため、リンクコードを生成できません。サポートにお問い合わせください。';
+
+  @override
   String invoicesBulkRejectTitle(int count) {
     return '$count件の請求書を却下';
   }
@@ -2384,6 +2408,11 @@ class AppLocalizationsJa extends AppLocalizations {
   }
 
   @override
+  String erpRefusalBillKeyShared(String provider) {
+    return '$provider には既にこの仕入先とこの請求書番号の請求書があり、FeohLedger の別の請求書にも同じ仕入先と番号があるため、その請求書をこの請求書に紐付けず、2 件目も作成しませんでした。$provider でその請求書がどの請求書のものか確認してください。この請求書の番号が誤っている場合は修正して再試行し、そうでない場合は管理者に対応方法を確認してください。';
+  }
+
+  @override
   String erpRefusalExceptionBlocksExport(String type) {
     return 'この請求書には未解決の例外（$type）があります。「例外」で解決または却下してから、ERP に送信してください。';
   }
@@ -3733,6 +3762,21 @@ class AppLocalizationsJa extends AppLocalizations {
       'ご利用の ERP はこの請求書の支払いを記録しなかったため、資金は支払済みにもかかわらず、ERP では請求書が未払いのまま表示されています。原因を解消してから、「支払い」でこの支払いの支払実行にある「ERP連携を再実行」を使用してください。';
 
   @override
+  String exceptionDescriptionErpPaymentWritebackUnconfirmed(
+    String erp,
+    String marker,
+  ) {
+    return '$erp にはこの請求書の支払いがすでに表示されている可能性があります。FeohLedger は支払いを送信しましたが、記録されたことを確認できませんでした。支払いを記録する前に、請求書に参照「$marker」の支払いがないか確認してください。';
+  }
+
+  @override
+  String exceptionDescriptionErpPaymentWritebackUnconfirmedUnnamed(
+    String marker,
+  ) {
+    return 'ご利用の ERP にはこの請求書の支払いがすでに表示されている可能性があります。FeohLedger は支払いを送信しましたが、記録されたことを確認できませんでした。支払いを記録する前に、請求書に参照「$marker」の支払いがないか確認してください。';
+  }
+
+  @override
   String exceptionDescriptionErpPaymentWritebackBalanceOpen(
     String erp,
     String amount,
@@ -3748,6 +3792,40 @@ class AppLocalizationsJa extends AppLocalizations {
   }
 
   @override
+  String exceptionDescriptionErpDiscountCreditPending(
+    String erp,
+    String amount,
+    String credit,
+  ) {
+    return '$erp はこの請求書の支払いを記録しましたが、請求書にはまだ $amount の未決済残高が表示されています。FeohLedger は早期支払割引のクレジット $credit を計上済みで、これから適用します。別のクレジットは計上しないでください。';
+  }
+
+  @override
+  String exceptionDescriptionErpDiscountCreditPendingUnnamed(
+    String amount,
+    String credit,
+  ) {
+    return 'ご利用の ERP はこの請求書の支払いを記録しましたが、請求書にはまだ $amount の未決済残高が表示されています。FeohLedger は早期支払割引のクレジット $credit を計上済みで、これから適用します。別のクレジットは計上しないでください。';
+  }
+
+  @override
+  String exceptionDescriptionErpDiscountCreditPendingUnidentified(
+    String erp,
+    String amount,
+    String marker,
+  ) {
+    return '$erp はこの請求書の支払いを記録しましたが、請求書にはまだ $amount の未決済残高が表示されています。FeohLedger がこの割引のクレジットを計上している可能性があります。クレジットを計上する前に「$marker」を検索してください。';
+  }
+
+  @override
+  String exceptionDescriptionErpDiscountCreditPendingUnidentifiedUnnamed(
+    String amount,
+    String marker,
+  ) {
+    return 'ご利用の ERP はこの請求書の支払いを記録しましたが、請求書にはまだ $amount の未決済残高が表示されています。FeohLedger がこの割引のクレジットを計上している可能性があります。クレジットを計上する前に「$marker」を検索してください。';
+  }
+
+  @override
   String exceptionDescriptionErpPaymentVoidWritebackFailed(String erp) {
     return '$erp では、FeohLedger で無効化された支払いによってこの請求書がまだ支払済みと表示されています。ERP での無効化に失敗したためです。帳簿を一致させるため、ERP でその支払いを無効化してください。';
   }
@@ -3755,6 +3833,15 @@ class AppLocalizationsJa extends AppLocalizations {
   @override
   String get exceptionDescriptionErpPaymentVoidWritebackFailedUnnamed =>
       'ご利用の ERP では、FeohLedger で無効化された支払いによってこの請求書がまだ支払済みと表示されています。ERP での無効化に失敗したためです。帳簿を一致させるため、ERP でその支払いを無効化してください。';
+
+  @override
+  String exceptionDescriptionErpDiscountCreditStalled(String erp) {
+    return '$erp に、FeohLedger がこの請求書の支払いのために作成したものの、自動で適用または取り消しできなかった早期支払割引のクレジットが残っている可能性があります。そこで「FeohLedger discount」とこの支払いの ID が記載されたクレジットを探し、割引が一度だけ計上されるよう適用または削除してください。';
+  }
+
+  @override
+  String get exceptionDescriptionErpDiscountCreditStalledUnnamed =>
+      'ご利用の ERP に、FeohLedger がこの請求書の支払いのために作成したものの、自動で適用または取り消しできなかった早期支払割引のクレジットが残っている可能性があります。そこで「FeohLedger discount」とこの支払いの ID が記載されたクレジットを探し、割引が一度だけ計上されるよう適用または削除してください。';
 
   @override
   String get exceptionDescriptionErpSyncBackFailed =>
@@ -4885,4 +4972,18 @@ class AppLocalizationsJa extends AppLocalizations {
   @override
   String get legalAcceptAppOutdated =>
       'このバージョンのアプリは現在有効なものより古い利用規約またはプライバシーポリシーを表示しているため、同意を記録できません。アプリストアからアプリを更新するか、Web アプリで同意してから、もう一度サインインしてください。';
+
+  @override
+  String invoiceDetailAssignedElsewhere(String name) {
+    return '担当者: $name(承認者としてこのまま処理できます)';
+  }
+
+  @override
+  String get invoiceDetailAssignedElsewhereUnnamed =>
+      '別の担当者に割り当て済み(承認者としてこのまま処理できます)';
+
+  @override
+  String payQueueRescheduledFrom(String date) {
+    return '$date から変更';
+  }
 }

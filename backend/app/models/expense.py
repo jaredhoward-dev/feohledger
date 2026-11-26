@@ -281,6 +281,21 @@ class Expense(Base, EntityMixin, TimestampMixin):
     # the pre-0134 rules apply to it.
     created_by_user_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
 
+    # The approved pre-approval this line DRAWS DOWN, and how much of it
+    # (migration 0149, decisions §563). Set together at report submit, under a
+    # row lock on the pre-approval, only on a line the policy engine says needs
+    # cover; cleared together when the line leaves the submitted / approved
+    # states (report reject hands it back to draft). A pre-approval's remaining
+    # balance is ``estimated_amount`` minus the sum of these over its lines, so
+    # one estimate can no longer clear ``preapproval_required`` on any number of
+    # lines. The drawn amount is in the pre-approval's currency, which cover
+    # requires to equal the line's. NULL on every line submitted before 0149:
+    # no link is invented (§141), so those lines draw nothing.
+    preapproval_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("expense_preapprovals.id"), index=True
+    )
+    preapproval_drawn_amount: Mapped[Decimal | None] = mapped_column(Numeric(15, 2))
+
     organization_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), nullable=False, index=True
     )

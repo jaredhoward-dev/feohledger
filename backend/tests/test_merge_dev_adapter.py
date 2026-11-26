@@ -767,6 +767,57 @@ def test_changed_bills_past_the_row_cap_is_truncated_not_partial():
     assert exc.value.gap is ListingGap.truncated
 
 
+def test_bill_change_feed_carries_the_listings_deletions_and_its_upper_bound():
+    """The invoice listing's ``remote_was_deleted`` rides out as ``deleted``
+    (decisions §567): Merge documents it there, not on the single read. A
+    deleted receivable or a deleted payment is not a deleted bill."""
+    since = datetime(2026, 11, 20, 9, 30, tzinfo=UTC)
+    until = datetime(2026, 11, 20, 21, 30, 45, 900, tzinfo=UTC)
+    get, calls = _routed(
+        {
+            "invoices": [
+                _page(
+                    [
+                        {"id": "b1", "type": "ACCOUNTS_PAYABLE", "remote_was_deleted": True},
+                        {"id": "b2", "type": "ACCOUNTS_PAYABLE", "remote_was_deleted": False},
+                        {"id": "ar1", "type": "ACCOUNTS_RECEIVABLE", "remote_was_deleted": True},
+                    ]
+                )
+            ],
+            "payments": [_page([{**_pay("p1", _line("b3")), "remote_was_deleted": True}])],
+        }
+    )
+    with patch("httpx.AsyncClient") as cm:
+        cm.return_value.__aenter__.return_value.get = get
+        feed = _run(MergeDevAdapter(_ADAPTER).bill_change_feed(since, until))
+    assert feed.bills == ["b1", "b2", "b3"]
+    assert feed.deleted == frozenset({"b1"})
+    assert {c[1]["modified_before"] for c in calls} == {"2026-11-20T21:30:45Z"}
+    assert {c[1]["include_deleted_data"] for c in calls} == {"true"}
+
+
+def test_bill_change_feed_with_no_until_asks_no_upper_bound():
+    get, calls = _routed({"invoices": [_page([])], "payments": [_page([])]})
+    with patch("httpx.AsyncClient") as cm:
+        cm.return_value.__aenter__.return_value.get = get
+        feed = _run(MergeDevAdapter(_ADAPTER).bill_change_feed(datetime(2026, 11, 1, tzinfo=UTC)))
+    assert feed.bills == [] and feed.deleted == frozenset()
+    assert all("modified_before" not in c[1] for c in calls)
+
+
+def test_bill_change_feed_refuses_a_naive_until_before_any_call():
+    get, calls = _routed({"invoices": [_page([])], "payments": [_page([])]})
+    with patch("httpx.AsyncClient") as cm:
+        cm.return_value.__aenter__.return_value.get = get
+        with pytest.raises(ValueError, match="timezone-aware"):
+            _run(
+                MergeDevAdapter(_ADAPTER).bill_change_feed(
+                    datetime(2026, 11, 1, tzinfo=UTC), datetime(2026, 11, 2)
+                )
+            )
+    assert calls == []
+
+
 def test_bills_for_payment_reads_the_payments_invoice_lines():
     with patch("httpx.AsyncClient") as cm:
         client = cm.return_value.__aenter__.return_value

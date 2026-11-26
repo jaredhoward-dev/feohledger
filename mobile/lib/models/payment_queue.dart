@@ -28,7 +28,14 @@ class PaymentQueueItem {
   /// `null` when the row carries no usable code, in which case the figure
   /// renders bare rather than wearing a substituted symbol.
   final String? currency;
+
+  /// The EFFECTIVE due date (decisions §565): the invoice's current payment
+  /// schedule's, else its own — the date [isOverdue] and the queue's order read.
   final DateTime? dueDate;
+
+  /// The invoice's own due date (`own_due_date`), which differs from [dueDate]
+  /// only when a payment schedule moved it. Read through [rescheduledFrom].
+  final DateTime? ownDueDate;
   final String? paymentTerms;
   final String status;
   final bool isOverdue;
@@ -92,6 +99,7 @@ class PaymentQueueItem {
     required this.amountDisplay,
     this.currency,
     this.dueDate,
+    this.ownDueDate,
     this.paymentTerms,
     required this.status,
     required this.isOverdue,
@@ -133,6 +141,19 @@ class PaymentQueueItem {
   /// diverge between the store's guard and the screen's checkbox.
   bool get isSelectable => !blocked && !hasUnknownRequiredMethod;
 
+  /// The invoice's own due date when a payment schedule moved it — the
+  /// "rescheduled from …" line — else `null` (either date missing, or the two
+  /// the same calendar day). Mirrors the web's `utils/time.ts::rescheduledFrom`,
+  /// compared on the date alone so a time part never reads as a reschedule.
+  DateTime? get rescheduledFrom {
+    final due = dueDate;
+    final own = ownDueDate;
+    if (due == null || own == null) return null;
+    final same =
+        due.year == own.year && due.month == own.month && due.day == own.day;
+    return same ? null : own;
+  }
+
   factory PaymentQueueItem.fromJson(Map<String, dynamic> json) {
     DateTime? parseDate(Object? v) {
       if (v is String && v.isNotEmpty) return DateTime.tryParse(v);
@@ -146,6 +167,7 @@ class PaymentQueueItem {
       amountDisplay: moneyToDisplay(json['amount']),
       currency: json['currency'] as String?,
       dueDate: parseDate(json['due_date']),
+      ownDueDate: parseDate(json['own_due_date']),
       paymentTerms: json['payment_terms'] as String?,
       status: json['status'] as String? ?? 'approved',
       isOverdue: json['is_overdue'] as bool? ?? false,

@@ -57,7 +57,12 @@ surfaces:
   same body → the original 201; same key + another body → 400);
   `X-Idempotency-Key` is ignored, as Merge ignores it. `GET
   /invoices?number=&contact_id=&type=` (exact filters, the adapter's pre-create
-  lookup), `GET /invoices/{id}` (top-level `status`, `payments`,
+  lookup; also `modified_after` / `modified_before` against `modified_at`, and
+  `page_size` + `cursor` paging when `page_size` is given — the read-back
+  sweep's change feed, decisions §567; a bill `remote_was_deleted` stays
+  listed), `GET /payments` (always empty: nothing writes a Merge Payment, §504),
+  `GET /invoices/{id}` (404 for a bill `__set-status` marked `retrieve_gone`,
+  the deleted-record answer Merge's docs leave open; top-level `status`, `payments`,
   `applied_payments`, `applied_credit_notes`, `applied_vendor_credits`,
   `remote_was_deleted`, `modified_at`), `GET /purchase-orders` + `GET /accounts`
   + `GET /contacts` (all cursor-paginated 2 + rest via `next` / `?cursor=`),

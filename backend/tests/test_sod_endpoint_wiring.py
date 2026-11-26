@@ -287,6 +287,11 @@ CASES = [
     # voiding it are the same duty (decisions §556).
     ("/api/invoices/{invoice_id}/erp-orphan-bill", "GET", _VOID),
     ("/api/invoices/{invoice_id}/void-erp-orphan-bill", "POST", _VOID),
+    # Naming the bill on a shared Xero key and confirming it as this
+    # invoice's decide whether it stays payable in the ERP: the same duty
+    # (the role list `POST /retry-erp` takes is checked in the verdict, §587).
+    ("/api/invoices/{invoice_id}/erp-bill-confirmation", "GET", _VOID),
+    ("/api/invoices/{invoice_id}/confirm-erp-bill", "POST", _VOID),
     # The NACHA export is the counterpart of `/execute` — uploading the file is
     # the money moving — so it gates on `payment.execute`, not on recording.
     ("/api/payments/runs/{run_id}/nacha", "GET", _EXECUTE),

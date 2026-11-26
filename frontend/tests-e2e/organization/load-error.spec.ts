@@ -150,4 +150,37 @@ test.describe('/organization load error', () => {
 		await expect(card.getByText('Deployment alignment')).toBeVisible();
 		await expect(card.getByRole('button', { name: /save/i })).toBeDisabled();
 	});
+
+	test('a failed Commerce catalogue load offers Retry, and Retry loads the panel', async ({
+		page
+	}) => {
+		// The Commerce panel's own catalogue (`commerce-load-failed`), the
+		// sibling of the ERP panel's (`erp-connection.spec.ts`).
+		let failed = false;
+		await page.route(
+			(url) => url.pathname === '/api/commerce/providers',
+			async (route) => {
+				if (!failed && route.request().method() === 'GET') {
+					failed = true;
+					return route.fulfill({
+						status: 500,
+						contentType: 'application/json',
+						body: JSON.stringify({ detail: 'boom' })
+					});
+				}
+				return route.fallback();
+			}
+		);
+
+		await page.goto('/organization?section=commerce');
+		const panel = page.getByTestId('commerce-panel');
+		const error = panel.getByTestId('commerce-load-failed');
+		await expect(error).toHaveAttribute('role', 'alert');
+		await error.getByRole('button', { name: 'Retry', exact: true }).click();
+
+		await expect(panel.getByTestId('commerce-provider-select')).toBeVisible();
+		await expect(error).toHaveCount(0);
+		// Retry unmounted the focused button; focus resumes in <main>.
+		await expect(page.locator('main')).toBeFocused();
+	});
 });

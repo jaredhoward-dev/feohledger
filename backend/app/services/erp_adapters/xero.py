@@ -84,12 +84,14 @@ from app.services.erp_adapters.base import (
     PAYMENTS_SCOPE_MISSING,
     SYNC_LISTING_MAX_ROWS,
     VENDOR_NOT_LINKED,
+    DiscountCreditPayload,
     ErpBillReport,
     ErpBillState,
     ErpInvoiceStatus,
     ErpListingIncomplete,
     ErpPostResult,
     ErpScopeMissing,
+    FoundBill,
     GLAccountPayload,
     InvoicePayload,
     ListingGap,
@@ -150,6 +152,11 @@ CURRENCY_MISMATCH = "currency_mismatch"
 PERIOD_CLOSED = "period_closed"
 VENDOR_INACTIVE = "vendor_inactive"
 ACCOUNT_INACTIVE = "account_inactive"
+#: The pre-create lookup found a live bill on this supplier + number while
+#: another invoice in the tenant carries the same pair (``payload.bill_key_shared``):
+#: the bill may be that invoice's, so it is not adopted and none is created
+#: (decisions §572). A person decides which invoice the bill is.
+ERP_BILL_KEY_SHARED = "erp_bill_key_shared"
 #: A vendor-link search by tax number puts the number in the query string
 #: (``where=TaxNumber==...``), and httpx logs every request URL at INFO: the
 #: query of any logged URL naming the field is redacted (a tax id never
@@ -202,6 +209,9 @@ XERO_OAUTH = register_oauth_provider(
 )
 
 _BILL_STATUSES = {"AUTHORISED", "DRAFT"}
+#: The statuses the push's idempotency lookup (and so the orphan-bill lookup)
+#: reads a bill at: everything but DELETED / VOIDED.
+_LIVE_BILL_STATUSES = "DRAFT,SUBMITTED,AUTHORISED,PAID"
 
 _STATUS_MAP = {
     "DRAFT": ErpInvoiceStatus.draft,
@@ -327,6 +337,12 @@ class XeroAdapter(OAuthErpAdapter):
     #: The vendor page can find any contact by name or tax number and link it
     #: by hand (``search_vendors`` / ``get_vendor``, decisions §415).
     supports_vendor_search = True
+    #: The push's idempotency lookup is offered on its own
+    #: (:meth:`find_posted_bill`, decisions §566). Its key is the supplier and
+    #: invoice number, nothing unique to one invoice, so the lookup is refused
+    #: while another invoice in the tenant shares that key.
+    supports_bill_lookup = True
+    bill_lookup_key_shared = True
 
     @classmethod
     async def list_external_tenants(
@@ -373,9 +389,9 @@ class XeroAdapter(OAuthErpAdapter):
 
     # -- post ---------------------------------------------------------------
 
-    async def _find_existing_bill(self, client, headers, payload: InvoicePayload):
-        """Pre-create idempotency lookup: a live ACCPAY bill from this supplier
-        carrying this invoice number. Returns ``(response, bill | None)``.
+    async def _matching_bills(self, client, headers, payload: InvoicePayload):
+        """Every live ACCPAY bill from this supplier carrying this invoice
+        number. Returns ``(response, bills)``; ``bills`` is empty on a non-200.
 
         ``Reference`` is ACCREC-only in Xero, so there is no bill field to carry
         our correlation id; the supplier + supplier invoice number is the key
@@ -386,19 +402,80 @@ class XeroAdapter(OAuthErpAdapter):
             params={
                 "InvoiceNumbers": payload.invoice_number,
                 "ContactIDs": payload.vendor_erp_id,
-                "Statuses": "DRAFT,SUBMITTED,AUTHORISED,PAID",
+                "Statuses": _LIVE_BILL_STATUSES,
                 "where": 'Type=="ACCPAY"',
             },
             headers=headers,
         )
         if resp.status_code != 200:
-            return resp, None
-        for bill in _json(resp).get("Invoices") or []:
-            if bill.get("Type", "ACCPAY") == "ACCPAY" and (
-                bill.get("InvoiceNumber") == payload.invoice_number
-            ):
-                return resp, bill
-        return resp, None
+            return resp, []
+        return resp, [
+            bill
+            for bill in _json(resp).get("Invoices") or []
+            if isinstance(bill, dict)
+            and bill.get("Type", "ACCPAY") == "ACCPAY"
+            and bill.get("InvoiceNumber") == payload.invoice_number
+        ]
+
+    async def _find_existing_bill(self, client, headers, payload: InvoicePayload):
+        """Pre-create idempotency lookup: the first of :meth:`_matching_bills`.
+        Returns ``(response, bill | None)``.
+
+        The key names a supplier's invoice number, not one FeohLedger invoice,
+        so the push adopts the found bill only when no other invoice in the
+        tenant shares it (``payload.bill_key_shared`` false, set by
+        ``services/erp`` from ``erp_bill_void.shared_lookup_keys``, the rule
+        the orphan-bill lookup applies); otherwise it refuses
+        ``erp_bill_key_shared`` (decisions §572), unless the bill found is
+        the one a person confirmed (``payload.confirmed_bill_id``, §587)."""
+        resp, bills = await self._matching_bills(client, headers, payload)
+        return resp, (bills[0] if bills else None)
+
+    async def find_posted_bill(self, payload: InvoicePayload) -> FoundBill | None:
+        """The push's own match (:meth:`_matching_bills`), read-only, as a
+        :class:`FoundBill` (decisions §556, §566). One GET.
+
+        Raises rather than answer "none" on anything it cannot read plainly: a
+        payload the push would refuse before sending (no linked supplier, no
+        number), a non-200 (:class:`XeroRequestError`), more than one bill on
+        the key (which is ours is not knowable), or a bill without an id, on
+        another contact, or at a status the filter did not ask for
+        (:class:`XeroBillLookupAmbiguous`: Xero answered 200, so an HTTP status
+        would misname it, decisions §569). The key carries nothing unique to one
+        invoice; ``services/erp_bill_void`` keeps it from naming another
+        invoice's bill (:attr:`bill_lookup_key_shared`)."""
+        if not payload.vendor_erp_id:
+            raise ValueError(VENDOR_NOT_LINKED)
+        if not (payload.invoice_number or "").strip():
+            raise ValueError("xero bill lookup: no invoice number")
+        headers = await self._headers()
+        async with self.oauth_client(timeout=30) as client:
+            resp, bills = await self._matching_bills(client, headers, payload)
+        if resp.status_code != 200:
+            raise XeroRequestError(resp.status_code)
+        if not bills:
+            return None
+        if len(bills) > 1:
+            raise XeroBillLookupAmbiguous("more than one live bill carries this key")
+        bill = bills[0]
+        bill_id = str(bill.get("InvoiceID") or "").strip()
+        contact = bill.get("Contact") if isinstance(bill.get("Contact"), dict) else {}
+        status = str(bill.get("Status") or "").upper()
+        if (
+            not bill_id
+            or str(contact.get("ContactID") or "") != str(payload.vendor_erp_id)
+            or status not in _LIVE_BILL_STATUSES.split(",")
+        ):
+            raise XeroBillLookupAmbiguous(
+                "the matched bill has no id, another contact, or an unrequested status"
+            )
+        return FoundBill(
+            document_id=bill_id,
+            document_number=bill.get("InvoiceNumber") or None,
+            amount=_decimal(bill.get("Total")),
+            currency=iso_currency_or_none(bill.get("CurrencyCode")),
+            status=map_bill_status(bill),
+        )
 
     async def _account_tax_types(self, client, headers, account_ids: set[str]) -> dict[str, str]:
         """Each account's default ``TaxType`` from the customer's own chart."""
@@ -497,7 +574,28 @@ class XeroAdapter(OAuthErpAdapter):
                 # Fail closed: without the lookup we cannot rule out a duplicate.
                 return _failure(lookup)
             if existing is not None:
+                if payload.bill_key_shared and not (
+                    payload.confirmed_bill_id
+                    and existing.get("InvoiceID") == payload.confirmed_bill_id
+                ):
+                    # Another invoice carries this supplier + number, so the
+                    # bill may be its own: never adopted as this invoice's,
+                    # and no second bill is created beside it (§572) — unless
+                    # a person confirmed this very bill as this invoice's
+                    # (§587), when it is adopted as below, total included.
+                    return erp_refusal(PROVIDER, ERP_BILL_KEY_SHARED)
                 if _decimal(existing.get("Total")) == payload.amount:
+                    # The same figure in another currency is another bill:
+                    # adopting it would book this invoice's amount in the
+                    # wrong currency. A bill or payload that states none is
+                    # not known to match, so it is refused too, coded
+                    # (decisions §588). Not ``not_posted``: the bill found may
+                    # be an earlier attempt of ours.
+                    bill_currency = iso_currency_or_none(existing.get("CurrencyCode"))
+                    if bill_currency is None or bill_currency != iso_currency_or_none(
+                        payload.currency
+                    ):
+                        return erp_refusal(PROVIDER, CURRENCY_MISMATCH)
                     return ErpPostResult(
                         success=True,
                         erp_document_id=existing.get("InvoiceID"),
@@ -1186,6 +1284,330 @@ class XeroAdapter(OAuthErpAdapter):
         except httpx.HTTPError:
             return ErpPostResult(success=False, message=f"{PROVIDER} void failed: network_error")
 
+    # -- early-payment discount as a credit note (decisions §575) -----------
+    #
+    # Shapes, confirmed on 2026-11-25 against Xero's published OpenAPI spec,
+    # https://github.com/XeroAPI/Xero-OpenAPI/blob/master/xero_accounting.yaml
+    # (v20.1.0, commit cad38324; developer.xero.com renders client-side and
+    # could not be fetched) — decisions §577:
+    # * PUT CreditNotes (createCreditNotes, Idempotency-Key header)
+    #   {"CreditNotes": [{Type "ACCPAYCREDIT", Contact {ContactID}, Date,
+    #   Status "AUTHORISED", LineAmountTypes "NoTax", CurrencyCode,
+    #   CreditNoteNumber, LineItems [{Description, Quantity, UnitAmount,
+    #   AccountID (uuid)}]}]}. The spec marks ``Reference`` "ACCRECCREDIT
+    #   only", so our marker rides ``CreditNoteNumber``; what Xero does with a
+    #   supplied number on an ACCPAYCREDIT is not stated, so the read-back
+    #   checks it and fails closed.
+    # * GET CreditNotes?where=… — the spec's ``where`` is "Filter by an any
+    #   element"; that ``CreditNoteNumber`` filters is not separately stated.
+    # * PUT CreditNotes/{CreditNoteID}/Allocations (createCreditNoteAllocation)
+    #   {"Allocations": [{Amount, Invoice {InvoiceID}, Date}]}.
+    # * DELETE CreditNotes/{CreditNoteID}/Allocations/{AllocationID}
+    #   (deleteCreditNoteAllocations; 200 with IsDeleted true), then POST
+    #   CreditNotes/{CreditNoteID} (updateCreditNote) {Status "VOIDED"}. That
+    #   Xero refuses to void a credit note still allocated is not in the spec
+    #   (unconfirmed); removing ours first is safe either way.
+    # A read-back that is not one credit note with our number fails closed.
+
+    supports_discount_credit = True
+
+    async def _our_credit_notes(self, client, headers, payment_id: str) -> list[dict]:
+        """Every credit note carrying our marker for ``payment_id``, read whole
+        (allocations included), voided and deleted ones too."""
+        resp = await _status_get(
+            client,
+            f"{_api_base()}/CreditNotes",
+            params={"where": f'CreditNoteNumber=="{_discount_reference(payment_id)}"'},
+            headers=headers,
+        )
+        if resp.status_code != 200:
+            raise XeroRequestError(resp.status_code)
+        out = []
+        for row in _json(resp).get("CreditNotes") or []:
+            if not isinstance(row, dict) or _discount_marker(row) != str(payment_id).lower():
+                continue
+            out.append(await self._read_credit_note(client, headers, str(row.get("CreditNoteID"))))
+        return out
+
+    async def _read_credit_note(self, client, headers, credit_id: str) -> dict:
+        resp = await _status_get(client, f"{_api_base()}/CreditNotes/{credit_id}", headers=headers)
+        if resp.status_code != 200:
+            raise XeroRequestError(resp.status_code)
+        rows = _json(resp).get("CreditNotes") or []
+        if not rows or not isinstance(rows[0], dict) or not rows[0].get("CreditNoteID"):
+            raise XeroRequestError(resp.status_code)
+        return rows[0]
+
+    async def post_discount_credit(self, payload: DiscountCreditPayload) -> ErpPostResult:
+        """Book the discount as an ACCPAYCREDIT credit note to the org's
+        discount account and allocate it to the bill.
+
+        Idempotent on ``payload.payment_id``: our credit note is looked up by
+        its number (``"FeohLedger discount <id>"``) first; one found live but
+        not yet allocated to this bill (a crash between the two writes) is
+        allocated, never created again; each write carries its own
+        ``Idempotency-Key``. A credit note of ours someone voided or deleted in
+        Xero is refused (``bill_payment_voided``, ``params.document``); a
+        recorded id that reads back without our number fails
+        (``discount_credit_not_ours``) with the id, so the record is held.
+        Refused before any write: no discount account mapped, a bill gone,
+        another currency or none stated, more than the bill still has due.
+        Any failure before the create request goes out is ``not_posted``
+        (decisions §582).
+        """
+        if not payload.bill_id:
+            return erp_preflight_refusal(PROVIDER, BILL_NOT_IN_ERP)
+        if not payload.discount_account_erp_id:
+            refused = erp_preflight_refusal(PROVIDER, PAYMENT_ACCOUNT_NOT_MAPPED)
+            refused.refusal_params = {"account": "discount"}
+            return refused
+        # What a failure below may leave in Xero (decisions §582): until the
+        # create goes out, nothing (``not_posted``, so the write-back drops its
+        # reservation and a later pass retries); once a note of ours is known
+        # (found live, or answered to our create), its id rides every failure.
+        sent = False
+        known_id: str | None = None
+
+        def failed(result: ErpPostResult) -> ErpPostResult:
+            if known_id and not result.erp_document_id:
+                result.erp_document_id = known_id
+            result.not_posted = not sent and known_id is None
+            return result
+
+        try:
+            headers = await self._headers()
+            async with self.oauth_client(timeout=30) as client:
+                bill = await self._read_bill(client, headers, payload.bill_id)
+                if str(bill.get("Status") or "").upper() in _GONE_STATUSES:
+                    return _nothing_posted(erp_refusal(PROVIDER, BILL_NOT_IN_ERP))
+                if payload.credit_id:
+                    # A credit note an earlier attempt recorded (decisions
+                    # §577, §579): read THAT one by id, never look it up by
+                    # number again and create on a miss. Not ours, voided or
+                    # deleted is refused below as someone's decision.
+                    known = await self._read_credit_note(client, headers, str(payload.credit_id))
+                    if _discount_marker(known) != str(payload.payment_id).lower():
+                        # Recorded as ours, read without our number: Xero may
+                        # have kept its own on our create (§581's residual).
+                        # Held for a person, never dropped as someone's void
+                        # nor booked over (decisions §582).
+                        return ErpPostResult(
+                            success=False,
+                            erp_document_id=str(payload.credit_id),
+                            message=f"{PROVIDER} post failed: discount_credit_not_ours",
+                        )
+                    ours = [known]
+                else:
+                    ours = await self._our_credit_notes(client, headers, payload.payment_id)
+                live = [c for c in ours if str(c.get("Status") or "").upper() not in _GONE_STATUSES]
+                if not live and ours:
+                    refused = erp_refusal(PROVIDER, BILL_PAYMENT_VOIDED)
+                    refused.refusal_params = {"document": "discount_credit"}
+                    refused.erp_document_id = str(ours[0].get("CreditNoteID"))
+                    return refused
+                bill_currency = iso_currency_or_none(bill.get("CurrencyCode"))
+                if bill_currency is None or bill_currency != iso_currency_or_none(payload.currency):
+                    return _nothing_posted(erp_refusal(PROVIDER, CURRENCY_MISMATCH))
+                credit = live[0] if live else None
+                if credit is not None:
+                    known_id = str(credit.get("CreditNoteID"))
+                if credit is not None and _allocated_to(credit, payload.bill_id) > 0:
+                    return ErpPostResult(
+                        success=True,
+                        erp_document_id=str(credit.get("CreditNoteID")),
+                        message="Discount credit already in Xero (found by number)",
+                        bill_balance_after=_decimal(bill.get("AmountDue")),
+                    )
+                if (
+                    credit is not None
+                    and iso_currency_or_none(credit.get("CurrencyCode")) != bill_currency
+                ):
+                    return erp_refusal(PROVIDER, CURRENCY_MISMATCH)
+                due = _decimal(bill.get("AmountDue"))
+                if due is None or payload.amount <= 0 or payload.amount > due:
+                    refused = _nothing_posted(erp_refusal(PROVIDER, PAYMENT_EXCEEDS_BALANCE))
+                    refused.refusal_params = {"document": "discount_credit"}
+                    return refused
+                if credit is None:
+                    contact_id = (bill.get("Contact") or {}).get("ContactID")
+                    body = {
+                        "CreditNotes": [
+                            {
+                                "Type": "ACCPAYCREDIT",
+                                "Contact": {"ContactID": str(contact_id)},
+                                "Date": payload.credit_on.isoformat(),
+                                "Status": "AUTHORISED",
+                                "LineAmountTypes": "NoTax",
+                                "CurrencyCode": bill_currency,
+                                "CreditNoteNumber": _discount_reference(payload.payment_id),
+                                "LineItems": [
+                                    {
+                                        "Description": "Early-payment discount",
+                                        "Quantity": Decimal("1"),
+                                        "UnitAmount": payload.amount,
+                                        "AccountID": str(payload.discount_account_erp_id),
+                                    }
+                                ],
+                            }
+                        ]
+                    }
+                    sent = True
+                    resp = await client.put(
+                        f"{_api_base()}/CreditNotes",
+                        content=dumps_exact_json(body),
+                        headers={
+                            **headers,
+                            "Content-Type": "application/json",
+                            "Idempotency-Key": _credit_key(payload.payment_id, "cn"),
+                        },
+                    )
+                    if resp.status_code not in (200, 201):
+                        refused = _failure(resp)
+                        refused.not_posted = not erp_status_retryable(resp.status_code)
+                        return refused
+                    rows = _json(resp).get("CreditNotes") or [{}]
+                    created_id = rows[0].get("CreditNoteID") if isinstance(rows[0], dict) else None
+                    if not created_id:
+                        return ErpPostResult(
+                            success=False,
+                            message=f"{PROVIDER} post failed: credit_note_unconfirmed",
+                        )
+                    # Xero answered OUR create with this id: from here every
+                    # failure carries it (decisions §582).
+                    known_id = str(created_id)
+                    credit = await self._read_credit_note(client, headers, str(created_id))
+                    if _discount_marker(credit) != str(payload.payment_id).lower():
+                        # Xero answered OUR create with this id: it is ours
+                        # whatever the read-back says, so the id is kept for
+                        # the record a void reverses it by (decisions §581).
+                        return ErpPostResult(
+                            success=False,
+                            erp_document_id=str(created_id),
+                            message=f"{PROVIDER} post failed: credit_note_unconfirmed",
+                        )
+                credit_id = str(credit.get("CreditNoteID"))
+                allocation = {
+                    "Allocations": [
+                        {
+                            "Amount": payload.amount,
+                            "Invoice": {"InvoiceID": str(payload.bill_id)},
+                            "Date": payload.credit_on.isoformat(),
+                        }
+                    ]
+                }
+                resp = await client.put(
+                    f"{_api_base()}/CreditNotes/{credit_id}/Allocations",
+                    content=dumps_exact_json(allocation),
+                    headers={
+                        **headers,
+                        "Content-Type": "application/json",
+                        "Idempotency-Key": _credit_key(payload.payment_id, "cna"),
+                    },
+                )
+                if resp.status_code not in (200, 201):
+                    # The credit note stands unallocated; a retry finds it by
+                    # its number and allocates it.
+                    refused = _failure(resp)
+                    refused.erp_document_id = credit_id
+                    return refused
+                after = await self._read_bill(client, headers, payload.bill_id)
+            return ErpPostResult(
+                success=True,
+                erp_document_id=credit_id,
+                message="Discount booked as a credit note in Xero",
+                bill_balance_after=_decimal(after.get("AmountDue")),
+            )
+        except erp_oauth.ErpTokenRefreshError as exc:
+            return failed(ErpPostResult(success=False, message=str(exc)))
+        except erp_oauth.ErpNotConnectedError:
+            return failed(erp_refusal(PROVIDER, NOT_CONNECTED))
+        except XeroRequestError as exc:
+            return failed(erp_http_failure(PROVIDER, exc.status_code))
+        except httpx.HTTPError:
+            return failed(
+                ErpPostResult(success=False, message=f"{PROVIDER} post failed: network_error")
+            )
+
+    async def find_discount_credit(self, payload: DiscountCreditPayload) -> str | None:
+        """Our live credit note for the payment, found by its number."""
+        headers = await self._headers()
+        async with self.oauth_client(timeout=30) as client:
+            for credit in await self._our_credit_notes(client, headers, payload.payment_id):
+                if str(credit.get("Status") or "").upper() not in _GONE_STATUSES:
+                    return str(credit.get("CreditNoteID"))
+        return None
+
+    async def void_discount_credit(self, payload: DiscountCreditPayload) -> ErpPostResult:
+        """Remove our credit note's allocations, then void it.
+
+        A recorded ``payload.credit_id`` is read BY ID and must carry our
+        marker: one not ours is refused, never reported done (decisions §581) —
+        the number lookup is not confirmed to find a note, and a miss there
+        must not erase the record of one that stands allocated. With no id the
+        note is found by its number, as :meth:`post_discount_credit` finds it.
+        None live (or ours already voided / deleted) is a success with nothing
+        to do, so a retry never voids twice."""
+        try:
+            headers = await self._headers()
+            async with self.oauth_client(timeout=30) as client:
+                if payload.credit_id:
+                    known = await self._read_credit_note(client, headers, str(payload.credit_id))
+                    if _discount_marker(known) != str(payload.payment_id).lower():
+                        return ErpPostResult(
+                            success=False,
+                            erp_document_id=str(payload.credit_id),
+                            message=f"{PROVIDER} void failed: discount_credit_not_ours",
+                        )
+                    ours = [known]
+                else:
+                    ours = await self._our_credit_notes(client, headers, payload.payment_id)
+                live = [c for c in ours if str(c.get("Status") or "").upper() not in _GONE_STATUSES]
+                if not live:
+                    return ErpPostResult(success=True, message="No discount credit of ours")
+                credit_id = str(live[0].get("CreditNoteID"))
+                for allocation in live[0].get("Allocations") or []:
+                    allocation_id = (
+                        allocation.get("AllocationID") if isinstance(allocation, dict) else None
+                    )
+                    if not allocation_id:
+                        # Cannot be removed without its id; Xero would refuse
+                        # the void, so say so rather than try.
+                        return ErpPostResult(
+                            success=False,
+                            erp_document_id=credit_id,
+                            message=f"{PROVIDER} void failed: allocation_unidentified",
+                        )
+                    resp = await client.delete(
+                        f"{_api_base()}/CreditNotes/{credit_id}/Allocations/{allocation_id}",
+                        headers=headers,
+                    )
+                    if resp.status_code not in (200, 204):
+                        refused = _failure(resp)
+                        refused.erp_document_id = credit_id
+                        return refused
+                resp = await client.post(
+                    f"{_api_base()}/CreditNotes/{credit_id}",
+                    content=dumps_exact_json(
+                        {"CreditNotes": [{"CreditNoteID": credit_id, "Status": "VOIDED"}]}
+                    ),
+                    headers={**headers, "Content-Type": "application/json"},
+                )
+            if resp.status_code not in (200, 201):
+                refused = _failure(resp)
+                refused.erp_document_id = credit_id
+                return refused
+            return ErpPostResult(
+                success=True, erp_document_id=credit_id, message="Discount credit voided in Xero"
+            )
+        except erp_oauth.ErpTokenRefreshError as exc:
+            return ErpPostResult(success=False, message=str(exc))
+        except erp_oauth.ErpNotConnectedError:
+            return erp_refusal(PROVIDER, NOT_CONNECTED)
+        except XeroRequestError as exc:
+            return erp_http_failure(PROVIDER, exc.status_code)
+        except httpx.HTTPError:
+            return ErpPostResult(success=False, message=f"{PROVIDER} void failed: network_error")
+
     # -- reads -------------------------------------------------------------
 
     async def test_connection(self) -> bool:
@@ -1446,6 +1868,14 @@ class XeroRequestError(RuntimeError):
         super().__init__(f"{PROVIDER} request failed: HTTP {status_code}")
 
 
+class XeroBillLookupAmbiguous(RuntimeError):
+    """:meth:`XeroAdapter.find_posted_bill` got a readable answer that does not
+    name exactly one bill of ours (decisions §569). Not an HTTP failure, so not
+    a :class:`XeroRequestError`; the lookup still fails closed on it
+    (``erp_bill_void.find_orphan`` answers ``erp_lookup_failed``). PII-free:
+    the reason is fixed text, never the bill."""
+
+
 #: ``post_payment``'s mark on the Xero payment it writes, in its ``Reference``.
 _PAYMENT_MARKER = re.compile(r"FeohLedger payment ([0-9a-fA-F-]{36})(?:\s|$)")
 #: Xero's JSON date: ``/Date(<milliseconds since the epoch>[+-HHMM])/``.
@@ -1460,6 +1890,34 @@ def _payment_marker(record: dict) -> str | None:
     """Our payment id, when this Xero payment is one ``post_payment`` wrote."""
     match = _PAYMENT_MARKER.search(str(record.get("Reference") or ""))
     return match.group(1).lower() if match else None
+
+
+#: Our early-payment discount credit note's number (decisions §575).
+_DISCOUNT_MARKER = re.compile(r"FeohLedger discount ([0-9a-fA-F-]{36})(?:\s|$)")
+
+
+def _discount_reference(payment_id: str) -> str:
+    return f"FeohLedger discount {payment_id}"
+
+
+def _discount_marker(record: dict) -> str | None:
+    match = _DISCOUNT_MARKER.search(str(record.get("CreditNoteNumber") or ""))
+    return match.group(1).lower() if match else None
+
+
+def _credit_key(payment_id: str, step: str) -> str:
+    return f"{payment_id}:{step}"[:IDEMPOTENCY_KEY_MAX]
+
+
+def _allocated_to(credit: dict, bill_id: str) -> Decimal:
+    """What this credit note's allocations applied to ``bill_id``."""
+    total = Decimal(0)
+    for allocation in credit.get("Allocations") or []:
+        if not isinstance(allocation, dict):
+            continue
+        if str((allocation.get("Invoice") or {}).get("InvoiceID") or "") == str(bill_id):
+            total += _decimal(allocation.get("Amount")) or Decimal(0)
+    return total
 
 
 def _payment_deleted(record: dict) -> bool:

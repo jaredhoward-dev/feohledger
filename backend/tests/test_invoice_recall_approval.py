@@ -49,6 +49,8 @@ async def _invoice(
     erp_document_id: str | None = None,
     claim: str | None = None,
     approval_enabled: bool = True,
+    peppol: str | None = None,
+    mirror: str | None = None,
 ) -> uuid.UUID:
     """One invoice in the given state, with a workflow instance whose snapshot
     carries ``approval_config``. A distinct amount and number per row and no
@@ -56,6 +58,16 @@ async def _invoice(
 
     ``claim``: ``payment`` / ``voided_payment`` (a run holding a pending or a
     voided payment) or ``card`` / ``cancelled_card``.
+
+    ``peppol``: the status of an outbound PEPPOL transmission of the invoice
+    (``sending`` / ``sent`` / ``delivered`` / ``failed``).
+
+    ``mirror``: pair the invoice inter-company, as routing does (both links,
+    both ``invoice.intercompany_routed`` rows). ``unsigned`` / ``approved`` /
+    ``paid`` / ``paying`` (unsigned, but a live payment holds it) /
+    ``carded`` (unsigned, but a live virtual card holds it) name the
+    mirror's state with this invoice as the origin; ``self`` makes THIS invoice
+    the mirror of an approved origin.
     """
     from datetime import date
 
@@ -140,8 +152,116 @@ async def _invoice(
                     last_four="4242",
                 )
             )
+        if peppol is not None:
+            from app.models.peppol_transmission import PeppolTransmission
+
+            s.add(
+                PeppolTransmission(
+                    invoice_id=inv.id,
+                    direction="outbound",
+                    participant_scheme="0088",
+                    participant_value="7300010000001",
+                    doc_type_id="dt",
+                    process_id="pr",
+                    business_message_id=inv.correlation_id.hex,
+                    status=peppol,
+                    provider="mock",
+                    amount=inv.amount,
+                    currency="USD",
+                    organization_id=org_id,
+                    entity_id=entity_id,
+                )
+            )
+        if mirror is not None:
+            await _pair(s, inv, mirror, org_id=org_id)
         await s.commit()
         return inv.id
+
+
+async def _pair(s, inv: Invoice, mirror: str, *, org_id) -> None:
+    """Pair ``inv`` inter-company the way `route_intercompany_invoice` leaves
+    it — see ``_invoice``'s ``mirror``."""
+    from datetime import date
+
+    from app.models.payment import Payment, PaymentRun
+    from app.models.workflow import AuditLog
+
+    tag = uuid.uuid4().hex[:8]
+    counterparty = Entity(organization_id=org_id, name=f"Sub {tag}", slug=f"sub-{tag}")
+    s.add(counterparty)
+    await s.flush()
+    status = {
+        "unsigned": InvoiceStatus.ready_for_review,
+        "paying": InvoiceStatus.ready_for_review,
+        "carded": InvoiceStatus.ready_for_review,
+        "approved": InvoiceStatus.approved,
+        "paid": InvoiceStatus.paid,
+        "self": InvoiceStatus.approved,
+    }[mirror]
+    signed = status != InvoiceStatus.ready_for_review
+    other = Invoice(
+        invoice_number=f"IC-{inv.invoice_number}",
+        vendor_name=inv.vendor_name,
+        amount=inv.amount,
+        currency=inv.currency,
+        status=status,
+        uploaded_by_id=uuid.uuid4(),
+        approved_by="Counterparty Approver" if signed else None,
+        approval_date=date(2026, 11, 2) if signed else None,
+        organization_id=org_id,
+        entity_id=counterparty.id,
+        counterparty_entity_id=inv.entity_id,
+        intercompany_mirror_id=inv.id,
+    )
+    s.add(other)
+    await s.flush()
+    inv.intercompany_mirror_id = other.id
+    # Routing's audit rows name the sides; `self` swaps them.
+    origin, mirror_row = (other, inv) if mirror == "self" else (inv, other)
+    for row, role in ((origin, "origin"), (mirror_row, "mirror")):
+        s.add(
+            AuditLog(
+                organization_id=org_id,
+                action="invoice.intercompany_routed",
+                entity_type="invoice",
+                entity_id=row.id,
+                details={"role": role},
+            )
+        )
+    if mirror == "carded":
+        from app.models.virtual_card import VirtualCard
+
+        s.add(
+            VirtualCard(
+                organization_id=org_id,
+                invoice_id=other.id,
+                card_provider="mock",
+                provider_card_id=f"mock-{uuid.uuid4().hex[:8]}",
+                amount_limit=other.amount,
+                currency="USD",
+                status="active",
+                last_four="4242",
+            )
+        )
+    if mirror == "paying":
+        run = PaymentRun(
+            organization_id=org_id,
+            status="draft",
+            total_amount=other.amount,
+            requires_cfo_approval=False,
+        )
+        s.add(run)
+        await s.flush()
+        s.add(
+            Payment(
+                invoice_id=other.id,
+                payment_run_id=run.id,
+                amount=other.amount,
+                method="ach",
+                status="pending",
+                correlation_id=other.correlation_id,
+            )
+        )
 
 
 async def _row(realdb, invoice_id) -> Invoice:
@@ -344,6 +464,60 @@ _REFUSALS = {
     ),
     "in_a_payment_run": ({"claim": "payment"}, "invoice_recall_claimed", {"claim": "payment"}),
     "virtual_card": ({"claim": "card"}, "invoice_recall_claimed", {"claim": "virtual_card"}),
+    # The approved document went out over PEPPOL (decisions §573). A `sending`
+    # row's outcome is unknown, so it counts.
+    "peppol_sent": ({"peppol": "sent"}, "invoice_recall_peppol_transmitted", {}),
+    "peppol_delivered": ({"peppol": "delivered"}, "invoice_recall_peppol_transmitted", {}),
+    "peppol_sending": ({"peppol": "sending"}, "invoice_recall_peppol_transmitted", {}),
+    # Paired inter-company (decisions §573): the other side holds a copy.
+    "mirror_unsigned": ({"mirror": "unsigned"}, "invoice_recall_mirror_unsigned", {}),
+    "mirror_approved": (
+        {"mirror": "approved"},
+        "invoice_recall_mirror_progressed",
+        {"mirror_status": "approved"},
+    ),
+    "mirror_paid": (
+        {"mirror": "paid"},
+        "invoice_recall_mirror_progressed",
+        {"mirror_status": "paid"},
+    ),
+    # Unsigned, but a run is already paying it: it has progressed.
+    "mirror_paying": (
+        {"mirror": "paying"},
+        "invoice_recall_mirror_progressed",
+        {"mirror_status": "ready_for_review"},
+    ),
+    # Unsigned, but a live virtual card holds it: progressed too.
+    "mirror_carded": (
+        {"mirror": "carded"},
+        "invoice_recall_mirror_progressed",
+        {"mirror_status": "ready_for_review"},
+    ),
+    "is_the_mirror": ({"mirror": "self"}, "invoice_recall_is_mirror", {}),
+    # PEPPOL is named before the pair and before a claim: nothing clears it.
+    "peppol_and_mirror": (
+        {"peppol": "sent", "mirror": "unsigned", "claim": "payment"},
+        "invoice_recall_peppol_transmitted",
+        {},
+    ),
+    # A claim is named before the pair refusals whose way out is a DELETE: the
+    # delete refuses a claimed invoice, so the run / payment goes first (§578).
+    "mirror_in_a_payment_run": (
+        {"mirror": "self", "claim": "payment"},
+        "invoice_recall_claimed",
+        {"claim": "payment"},
+    ),
+    "mirror_unsigned_and_origin_in_a_run": (
+        {"mirror": "unsigned", "claim": "payment"},
+        "invoice_recall_claimed",
+        {"claim": "payment"},
+    ),
+    # …but a progressed mirror, which only a credit memo corrects, stays first.
+    "mirror_progressed_and_origin_in_a_run": (
+        {"mirror": "approved", "claim": "payment"},
+        "invoice_recall_mirror_progressed",
+        {"mirror_status": "approved"},
+    ),
     # Both: the ERP is named first — nothing in FeohLedger clears it.
     "erp_and_payment": (
         {"erp_document_id": "BILL-3", "claim": "payment"},
@@ -367,6 +541,45 @@ async def test_each_refusal_leaves_the_invoice_where_it_was(realdb, scenario):
     assert after.status == before.status
     assert not after.segregation_actor_ids
     assert await _audit(realdb, invoice_id, RECALL) == []
+
+
+async def test_a_failed_peppol_send_does_not_refuse(realdb):
+    """A `failed` transmission reached nobody — the same reading of "live" as
+    the send's own idempotency index (decisions §573)."""
+    invoice_id = await _invoice(realdb, peppol="failed")
+    resp = await _recall(realdb, "ap_manager", invoice_id)
+    assert resp.status_code == 200, resp.text
+
+
+async def test_deleting_the_unsigned_mirror_lets_the_recall_through(realdb):
+    """The way out the `invoice_recall_mirror_unsigned` refusal names: delete
+    the mirror (which unlinks the origin), then recall (decisions §573)."""
+    invoice_id = await _invoice(realdb, mirror="unsigned")
+    mirror_id = (await _row(realdb, invoice_id)).intercompany_mirror_id
+    async with realdb.client(key=TENANT, role="ap_manager") as c:
+        resp = await c.delete(f"/api/invoices/{mirror_id}")
+    assert resp.status_code == 204, resp.text
+    assert (await _row(realdb, invoice_id)).intercompany_mirror_id is None
+    resp = await _recall(realdb, "ap_manager", invoice_id)
+    assert resp.status_code == 200, resp.text
+
+
+@pytest.mark.parametrize(("mirror", "claim"), [("paying", "payment"), ("carded", "virtual_card")])
+async def test_a_claimed_mirror_cannot_be_deleted_out_of_the_way(realdb, mirror, claim):
+    """A mirror a live payment or card holds has progressed: the recall says so,
+    and the delete door — the way out for an UNSIGNED mirror — refuses it too,
+    rather than cascading the claim away to clear the recall (decisions §577)."""
+    invoice_id = await _invoice(realdb, mirror=mirror)
+    mirror_id = (await _row(realdb, invoice_id)).intercompany_mirror_id
+    async with realdb.client(key=TENANT, role="ap_manager") as c:
+        resp = await c.delete(f"/api/invoices/{mirror_id}")
+    assert resp.status_code == 409, resp.text
+    assert resp.json()["detail"]["code"] == "invoice_delete_claimed"
+    assert resp.json()["detail"]["params"] == {"claim": claim}
+    assert (await _row(realdb, invoice_id)).intercompany_mirror_id == mirror_id
+    resp = await _recall(realdb, "ap_manager", invoice_id)
+    assert resp.status_code == 409, resp.text
+    assert resp.json()["detail"]["code"] == "invoice_recall_mirror_progressed"
 
 
 @pytest.mark.parametrize("claim", ["voided_payment", "cancelled_card"])
@@ -447,6 +660,10 @@ async def test_the_recall_verdict_matches_what_the_door_answers(realdb, role):
             "invoice_not_recallable",
             "invoice_recall_in_erp",
             "invoice_recall_claimed",
+            "invoice_recall_peppol_transmitted",
+            "invoice_recall_mirror_unsigned",
+            "invoice_recall_mirror_progressed",
+            "invoice_recall_is_mirror",
         }, seen
 
 
@@ -817,3 +1034,16 @@ async def test_the_engine_walks_the_recall_edges_only_for_the_recall(realdb):
         await transition_invoice(s, inv, InvoiceStatus.ready_for_review, action_name=RECALL_ACTION)
         assert inv.status == InvoiceStatus.ready_for_review
         await s.rollback()
+
+
+async def test_a_mirror_in_a_payment_run_is_told_to_clear_the_run_first(realdb):
+    """§578: the mirror refusal's way out is deleting the mirror, which the
+    delete door refuses while a payment holds it — so the recall names the run
+    first, and the delete agrees it is the blocker."""
+    invoice_id = await _invoice(realdb, mirror="self", claim="payment")
+    resp = await _recall(realdb, "ap_manager", invoice_id)
+    assert resp.status_code == 409, resp.text
+    assert resp.json()["detail"]["code"] == "invoice_recall_claimed"
+    async with realdb.client(key=TENANT, role="ap_manager") as c:
+        deleted = await c.delete(f"/api/invoices/{invoice_id}")
+    assert deleted.status_code == 409, deleted.text

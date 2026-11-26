@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:ui' show Tristate;
 
 import 'package:material_ui/material_ui.dart';
 import 'package:flutter/services.dart';
@@ -336,6 +337,85 @@ void main() {
 
     expect(find.widgetWithText(FilledButton, 'Approve'), findsOneWidget);
     expect(find.widgetWithText(OutlinedButton, 'Reject'), findsOneWidget);
+  });
+
+  // Assignment is routing, not authority (decisions §564): an invoice routed to
+  // a colleague keeps its Approve / Reject (the verdict alone decides), with a
+  // note naming the assignee that the buttons' semantics carry too.
+  group('assigned to someone else', () {
+    Map<String, dynamic> assigned(String? id, String? name) => {
+      ..._invoiceJson('1', status: 'ready_for_review'),
+      'assigned_to_id': id,
+      'assigned_to': name,
+    };
+
+    testWidgets('names the colleague above the buttons and in their hint', (
+      tester,
+    ) async {
+      final handle = tester.ensureSemantics();
+      await _arrange(_detailClient(assigned('u2', 'Pat Lee')));
+
+      await tester.pumpWidget(_localized());
+      await _pumpUntil(tester, find.text('Approve'));
+
+      const note = 'Assigned to Pat Lee — you can still act as an approver.';
+      expect(find.text(note), findsOneWidget);
+      expect(find.widgetWithText(FilledButton, 'Approve'), findsOneWidget);
+      expect(find.widgetWithText(OutlinedButton, 'Reject'), findsOneWidget);
+      for (final key in const [
+        'review-approve-semantics',
+        'review-reject-semantics',
+      ]) {
+        // The boundary node's own hint, and what a screen reader is handed
+        // for it: its data merged with the button node folded into it, which
+        // is where the button's flags live (the node alone carries only what
+        // the boundary itself states).
+        final node = tester.getSemantics(find.byKey(ValueKey(key)));
+        expect(node.hint, note, reason: key);
+        final data = node.getSemanticsData();
+        expect(data.hint, note, reason: key);
+        expect(data.flagsCollection.isButton, isTrue, reason: key);
+        expect(data.flagsCollection.isEnabled, Tristate.isTrue, reason: key);
+        expect(node.flagsCollection.isEnabled, Tristate.isTrue, reason: key);
+      }
+      handle.dispose();
+    });
+
+    testWidgets('an assignee with no stored name gets the generic note', (
+      tester,
+    ) async {
+      await _arrange(_detailClient(assigned('u2', '  ')));
+
+      await tester.pumpWidget(_localized());
+      await _pumpUntil(tester, find.text('Approve'));
+
+      expect(
+        find.text(
+          'Assigned to a colleague — you can still act as an approver.',
+        ),
+        findsOneWidget,
+      );
+    });
+
+    testWidgets('no note when the invoice is the reader\'s own or unassigned', (
+      tester,
+    ) async {
+      for (final id in const ['u1', null]) {
+        InvoiceStore.instance.reset();
+        await _arrange(_detailClient(assigned(id, 'Demo User')));
+
+        await tester.pumpWidget(const SizedBox());
+        await tester.pumpWidget(_localized());
+        await _pumpUntil(tester, find.text('Approve'));
+
+        expect(
+          find.byKey(const ValueKey('review-assigned-elsewhere')),
+          findsNothing,
+          reason: 'assigned_to_id: $id',
+        );
+        expect(find.widgetWithText(FilledButton, 'Approve'), findsOneWidget);
+      }
+    });
   });
 
   // Approve / reject are require_permission(PERM_INVOICE_APPROVE). The CFO

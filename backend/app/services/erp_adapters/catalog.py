@@ -105,6 +105,7 @@ def _field(
     destination: bool | None = None,
     show_when: dict[str, Any] | None = None,
     stored_default: str | None = None,
+    picker: str | None = None,
 ) -> dict[str, Any]:
     """One form field. ``label_key`` is a frontend i18n ``MessageKey``.
 
@@ -138,6 +139,10 @@ def _field(
         out["show_when"] = show_when
     if stored_default is not None:
         out["stored_default"] = stored_default
+    if picker is not None:
+        # The form offers the value from a list the app already holds instead
+        # of free text: ``gl_account`` = our synced chart, by code (§575).
+        out["picker"] = picker
     return out
 
 
@@ -167,6 +172,48 @@ SAGE_INTACCT_FIELDS: list[dict[str, Any]] = [
 #: each one's fields apply only while it is the chosen ``auth_method``.
 _NETSUITE_OAUTH2: dict[str, Any] = {"field": "auth_method", "values": ["oauth2_m2m"]}
 _NETSUITE_TBA: dict[str, Any] = {"field": "auth_method", "values": ["tba"]}
+
+#: The opt-in that books an early-payment discount as a vendor credit applied
+#: to the bill on payment write-back, and the account it is booked to (a GL
+#: code of ours, picked from the synced chart; required while the opt-in is on).
+#: Read by ``services/erp_payment_writeback`` (decisions §575).
+DISCOUNT_CREDIT_FIELD = "book_discount_as_credit"
+DISCOUNT_ACCOUNT_FIELD = "discount_credit_account"
+
+
+def _discount_credit_fields() -> list[dict[str, Any]]:
+    return [
+        _field(
+            DISCOUNT_CREDIT_FIELD,
+            required=False,
+            options=["off", "on"],
+            stored_default="off",
+            help_key="org.erp.help.bookDiscountAsCredit",
+        ),
+        _field(
+            DISCOUNT_ACCOUNT_FIELD,
+            show_when={"field": DISCOUNT_CREDIT_FIELD, "values": ["on"]},
+            help_key="org.erp.help.discountCreditAccount",
+            picker="gl_account",
+        ),
+    ]
+
+
+def discount_credit_refusal(erp: dict | None) -> str | None:
+    """Why a saved ``settings.erp`` block cannot turn the discount credit on,
+    or None. Off (or absent) is always fine; on needs an account, since a
+    credit booked to a guessed account is worse than none."""
+    if not isinstance(erp, dict):
+        return None
+    flag = erp.get(DISCOUNT_CREDIT_FIELD)
+    if flag in (None, "", "off"):
+        return None
+    if flag != "on":
+        return f"erp.{DISCOUNT_CREDIT_FIELD} must be 'on' or 'off'."
+    if not str(erp.get(DISCOUNT_ACCOUNT_FIELD) or "").strip():
+        return f"erp.{DISCOUNT_ACCOUNT_FIELD} is required when {DISCOUNT_CREDIT_FIELD} is on."
+    return None
+
 
 #: Every direct ERP, in dropdown order within its region group.
 ERP_PROVIDERS: list[dict[str, Any]] = [
@@ -203,6 +250,7 @@ ERP_PROVIDERS: list[dict[str, Any]] = [
                 required=False,
                 help_key="org.erp.help.billPaymentCardAccount",
             ),
+            *_discount_credit_fields(),
         ],
         "docs_url": "https://developer.intuit.com/app/developer/qbo/docs/get-started",
     },
@@ -220,6 +268,7 @@ ERP_PROVIDERS: list[dict[str, Any]] = [
                 help_key="org.erp.help.xeroBillStatus",
             ),
             _field("default_tax_type", required=False),
+            *_discount_credit_fields(),
         ],
         "docs_url": "https://developer.xero.com/documentation/getting-started-guide/",
     },

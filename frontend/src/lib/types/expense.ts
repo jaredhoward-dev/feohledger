@@ -255,6 +255,13 @@ export interface Expense {
 	// only person who may put it on one (decisions §434). null for a line
 	// written before migration 0134 (no recorded creator).
 	created_by_user_id: string | null;
+	// The approved pre-approval this line draws down, and how much of it
+	// (decisions §563). Set when the report is submitted, on a line that
+	// needed cover; cleared when the report is rejected. null on a draft line
+	// and on a line submitted before migration 0149 (no link is invented).
+	// Optional so an older payload without the fields still type-checks.
+	preapproval_id?: string | null;
+	preapproval_drawn_amount?: MoneyAmount;
 	created_at: string;
 	updated_at: string;
 }
@@ -531,8 +538,44 @@ export interface ExpensePreapproval {
 	decided_by: string | null;
 	decided_at: string | null;
 	expense_report_id: string | null;
+	// The draw-down (decisions §563): what submitted / approved lines have
+	// drawn against the estimate, and what is left, both in `currency`.
+	// `remaining_amount` is null unless the pre-approval is approved.
+	drawn_amount?: MoneyAmount;
+	remaining_amount?: MoneyAmount;
 	created_at: string;
 	updated_at: string;
+}
+
+/** An approved pre-approval's balance, as the pre-approvals table shows it. */
+export interface PreapprovalBalance {
+	drawn: MoneyAmount;
+	remaining: MoneyAmount;
+	/** Nothing left: the next line that needs cover will be refused. */
+	exhausted: boolean;
+}
+
+/**
+ * The draw-down to show for a pre-approval, or `null` when there is none to
+ * show: a pending or rejected request covers nothing, so it has no balance
+ * (the server sends `remaining_amount: null` for it). Display only — the
+ * server decides cover, under a row lock, at report submit (decisions §563).
+ */
+export function preapprovalBalance(
+	pa: Pick<ExpensePreapproval, 'status' | 'drawn_amount' | 'remaining_amount'>
+): PreapprovalBalance | null {
+	if (pa.status !== 'approved') return null;
+	if (pa.remaining_amount === null || pa.remaining_amount === undefined) return null;
+	const left = Number(pa.remaining_amount);
+	if (!Number.isFinite(left)) return null;
+	return { drawn: pa.drawn_amount ?? 0, remaining: pa.remaining_amount, exhausted: left <= 0 };
+}
+
+/** Whether a line draws down a pre-approval (it was covered at submit). */
+export function drawsPreapproval(
+	exp: Pick<Expense, 'preapproval_id' | 'preapproval_drawn_amount'>
+): boolean {
+	return Boolean(exp.preapproval_id) && exp.preapproval_drawn_amount != null;
 }
 
 export interface ExpensePreapprovalCreate {

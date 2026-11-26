@@ -23,7 +23,7 @@ import uuid
 from datetime import date, timedelta
 from decimal import Decimal
 
-from sqlalchemy import case, func, select
+from sqlalchemy import func, select, true
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.invoice import Invoice
@@ -34,8 +34,12 @@ from app.services.currency_conversion import (
     resolve_reporting_currency,
 )
 from app.services.open_ap_due import (
+    AGING_BANDS,
     COMMITTED_STATUSES,
     PENDING_STATUSES,
+    aging_band,
+    current_schedule_due,
+    effective_due_of,
     is_overdue,
     open_ap_due_population,
 )
@@ -188,9 +192,6 @@ async def commitment_rows(
     return rows
 
 
-AGING_BANDS = ("current", "days_30", "days_60", "days_90", "days_90_plus")
-
-
 async def aging_snapshot_buckets(
     db: AsyncSession,
     *,
@@ -212,9 +213,10 @@ async def aging_snapshot_buckets(
     `unconverted_count`, so a band that is part-converted says so.
 
     Population and band edges are the dashboard's exactly: `OPEN_AP_STATUSES`
-    with no `due_date` filter (a NULL due date is `current` — unknowable, so
-    not overdue), days past due computed by Postgres `date - date` against the
-    caller's `today`, and 0 / 30 / 60 / 90 as inclusive upper edges.
+    with no due-date filter, each row banded by `open_ap_due.aging_band` on
+    its effective due date (`effective_due_of` over `current_schedule_due`: the
+    current payment schedule's, else the invoice's own; NULL is `current` — unknowable, so not
+    overdue), the date the overdue count reads (decisions §565).
     """
     rep = invoice_reporting_amount_sql(
         reporting_currency=reporting_currency,
@@ -223,15 +225,8 @@ async def aging_snapshot_buckets(
         persisted_reporting_amount=Invoice.reporting_amount,
         persisted_reporting_currency=Invoice.reporting_currency,
     )
-    days_past = today - Invoice.due_date
-    band = case(
-        (Invoice.due_date.is_(None), "current"),
-        (days_past <= 0, "current"),
-        (days_past <= 30, "days_30"),
-        (days_past <= 60, "days_60"),
-        (days_past <= 90, "days_90"),
-        else_="days_90_plus",
-    )
+    current = current_schedule_due()
+    band = aging_band(effective_due_of(current.c.sched_due), today)
     result = await db.execute(
         apply_entity_scope(
             select(
@@ -239,6 +234,8 @@ async def aging_snapshot_buckets(
                 func.coalesce(func.sum(rep.amount), 0),
                 func.coalesce(func.sum(rep.unconverted), 0),
             )
+            .select_from(Invoice)
+            .outerjoin(current, true())
             .where(Invoice.status.in_(OPEN_AP_STATUSES))
             .group_by(band),
             Invoice,

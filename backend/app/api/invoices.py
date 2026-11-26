@@ -111,11 +111,17 @@ from app.services.applied_credit_integrity import refuse_edit_stranding_applied_
 from app.services.audit_access import build_field_diff
 from app.services.audit_dispatch import dispatch_audit
 from app.services.csv_import import MAX_CSV_IMPORT_SIZE, import_invoices_csv
+from app.services.erp_export_gate import live_claims
+from app.services.erp_payment_writeback import (
+    PENDING_CREDITS_KEY,
+    PENDING_VOID_CREDITS_KEY,
+    PENDING_VOIDS_KEY,
+    PENDING_WRITES_KEY,
+)
 from app.services.gl_chart import refuse_gl_codes_outside_chart
 from app.services.gl_recode import RecodeFilter, bulk_recode_gl
 from app.services.invoice_warnings import reconcile_line_totals, refresh_warnings
 from app.services.open_ap_due import overdue_invoice_ids
-from app.services.payment_runs import live_payment_invoices
 from app.services.report_export import csv_safe_cell
 from app.services.storage import (
     invoice_file_display_name,
@@ -913,13 +919,59 @@ async def peppol_send(
     from app.models.entity import Entity
     from app.services.e_invoice import EInvoiceValidationError
     from app.services.peppol_adapters import ParticipantId, PeppolSendError
-    from app.services.peppol_send import send_invoice_over_peppol
+    from app.services.peppol_send import (
+        live_outbound_transmission,
+        resolve_receiver,
+        send_invoice_over_peppol,
+    )
 
-    invoice = (
-        await db.execute(select(Invoice).where(Invoice.id == invoice_id))
+    # Unlocked pre-checks, before any network: an unapproved invoice is refused
+    # and an already-sent one answered `already_sent` without an SMP lookup.
+    # Column reads, not the ORM row, so the locked read below is not served
+    # stale from the identity map. Both are re-checked under the lock.
+    current_status = (
+        await db.execute(select(Invoice.status).where(Invoice.id == invoice_id))
     ).scalar_one_or_none()
-    if not invoice:
+    if current_status is None:
         raise HTTPException(status_code=404, detail="Invoice not found")
+    if current_status not in _PEPPOL_SENDABLE_STATUSES:
+        raise HTTPException(status_code=422, detail="invoice_not_approved")
+    existing = await live_outbound_transmission(db, invoice_id)
+    if existing is not None:
+        return _peppol_send_response(existing, already_sent=True)
+    # End the read transaction: nothing is held open across the SMP lookup.
+    await db.commit()
+
+    # Everything that needs no network next: a malformed participant id or a
+    # missing sender is a 400 before any lookup.
+    peppol_config = (org.settings or {}).get("peppol") or {}
+    sender_scheme = body.sender_scheme or peppol_config.get("sender_scheme")
+    sender_value = body.sender_value or peppol_config.get("sender_value")
+    if not sender_scheme or not sender_value:
+        raise HTTPException(status_code=400, detail="sender participant id is not configured")
+
+    try:
+        sender_id = ParticipantId(scheme=str(sender_scheme), value=str(sender_value))
+        # Round-trip through parse to validate the scheme format (PII-free error).
+        ParticipantId.parse(sender_id.format())
+        receiver_id = ParticipantId.parse(f"{body.receiver_scheme}:{body.receiver_value}")
+    except ValueError as exc:
+        # str(exc) names the field only — never the value (PII-free).
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    # Reserve → commit → call → record (decisions §578). The SMP lookup is a
+    # network call, so it runs BEFORE the invoice row is locked; then, under the
+    # lock, the status is checked and `send_invoice_over_peppol` reserves the
+    # `sending` row and commits it, releasing the lock before the AS4 transmit.
+    # The approval recall (`review.recall_refusal`) locks this row too and
+    # refuses on any transmission not `failed`, so a send and a recall
+    # serialize without holding a lock across the network: the send re-reads
+    # the status a recall left, and a recall sees the committed reservation.
+    try:
+        adapter = await resolve_receiver(peppol_config, receiver_id)
+    except PeppolSendError as exc:
+        raise HTTPException(status_code=422, detail=exc.code) from exc
+    invoice = await get_invoice_for_update(db, invoice_id)
 
     # PEPPOL transmission is a compliance-significant outbound to a counterparty
     # (inserts a row, emits to the network, writes an audit row) — gate it on AP
@@ -950,21 +1002,6 @@ async def peppol_send(
 
     buyer = _buyer_identity_from_org(org, entity_name=entity_name)
 
-    peppol_config = (org.settings or {}).get("peppol") or {}
-    sender_scheme = body.sender_scheme or peppol_config.get("sender_scheme")
-    sender_value = body.sender_value or peppol_config.get("sender_value")
-    if not sender_scheme or not sender_value:
-        raise HTTPException(status_code=400, detail="sender participant id is not configured")
-
-    try:
-        sender_id = ParticipantId(scheme=str(sender_scheme), value=str(sender_value))
-        # Round-trip through parse to validate the scheme format (PII-free error).
-        ParticipantId.parse(sender_id.format())
-        receiver_id = ParticipantId.parse(f"{body.receiver_scheme}:{body.receiver_value}")
-    except ValueError as exc:
-        # str(exc) names the field only — never the value (PII-free).
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-
     try:
         transmission, already_sent = await send_invoice_over_peppol(
             db,
@@ -977,6 +1014,7 @@ async def peppol_send(
             entity_id=invoice.entity_id,
             actor_id=user.id,
             peppol_config=peppol_config,
+            adapter=adapter,
         )
     except EInvoiceValidationError as exc:
         # Structured + PII-free. The BIS Billing 3.0 conformance pass reports
@@ -987,6 +1025,10 @@ async def peppol_send(
     except PeppolSendError as exc:
         raise HTTPException(status_code=422, detail=exc.code) from exc
 
+    return _peppol_send_response(transmission, already_sent=already_sent)
+
+
+def _peppol_send_response(transmission, *, already_sent: bool) -> PeppolSendResponse:
     return PeppolSendResponse(
         transmission_id=transmission.id,
         status=transmission.status,
@@ -2439,15 +2481,107 @@ async def reopen_invoice_chat(
     return await _chat_thread_response(db, invoice)
 
 
-#: An `approved` invoice is not in `IMMUTABLE_STATUSES`, yet it can already sit
-#: in a payment run with a live `Payment` — one exported to the bank as a NACHA
-#: file, say. Deleting it cascades that payment away while the bank still pays
-#: it, so the ledger stops matching the money that moved. Its payment has to be
-#: cancelled or voided first, which is the audited way out of a run.
-LIVE_PAYMENT_DELETE_REFUSAL = (
-    "This invoice has a payment in a payment run. Cancel or void that payment "
-    "before deleting the invoice."
+#: An `approved` invoice is not in `IMMUTABLE_STATUSES`, yet one of our rails
+#: can already be paying it: a live `Payment` in a run (exported to the bank as
+#: a NACHA file, say), or a live virtual card — bearer-spendable for the face
+#: amount, or already charged. Deleting the invoice cascaded either away while
+#: the money still moved, so the ledger stopped matching it (decisions §577).
+#: The claim has to be cancelled or voided first, which is the audited way out.
+#: "Live" is the rails' own predicate, read by `erp_export_gate.live_claims`, as
+#: the recall, close and ERP-push doors read it.
+INVOICE_DELETE_CLAIMED = "invoice_delete_claimed"
+_DELETE_CLAIM_MESSAGES = {
+    "payment": (
+        "FeohLedger is already paying this invoice: it has a live payment. Cancel its "
+        "payment run or void the payment before deleting the invoice."
+    ),
+    "virtual_card": (
+        "A virtual card has been issued to pay this invoice. Cancel the card before "
+        "deleting the invoice."
+    ),
+}
+
+
+def _delete_claim_refusal(claim: str) -> dict:
+    return coded_refusal(INVOICE_DELETE_CLAIMED, _DELETE_CLAIM_MESSAGES[claim], claim=claim)
+
+
+#: A voided payment returns the invoice to `approved`, so it is deletable, while
+#: the ERP side of the void (or of a discount credit) may still be unfinished:
+#: `WorkflowInstance.state_data` holds the payment ids the status-sync sweep has
+#: yet to reverse, apply or record (`erp_payment_writeback`'s four pending maps). The
+#: cascade deletes that instance, and the BillPayment / VendorCredit would stand
+#: in the ERP with nothing left to finish or report them (decisions §580).
+INVOICE_DELETE_ERP_REVERSAL_PENDING = "invoice_delete_erp_reversal_pending"
+_DELETE_ERP_REVERSAL_MESSAGE = (
+    "A payment on this invoice is still being reversed in the ERP, or its discount "
+    "credit is still being booked there. Wait for the ERP sync to finish it, or resolve "
+    "the ERP exception on this invoice, before deleting the invoice."
 )
+_ERP_PENDING_KEYS = (
+    PENDING_VOIDS_KEY,
+    PENDING_VOID_CREDITS_KEY,
+    PENDING_CREDITS_KEY,
+    # A payment write whose outcome was never recorded: our BillPayment may
+    # stand on the bill with nothing else naming it (decisions §584).
+    PENDING_WRITES_KEY,
+)
+
+#: Any outbound PEPPOL transmission not `failed` (`sending` counts: its outcome
+#: is unknown) is the local record of an e-invoice the receiver may hold. A
+#: transmitted e-invoice is corrected by a credit note, not erased — the rule
+#: §573 applies to the recall (decisions §580).
+INVOICE_DELETE_PEPPOL_TRANSMITTED = "invoice_delete_peppol_transmitted"
+_DELETE_PEPPOL_MESSAGE = (
+    "This invoice has been sent over PEPPOL, and the receiver may hold it. Issue a "
+    "credit note to cancel it; the invoice and its transmission record can't be deleted."
+)
+
+
+async def _delete_refusals(db: AsyncSession, invoice_ids) -> dict[uuid.UUID, dict]:
+    """The coded refusal, per invoice id, of everything that stops a hard delete
+    beyond the status check: a live claim (§577), an unfinished ERP reversal and
+    a PEPPOL transmission (§580), named in that order — a claim is cleared
+    first, and a transmission is never cleared."""
+    ids = list(invoice_ids)
+    if not ids:
+        return {}
+    refusals: dict[uuid.UUID, dict] = {}
+    for inv_id, claim in (await live_claims(db, ids)).items():
+        refusals[inv_id] = _delete_claim_refusal(claim)
+    # Locked, after the invoice rows the doors already hold (the order the
+    # write-back takes too, decisions §581): a discount credit's reservation
+    # or a void re-armed by a write-back that is committing now is waited for
+    # and seen, never read from the snapshot before it and then cascaded away.
+    states = (
+        await db.execute(
+            select(WorkflowInstance.invoice_id, WorkflowInstance.state_data)
+            .where(WorkflowInstance.invoice_id.in_(ids))
+            .order_by(WorkflowInstance.invoice_id)
+            .with_for_update()
+        )
+    ).all()
+    for inv_id, state in states:
+        if inv_id not in refusals and any((state or {}).get(k) for k in _ERP_PENDING_KEYS):
+            refusals[inv_id] = coded_refusal(
+                INVOICE_DELETE_ERP_REVERSAL_PENDING, _DELETE_ERP_REVERSAL_MESSAGE
+            )
+    transmitted = (
+        await db.execute(
+            select(PeppolTransmission.invoice_id)
+            .where(
+                PeppolTransmission.invoice_id.in_(ids),
+                PeppolTransmission.direction == "outbound",
+                PeppolTransmission.status != "failed",
+            )
+            .distinct()
+        )
+    ).scalars()
+    for inv_id in transmitted:
+        refusals.setdefault(
+            inv_id, coded_refusal(INVOICE_DELETE_PEPPOL_TRANSMITTED, _DELETE_PEPPOL_MESSAGE)
+        )
+    return refusals
 
 
 @router.delete("/{invoice_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -2458,14 +2592,16 @@ async def delete_invoice(
     entity_id: uuid.UUID | None = Depends(get_entity_id),
 ):
     await ensure_in_entity_scope(db, Invoice, invoice_id, entity_id, detail="Invoice not found")
-    # Row-locked: the status and live-payment reads below decide a hard delete,
+    # Row-locked: the status and live-claim reads below decide a hard delete,
     # and the lock is what serialises them against a payment run inserting a
-    # payment for this invoice (the FK takes a share lock on this row).
+    # payment for this invoice (the FK takes a share lock on this row) and the
+    # card mint, which locks the invoice row too.
     invoice = await get_invoice_for_update(db, invoice_id)
     if invoice.status in IMMUTABLE_STATUSES:
         raise HTTPException(status_code=409, detail="Cannot delete invoice in this status")
-    if await live_payment_invoices(db, [invoice.id]):
-        raise HTTPException(status_code=409, detail=LIVE_PAYMENT_DELETE_REFUSAL)
+    refusal = (await _delete_refusals(db, [invoice.id])).get(invoice.id)
+    if refusal is not None:
+        raise HTTPException(status_code=409, detail=refusal)
     # Audit BEFORE the cascade: afterwards there is no row left to describe.
     # `_delete_invoice_cascade` deliberately does not touch `audit_log`, so this
     # row (and the invoice's whole prior trail) survives the delete — which is
@@ -2473,7 +2609,7 @@ async def delete_invoice(
     # instances, extraction results, chat threads and virtual cards was the one
     # destructive tenant operation leaving no record of who did it.
     await _audit_invoice_deleted(db, invoice, actor_id=user.id, bulk=False)
-    await _delete_invoice_cascade(db, invoice_id)
+    await _delete_invoice_cascade(db, invoice_id, actor_id=user.id)
     await db.commit()
 
 
@@ -2506,7 +2642,9 @@ async def _audit_invoice_deleted(
 # ---------- Helpers ----------
 
 
-async def _delete_invoice_cascade(db: AsyncSession, invoice_id: uuid.UUID) -> None:
+async def _delete_invoice_cascade(
+    db: AsyncSession, invoice_id: uuid.UUID, *, actor_id: uuid.UUID
+) -> None:
     """Delete an invoice and all related records across tables.
 
     Every FK referencing `invoices.id` (or transitively, `virtual_cards.id` /
@@ -2520,6 +2658,13 @@ async def _delete_invoice_cascade(db: AsyncSession, invoice_id: uuid.UUID) -> No
     statement import, a vendor-statement reconciliation line, the other side
     of an inter-company mirror pair — are unlinked (FK set NULL) instead,
     so deleting the invoice doesn't destroy that external history.
+
+    An INBOUND PEPPOL transmission is the second kind: the record of an
+    e-invoice a supplier delivered to us. It is detached and stamped with
+    ``actor_id`` and the time, never deleted, and kept under the
+    ``peppol_transmissions`` retention class (decisions §586). Outbound rows
+    reaching here are only ``failed`` ones — `_delete_refusals` refuses any
+    other (§580) — and are deleted: they never left.
     """
     # Grandchildren first: supplier chat messages (child of chat threads),
     # and virtual card reveal tokens / rebates (children of virtual_cards).
@@ -2543,6 +2688,21 @@ async def _delete_invoice_cascade(db: AsyncSession, invoice_id: uuid.UUID) -> No
     # Workflow steps (child of workflow_instances).
     wf_ids_q = select(WorkflowInstance.id).where(WorkflowInstance.invoice_id == invoice_id)
     await db.execute(sa_delete(WorkflowStep).where(WorkflowStep.instance_id.in_(wf_ids_q)))
+
+    # Received e-invoices outlive the invoice (§586): detach, never delete.
+    await db.execute(
+        sa_update(PeppolTransmission)
+        .where(
+            PeppolTransmission.invoice_id == invoice_id,
+            PeppolTransmission.direction == "inbound",
+        )
+        .values(
+            invoice_id=None,
+            deleted_invoice_id=invoice_id,
+            invoice_deleted_by_id=actor_id,
+            invoice_deleted_at=func.now(),
+        )
+    )
 
     # Direct children of invoices, owned outright.
     for model in (
@@ -2658,8 +2818,8 @@ async def bulk_delete(
     ids = body.ids
     # The same treatment `bulk/status` has: scoped to the selected entity like
     # the single-invoice DELETE, and row-locked in id order so the status and
-    # live-payment reads below cannot come from a row a concurrent approval is
-    # changing or a payment run is inserting a payment for. Without the scope,
+    # live-claim reads below cannot come from a row a concurrent approval is
+    # changing or a payment run (or card mint) is claiming. Without the scope,
     # another subsidiary's invoice could be deleted by id from a view that
     # never showed it.
     result = await db.execute(
@@ -2674,13 +2834,15 @@ async def bulk_delete(
     # reported as skipped rather than silently dropped from the count.
     found = {inv.id for inv in invoices}
     skipped: list[str] = [str(i) for i in ids if i not in found]
-    in_a_run = await live_payment_invoices(db, found)
+    # A live claim, an unfinished ERP reversal or a PEPPOL transmission skips
+    # the row, as the single delete refuses it (decisions §577, §580).
+    refused = await _delete_refusals(db, found)
     for inv in invoices:
-        if inv.status in IMMUTABLE_STATUSES or inv.id in in_a_run:
+        if inv.status in IMMUTABLE_STATUSES or inv.id in refused:
             skipped.append(str(inv.id))
         else:
             await _audit_invoice_deleted(db, inv, actor_id=user.id, bulk=True)
-            await _delete_invoice_cascade(db, inv.id)
+            await _delete_invoice_cascade(db, inv.id, actor_id=user.id)
             deleted += 1
 
     await db.commit()

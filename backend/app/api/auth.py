@@ -316,6 +316,8 @@ async def _user_response(
         # grants — never the raw entitlements JSON, which an operator may have
         # extended with keys that mean nothing to the client.
         entitlements=sorted(f for f in ALL_FEATURES if has_entitlement(entitlements, f)),
+        # The operator-granted partner capability `/api/partner` requires (§574).
+        is_partner=bool(org is not None and org.is_partner),
         locale=user.locale,
         legal_acceptance_required=bool(await legal_acceptance.missing_documents(db, user.id)),
     )

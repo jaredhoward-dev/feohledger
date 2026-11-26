@@ -12,6 +12,9 @@ Coverage:
   * `positive_pay` class (#425) — expires the STORED FILE past a deliberately
     short window while keeping the PII-free row, idempotent, and a failed
     object delete leaves the key for the next tick.
+  * `peppol_transmissions` class (§586) — an inbound transmission that outlived
+    its deleted invoice is deleted once past its window from receipt; a row
+    still attached to an invoice, or a detached one inside the window, is kept.
 """
 
 from __future__ import annotations
@@ -598,3 +601,115 @@ async def test_policy_endpoint_exposes_and_accepts_positive_pay(realdb):
         put = await c.put("/api/retention-policy", json={"policy": {"positive_pay": 3}})
     assert put.status_code == 200
     assert put.json()["policy"]["positive_pay"] == 3
+
+
+# ---------------------------------------------------------------------------
+# peppol_transmissions class (§586) — a received e-invoice's record that
+# outlived its deleted invoice is kept for the window, then expired
+# ---------------------------------------------------------------------------
+
+
+async def _add_inbound(mk, org_id, *, created_at, invoice_id=None):
+    from sqlalchemy import update
+
+    from app.models.peppol_transmission import PeppolTransmission
+
+    row_id = uuid.uuid4()
+    detached = invoice_id is None
+    async with mk() as s:
+        s.add(
+            PeppolTransmission(
+                id=row_id,
+                invoice_id=invoice_id,
+                direction="inbound",
+                participant_scheme="9930",
+                participant_value="SUPPLIER123",
+                doc_type_id="doc",
+                process_id="proc",
+                business_message_id=uuid.uuid4().hex,
+                message_id=uuid.uuid4().hex,
+                status="delivered",
+                provider="mock",
+                organization_id=org_id,
+                invoice_deleted_at=datetime.now(UTC) if detached else None,
+                deleted_invoice_id=uuid.uuid4() if detached else None,
+            )
+        )
+        await s.commit()
+        await s.execute(
+            update(PeppolTransmission)
+            .where(PeppolTransmission.id == row_id)
+            .values(created_at=created_at)
+        )
+        await s.commit()
+    return row_id
+
+
+@pytest.mark.asyncio
+async def test_sweep_expires_only_a_detached_inbound_record_past_its_window(realdb):
+    from app.models.peppol_transmission import PeppolTransmission
+
+    org_id = realdb.info("a").org_id
+    mk = realdb.sessionmaker("a")
+    old = datetime.now(UTC) - timedelta(days=4000)  # past the 84-month default
+    expired = await _add_inbound(mk, org_id, created_at=old)
+    young = await _add_inbound(mk, org_id, created_at=datetime.now(UTC) - timedelta(days=30))
+    # Still attached: lives as long as its invoice, however old.
+    inv_id = await _add_invoice(mk, org_id, status=InvoiceStatus.approved, created_at=old)
+    attached = await _add_inbound(mk, org_id, created_at=old, invoice_id=inv_id)
+
+    tmk = realdb.sessionmaker("a")
+    async with tmk() as db:
+        first = await sweep_tenant(db, organization_id=org_id, settings_dict={})
+        await db.commit()
+    async with tmk() as db:
+        second = await sweep_tenant(db, organization_id=org_id, settings_dict={})
+        await db.commit()
+
+    assert first.peppol_transmissions_expired == 1
+    assert second.peppol_transmissions_expired == 0
+    async with mk() as s:
+        assert await s.get(PeppolTransmission, expired) is None
+        assert await s.get(PeppolTransmission, young) is not None
+        assert await s.get(PeppolTransmission, attached) is not None
+        manifest = (
+            (await s.execute(select(AuditLog).where(AuditLog.action == "retention.archived")))
+            .scalars()
+            .all()
+        )
+    assert manifest and manifest[-1].details["peppol_transmissions_expired"] == 1
+    assert manifest[-1].details["peppol_transmissions_months"] == resolve_retention_months(
+        {}, "peppol_transmissions"
+    )
+    assert "SUPPLIER123" not in str(manifest[-1].details)
+
+
+@pytest.mark.asyncio
+async def test_policy_endpoint_exposes_and_accepts_peppol_transmissions(realdb):
+    async with realdb.client(key="a", role="admin") as c:
+        got = await c.get("/api/retention-policy")
+        assert got.status_code == 200
+        assert "peppol_transmissions" in got.json()["policy"]
+
+        put = await c.put("/api/retention-policy", json={"policy": {"peppol_transmissions": 120}})
+        assert put.status_code == 200
+        assert put.json()["policy"]["peppol_transmissions"] == 120
+
+        # Bounded like every other class: a non-positive window is refused
+        # before any write, so the stored 120 survives.
+        for bad in (0, -1):
+            resp = await c.put(
+                "/api/retention-policy", json={"policy": {"peppol_transmissions": bad}}
+            )
+            assert resp.status_code == 422, resp.text
+
+    # Persisted under the class's own key on org settings, which is what the
+    # sweep resolves (`resolve_retention_months(..., "peppol_transmissions")`).
+    from app.models.organization import Organization
+
+    async with realdb.control_sessionmaker()() as s:
+        org = (
+            await s.execute(select(Organization).where(Organization.id == realdb.info("a").org_id))
+        ).scalar_one()
+    assert org.settings["retention"]["peppol_transmissions_months"] == 120
+    assert resolve_retention_months(org.settings, "peppol_transmissions") == 120

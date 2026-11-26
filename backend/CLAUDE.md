@@ -662,6 +662,8 @@ Step types: `extraction` → `approval` → `erp_export` → `done`
 
 **Snapshot pattern**: `WorkflowInstance.steps_config_snapshot` freezes the active definition at invoice creation. All runtime logic reads the snapshot, not the live definition.
 
+**`WorkflowInstance.state_data` carries ERP push state**: `erp_payment_writes_pending` (the reserved payment write, keyed by payment id; cleared only by the outcome naming its token, else finished by `resume_pending_writes`, decisions §584) and `erp_last_refusal_code` (the coded refusal of the last push that landed at `failed`; `reset_erp_push_budget` drops it as each push starts, §587). Write them only through their owners in `erp_payment_writeback` / `erp`.
+
 **Notification hook**: `transition_invoice()` is also the single chokepoint for invoice-event notifications — after the audit write it calls `notification_dispatch.notify_event()` keyed off the resulting status (`approved`/`rejected`/`paid`). The `invoice_assigned` event is fired separately from `review.assign_reviewer`. All best-effort (never breaks the transition). **The outbound legs — every email and the chat post — run AFTER the caller's transaction commits**, via `services/post_commit.enqueue_post_commit` and SQLAlchemy's `after_commit`; only the in-app `Notification` rows ride the caller's commit, because those are DB writes. Before this the fan-out was awaited inside the still-open transaction, so a hung chat webhook held `payment_erp_sync`'s / `review.approve_invoice`'s `FOR UPDATE` row lock on a live invoice for its full 10-second timeout, and N recipients multiplied the email leg linearly. A transaction that rolls back now sends nothing. The outbound webhook emit from the same hook rides the same queue (the typed emitters take `db=`), so a rolled-back transition announces no event (decisions §427). See `docs/notifications.md` § The outbound legs run POST-COMMIT.
 
 ## Key background services
@@ -1097,7 +1099,9 @@ AWS_PROFILE=feohledger sops feohledger/prod.sops.yaml   # decrypts → $EDITOR �
   where money goes uses `ExactMoneyInput` (a JSON number is already a float by
   the time pydantic sees it).
 - **No dotenv in Lambda paths** — `main.py` imports dotenv for local dev; Lambda entry points must not.
+- **Due dates: read the effective one.** Every per-row overdue flag, shown due date or aging band reads `services/open_ap_due` (`effective_due_of` / `current_schedule_due`, banded by `aging_band`; counts through `open_ap_due_population`), never `Invoice.due_date` alone: a payment schedule moves the date (decisions §565, §569, `docs/analytics.md`). `tests/test_open_ap_due_single_statement.py` is the guard.
 - **Tenant isolation** — always resolve tenant via dependency injection (`get_tenant_db()`), never hardcode DB names.
+- **An inbound `PeppolTransmission.invoice_id` may be NULL** — a received e-invoice's row outlives its deleted invoice, detached and stamped (decisions §586). Code joining a transmission to its invoice must tolerate NULL (outer join, or filter by an invoice id).
 - **Row locking** — use `get_invoice_for_update()` for any status transition to prevent race conditions.
 - **No row lock held across a third-party call.** Lock, write a committed marker, call with no lock, re-lock and check the marker is still yours (the ERP bill void, decisions §545, §550; `services/post_commit.py` for best-effort legs).
 - **Every change within the public contract (`/api/v1`, its OpenAPI, the webhook events) gets an entry in `app/api/v1_changelog.py::PUBLIC_API_CHANGES`** in the same change; `info.version` is not bumped (decisions §548).

@@ -561,7 +561,116 @@ test.describe('/organization ERP connection', () => {
 		}
 	});
 
-	test('a failed ERP list load offers Try again', async ({ page }) => {
+	test('the discount credit account: opt-in reveals the picker, offering only shared ERP-linked accounts, and is required', async ({
+		page
+	}) => {
+		await stubStatus(page, () => oauthStatus());
+		let authorizeCalls = 0;
+		await page.route(
+			(url) => url.pathname === '/api/organization/erp/oauth/quickbooks_online/authorize',
+			(route) => {
+				authorizeCalls += 1;
+				return route.fulfill({ status: 500, json: { detail: 'must not be reached' } });
+			}
+		);
+		// The chart as the picker reads it: one eligible account, one entity
+		// override of the same code, one never linked to the ERP.
+		const row = (code: string, name: string, entityId: string | null, erpId: string | null) => ({
+			id: `gl-${code}-${entityId ?? 'shared'}`,
+			code,
+			name,
+			account_type: 'expense',
+			parent_code: null,
+			is_active: true,
+			erp_account_id: erpId,
+			entity_id: entityId
+		});
+		await page.route(
+			(url) => url.pathname === '/api/gl-accounts',
+			(route) =>
+				route.fulfill({
+					json: [
+						row('4900', 'Discounts received', null, 'qbo-77'),
+						row('4900', 'Subsidiary override', 'ent-a', 'qbo-78'),
+						row('4950', 'Created here only', null, null)
+					]
+				})
+		);
+
+		await page.goto('/organization?section=erp');
+		const card = panel(page);
+		try {
+			await card.getByTestId('erp-provider-select').selectOption('quickbooks_online');
+			const picker = card.getByTestId('erp-picker-discount_credit_account');
+			await expect(picker).toHaveCount(0);
+			await card.locator('select[name="book_discount_as_credit"]').selectOption('on');
+			await expect(picker).toBeVisible();
+			await expect(picker).not.toHaveAttribute('aria-busy');
+			await expect(picker.locator('option')).toHaveText([
+				'Choose an account',
+				'4900 — Discounts received'
+			]);
+
+			// Required while on: Connect refuses, marks and focuses it, and never
+			// reaches the provider.
+			await card.getByRole('button', { name: 'Connect to QuickBooks Online' }).click();
+			await expect(card.getByTestId('erp-status')).toHaveText(
+				'Fill in: Discount credit account.'
+			);
+			await expect(picker).toHaveAttribute('aria-invalid', 'true');
+			await expect(picker).toBeFocused();
+			expect(authorizeCalls).toBe(0);
+			await picker.selectOption('4900');
+			await expect(picker).not.toHaveAttribute('aria-invalid');
+
+			await expectNoA11yViolations(page);
+		} finally {
+			await resetErp(page);
+		}
+	});
+
+	test('the discount credit account picker says when the chart failed to load, and when it is empty', async ({
+		page
+	}) => {
+		await stubStatus(page, () => oauthStatus());
+		let failures = 1;
+		await page.route(
+			(url) => url.pathname === '/api/gl-accounts',
+			(route) => {
+				if (failures > 0) {
+					failures -= 1;
+					return route.fulfill({ status: 500, json: { detail: 'boom' } });
+				}
+				return route.fulfill({ json: [] });
+			}
+		);
+
+		await page.goto('/organization?section=erp');
+		const card = panel(page);
+		try {
+			await card.getByTestId('erp-provider-select').selectOption('quickbooks_online');
+			await card.locator('select[name="book_discount_as_credit"]').selectOption('on');
+			const failed = card.getByTestId('erp-picker-discount_credit_account-failed');
+			await expect(failed).toContainText("Couldn't load your chart of accounts.");
+			// `ui/LoadError`'s own button, which reads `common.retry` ("Retry"), as
+			// the panel's catalogue failure (`erp-load-failed`) does too.
+			await failed.getByRole('button', { name: 'Retry', exact: true }).click();
+			await expect(failed).toHaveCount(0);
+
+			const status = card.getByTestId('erp-picker-discount_credit_account-status');
+			await expect(status).toContainText('No accounts synced yet.');
+			await expect(
+				status.getByRole('link', { name: 'Open the chart of accounts' })
+			).toHaveAttribute('href', '/gl-accounts');
+			await expect(
+				card.getByTestId('erp-picker-discount_credit_account').locator('option')
+			).toHaveText(['Choose an account']);
+		} finally {
+			await resetErp(page);
+		}
+	});
+
+	test('a failed ERP list load offers Retry', async ({ page }) => {
 		let failures = 1;
 		await page.route(
 			(url) => url.pathname === '/api/organization/erp/providers',
@@ -577,7 +686,7 @@ test.describe('/organization ERP connection', () => {
 		const card = panel(page);
 		const failed = card.getByTestId('erp-load-failed');
 		await expect(failed).toContainText("Couldn't load the ERP list.");
-		await failed.getByRole('button', { name: 'Try again' }).click();
+		await failed.getByRole('button', { name: 'Retry', exact: true }).click();
 		await expect(card.getByTestId('erp-provider-select')).toBeVisible();
 		await expect(failed).toHaveCount(0);
 	});

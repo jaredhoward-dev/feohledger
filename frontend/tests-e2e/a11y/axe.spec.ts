@@ -8,6 +8,7 @@ import {
 	expect,
 	invoicePicker,
 	NO_TENANT_BASE,
+	stubPartnerWorkspace,
 	test,
 	vendorPicker
 } from '../fixtures/helpers';
@@ -86,10 +87,17 @@ const ORG_PANELS: [slug: string, heading: string][] = [
 	['exception-agents', 'Exception agents'],
 	['residency', 'Data Residency'],
 	['plan', 'Plan'],
+	['partner-link', 'Join a partner'],
 	['close', 'Close this workspace']
 ];
 
-const AUTHED_ROUTES: { path: string; name: string; ready?: string }[] = [
+const AUTHED_ROUTES: {
+	path: string;
+	name: string;
+	ready?: string;
+	/** Network stubs registered before navigation, for a page the worker tenant cannot reach as seeded. */
+	setup?: (page: Page) => Promise<void>;
+}[] = [
 	{ path: '/', name: 'dashboard' },
 	{ path: '/invoices', name: 'invoices list' },
 	{ path: '/vendors', name: 'vendors list' },
@@ -105,10 +113,11 @@ const AUTHED_ROUTES: { path: string; name: string; ready?: string }[] = [
 	{ path: '/admin?tab=roles', name: 'admin roles', ready: 'Custom roles' },
 	{ path: '/admin/api-keys', name: 'admin API keys', ready: 'API Keys' },
 	{ path: '/admin/webhooks', name: 'admin webhooks', ready: 'Webhooks' },
-	// A standalone (non-partner) tenant renders the "not a partner" empty state
-	// here; the heading is present either way, so the scan is meaningful for
-	// both shapes.
-	{ path: '/admin/partner', name: 'admin partner', ready: 'Partner Admin' },
+	// The page opens only for a workspace the operator made a partner and
+	// bounces every other one (decisions §574). No e2e tenant is a partner, so
+	// the capability and an empty overview are stubbed and the real page —
+	// heading, attach button, child table — is what axe scans.
+	{ path: '/admin/partner', name: 'admin partner', ready: 'Partner Admin', setup: stubPartnerWorkspace },
 	// Its create modal has since gained a radio fieldset/legend intake picker, a
 	// file input and a persistent role="alert" refusal region — new interactive
 	// controls that had never seen an axe pass. (The list page is scanned here;
@@ -163,8 +172,9 @@ const AUTHED_ROUTES: { path: string; name: string; ready?: string }[] = [
 ];
 
 test.describe('accessibility — authenticated app (WCAG 2.2 AA)', () => {
-	for (const { path, name, ready } of AUTHED_ROUTES) {
+	for (const { path, name, ready, setup } of AUTHED_ROUTES) {
 		test(`${name} (${path}) has no axe violations`, async ({ page }) => {
+			await setup?.(page);
 			await page.goto(path);
 			// The sidebar means we're inside the authenticated app shell;
 			// waiting on it ensures axe scans the rendered page, not a

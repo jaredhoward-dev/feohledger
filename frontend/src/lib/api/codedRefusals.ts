@@ -419,6 +419,18 @@ const BUILDERS: Record<string, Builder> = {
 	// sentence.
 	invoice_not_recallable: fixed('refusal.invoiceNotRecallable'),
 	invoice_recall_in_erp: fixed('refusal.invoiceRecallInErp'),
+	// The document already went out over PEPPOL, or the invoice is paired
+	// inter-company (decisions §573).
+	invoice_recall_peppol_transmitted: fixed('refusal.recallPeppolTransmitted'),
+	invoice_recall_mirror_unsigned: fixed('refusal.recallMirrorUnsigned'),
+	invoice_recall_mirror_progressed: fixed('refusal.recallMirrorProgressed'),
+	invoice_recall_is_mirror: fixed('refusal.recallIsMirror'),
+	// Partner Admin (decisions §574): an admin of a workspace the operator has
+	// not made a partner, on any `/api/partner` route; and the link-code mint
+	// (`POST /api/organization/partner-link-code`) while the platform has no
+	// signing key configured (503).
+	partner_capability_required: fixed('refusal.partnerCapabilityRequired'),
+	partner_linking_disabled: fixed('refusal.partnerLinkingDisabled'),
 	// `services/erp_bill_void` — `POST /api/exceptions/{id}/void-erp-bill` and
 	// the queue's `void_erp_bill_refusal` verdict (decisions §539).
 	erp_void_not_flagged: fixed('refusal.erpVoidNotFlagged'),
@@ -437,12 +449,29 @@ const BUILDERS: Record<string, Builder> = {
 	erp_lookup_not_failed: fixed('refusal.erpLookupNotFailed'),
 	erp_lookup_unsupported: fixed('refusal.erpLookupUnsupported'),
 	erp_lookup_failed: fixed('refusal.erpLookupFailed'),
+	// A bill on a shared Xero key, confirmed as this invoice's (decisions §587).
+	erp_bill_confirm_not_offered: fixed('refusal.erpBillConfirmNotOffered'),
+	erp_bill_confirm_not_found: fixed('refusal.erpBillConfirmNotFound'),
+	erp_bill_claimed: fixed('refusal.erpBillClaimed'),
 	invoice_recall_claimed: (params, t) => {
 		const claim = str(params, 'claim');
 		if (claim === 'payment') return t('refusal.paymentBlocksRecall');
 		if (claim === 'virtual_card') return t('refusal.cardBlocksRecall');
 		return null;
 	},
+	// `DELETE /api/invoices/{id}` — a live payment or virtual card holds the
+	// invoice (decisions §577). `params.claim` names the rail; an unknown one
+	// falls back to the server's sentence.
+	invoice_delete_claimed: (params, t) => {
+		const claim = str(params, 'claim');
+		if (claim === 'payment') return t('refusal.paymentBlocksDelete');
+		if (claim === 'virtual_card') return t('refusal.cardBlocksDelete');
+		return null;
+	},
+	// `DELETE /api/invoices/{id}` — the ERP side of a void or a discount credit is
+	// unfinished, or the invoice went out over PEPPOL (decisions §580).
+	invoice_delete_erp_reversal_pending: fixed('refusal.erpReversalBlocksDelete'),
+	invoice_delete_peppol_transmitted: fixed('refusal.peppolBlocksDelete'),
 	// The state machine's own 409s (`services/workflow_engine.py`), reached
 	// through every door that transitions an invoice and through a
 	// `POST /bulk/status` row's skip. `params.status` / `params.target` are

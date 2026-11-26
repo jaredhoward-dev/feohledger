@@ -6,7 +6,7 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, Header, HTTPException, Response
 from pydantic import BaseModel
 from sqlalchemy import select, text
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm.attributes import flag_modified
 
 from app.api.auth import require_sensitive_step_up
@@ -21,7 +21,7 @@ from app.api.organization_controls import AUDIT_UNWRITABLE_DETAIL, guard_owned_k
 from app.api.organization_match_rules import guard_matching_block
 from app.api.refusals import coded_refusal, credential_block_unopenable_detail
 from app.config import settings
-from app.database import get_control_db
+from app.database import get_control_db, get_tenant_engine
 from app.models.organization import Organization
 from app.models.user import User
 from app.schemas.auth import STEP_UP_OPERATION_SCIM_TOKEN_MINT, MFAStepUpRequest
@@ -363,6 +363,19 @@ def _stamp_erp_configured_at(stored: object, merged: dict) -> dict:
     return out
 
 
+async def _discount_account_refusal(org: Organization, erp: dict | None) -> str | None:
+    """`erp_payment_writeback.discount_account_refusal` for the block about to
+    be saved. The GL chart is tenant data, so a tenant session is opened only
+    when the discount credit is on — every other save touches no tenant DB."""
+    from app.services import erp_payment_writeback
+
+    if not isinstance(erp, dict) or not erp_payment_writeback.discount_credit_on(erp):
+        return None
+    factory = async_sessionmaker(get_tenant_engine(org.db_name), expire_on_commit=False)
+    async with factory() as tenant_db:
+        return await erp_payment_writeback.discount_account_refusal(tenant_db, org.id, erp)
+
+
 @router.patch("", response_model=OrganizationResponse)
 async def update_organization(
     body: UpdateOrganizationRequest,
@@ -447,6 +460,12 @@ async def update_organization(
                 if isinstance(erp_before, dict) and erp_catalog.OAUTH_KEY in erp_before:
                     kept[erp_catalog.OAUTH_KEY] = erp_before[erp_catalog.OAUTH_KEY]
                 body.settings["erp"] = kept or None
+            discount_refusal = erp_catalog.discount_credit_refusal(body.settings.get("erp"))
+            if discount_refusal:
+                raise HTTPException(status_code=422, detail=discount_refusal)
+            discount_refusal = await _discount_account_refusal(org, body.settings.get("erp"))
+            if discount_refusal:
+                raise HTTPException(status_code=422, detail=discount_refusal)
             await ensure_live_erp_entitled(db, org.id, body.settings.get("erp"))
             # Same connection: only a switched-off sign-in method's secrets go.
             secret_drops["erp"] = (

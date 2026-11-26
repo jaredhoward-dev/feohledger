@@ -11,7 +11,8 @@ import { expect, test } from '../fixtures/helpers';
  *
  * Both uploads are stubbed: the code under test is the client's reporting of a
  * mixed result, and stubbing keeps a real invoice (and a real extraction) out of
- * the tenant. The requests are held until the progress line has been read,
+ * the tenant: a.pdf is accepted and b.pdf refused, told apart by the filename
+ * in each request's body. The requests are held until the progress line has been read,
  * because it only exists while they are in flight. The list refetch is real.
  * `untranslatedCopy.test.ts` (`TOASTS_TRANSLATED`) is the static half.
  */
@@ -29,9 +30,16 @@ test.describe('/invoices upload feedback is localized', () => {
 		const held = new Promise<void>((resolve) => (release = resolve));
 		let seen = 0;
 		await page.route('**/api/invoices/upload', async (route) => {
-			const n = ++seen;
+			seen++;
+			// Which file this is, read off its own multipart part: the page sends
+			// a batch's uploads at once (`Promise.allSettled`), so the order they
+			// reach the route is not the order of FILES, and answering by arrival
+			// order failed a.pdf instead of b.pdf whenever b.pdf's request won.
+			const isB = (route.request().postDataBuffer() ?? Buffer.alloc(0))
+				.toString('latin1')
+				.includes('filename="b.pdf"');
 			await held;
-			if (n === 1) {
+			if (!isB) {
 				// Not `pending`, so the page does not start polling an id that
 				// does not exist.
 				return route.fulfill({

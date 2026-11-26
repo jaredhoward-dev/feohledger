@@ -552,6 +552,30 @@
   "@codedRefusalCardBlocksRecall": {
     "description": "Coded refusal `invoice_recall_claimed` with claim `virtual_card`."
   },
+  "codedRefusalRecallPeppolTransmitted": "This invoice has already been sent over PEPPOL, and the receiver holds the approved document. Issue a credit note and send a corrected invoice; its approval can't be recalled.",
+  "@codedRefusalRecallPeppolTransmitted": {
+    "description": "Coded refusal `invoice_recall_peppol_transmitted`: the approved document was already sent over PEPPOL."
+  },
+  "codedRefusalRecallMirrorUnsigned": "This invoice has been routed inter-company, and its mirror under the other entity copied the approved figures. Delete the mirror (it hasn't been approved yet), then recall this approval, and route the invoice again once it is re-approved.",
+  "@codedRefusalRecallMirrorUnsigned": {
+    "description": "Coded refusal `invoice_recall_mirror_unsigned`: the inter-company mirror is unsigned; delete it first."
+  },
+  "codedRefusalRecallMirrorProgressed": "This invoice has been routed inter-company, and its mirror under the other entity has already been approved or is being paid there. Correct the pair with a credit memo on each side; this approval can't be recalled.",
+  "@codedRefusalRecallMirrorProgressed": {
+    "description": "Coded refusal `invoice_recall_mirror_progressed`: the inter-company mirror was approved or is being paid."
+  },
+  "codedRefusalRecallIsMirror": "This invoice is an inter-company mirror: its figures are copied from the originating invoice under the other entity. Delete this mirror and correct the original invoice, then route it again.",
+  "@codedRefusalRecallIsMirror": {
+    "description": "Coded refusal `invoice_recall_is_mirror`: the invoice is itself an inter-company mirror."
+  },
+  "codedRefusalPartnerCapabilityRequired": "This workspace is not set up as a partner. Partner Admin is enabled by FeohLedger on request — contact support if you resell or manage other workspaces.",
+  "@codedRefusalPartnerCapabilityRequired": {
+    "description": "Coded refusal `partner_capability_required`: an admin of a workspace the operator has not made a partner opened a Partner Admin action."
+  },
+  "codedRefusalPartnerLinkingDisabled": "Partner linking is not enabled on this platform yet, so no link code can be generated. Contact support.",
+  "@codedRefusalPartnerLinkingDisabled": {
+    "description": "Coded refusal `partner_linking_disabled`: the link-code mint is off because the platform has no signing key configured."
+  },
   "invoicesBulkRejectTitle": "Reject {count, plural, one {{count} invoice} other {{count} invoices}}",
   "@invoicesBulkRejectTitle": {
     "description": "Title of the reason prompt shown before bulk-rejecting the selected invoices.",
@@ -2083,6 +2107,14 @@
       }
     }
   },
+  "erpRefusalBillKeyShared": "{provider} already has a bill with this supplier and invoice number, and another invoice in FeohLedger has the same supplier and number, so that bill wasn't linked to this invoice and no second bill was created. Check in {provider} which invoice the bill is for. If this invoice's number is wrong, correct it and retry; otherwise ask an administrator how to proceed.",
+  "@erpRefusalBillKeyShared": {
+    "placeholders": {
+      "provider": {
+        "type": "String"
+      }
+    }
+  },
   "erpRefusalExceptionBlocksExport": "This invoice has an open {type} exception. Resolve or dismiss it in Exceptions, then send it to the ERP.",
   "@erpRefusalExceptionBlocksExport": {
     "placeholders": {
@@ -3362,6 +3394,25 @@
     }
   },
   "exceptionDescriptionErpPaymentWritebackFailedUnnamed": "Your ERP did not record this invoice's payment, so the bill still shows as unpaid there although the money was paid. Resolve what stopped it, then use Retry ERP sync on the payment's run in Payments.",
+  "exceptionDescriptionErpPaymentWritebackUnconfirmed": "{erp} may already show this invoice's payment: FeohLedger sent it but could not confirm it was recorded. Check the bill for a payment referenced “{marker}” before recording one.",
+  "@exceptionDescriptionErpPaymentWritebackUnconfirmed": {
+    "placeholders": {
+      "erp": {
+        "type": "String"
+      },
+      "marker": {
+        "type": "String"
+      }
+    }
+  },
+  "exceptionDescriptionErpPaymentWritebackUnconfirmedUnnamed": "Your ERP may already show this invoice's payment: FeohLedger sent it but could not confirm it was recorded. Check the bill for a payment referenced “{marker}” before recording one.",
+  "@exceptionDescriptionErpPaymentWritebackUnconfirmedUnnamed": {
+    "placeholders": {
+      "marker": {
+        "type": "String"
+      }
+    }
+  },
   "exceptionDescriptionErpPaymentWritebackBalanceOpen": "{erp} recorded this invoice's payment, but the bill still shows {amount} open there (a discount or credit taken in FeohLedger). Close the difference in the ERP.",
   "@exceptionDescriptionErpPaymentWritebackBalanceOpen": {
     "placeholders": {
@@ -3381,6 +3432,56 @@
       }
     }
   },
+  "exceptionDescriptionErpDiscountCreditPending": "{erp} recorded this invoice's payment, but the bill still shows {amount} open there. FeohLedger booked credit {credit} for the early-payment discount and will apply it, so don't book another.",
+  "@exceptionDescriptionErpDiscountCreditPending": {
+    "placeholders": {
+      "erp": {
+        "type": "String"
+      },
+      "amount": {
+        "type": "String"
+      },
+      "credit": {
+        "type": "String"
+      }
+    }
+  },
+  "exceptionDescriptionErpDiscountCreditPendingUnnamed": "Your ERP recorded this invoice's payment, but the bill still shows {amount} open there. FeohLedger booked credit {credit} for the early-payment discount and will apply it, so don't book another.",
+  "@exceptionDescriptionErpDiscountCreditPendingUnnamed": {
+    "placeholders": {
+      "amount": {
+        "type": "String"
+      },
+      "credit": {
+        "type": "String"
+      }
+    }
+  },
+  "exceptionDescriptionErpDiscountCreditPendingUnidentified": "{erp} recorded this invoice's payment, but the bill still shows {amount} open there. FeohLedger may have booked a credit for this discount, so check for “{marker}” before booking one.",
+  "@exceptionDescriptionErpDiscountCreditPendingUnidentified": {
+    "placeholders": {
+      "erp": {
+        "type": "String"
+      },
+      "amount": {
+        "type": "String"
+      },
+      "marker": {
+        "type": "String"
+      }
+    }
+  },
+  "exceptionDescriptionErpDiscountCreditPendingUnidentifiedUnnamed": "Your ERP recorded this invoice's payment, but the bill still shows {amount} open there. FeohLedger may have booked a credit for this discount, so check for “{marker}” before booking one.",
+  "@exceptionDescriptionErpDiscountCreditPendingUnidentifiedUnnamed": {
+    "placeholders": {
+      "amount": {
+        "type": "String"
+      },
+      "marker": {
+        "type": "String"
+      }
+    }
+  },
   "exceptionDescriptionErpPaymentVoidWritebackFailed": "{erp} still shows this bill paid by a payment that was voided in FeohLedger, because voiding it in the ERP failed. Void that payment in the ERP so the books agree.",
   "@exceptionDescriptionErpPaymentVoidWritebackFailed": {
     "placeholders": {
@@ -3390,6 +3491,15 @@
     }
   },
   "exceptionDescriptionErpPaymentVoidWritebackFailedUnnamed": "Your ERP still shows this bill paid by a payment that was voided in FeohLedger, because voiding it in the ERP failed. Void that payment in the ERP so the books agree.",
+  "exceptionDescriptionErpDiscountCreditStalled": "{erp} may hold an early-payment discount credit FeohLedger created for this invoice's payment that it could not apply or reverse automatically. Find the credit marked “FeohLedger discount” with this payment's id there, and apply or delete it so the discount is counted once.",
+  "@exceptionDescriptionErpDiscountCreditStalled": {
+    "placeholders": {
+      "erp": {
+        "type": "String"
+      }
+    }
+  },
+  "exceptionDescriptionErpDiscountCreditStalledUnnamed": "Your ERP may hold an early-payment discount credit FeohLedger created for this invoice's payment that it could not apply or reverse automatically. Find the credit marked “FeohLedger discount” with this payment's id there, and apply or delete it so the discount is counted once.",
   "exceptionDescriptionErpSyncBackFailed": "This invoice's payment settled, but FeohLedger could not finish recording it, so the invoice has not moved to Paid although the money has gone. Nothing retries this automatically: use Retry ERP sync on the payment's run in Payments.",
   "exceptionDescriptionExtractionFailed": "Extraction failed: {errorClass}",
   "@exceptionDescriptionExtractionFailed": {
@@ -4593,5 +4703,27 @@
   "legalAcceptAppOutdated": "This version of the app shows older Terms or an older Privacy Policy than the ones now in force, so it cannot record your acceptance. Update the app from your app store, or accept in the web app, then sign in again.",
   "@legalAcceptAppOutdated": {
     "description": "Accept screen: the server refused the versions this build carries (422 legal_acceptance_required), so the app is older than the Terms / Privacy in force."
+  },
+  "invoiceDetailAssignedElsewhere": "Assigned to {name} — you can still act as an approver.",
+  "@invoiceDetailAssignedElsewhere": {
+    "description": "Invoice detail: note above Approve / Reject when the invoice is assigned to a colleague (decisions §564). Assignment is routing, not authority; also read as the buttons' semantics hint.",
+    "placeholders": {
+      "name": {
+        "type": "String"
+      }
+    }
+  },
+  "invoiceDetailAssignedElsewhereUnnamed": "Assigned to a colleague — you can still act as an approver.",
+  "@invoiceDetailAssignedElsewhereUnnamed": {
+    "description": "Invoice detail: the same note when the assignee has no stored name."
+  },
+  "payQueueRescheduledFrom": "rescheduled from {date}",
+  "@payQueueRescheduledFrom": {
+    "description": "Payment queue row: the invoice's own due date when a payment schedule moved it; the row's date is the effective one (decisions §565).",
+    "placeholders": {
+      "date": {
+        "type": "String"
+      }
+    }
   }
 }

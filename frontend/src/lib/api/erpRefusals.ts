@@ -178,7 +178,9 @@ const KEYS: Record<string, MessageKey> = {
 	payment_exceeds_balance: 'erpRefusal.paymentExceedsBalance',
 	bill_payment_voided: 'erpRefusal.billPaymentVoided',
 	// A Xero consent from before `accounting.payments` (decisions §415)
-	payments_scope_missing: 'erpRefusal.paymentsScopeMissing'
+	payments_scope_missing: 'erpRefusal.paymentsScopeMissing',
+	// Xero: a bill on a supplier + number another invoice shares (decisions §572)
+	erp_bill_key_shared: 'erpRefusal.billKeyShared'
 };
 
 /** The sentences that name Intuit's numeric fault code as `{code}`. */

@@ -605,7 +605,7 @@ export const GLOSSARY: GlossaryEntry[] = [
 	{
 		id: 'spend-preapproval',
 		category: 'platform',
-		long: "Permission to spend, asked for before the expense is incurred, for example ahead of a conference trip. You raise a request with a title, estimated amount, currency, category and justification on the {ui:expenses.tab.preapprovals} tab of {ui:nav.expenses}, and an admin or AP manager approves or rejects it. Nobody can decide their own request.\n\nWhen an [[expense-policy]] requires pre-approval above an amount, an expense over it can't be submitted until an approved pre-approval covers it. A pre-approval covers only its requester's own expenses, and only in its own currency.",
+		long: "Permission to spend, asked for before the expense is incurred, for example ahead of a conference trip. You raise a request with a title, estimated amount, currency, category and justification on the {ui:expenses.tab.preapprovals} tab of {ui:nav.expenses}, and an admin or AP manager approves or rejects it. Nobody can decide their own request.\n\nWhen an [[expense-policy]] requires pre-approval above an amount, an expense over it can't be submitted until an approved pre-approval covers it. A pre-approval covers only its requester's own expenses, and only in its own currency. It is a budget, not a pass: each line it covers when a report is submitted draws down its estimated amount, the {ui:expenses.preapprovals.col.remaining} column shows what is left, and once the lines it covers add up to the estimate, the next line that needs it is refused. A rejected report hands its lines' share back.",
 		aliases: ['pre-approval', 'preapproval', 'spend request', 'travel request', 'prior approval'],
 		related: ['expense-policy', 'expense-report', 'segregation-of-duties']
 	}

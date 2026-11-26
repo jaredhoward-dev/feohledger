@@ -26,7 +26,7 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 
-from sqlalchemy import Date, and_, case, cast, func, not_, select
+from sqlalchemy import Date, and_, case, cast, func, not_, select, true
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.exception import Exception as APException
@@ -46,7 +46,11 @@ from app.services.currency_conversion import (
     rollup_from_grouped_rows,
 )
 from app.services.open_ap_due import (
+    AGING_BANDS,
     DUE_SOON_DAYS,
+    aging_band,
+    current_schedule_due,
+    effective_due_of,
     is_due_soon,
     is_overdue,
     open_ap_due_population,
@@ -293,13 +297,7 @@ async def vendor_spend(s: DashboardScope) -> list[dict]:
 
 
 def _empty_aging_bands() -> dict[str, Decimal]:
-    return {
-        "current": Decimal("0"),
-        "days_30": Decimal("0"),
-        "days_60": Decimal("0"),
-        "days_90": Decimal("0"),
-        "days_90_plus": Decimal("0"),
-    }
+    return {band: Decimal("0") for band in AGING_BANDS}
 
 
 async def aging(s: DashboardScope) -> tuple[dict, dict]:
@@ -332,23 +330,21 @@ async def aging(s: DashboardScope) -> tuple[dict, dict]:
     bands reconcile with it (F-4): approved → payment_scheduled. The AP
     balance has no due_date filter, so aging must not either — an open invoice
     missing a due date used to inflate the balance while vanishing from every
-    bucket. A null due_date can't be judged overdue, so it buckets as
-    "current" (the conservative read) rather than being dropped. Bucket + sum
-    in SQL (Postgres `date - date` is integer days) rather than pulling every
-    open row into Python; the band boundaries match the old loop exactly.
+    bucket. A row is banded by its EFFECTIVE due date
+    (`open_ap_due.effective_due_of` over `current_schedule_due`: the current
+    payment schedule's,
+    else the invoice's own) through `open_ap_due.aging_band`, the same date
+    the overdue count reads, so a rescheduled invoice is past due in a band
+    exactly when it is counted overdue (decisions §565). An untimeable row is
+    "current" (the conservative read) rather than dropped. Bucket + sum in
+    SQL (Postgres `date - date` is integer days) rather than pulling every
+    open row into Python.
     """
     aging_dec = _empty_aging_bands()
     aging_reporting_dec = _empty_aging_bands()
     aging_reporting_unconverted = 0
-    days_past = s.today - Invoice.due_date
-    aging_bucket = case(
-        (Invoice.due_date.is_(None), "current"),
-        (days_past <= 0, "current"),
-        (days_past <= 30, "days_30"),
-        (days_past <= 60, "days_60"),
-        (days_past <= 90, "days_90"),
-        else_="days_90_plus",
-    )
+    current = current_schedule_due()
+    aging_bucket = aging_band(effective_due_of(current.c.sched_due), s.today)
     aging_rows = await s.db.execute(
         s.inv(
             select(
@@ -357,6 +353,8 @@ async def aging(s: DashboardScope) -> tuple[dict, dict]:
                 func.coalesce(func.sum(s.rep.amount), 0),
                 func.coalesce(func.sum(s.rep.unconverted), 0),
             )
+            .select_from(Invoice)
+            .outerjoin(current, true())
             .where(Invoice.status.in_(OPEN_AP_STATUSES))
             .group_by(aging_bucket)
         )
@@ -424,12 +422,24 @@ async def monthly_trend(s: DashboardScope) -> list[dict]:
 async def upcoming_payments(s: DashboardScope) -> dict:
     """Upcoming payments (due within `DUE_SOON_DAYS` + overdue), capped at ten rows,
     with their totals: `upcoming_payments`, `upcoming_total_amount`,
-    `upcoming_total_amount_reporting`, `upcoming_unconverted_count`."""
+    `upcoming_total_amount_reporting`, `upcoming_unconverted_count`.
+
+    The rows are `open_ap_due_population`'s, the select the overdue and
+    due-soon counts beside this list read, windowed and ordered on its
+    `effective_due` (the current payment schedule's due date, else the
+    invoice's own). So a rescheduled invoice is flagged overdue here exactly
+    when `overdue_count` counts it, and an invoice already paid out (a
+    completed payment awaiting its `paid` sync-back) is in neither
+    (decisions §565). Each row carries both dates: `due_date` is the
+    effective one the flag reads, `own_due_date` the invoice's, so a client
+    can say "rescheduled from" when they differ.
+    """
     today = s.today
     # The due-soon window's far edge, so this list and `due_soon_count`
     # (`overdue_and_due_soon`) cannot drift apart.
     week_ahead = today + timedelta(days=DUE_SOON_DAYS)
-    paid_ids = select(Payment.invoice_id).where(Payment.status == "completed").scalar_subquery()
+    population = open_ap_due_population()
+    due = population.c.effective_due
     upcoming_rows = await s.db.execute(
         s.inv(
             select(
@@ -437,17 +447,17 @@ async def upcoming_payments(s: DashboardScope) -> dict:
                 Invoice.invoice_number,
                 Invoice.vendor_name,
                 Invoice.amount,
-                Invoice.due_date,
+                due,
                 Invoice.currency,
                 Invoice.reporting_amount,
                 Invoice.reporting_currency,
+                Invoice.due_date,
+                is_overdue(due, today),
             )
-            .where(
-                Invoice.due_date.isnot(None),
-                Invoice.due_date <= week_ahead,
-                Invoice.id.notin_(paid_ids),
-            )
-            .order_by(Invoice.due_date)
+            .join(population, population.c.invoice_id == Invoice.id)
+            # NULL (untimeable) fails `<=`, as it fails both windows.
+            .where(due <= week_ahead)
+            .order_by(due, Invoice.id)
             .limit(10)
         )
     )
@@ -466,7 +476,10 @@ async def upcoming_payments(s: DashboardScope) -> dict:
             # wrong for every foreign invoice in the list.
             "currency": r[5],
             "due_date": r[4].isoformat() if r[4] else None,
-            "is_overdue": r[4] < today if r[4] else False,
+            "own_due_date": r[8].isoformat() if r[8] else None,
+            # `open_ap_due.is_overdue`, evaluated in the same SELECT as the
+            # date above, so the flag and the printed date cannot disagree.
+            "is_overdue": bool(r[9]),
         }
         for r in rows
     ]

@@ -65,11 +65,50 @@ void main() {
       localizeCodedRefusal(en, refusal('invoice_recall_claimed', {'claim': 'virtual_card'})),
       en.codedRefusalCardBlocksRecall,
     );
+    // Sent over PEPPOL, or paired inter-company (backend decisions §573).
+    expect(
+      localizeCodedRefusal(de, refusal('invoice_recall_peppol_transmitted')),
+      de.codedRefusalRecallPeppolTransmitted,
+    );
+    expect(
+      localizeCodedRefusal(de, refusal('invoice_recall_mirror_unsigned')),
+      de.codedRefusalRecallMirrorUnsigned,
+    );
+    expect(
+      localizeCodedRefusal(
+        de,
+        refusal('invoice_recall_mirror_progressed', {'mirror_status': 'paid'}),
+      ),
+      de.codedRefusalRecallMirrorProgressed,
+    );
+    expect(
+      localizeCodedRefusal(de, refusal('invoice_recall_is_mirror')),
+      de.codedRefusalRecallIsMirror,
+    );
     // A claim this build does not know keeps the caller's generic failure.
     expect(localizeCodedRefusal(en, refusal('invoice_recall_claimed')), isNull);
     expect(
       localizeCodedRefusal(en, refusal('invoice_recall_claimed', {'claim': 'cheque'})),
       isNull,
+    );
+  });
+
+  test('Partner Admin and the link-code mint are stated (decisions §574)', () {
+    expect(codedRefusalCodes, contains('partner_capability_required'));
+    expect(codedRefusalCodes, contains('partner_linking_disabled'));
+    for (final l in [en, de]) {
+      expect(
+        localizeCodedRefusal(l, refusal('partner_capability_required')),
+        l.codedRefusalPartnerCapabilityRequired,
+      );
+      expect(
+        localizeCodedRefusal(l, refusal('partner_linking_disabled')),
+        l.codedRefusalPartnerLinkingDisabled,
+      );
+    }
+    expect(
+      de.codedRefusalPartnerLinkingDisabled,
+      isNot(en.codedRefusalPartnerLinkingDisabled),
     );
   });
 

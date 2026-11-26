@@ -1,6 +1,12 @@
 import type { Page } from '@playwright/test';
 
-import { NAV, sidebarHrefs, visibleChildren, type NavGroup } from '#lib/nav.ts';
+import {
+	NAV,
+	sidebarHrefs,
+	visibleChildren,
+	type NavGroup,
+	type OrgCapability
+} from '#lib/nav.ts';
 
 import {
 	API_BASE,
@@ -44,6 +50,8 @@ import {
 interface Identity {
 	roles: string[];
 	permissions: string[];
+	/** The workspace's operator-granted partner capability (decisions §574). */
+	is_partner: boolean;
 }
 
 async function identity(page: Page): Promise<Identity> {
@@ -52,7 +60,11 @@ async function identity(page: Page): Promise<Identity> {
 	});
 	expect(res.ok(), `GET /api/auth/me → ${res.status()}`).toBe(true);
 	const me = (await res.json()) as Partial<Identity>;
-	return { roles: me.roles ?? [], permissions: me.permissions ?? [] };
+	return {
+		roles: me.roles ?? [],
+		permissions: me.permissions ?? [],
+		is_partner: me.is_partner === true
+	};
 }
 
 async function renderedSidebar(page: Page): Promise<string[]> {
@@ -75,16 +87,17 @@ async function expectNavMatchesPolicy(page: Page, expectedRoles: string[]) {
 	);
 	const has = (...roles: string[]) => roles.some((r) => me.roles.includes(r));
 	const can = (perm: string) => me.permissions.includes(perm);
+	const hasCapability = (c: OrgCapability) => c === 'partner' && me.is_partner;
 
 	await page.goto('/');
 	await expect(page.locator('aside.sidebar a.nav-item').first()).toBeVisible();
 	expect(await renderedSidebar(page), 'sidebar rows, in nav order').toEqual(
-		sidebarHrefs(has, can)
+		sidebarHrefs(has, can, hasCapability)
 	);
 
 	const groups = NAV.filter((e): e is NavGroup => e.kind === 'group');
 	for (const group of groups) {
-		const tabs = visibleChildren(group, has, can).map((c) => c.href);
+		const tabs = visibleChildren(group, has, can, hasCapability).map((c) => c.href);
 		if (tabs.length === 0) continue; // no row, nothing to land on
 		await page.goto(tabs[0]);
 		await expect(page.locator('aside.sidebar')).toBeVisible();

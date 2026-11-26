@@ -48,6 +48,12 @@ export type InvoiceActionVerdicts = {
 	 *  Present only on a failed push that may have left a bill in the ERP
 	 *  (decisions §556 / §560); absent, nothing is offered. */
 	erp_orphan_lookup_refusal?: ActionRefusal;
+	/** `GET /erp-bill-confirmation` + `POST /confirm-erp-bill` ("This bill is
+	 *  this invoice's…") — `erp_bill_confirm.confirm_lookup_refusal`:
+	 *  `payment.void` and a role that may retry the push, then an ERP whose
+	 *  bill key may be shared. Present only on a push last refused
+	 *  `erp_bill_key_shared` (decisions §587); absent, nothing is offered. */
+	erp_bill_confirm_refusal?: ActionRefusal;
 };
 
 /** `invoice_not_completable` — `/complete` from a status it does not advance

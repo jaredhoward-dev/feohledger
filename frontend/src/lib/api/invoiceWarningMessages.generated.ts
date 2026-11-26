@@ -247,14 +247,30 @@ export const INVOICE_WARNING_MESSAGE_KEYS = {
 	'exception.erp_payment_writeback_failed': 'exceptions.description.erpPaymentWritebackFailed',
 	// Your ERP did not record this invoice's payment, so the bill still shows as unpaid there although the money was paid. Resolve what stopped it, then use Retry ERP sync on the payment's run in Payments.
 	'exception.erp_payment_writeback_failed_unnamed': 'exceptions.description.erpPaymentWritebackFailedUnnamed',
+	// {erp} may already show this invoice's payment: FeohLedger sent it but could not confirm it was recorded. Check the bill for a payment referenced “{marker}” before recording one.
+	'exception.erp_payment_writeback_unconfirmed': 'exceptions.description.erpPaymentWritebackUnconfirmed',
+	// Your ERP may already show this invoice's payment: FeohLedger sent it but could not confirm it was recorded. Check the bill for a payment referenced “{marker}” before recording one.
+	'exception.erp_payment_writeback_unconfirmed_unnamed': 'exceptions.description.erpPaymentWritebackUnconfirmedUnnamed',
 	// {erp} recorded this invoice's payment, but the bill still shows {amount} {currency} open there (a discount or credit taken in FeohLedger). Close the difference in the ERP.
 	'exception.erp_payment_writeback_balance_open': 'exceptions.description.erpPaymentWritebackBalanceOpen',
 	// Your ERP recorded this invoice's payment, but the bill still shows {amount} {currency} open there (a discount or credit taken in FeohLedger). Close the difference in the ERP.
 	'exception.erp_payment_writeback_balance_open_unnamed': 'exceptions.description.erpPaymentWritebackBalanceOpenUnnamed',
+	// {erp} recorded this invoice's payment, but the bill still shows {amount} {currency} open there. FeohLedger booked credit {credit} for the early-payment discount and will apply it, so don't book another.
+	'exception.erp_discount_credit_pending': 'exceptions.description.erpDiscountCreditPending',
+	// Your ERP recorded this invoice's payment, but the bill still shows {amount} {currency} open there. FeohLedger booked credit {credit} for the early-payment discount and will apply it, so don't book another.
+	'exception.erp_discount_credit_pending_unnamed': 'exceptions.description.erpDiscountCreditPendingUnnamed',
+	// {erp} recorded this invoice's payment, but the bill still shows {amount} {currency} open there. FeohLedger may have booked a credit for this discount, so check for “{marker}” before booking one.
+	'exception.erp_discount_credit_pending_unidentified': 'exceptions.description.erpDiscountCreditPendingUnidentified',
+	// Your ERP recorded this invoice's payment, but the bill still shows {amount} {currency} open there. FeohLedger may have booked a credit for this discount, so check for “{marker}” before booking one.
+	'exception.erp_discount_credit_pending_unidentified_unnamed': 'exceptions.description.erpDiscountCreditPendingUnidentifiedUnnamed',
 	// {erp} still shows this bill paid by a payment that was voided in FeohLedger, because voiding it in the ERP failed. Void that payment in the ERP so the books agree.
 	'exception.erp_payment_void_writeback_failed': 'exceptions.description.erpPaymentVoidWritebackFailed',
 	// Your ERP still shows this bill paid by a payment that was voided in FeohLedger, because voiding it in the ERP failed. Void that payment in the ERP so the books agree.
 	'exception.erp_payment_void_writeback_failed_unnamed': 'exceptions.description.erpPaymentVoidWritebackFailedUnnamed',
+	// {erp} may hold an early-payment discount credit FeohLedger created for this invoice's payment that it could not apply or reverse automatically. Find the credit marked “FeohLedger discount” with this payment's id there, and apply or delete it so the discount is counted once.
+	'exception.erp_discount_credit_stalled': 'exceptions.description.erpDiscountCreditStalled',
+	// Your ERP may hold an early-payment discount credit FeohLedger created for this invoice's payment that it could not apply or reverse automatically. Find the credit marked “FeohLedger discount” with this payment's id there, and apply or delete it so the discount is counted once.
+	'exception.erp_discount_credit_stalled_unnamed': 'exceptions.description.erpDiscountCreditStalledUnnamed',
 	// The ERP shows this bill settled, at least in part by a vendor credit applied there. FeohLedger will not pay it until someone confirms what is still owed.
 	'exception.erp_credit_settlement': 'exceptions.description.erpCreditSettlement',
 	// The ERP shows nothing owing on this bill, but no payment against it: a credit was applied or the balance written off there. FeohLedger will not pay it until someone confirms what is still owed.
@@ -463,10 +479,18 @@ export const INVOICE_WARNING_PARAM_KINDS = {
 	'exception.erp_voided_after_post_unnamed': {},
 	'exception.erp_payment_writeback_failed': { erp: 'text' },
 	'exception.erp_payment_writeback_failed_unnamed': {},
+	'exception.erp_payment_writeback_unconfirmed': { erp: 'text', marker: 'text' },
+	'exception.erp_payment_writeback_unconfirmed_unnamed': { marker: 'text' },
 	'exception.erp_payment_writeback_balance_open': { erp: 'text', amount: 'money', currency: 'currency' },
 	'exception.erp_payment_writeback_balance_open_unnamed': { amount: 'money', currency: 'currency' },
+	'exception.erp_discount_credit_pending': { erp: 'text', amount: 'money', currency: 'currency', credit: 'text' },
+	'exception.erp_discount_credit_pending_unnamed': { amount: 'money', currency: 'currency', credit: 'text' },
+	'exception.erp_discount_credit_pending_unidentified': { erp: 'text', amount: 'money', currency: 'currency', marker: 'text' },
+	'exception.erp_discount_credit_pending_unidentified_unnamed': { amount: 'money', currency: 'currency', marker: 'text' },
 	'exception.erp_payment_void_writeback_failed': { erp: 'text' },
 	'exception.erp_payment_void_writeback_failed_unnamed': {},
+	'exception.erp_discount_credit_stalled': { erp: 'text' },
+	'exception.erp_discount_credit_stalled_unnamed': {},
 	'exception.erp_credit_settlement': {},
 	'exception.erp_settled_no_payment': {},
 	'exception.erp_paid_while_scheduled': {},

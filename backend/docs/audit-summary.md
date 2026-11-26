@@ -66,6 +66,11 @@ ERP." (2026-10-19): the failure vanished and the submission read as a delivery.
   `invoice.erp_confirmed` reads "accepted by the ERP"; `invoice.erp_failed`
   reads "failed to post to the ERP". The LLM prompt states the same meanings
   and says the invoice's current status is authoritative.
+- PEPPOL reads the same way: `invoice.peppol_send_started` is the start
+  ("submitted over PEPPOL"); `invoice.peppol_sent` / `invoice.peppol_send_failed`
+  say how it ended; an operator's `invoice.peppol_send_settled` of a stalled
+  send reads "had its stalled PEPPOL send settled" with the outcome it recorded
+  in brackets (decisions §580; format version 3).
 - Every `invoice.*` action written under `app/` must be phrased, or listed in
   `_UNSUMMARIZED_ACTIONS` (edits and attachments — not outcomes).
   `tests/test_audit_summary.py` AST-scans `app/` and fails on one that is

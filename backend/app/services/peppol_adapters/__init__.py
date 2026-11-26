@@ -13,6 +13,7 @@ from app.services.peppol_adapters.base import (
     ParticipantId,
     PeppolAdapter,
     PeppolSendError,
+    TransmissionLookup,
     TransmissionRequest,
     TransmissionResult,
 )
@@ -34,6 +35,7 @@ __all__ = [
     "ParticipantId",
     "PeppolAdapter",
     "PeppolSendError",
+    "TransmissionLookup",
     "TransmissionRequest",
     "TransmissionResult",
     "UnknownPeppolProviderError",

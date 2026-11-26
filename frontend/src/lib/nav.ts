@@ -24,6 +24,12 @@
  * Omit `permissions` for anything not behind `require_permission` on the
  * backend.
  *
+ * `capability` is ANDed on top of both: a row whose page needs something the
+ * operator grants the WORKSPACE (today only `partner`, `Organization.is_partner`
+ * behind every `/api/partner` route — decisions §574) is hidden unless the
+ * caller's workspace holds it, whatever the caller's role. With no
+ * `CapabilityCheck` passed, a capability-gated row is hidden (fail-closed).
+ *
  * i18n: each entry carries a `labelKey` (an i18n message key) — the single
  * source of truth for the *translated* display string. The bare `label` is
  * retained as a stable, locale-independent identifier (used as an `{#each}`
@@ -87,6 +93,8 @@ export interface NavLink {
 	 * single-permission entry is just a one-element array (e.g. `[PERM_USER_MANAGE]`).
 	 */
 	permissions?: string[];
+	/** ANDed with the role / permission gate — see the module doc. */
+	capability?: OrgCapability;
 }
 
 export interface NavChild {
@@ -96,6 +104,8 @@ export interface NavChild {
 	roles?: string[];
 	/** See `NavLink.permissions`. */
 	permissions?: string[];
+	/** See `NavLink.capability`. */
+	capability?: OrgCapability;
 }
 
 export interface NavGroup {
@@ -113,6 +123,12 @@ export type RoleCheck = (...roles: string[]) => boolean;
 
 /** Matches the signature of `auth.can`. */
 export type PermissionCheck = (perm: string) => boolean;
+
+/** A capability the operator grants a workspace (not a role, not a plan). */
+export type OrgCapability = 'partner';
+
+/** Matches the signature of `auth.hasCapability`. */
+export type CapabilityCheck = (capability: OrgCapability) => boolean;
 
 export const NAV: NavEntry[] = [
 	{ kind: 'link', label: 'Dashboard', labelKey: 'nav.dashboard', href: '/', icon: 'dashboard' },
@@ -370,9 +386,17 @@ export const NAV: NavEntry[] = [
 			// set-default are all `require_roles(ROLE_ADMIN)`), so admin only.
 			{ label: 'Entities', labelKey: 'nav.entities', href: '/admin/entities', roles: ['admin'] },
 			// Partner / reseller multi-tenant admin — manage branded child tenants.
-			// Admin only (the backend /api/partner surface 403s the rest). A
-			// standalone org sees an empty "not a partner" state.
-			{ label: 'Partner Admin', labelKey: 'nav.partner', href: '/admin/partner', roles: ['admin'] },
+			// Admin of a workspace the operator made a partner: every /api/partner
+			// route requires both (`require_partner_capability`, decisions §574),
+			// so the row does too. Consenting to BE adopted (the link code) is in
+			// Organization settings, open to any admin.
+			{
+				label: 'Partner Admin',
+				labelKey: 'nav.partner',
+				href: '/admin/partner',
+				roles: ['admin'],
+				capability: 'partner'
+			},
 			// Developer-API key management — admin only (the backend 403s the rest).
 			{ label: 'API Keys', labelKey: 'nav.apiKeys', href: '/admin/api-keys', roles: ['admin'] },
 			// Outbound-webhook subscriptions + delivery log / redelivery — admin
@@ -392,44 +416,75 @@ export const NAV: NavEntry[] = [
  * `roles` and `permissions` are OR'd: no gate at all (both omitted) is
  * visible to everyone; otherwise visible if EITHER the role check OR the
  * permission check passes. A custom role holding only the permission (no
- * listed role) still sees the entry.
+ * listed role) still sees the entry. A `capability` is ANDed on top: the row
+ * is hidden unless `hasCapability` says the workspace holds it (no check
+ * passed = hidden).
  */
 export function canSee(
 	roles: string[] | undefined,
 	has: RoleCheck,
 	permissions?: string[],
-	can?: PermissionCheck
+	can?: PermissionCheck,
+	capability?: OrgCapability,
+	hasCapability?: CapabilityCheck
 ): boolean {
+	if (capability && !hasCapability?.(capability)) return false;
 	if (!roles && !permissions) return true;
 	if (roles && has(...roles)) return true;
 	if (permissions && can && permissions.some((p) => can(p))) return true;
 	return false;
 }
 
-/** The children of a group the current role/permissions can see, in order. */
+/** One nav row's whole gate — roles / permissions, then its capability. */
+function rowVisible(
+	row: NavLink | NavChild,
+	has: RoleCheck,
+	can?: PermissionCheck,
+	hasCapability?: CapabilityCheck
+): boolean {
+	return canSee(row.roles, has, row.permissions, can, row.capability, hasCapability);
+}
+
+/** The children of a group the current role/permissions/capabilities can see, in order. */
 export function visibleChildren(
 	group: NavGroup,
 	has: RoleCheck,
-	can?: PermissionCheck
+	can?: PermissionCheck,
+	hasCapability?: CapabilityCheck
 ): NavChild[] {
-	return group.children.filter((c) => canSee(c.roles, has, c.permissions, can));
+	return group.children.filter((c) => rowVisible(c, has, can, hasCapability));
 }
 
 /** A link is visible by its own gate; a group is visible if any child is. */
-export function isEntryVisible(entry: NavEntry, has: RoleCheck, can?: PermissionCheck): boolean {
+export function isEntryVisible(
+	entry: NavEntry,
+	has: RoleCheck,
+	can?: PermissionCheck,
+	hasCapability?: CapabilityCheck
+): boolean {
 	return entry.kind === 'link'
-		? canSee(entry.roles, has, entry.permissions, can)
-		: visibleChildren(entry, has, can).length > 0;
+		? rowVisible(entry, has, can, hasCapability)
+		: visibleChildren(entry, has, can, hasCapability).length > 0;
 }
 
 /** Where a group's sidebar row navigates to — its first accessible child. */
-export function groupHref(group: NavGroup, has: RoleCheck, can?: PermissionCheck): string | null {
-	return visibleChildren(group, has, can)[0]?.href ?? null;
+export function groupHref(
+	group: NavGroup,
+	has: RoleCheck,
+	can?: PermissionCheck,
+	hasCapability?: CapabilityCheck
+): string | null {
+	return visibleChildren(group, has, can, hasCapability)[0]?.href ?? null;
 }
 
 /** Where one sidebar row points: a link's own href, a group's landing child. */
-export function entryHref(entry: NavEntry, has: RoleCheck, can?: PermissionCheck): string | null {
-	return entry.kind === 'link' ? entry.href : groupHref(entry, has, can);
+export function entryHref(
+	entry: NavEntry,
+	has: RoleCheck,
+	can?: PermissionCheck,
+	hasCapability?: CapabilityCheck
+): string | null {
+	return entry.kind === 'link' ? entry.href : groupHref(entry, has, can, hasCapability);
 }
 
 /**
@@ -439,9 +494,13 @@ export function entryHref(entry: NavEntry, has: RoleCheck, can?: PermissionCheck
  * than against a hand-typed copy of the answer. What each role is ALLOWED to
  * see is pinned once, as a literal table, in `nav.test.ts`.
  */
-export function sidebarHrefs(has: RoleCheck, can?: PermissionCheck): string[] {
-	return NAV.filter((e) => isEntryVisible(e, has, can)).flatMap((e) => {
-		const href = entryHref(e, has, can);
+export function sidebarHrefs(
+	has: RoleCheck,
+	can?: PermissionCheck,
+	hasCapability?: CapabilityCheck
+): string[] {
+	return NAV.filter((e) => isEntryVisible(e, has, can, hasCapability)).flatMap((e) => {
+		const href = entryHref(e, has, can, hasCapability);
 		return href ? [href] : [];
 	});
 }

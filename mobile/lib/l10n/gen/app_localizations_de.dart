@@ -846,6 +846,30 @@ class AppLocalizationsDe extends AppLocalizations {
       'Für die Zahlung dieser Rechnung wurde eine virtuelle Karte ausgestellt. Stornieren Sie die Karte, bevor Sie die Genehmigung zurücknehmen.';
 
   @override
+  String get codedRefusalRecallPeppolTransmitted =>
+      'Diese Rechnung wurde bereits über PEPPOL versendet, und der Empfänger hat das genehmigte Dokument. Stellen Sie eine Gutschrift aus und senden Sie eine korrigierte Rechnung; die Genehmigung kann nicht zurückgenommen werden.';
+
+  @override
+  String get codedRefusalRecallMirrorUnsigned =>
+      'Diese Rechnung wurde konzernintern weitergeleitet, und ihre Spiegelrechnung bei der anderen Einheit hat die genehmigten Beträge übernommen. Löschen Sie die Spiegelrechnung (sie ist noch nicht genehmigt), nehmen Sie dann diese Genehmigung zurück und leiten Sie die Rechnung nach der erneuten Genehmigung wieder weiter.';
+
+  @override
+  String get codedRefusalRecallMirrorProgressed =>
+      'Diese Rechnung wurde konzernintern weitergeleitet, und ihre Spiegelrechnung bei der anderen Einheit ist dort bereits genehmigt oder wird bezahlt. Korrigieren Sie beide Seiten mit je einer Gutschrift; diese Genehmigung kann nicht zurückgenommen werden.';
+
+  @override
+  String get codedRefusalRecallIsMirror =>
+      'Diese Rechnung ist eine konzerninterne Spiegelrechnung: Ihre Beträge stammen aus der Ursprungsrechnung der anderen Einheit. Löschen Sie diese Spiegelrechnung, korrigieren Sie die Ursprungsrechnung und leiten Sie sie erneut weiter.';
+
+  @override
+  String get codedRefusalPartnerCapabilityRequired =>
+      'Dieser Arbeitsbereich ist nicht als Partner eingerichtet. Die Partner-Verwaltung wird von FeohLedger auf Anfrage freigeschaltet — wenden Sie sich an den Support, wenn Sie andere Arbeitsbereiche weiterverkaufen oder verwalten.';
+
+  @override
+  String get codedRefusalPartnerLinkingDisabled =>
+      'Die Partner-Verknüpfung ist auf dieser Plattform noch nicht aktiviert, daher kann kein Verknüpfungscode erstellt werden. Wenden Sie sich an den Support.';
+
+  @override
   String invoicesBulkRejectTitle(int count) {
     String _temp0 = intl.Intl.pluralLogic(
       count,
@@ -2519,6 +2543,11 @@ class AppLocalizationsDe extends AppLocalizations {
   }
 
   @override
+  String erpRefusalBillKeyShared(String provider) {
+    return '$provider hat bereits eine Rechnung mit diesem Lieferanten und dieser Rechnungsnummer, und eine andere Rechnung in FeohLedger hat denselben Lieferanten und dieselbe Nummer. Daher wurde diese Rechnung in $provider nicht mit dieser Rechnung verknüpft und keine zweite angelegt. Prüfen Sie in $provider, zu welcher Rechnung sie gehört. Ist die Nummer dieser Rechnung falsch, korrigieren Sie sie und versuchen Sie es erneut; andernfalls fragen Sie einen Administrator, wie weiter vorzugehen ist.';
+  }
+
+  @override
   String erpRefusalExceptionBlocksExport(String type) {
     return 'Diese Rechnung hat eine offene Ausnahme ($type). Lösen oder verwerfen Sie sie unter Ausnahmen und senden Sie die Rechnung dann an das ERP.';
   }
@@ -3919,6 +3948,21 @@ class AppLocalizationsDe extends AppLocalizations {
       'Ihr ERP hat die Zahlung dieser Rechnung nicht erfasst, daher wird die Rechnung dort weiterhin als unbezahlt angezeigt, obwohl das Geld gezahlt wurde. Beheben Sie die Ursache und verwenden Sie dann „ERP-Abgleich wiederholen“ beim Zahlungslauf dieser Zahlung unter Zahlungen.';
 
   @override
+  String exceptionDescriptionErpPaymentWritebackUnconfirmed(
+    String erp,
+    String marker,
+  ) {
+    return '$erp zeigt die Zahlung dieser Rechnung möglicherweise bereits an: FeohLedger hat sie gesendet, konnte aber nicht bestätigen, dass sie erfasst wurde. Suchen Sie bei der Rechnung nach einer Zahlung mit der Referenz „$marker“, bevor Sie eine erfassen.';
+  }
+
+  @override
+  String exceptionDescriptionErpPaymentWritebackUnconfirmedUnnamed(
+    String marker,
+  ) {
+    return 'Ihr ERP zeigt die Zahlung dieser Rechnung möglicherweise bereits an: FeohLedger hat sie gesendet, konnte aber nicht bestätigen, dass sie erfasst wurde. Suchen Sie bei der Rechnung nach einer Zahlung mit der Referenz „$marker“, bevor Sie eine erfassen.';
+  }
+
+  @override
   String exceptionDescriptionErpPaymentWritebackBalanceOpen(
     String erp,
     String amount,
@@ -3934,6 +3978,40 @@ class AppLocalizationsDe extends AppLocalizations {
   }
 
   @override
+  String exceptionDescriptionErpDiscountCreditPending(
+    String erp,
+    String amount,
+    String credit,
+  ) {
+    return '$erp hat die Zahlung dieser Rechnung erfasst, aber dort sind noch $amount offen. FeohLedger hat die Gutschrift $credit für das Skonto gebucht und wird sie verrechnen – buchen Sie keine weitere.';
+  }
+
+  @override
+  String exceptionDescriptionErpDiscountCreditPendingUnnamed(
+    String amount,
+    String credit,
+  ) {
+    return 'Ihr ERP hat die Zahlung dieser Rechnung erfasst, aber dort sind noch $amount offen. FeohLedger hat die Gutschrift $credit für das Skonto gebucht und wird sie verrechnen – buchen Sie keine weitere.';
+  }
+
+  @override
+  String exceptionDescriptionErpDiscountCreditPendingUnidentified(
+    String erp,
+    String amount,
+    String marker,
+  ) {
+    return '$erp hat die Zahlung dieser Rechnung erfasst, aber dort sind noch $amount offen. FeohLedger hat für dieses Skonto möglicherweise eine Gutschrift gebucht – suchen Sie nach „$marker“, bevor Sie eine buchen.';
+  }
+
+  @override
+  String exceptionDescriptionErpDiscountCreditPendingUnidentifiedUnnamed(
+    String amount,
+    String marker,
+  ) {
+    return 'Ihr ERP hat die Zahlung dieser Rechnung erfasst, aber dort sind noch $amount offen. FeohLedger hat für dieses Skonto möglicherweise eine Gutschrift gebucht – suchen Sie nach „$marker“, bevor Sie eine buchen.';
+  }
+
+  @override
   String exceptionDescriptionErpPaymentVoidWritebackFailed(String erp) {
     return '$erp zeigt diese Rechnung weiterhin als bezahlt an – durch eine Zahlung, die in FeohLedger storniert wurde, deren Stornierung im ERP aber fehlgeschlagen ist. Stornieren Sie diese Zahlung im ERP, damit die Bücher übereinstimmen.';
   }
@@ -3941,6 +4019,15 @@ class AppLocalizationsDe extends AppLocalizations {
   @override
   String get exceptionDescriptionErpPaymentVoidWritebackFailedUnnamed =>
       'Ihr ERP zeigt diese Rechnung weiterhin als bezahlt an – durch eine Zahlung, die in FeohLedger storniert wurde, deren Stornierung im ERP aber fehlgeschlagen ist. Stornieren Sie diese Zahlung im ERP, damit die Bücher übereinstimmen.';
+
+  @override
+  String exceptionDescriptionErpDiscountCreditStalled(String erp) {
+    return '$erp enthält möglicherweise eine Skontogutschrift, die FeohLedger für die Zahlung dieser Rechnung erstellt hat, aber nicht automatisch verrechnen oder stornieren konnte. Suchen Sie dort die Gutschrift mit der Kennzeichnung „FeohLedger discount“ und der ID dieser Zahlung, und verrechnen oder löschen Sie sie, damit das Skonto nur einmal gezählt wird.';
+  }
+
+  @override
+  String get exceptionDescriptionErpDiscountCreditStalledUnnamed =>
+      'Ihr ERP enthält möglicherweise eine Skontogutschrift, die FeohLedger für die Zahlung dieser Rechnung erstellt hat, aber nicht automatisch verrechnen oder stornieren konnte. Suchen Sie dort die Gutschrift mit der Kennzeichnung „FeohLedger discount“ und der ID dieser Zahlung, und verrechnen oder löschen Sie sie, damit das Skonto nur einmal gezählt wird.';
 
   @override
   String get exceptionDescriptionErpSyncBackFailed =>
@@ -5136,4 +5223,18 @@ class AppLocalizationsDe extends AppLocalizations {
   @override
   String get legalAcceptAppOutdated =>
       'Diese App-Version zeigt ältere Nutzungsbedingungen oder eine ältere Datenschutzerklärung als die derzeit geltenden und kann Ihre Zustimmung daher nicht erfassen. Aktualisieren Sie die App über Ihren App Store oder stimmen Sie in der Web-App zu und melden Sie sich dann erneut an.';
+
+  @override
+  String invoiceDetailAssignedElsewhere(String name) {
+    return 'Zugewiesen an $name – Sie können trotzdem als Genehmiger entscheiden.';
+  }
+
+  @override
+  String get invoiceDetailAssignedElsewhereUnnamed =>
+      'Einer Kollegin oder einem Kollegen zugewiesen – Sie können trotzdem als Genehmiger entscheiden.';
+
+  @override
+  String payQueueRescheduledFrom(String date) {
+    return 'verschoben vom $date';
+  }
 }

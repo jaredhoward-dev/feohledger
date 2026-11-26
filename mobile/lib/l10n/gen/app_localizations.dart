@@ -1392,6 +1392,42 @@ abstract class AppLocalizations {
   /// **'A virtual card has been issued to pay this invoice. Cancel the card before recalling the approval.'**
   String get codedRefusalCardBlocksRecall;
 
+  /// Coded refusal `invoice_recall_peppol_transmitted`: the approved document was already sent over PEPPOL.
+  ///
+  /// In en, this message translates to:
+  /// **'This invoice has already been sent over PEPPOL, and the receiver holds the approved document. Issue a credit note and send a corrected invoice; its approval can't be recalled.'**
+  String get codedRefusalRecallPeppolTransmitted;
+
+  /// Coded refusal `invoice_recall_mirror_unsigned`: the inter-company mirror is unsigned; delete it first.
+  ///
+  /// In en, this message translates to:
+  /// **'This invoice has been routed inter-company, and its mirror under the other entity copied the approved figures. Delete the mirror (it hasn't been approved yet), then recall this approval, and route the invoice again once it is re-approved.'**
+  String get codedRefusalRecallMirrorUnsigned;
+
+  /// Coded refusal `invoice_recall_mirror_progressed`: the inter-company mirror was approved or is being paid.
+  ///
+  /// In en, this message translates to:
+  /// **'This invoice has been routed inter-company, and its mirror under the other entity has already been approved or is being paid there. Correct the pair with a credit memo on each side; this approval can't be recalled.'**
+  String get codedRefusalRecallMirrorProgressed;
+
+  /// Coded refusal `invoice_recall_is_mirror`: the invoice is itself an inter-company mirror.
+  ///
+  /// In en, this message translates to:
+  /// **'This invoice is an inter-company mirror: its figures are copied from the originating invoice under the other entity. Delete this mirror and correct the original invoice, then route it again.'**
+  String get codedRefusalRecallIsMirror;
+
+  /// Coded refusal `partner_capability_required`: an admin of a workspace the operator has not made a partner opened a Partner Admin action.
+  ///
+  /// In en, this message translates to:
+  /// **'This workspace is not set up as a partner. Partner Admin is enabled by FeohLedger on request — contact support if you resell or manage other workspaces.'**
+  String get codedRefusalPartnerCapabilityRequired;
+
+  /// Coded refusal `partner_linking_disabled`: the link-code mint is off because the platform has no signing key configured.
+  ///
+  /// In en, this message translates to:
+  /// **'Partner linking is not enabled on this platform yet, so no link code can be generated. Contact support.'**
+  String get codedRefusalPartnerLinkingDisabled;
+
   /// Title of the reason prompt shown before bulk-rejecting the selected invoices.
   ///
   /// In en, this message translates to:
@@ -3873,6 +3909,12 @@ abstract class AppLocalizations {
   /// **'{provider} was connected before FeohLedger asked for permission to record payments, so this payment isn\'t recorded there. Reconnect {provider} in Organization settings to grant it, then record the payment in {provider} or retry.'**
   String erpRefusalPaymentsScopeMissing(String provider);
 
+  /// No description provided for @erpRefusalBillKeyShared.
+  ///
+  /// In en, this message translates to:
+  /// **'{provider} already has a bill with this supplier and invoice number, and another invoice in FeohLedger has the same supplier and number, so that bill wasn\'t linked to this invoice and no second bill was created. Check in {provider} which invoice the bill is for. If this invoice\'s number is wrong, correct it and retry; otherwise ask an administrator how to proceed.'**
+  String erpRefusalBillKeyShared(String provider);
+
   /// No description provided for @erpRefusalExceptionBlocksExport.
   ///
   /// In en, this message translates to:
@@ -5767,6 +5809,23 @@ abstract class AppLocalizations {
   /// **'Your ERP did not record this invoice\'s payment, so the bill still shows as unpaid there although the money was paid. Resolve what stopped it, then use Retry ERP sync on the payment\'s run in Payments.'**
   String get exceptionDescriptionErpPaymentWritebackFailedUnnamed;
 
+  /// No description provided for @exceptionDescriptionErpPaymentWritebackUnconfirmed.
+  ///
+  /// In en, this message translates to:
+  /// **'{erp} may already show this invoice\'s payment: FeohLedger sent it but could not confirm it was recorded. Check the bill for a payment referenced “{marker}” before recording one.'**
+  String exceptionDescriptionErpPaymentWritebackUnconfirmed(
+    String erp,
+    String marker,
+  );
+
+  /// No description provided for @exceptionDescriptionErpPaymentWritebackUnconfirmedUnnamed.
+  ///
+  /// In en, this message translates to:
+  /// **'Your ERP may already show this invoice\'s payment: FeohLedger sent it but could not confirm it was recorded. Check the bill for a payment referenced “{marker}” before recording one.'**
+  String exceptionDescriptionErpPaymentWritebackUnconfirmedUnnamed(
+    String marker,
+  );
+
   /// No description provided for @exceptionDescriptionErpPaymentWritebackBalanceOpen.
   ///
   /// In en, this message translates to:
@@ -5784,6 +5843,44 @@ abstract class AppLocalizations {
     String amount,
   );
 
+  /// No description provided for @exceptionDescriptionErpDiscountCreditPending.
+  ///
+  /// In en, this message translates to:
+  /// **'{erp} recorded this invoice\'s payment, but the bill still shows {amount} open there. FeohLedger booked credit {credit} for the early-payment discount and will apply it, so don\'t book another.'**
+  String exceptionDescriptionErpDiscountCreditPending(
+    String erp,
+    String amount,
+    String credit,
+  );
+
+  /// No description provided for @exceptionDescriptionErpDiscountCreditPendingUnnamed.
+  ///
+  /// In en, this message translates to:
+  /// **'Your ERP recorded this invoice\'s payment, but the bill still shows {amount} open there. FeohLedger booked credit {credit} for the early-payment discount and will apply it, so don\'t book another.'**
+  String exceptionDescriptionErpDiscountCreditPendingUnnamed(
+    String amount,
+    String credit,
+  );
+
+  /// No description provided for @exceptionDescriptionErpDiscountCreditPendingUnidentified.
+  ///
+  /// In en, this message translates to:
+  /// **'{erp} recorded this invoice\'s payment, but the bill still shows {amount} open there. FeohLedger may have booked a credit for this discount, so check for “{marker}” before booking one.'**
+  String exceptionDescriptionErpDiscountCreditPendingUnidentified(
+    String erp,
+    String amount,
+    String marker,
+  );
+
+  /// No description provided for @exceptionDescriptionErpDiscountCreditPendingUnidentifiedUnnamed.
+  ///
+  /// In en, this message translates to:
+  /// **'Your ERP recorded this invoice\'s payment, but the bill still shows {amount} open there. FeohLedger may have booked a credit for this discount, so check for “{marker}” before booking one.'**
+  String exceptionDescriptionErpDiscountCreditPendingUnidentifiedUnnamed(
+    String amount,
+    String marker,
+  );
+
   /// No description provided for @exceptionDescriptionErpPaymentVoidWritebackFailed.
   ///
   /// In en, this message translates to:
@@ -5795,6 +5892,18 @@ abstract class AppLocalizations {
   /// In en, this message translates to:
   /// **'Your ERP still shows this bill paid by a payment that was voided in FeohLedger, because voiding it in the ERP failed. Void that payment in the ERP so the books agree.'**
   String get exceptionDescriptionErpPaymentVoidWritebackFailedUnnamed;
+
+  /// No description provided for @exceptionDescriptionErpDiscountCreditStalled.
+  ///
+  /// In en, this message translates to:
+  /// **'{erp} may hold an early-payment discount credit FeohLedger created for this invoice\'s payment that it could not apply or reverse automatically. Find the credit marked “FeohLedger discount” with this payment\'s id there, and apply or delete it so the discount is counted once.'**
+  String exceptionDescriptionErpDiscountCreditStalled(String erp);
+
+  /// No description provided for @exceptionDescriptionErpDiscountCreditStalledUnnamed.
+  ///
+  /// In en, this message translates to:
+  /// **'Your ERP may hold an early-payment discount credit FeohLedger created for this invoice\'s payment that it could not apply or reverse automatically. Find the credit marked “FeohLedger discount” with this payment\'s id there, and apply or delete it so the discount is counted once.'**
+  String get exceptionDescriptionErpDiscountCreditStalledUnnamed;
 
   /// No description provided for @exceptionDescriptionErpSyncBackFailed.
   ///
@@ -7339,6 +7448,24 @@ abstract class AppLocalizations {
   /// In en, this message translates to:
   /// **'This version of the app shows older Terms or an older Privacy Policy than the ones now in force, so it cannot record your acceptance. Update the app from your app store, or accept in the web app, then sign in again.'**
   String get legalAcceptAppOutdated;
+
+  /// Invoice detail: note above Approve / Reject when the invoice is assigned to a colleague (decisions §564). Assignment is routing, not authority; also read as the buttons' semantics hint.
+  ///
+  /// In en, this message translates to:
+  /// **'Assigned to {name} — you can still act as an approver.'**
+  String invoiceDetailAssignedElsewhere(String name);
+
+  /// Invoice detail: the same note when the assignee has no stored name.
+  ///
+  /// In en, this message translates to:
+  /// **'Assigned to a colleague — you can still act as an approver.'**
+  String get invoiceDetailAssignedElsewhereUnnamed;
+
+  /// Payment queue row: the invoice's own due date when a payment schedule moved it; the row's date is the effective one (decisions §565).
+  ///
+  /// In en, this message translates to:
+  /// **'rescheduled from {date}'**
+  String payQueueRescheduledFrom(String date);
 }
 
 class _AppLocalizationsDelegate

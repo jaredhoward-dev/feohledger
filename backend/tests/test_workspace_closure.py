@@ -191,6 +191,12 @@ BLOCKING_OVERRIDES = {
     workspace_closure.BLOCKER_PROGRESSED_PURCHASE_ORDERS: {"status": "received"},
     workspace_closure.BLOCKER_APPROVED_REQUISITIONS: {"status": "approved"},
     workspace_closure.BLOCKER_APPROVED_INTAKE_REQUESTS: {"status": "approved"},
+    # `invoice_id` is nullable only for an inbound row that outlived its deleted
+    # invoice (§586), and that row is still an e-invoice record that blocks.
+    workspace_closure.BLOCKER_EINVOICE_TRANSMISSIONS: {
+        "direction": "inbound",
+        "invoice_deleted_at": datetime.now(UTC),
+    },
 }
 
 

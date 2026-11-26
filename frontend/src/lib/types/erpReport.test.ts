@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
+	discountCreditNote,
 	erpPaymentParts,
 	erpPrefill,
 	erpRefusalNote,
@@ -7,7 +8,8 @@ import {
 	isPoRematchClears,
 	poRematchNote,
 	spansSeveralRails,
-	splitNoteKey
+	splitNoteKey,
+	type ErpReport
 } from './erpReport.ts';
 
 describe('isErpPaidReport', () => {
@@ -70,6 +72,51 @@ describe('erpRefusalNote', () => {
 		).toBeNull();
 		expect(erpRefusalNote({ kind: 'payment_sync_back_failed', refusal }, t)).toBeNull();
 		expect(erpRefusalNote(null, t)).toBeNull();
+	});
+});
+
+describe('discountCreditNote (decisions §575)', () => {
+	const t = (key: string, params?: Record<string, string | number>) =>
+		`${key}${params ? ' ' + JSON.stringify(params) : ''}`;
+	const row = (failure: string | null | undefined): ErpReport => ({
+		kind: 'payment_writeback_balance_open',
+		discount_credit_failure: failure
+	});
+	const lead = 'exceptions.discountCredit.failed {"erp":"QuickBooks Online"}';
+
+	it('says the credit was attempted, and why from its ERP refusal code', () => {
+		const qbo = 'QuickBooks Online';
+		expect(discountCreditNote(row('payment_exceeds_balance'), qbo, qbo, t)).toBe(
+			`${lead} erpRefusal.paymentExceedsBalance {"provider":"QuickBooks Online"}`
+		);
+	});
+
+	it('keeps the lead alone when the reason cannot be stated', () => {
+		// The uncoded failure, a code this build does not know, a code whose
+		// sentence needs params the row does not keep, or no product name.
+		for (const failure of ['erp_discount_credit_failed', 'newer_code', 'account_not_linked']) {
+			const qbo = 'QuickBooks Online';
+			expect(discountCreditNote(row(failure), qbo, qbo, t)).toBe(lead);
+		}
+		expect(discountCreditNote(row('payment_exceeds_balance'), 'your ERP', null, t)).toBe(
+			'exceptions.discountCredit.failed {"erp":"your ERP"}'
+		);
+	});
+
+	it('is null when no credit was attempted, or on any other row', () => {
+		for (const failure of [null, undefined, '', '  ']) {
+			const qbo = 'QuickBooks Online';
+			expect(discountCreditNote(row(failure), qbo, qbo, t)).toBeNull();
+		}
+		expect(
+			discountCreditNote(
+				{ kind: 'payment_writeback_failed', discount_credit_failure: 'payment_exceeds_balance' },
+				'QuickBooks Online',
+				'QuickBooks Online',
+				t
+			)
+		).toBeNull();
+		expect(discountCreditNote(null, 'QuickBooks Online', null, t)).toBeNull();
 	});
 });
 

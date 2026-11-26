@@ -35,6 +35,7 @@ from sqlalchemy.dialects.postgresql import distinct_on
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 
+from app.models.invoice import Invoice
 from app.models.payment import PaymentSchedule
 
 #: The ordering that makes the first row an invoice's current schedule.
@@ -68,5 +69,27 @@ def latest_schedules() -> type[PaymentSchedule]:
         .ext(distinct_on(PaymentSchedule.invoice_id))
         .order_by(PaymentSchedule.invoice_id, *LATEST_SCHEDULE_ORDER)
         .subquery("latest_payment_schedule")
+    )
+    return aliased(PaymentSchedule, current)
+
+
+def current_schedule_of_row() -> type[PaymentSchedule]:
+    """`PaymentSchedule` narrowed to the OUTER `Invoice` row's current schedule,
+    as a LATERAL subquery aliased back to the entity: outer-join it
+    `ON true` after `invoices` (`.outerjoin(s, true())`).
+
+    The same row `latest_schedules()` gives, but correlated: one probe of
+    `ix_payment_schedules_invoice_current` per invoice the caller's own WHERE
+    keeps, where `latest_schedules()`'s `DISTINCT ON` reads every schedule in
+    the tenant whatever the caller filters (decisions §569). Prefer it on a
+    query whose invoice set is a small slice of the table (a page, a status
+    queue); one call per query, as with `latest_schedules()`.
+    """
+    current = (
+        select(PaymentSchedule)
+        .where(PaymentSchedule.invoice_id == Invoice.id)
+        .order_by(*LATEST_SCHEDULE_ORDER)
+        .limit(1)
+        .lateral("current_payment_schedule")
     )
     return aliased(PaymentSchedule, current)

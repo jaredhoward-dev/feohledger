@@ -36,6 +36,8 @@
 	import { replaceState } from '$app/navigation';
 	import { page } from '$app/state';
 	import { api, ApiError } from '#lib/api.ts';
+	import { listGlAccounts } from '#lib/api/glAccounts.ts';
+	import type { GlAccount } from '#lib/types/glAccount.ts';
 	import { CREDENTIAL_BLOCK_UNOPENABLE } from '#lib/api/codedRefusals.ts';
 	import CredentialResetPrompt from '#lib/components/organization/CredentialResetPrompt.svelte';
 	import { getProviderCredentials, updateProviderCredentials } from '#lib/api/providerCredentials.ts';
@@ -58,6 +60,7 @@
 	import { toast } from '#lib/components/ui/Toast.svelte';
 	import { m } from '#lib/i18n/store.svelte.ts';
 	import LoadingState from '#lib/components/ui/LoadingState.svelte';
+	import LoadError from '#lib/components/ui/LoadError.svelte';
 	import { FEATURE_ERP_INTEGRATIONS, FEATURE_ERP_MERGE } from '#lib/types/planFeatures.ts';
 	import {
 		BYO_APP_FIELDS,
@@ -80,6 +83,8 @@
 		oauthScopeGapKeys,
 		optionLabelKey,
 		pickRefusalKey,
+		glChartOptions,
+		discountCreditAccounts,
 		platformConnectUrl,
 		readOAuthReturn,
 		secretIsSaved,
@@ -176,6 +181,15 @@
 	 *  and says nothing. */
 	let pickExplicit = false;
 	let statusEl = $state<HTMLParagraphElement | null>(null);
+	/** The synced chart, for a `picker: 'gl_account'` field (the discount
+	 *  credit's account, decisions §575). Read once, when such a field shows. */
+	let glChart = $state<GlAccount[] | null>(null);
+	let glChartRequested = false;
+	/** The chart read's own async state, so the picker can say it is loading,
+	 *  that the read failed (with Retry), or that nothing eligible is synced —
+	 *  never an empty select that reads as "you have no accounts". */
+	let glChartState = $state<'loading' | 'error' | 'ready'>('loading');
+	const glChartEligible = $derived(discountCreditAccounts(glChart).length);
 
 	const groups = $derived(catalog ? groupProviders(catalog.providers) : []);
 	const provider = $derived<ErpProvider | null>(
@@ -192,6 +206,21 @@
 				)
 			: []
 	);
+	$effect(() => {
+		if (glChartRequested || !mainFields.some((f) => f.picker === 'gl_account')) return;
+		glChartRequested = true;
+		void loadGlChart();
+	});
+
+	async function loadGlChart() {
+		glChartState = 'loading';
+		try {
+			glChart = await listGlAccounts({ active_only: true });
+			glChartState = 'ready';
+		} catch {
+			glChartState = 'error';
+		}
+	}
 	const byoFields = $derived(
 		provider && isOAuth ? provider.fields.filter((f) => BYO_APP_FIELDS.includes(f.name)) : []
 	);
@@ -730,6 +759,47 @@
 				oninput={() => clearInvalid(f.name)}
 				testId="erp-secret-{f.name}"
 			/>
+		{:else if f.picker === 'gl_account'}
+			<!-- The synced chart, in its four states (ui-patterns § async
+			     states): loading says so on the busy select, a failed read is a
+			     LoadError with Retry, nothing eligible says where accounts come
+			     from, and only what saving accepts is offered. -->
+			{@const chart = glChartOptions(glChart, values[f.name])}
+			{@const chartId = `${inputId}-chart`}
+			<label>
+				<span>{fieldLabel(f)}</span>
+				<select
+					id={inputId}
+					bind:value={values[f.name]}
+					name={f.name}
+					required={isRequired(f)}
+					aria-invalid={invalid.includes(f.name) ? 'true' : undefined}
+					aria-busy={glChartState === 'loading' ? 'true' : undefined}
+					aria-describedby={[helpId, chartId].filter(Boolean).join(' ')}
+					onchange={() => clearInvalid(f.name)}
+					data-testid="erp-picker-{f.name}"
+				>
+					<option value="">{m('org.erp.pickAccount')}</option>
+					{#each chart as account (account.code)}
+						<option value={account.code}>{account.label}</option>
+					{/each}
+				</select>
+			</label>
+			<p class="field-hint" id={chartId} role="status" data-testid="erp-picker-{f.name}-status">
+				{#if glChartState === 'loading'}
+					{m('org.erp.glChart.loading')}
+				{:else if glChartState === 'ready' && glChartEligible === 0}
+					{m('org.erp.glChart.empty')}
+					<a href="/gl-accounts">{m('org.erp.glChart.openChart')}</a>
+				{/if}
+			</p>
+			{#if glChartState === 'error'}
+				<LoadError
+					message={m('org.erp.glChart.loadFailed')}
+					onretry={loadGlChart}
+					testId="erp-picker-{f.name}-failed"
+				/>
+			{/if}
 		{:else}
 			<label>
 				<span>{fieldLabel(f)}</span>
@@ -799,10 +869,7 @@
 		     needs no configuration. -->
 		<PlanUpgradeNotice feature={FEATURE_ERP_INTEGRATIONS} testId="erp-plan-upgrade" />
 	{:else if catalogError}
-		<div class="load-failed" role="alert" data-testid="erp-load-failed">
-			<p class="card-hint failure-text">{m('org.erp.loadFailed')}</p>
-			<button type="button" class="btn-test" onclick={loadCatalog}>{m('common.tryAgain')}</button>
-		</div>
+		<LoadError message={m('org.erp.loadFailed')} onretry={loadCatalog} testId="erp-load-failed" />
 	{:else if !catalog}
 		<LoadingState label={m('org.erp.loading')} />
 	{:else}
@@ -1167,17 +1234,6 @@
 		align-items: center;
 		flex-wrap: wrap;
 		gap: 12px;
-	}
-
-	.load-failed {
-		display: flex;
-		align-items: center;
-		flex-wrap: wrap;
-		gap: 12px;
-	}
-
-	.load-failed .card-hint {
-		margin: 0;
 	}
 
 	.byo {

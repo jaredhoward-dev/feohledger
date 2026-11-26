@@ -42,11 +42,9 @@ from app.models.expense import (
     CorporateCardTransaction,
     Expense,
     ExpensePolicy,
-    ExpensePreapproval,
     ExpenseReport,
     ExpenseReportStatus,
     ExpenseStatus,
-    PreapprovalStatus,
 )
 from app.models.gl_account import GLAccount
 from app.models.organization import Organization
@@ -98,13 +96,19 @@ from app.services.expense_currency import (
     conversion_requires_rate_source,
     lock_expense_conversion,
     lock_report_reporting_amount,
-    normalize_currency,
     rollup_report_lines,
 )
 from app.services.expense_policy import (
+    VIOLATION_PREAPPROVAL_REQUIRED,
     blocking_violations,
     evaluate_expense,
     evaluate_report,
+)
+from app.services.expense_preapproval_cover import (
+    advisory_cover,
+    draw_cover_for_lines,
+    draw_records,
+    release_draw,
 )
 from app.services.fx_adapters import UnknownFxProviderError, get_fx_adapter
 from app.services.storage import upload_expense_receipt
@@ -181,6 +185,8 @@ def _to_response(e: Expense) -> ExpenseResponse:
         reimbursable=e.reimbursable,
         mileage_miles=float(e.mileage_miles) if e.mileage_miles is not None else None,
         created_by_user_id=str(e.created_by_user_id) if e.created_by_user_id else None,
+        preapproval_id=str(e.preapproval_id) if e.preapproval_id else None,
+        preapproval_drawn_amount=e.preapproval_drawn_amount,
         created_at=e.created_at.isoformat() if e.created_at else "",
         updated_at=e.updated_at.isoformat() if e.updated_at else "",
     )
@@ -549,74 +555,26 @@ async def _active_policies(db: AsyncSession, entity_id: uuid.UUID | None) -> lis
 
 
 async def _approved_preapproval_amount(db: AsyncSession, expense: Expense) -> Decimal | None:
-    """Largest approved pre-approval estimate covering this expense.
+    """The approved pre-approval cover the policy engine may count for this line.
 
-    A pre-approval covers an expense when it's approved, denominated in the
-    SAME currency, and either linked to the expense's report or (loosely)
-    matching its category. Returns the largest matching estimate so the policy
-    engine can compare it against the amount.
+    Delegates to ``services/expense_preapproval_cover.advisory_cover``, which
+    owns the rules (decisions §563): a line that already draws is covered by its
+    recorded draw; otherwise the largest REMAINING balance among the approved
+    pre-approvals that may cover it — so one estimate no longer covers every
+    line on its own.
 
-    The currency match is load-bearing (issue #157): the engine compares
-    ``estimated_amount >= expense.amount`` as bare numbers, so without it a
-    €500 EUR pre-approval would silently satisfy the pre-approval requirement
-    for a $500 USD expense. We deliberately do NOT convert here — this is an
-    advisory, best-effort path with no FX budget, and "not covered" is the
-    fail-closed answer (it raises a blocking violation rather than waving the
-    expense through).
-
-    Scoped to the expense's own entity for the same reason the currency is
-    matched: a pre-approval is a specific authorization, and one subsidiary's
-    approved request has no standing to clear another subsidiary's blocking
-    `preapproval_required`. Unlike the policy read this scopes STRICTLY (no
-    `include_shared`) — excluding an unstamped row leaves the violation raised,
-    which is the fail-closed direction here.
-
-    **And scoped to the person who asked for it.** A pre-approval authorizes
-    ITS REQUESTER's spend; the lookup used to match on status + currency +
-    entity + (report OR category) and never on whose request it was, so one
-    clerk's approved "conference, travel, 5 000" cleared the blocking
-    ``preapproval_required`` on every colleague's travel expense in the entity.
-    The expense's owner is its report's ``employee_user_id`` (the authenticated
-    creator — `create_report` never takes it from the body), so the cover must
-    have ``requester_user_id`` equal to it. An UNATTACHED expense has no owner
-    yet, so nothing covers it — the violation stays raised (advisory until
+    Who may be covered is unchanged. **Same currency**, no conversion (issue
+    #157): the engine compares ``covered >= amount`` as bare numbers, so a
+    €500 EUR pre-approval must not satisfy a $500 USD line, and a NULL or
+    unusable code covers nothing (§473) — "not covered" is the fail-closed
+    answer. **Same entity**, strictly (no shared rows): one subsidiary's
+    approval has no standing to clear another's blocking
+    ``preapproval_required``. **Same person**: the cover must be the report
+    owner's own request (``requester_user_id`` = the report's
+    ``employee_user_id``), so a colleague's approval cannot be borrowed, and an
+    UNATTACHED line has no owner yet, so nothing covers it (advisory until
     then; the attach re-evaluates it, and submit is the gate)."""
-    if expense.report_id is None:
-        return None
-    owner = (
-        select(ExpenseReport.employee_user_id)
-        .where(ExpenseReport.id == expense.report_id)
-        .scalar_subquery()
-    )
-    conditions = [ExpensePreapproval.expense_report_id == expense.report_id]
-    if expense.category is not None:
-        conditions.append(ExpensePreapproval.category == expense.category)
-    rows = (
-        (
-            await db.execute(
-                apply_entity_scope(
-                    select(ExpensePreapproval.estimated_amount),
-                    ExpensePreapproval,
-                    expense.entity_id,
-                ).where(
-                    ExpensePreapproval.status == PreapprovalStatus.approved,
-                    ExpensePreapproval.requester_user_id == owner,
-                    # "" (no usable code on the expense) matches no
-                    # pre-approval, and a pre-approval with no currency (NULL)
-                    # is unknown, never USD: NULL compares as no match, so a
-                    # currency-less pre-approval covers nothing (§473).
-                    func.upper(func.btrim(ExpensePreapproval.currency))
-                    == (normalize_currency(expense.currency) or ""),
-                    or_(*conditions),
-                )
-            )
-        )
-        .scalars()
-        .all()
-    )
-    if not rows:
-        return None
-    return max(Decimal(r) for r in rows)
+    return await advisory_cover(db, expense)
 
 
 async def _refresh_policy_violations(db: AsyncSession, expense: Expense, org: Organization) -> None:
@@ -1851,12 +1809,6 @@ async def submit_report(
             ),
         )
 
-    cover: dict[str, Decimal] = {}
-    for child in report.expenses:
-        amount = await _approved_preapproval_amount(db, child)
-        if amount is not None:
-            cover[str(child.id)] = amount
-
     # Policies are per-entity, so each line is judged against ITS OWN entity's
     # rule set — `evaluate_report` applies every policy handed to it to every
     # expense, so one shared list would re-introduce the cross-entity bleed at
@@ -1868,33 +1820,19 @@ async def submit_report(
         lines_by_entity.setdefault(child.entity_id, []).append(child)
 
     reporting_currency_for_policies = resolve_reporting_currency(org.settings)
-    violations: list[dict] = []
-    for line_entity_id, group in lines_by_entity.items():
-        violations.extend(
-            evaluate_report(
-                report,
-                group,
-                await _active_policies(db, line_entity_id),
-                preapproval_amount_by_expense=cover,
-                default_threshold_currency=reporting_currency_for_policies,
-            )
-        )
-    blocking = blocking_violations(violations)
-    if blocking:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-            detail=report_policy_blocked_detail(blocking),
-        )
-
-    report.status = ExpenseReportStatus.submitted
-    report.submitted_at = datetime.now(UTC)
-    for child in report.expenses:
-        child.status = ExpenseStatus.submitted
+    policies_by_entity = {
+        line_entity_id: await _active_policies(db, line_entity_id)
+        for line_entity_id in lines_by_entity
+    }
 
     # Lock the total into the org reporting currency — the figure the CFO gate
-    # reads at approval. Best-effort: an FX outage leaves it NULL and the gate
-    # then fails CLOSED (CFO required), so a failure here never lets a report
-    # through with less scrutiny.
+    # reads at approval. Done BEFORE the pre-approval draw below (§570): the
+    # total does not depend on the draws, and the draw holds `FOR UPDATE` locks
+    # on shared pre-approval rows until commit, so a slow FX provider called
+    # after it would stall every other submit drawing on the same estimate. A
+    # refused submit rolls this back with everything else. Best-effort: an FX
+    # outage leaves it NULL and the gate then fails CLOSED (CFO required), so a
+    # failure here never lets a report through with less scrutiny.
     reporting_currency = resolve_reporting_currency(org.settings)
     submit_fx_adapter = _fx_adapter_for(org)
     if conversion_requires_rate_source(
@@ -1920,6 +1858,50 @@ async def submit_report(
             report, reporting_currency=reporting_currency, fx_adapter=submit_fx_adapter
         )
 
+    # Draw the lines that need a pre-approval down against one (decisions
+    # §563). First pass with NO cover finds them — a line under every
+    # `requires_preapproval_above` is never charged to the budget — then each is
+    # linked to an approved estimate with enough left, under a row lock on the
+    # pre-approval. A line nothing can cover stays out of `cover`, the second
+    # pass raises `preapproval_required` for it, and the 422 below rolls the
+    # draws back with everything else.
+    needs_cover: set[str] = set()
+    for line_entity_id, group in lines_by_entity.items():
+        for v in evaluate_report(
+            report,
+            group,
+            policies_by_entity[line_entity_id],
+            default_threshold_currency=reporting_currency_for_policies,
+        ):
+            if v.get("code") == VIOLATION_PREAPPROVAL_REQUIRED and v.get("expense_id"):
+                needs_cover.add(v["expense_id"])
+    cover = await draw_cover_for_lines(
+        db, report, [child for child in report.expenses if str(child.id) in needs_cover]
+    )
+
+    violations: list[dict] = []
+    for line_entity_id, group in lines_by_entity.items():
+        violations.extend(
+            evaluate_report(
+                report,
+                group,
+                policies_by_entity[line_entity_id],
+                preapproval_amount_by_expense=cover,
+                default_threshold_currency=reporting_currency_for_policies,
+            )
+        )
+    blocking = blocking_violations(violations)
+    if blocking:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail=report_policy_blocked_detail(blocking),
+        )
+
+    report.status = ExpenseReportStatus.submitted
+    report.submitted_at = datetime.now(UTC)
+    for child in report.expenses:
+        child.status = ExpenseStatus.submitted
+
     await dispatch_audit(
         db,
         correlation_id=uuid.uuid4(),
@@ -1938,6 +1920,9 @@ async def submit_report(
             ),
             "reporting_currency": report.reporting_currency,
             "expense_count": len(report.expenses),
+            # The pre-approval draws this submit recorded (§563): the columns
+            # holding them are wiped by a reject, so the trail keeps them.
+            "draws": draw_records(report.expenses),
         },
     )
     await db.commit()
@@ -2032,8 +2017,19 @@ async def reject_report(
         raise refusal.http()
 
     report.status = ExpenseReportStatus.rejected
+    released: list[dict] = []
     for child in report.expenses:
         child.status = ExpenseStatus.draft
+        # A draft line draws nothing: hand its share of the pre-approval back
+        # so a corrected re-submit (or another claim) can use it (§563), and
+        # record what was handed back in the same transaction (§570).
+        record = release_draw(child)
+        if record is not None:
+            released.append(record)
+    released.sort(key=lambda r: r["expense_id"])
+    reject_details: dict = {"released": released}
+    if body and body.reason:
+        reject_details["reason"] = body.reason
 
     await dispatch_audit(
         db,
@@ -2043,7 +2039,7 @@ async def reject_report(
         action="expense_report.rejected",
         entity_type="expense_report",
         entity_id=report.id,
-        details={"reason": body.reason} if body and body.reason else None,
+        details=reject_details,
     )
     await db.commit()
     fresh = await _get_report_or_404(db, report.id)

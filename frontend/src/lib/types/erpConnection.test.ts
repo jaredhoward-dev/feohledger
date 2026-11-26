@@ -2,6 +2,8 @@ import { describe, expect, it } from 'vitest';
 import { SUPPORTED_LOCALES } from '#lib/i18n/locale.ts';
 import type { MessageKey } from '#lib/i18n/messages.ts';
 import {
+	glChartOptions,
+	discountCreditAccounts,
 	buildErpPayload,
 	buildErpSecretUpdate,
 	buildErpTestPayload,
@@ -32,7 +34,8 @@ import {
 	statusSyncNowOffered,
 	storedErpStatusSyncNowOffered,
 	statusSyncStartedKey,
-	type ErpProvider
+	type ErpProvider,
+	type GlChartRow
 } from './erpConnection';
 
 /** `GET /api/organization/credentials` → `erp`: the stored secret NAMES. */
@@ -952,5 +955,61 @@ describe('oauthScopeGapKeys', () => {
 				expect(messages[key], `${locale}: ${key}`).toContain('{erp}');
 			}
 		}
+	});
+});
+
+describe('glChartOptions (the discount credit account picker, decisions §575)', () => {
+	const row = (code: string, name: string, over: Partial<GlChartRow> = {}): GlChartRow => ({
+		code,
+		name,
+		entity_id: null,
+		erp_account_id: `erp-${code}`,
+		...over
+	});
+
+	it('lists the chart by code with its name', () => {
+		const chart = [row('4900', 'Discounts received'), row('1010', 'Checking')];
+		expect(glChartOptions(chart, '')).toEqual([
+			{ code: '1010', label: '1010 — Checking' },
+			{ code: '4900', label: '4900 — Discounts received' }
+		]);
+	});
+
+	it('keeps a saved code the chart no longer lists, or before it loads', () => {
+		expect(glChartOptions(null, '4900')).toEqual([{ code: '4900', label: '4900' }]);
+		expect(glChartOptions([row('1010', 'Checking')], '4900').map((o) => o.code)).toEqual([
+			'1010',
+			'4900'
+		]);
+	});
+
+	it('offers only shared, ERP-linked accounts — what the write-back can resolve', () => {
+		const chart = [
+			row('4900', 'Discounts received'),
+			row('4910', 'Entity discounts', { entity_id: 'ent-a' }),
+			row('4920', 'Never synced', { erp_account_id: null }),
+			row('4930', 'Blank link', { erp_account_id: '' })
+		];
+		expect(discountCreditAccounts(chart).map((a) => a.code)).toEqual(['4900']);
+		expect(glChartOptions(chart, '').map((o) => o.code)).toEqual(['4900']);
+	});
+
+	it('dedupes by code after filtering, so an entity override never displaces the shared account', () => {
+		const chart = [
+			row('6000', 'Subsidiary A override', { entity_id: 'ent-a' }),
+			row('6000', 'Shared discounts'),
+			row('6000', 'Subsidiary B override', { entity_id: 'ent-b' }),
+			row('6100', 'Other shared')
+		];
+		expect(glChartOptions(chart, '')).toEqual([
+			{ code: '6000', label: '6000 — Shared discounts' },
+			{ code: '6100', label: '6100 — Other shared' }
+		]);
+	});
+
+	it('is empty when nothing eligible is synced (the picker then says so)', () => {
+		expect(discountCreditAccounts([])).toEqual([]);
+		expect(discountCreditAccounts(null)).toEqual([]);
+		expect(discountCreditAccounts([row('1', 'x', { erp_account_id: null })])).toEqual([]);
 	});
 });

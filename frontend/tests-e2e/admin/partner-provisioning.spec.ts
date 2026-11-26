@@ -1,83 +1,81 @@
 import { API_BASE, currentTenantSlug, expect, signInAndWait, test } from '../fixtures/helpers';
 
 /**
- * /admin/partner — link provisioning (attach / detach) surface.
+ * Partner link provisioning — the consent side and the privilege boundary.
  *
- * Backend `/api/partner` provisioning endpoints (`backend/app/api/partner.py`):
- *  - POST /api/partner/link-code        → the caller mints a single-use code so a
- *                                         partner can attach it AS a child (consent)
- *  - POST /api/partner/children         → redeem a child-issued code to attach it
- *  - DELETE /api/partner/children/{id}   → detach a child (back to standalone)
+ * Two-sided consent: a partner can only attach an org whose own admin minted a
+ * link code. Minting is NOT a partner act, so it lives in Organization settings
+ * (`POST /api/organization/partner-link-code`, any admin — decisions §574);
+ * redeeming it (`POST /api/partner/children`) needs the operator-granted
+ * partner capability on top of the admin role.
  *
- * The authorization model is TWO-SIDED CONSENT: a partner can only attach an org
- * that minted a link code. These specs assert (a) the admin UI exposes the
- * mint + attach affordances and minting returns a code, and (b) the privilege
- * boundary — attaching a garbage / non-consenting code is rejected so no
- * cross-tenant link is created. The full happy-path round-trip is covered
- * exhaustively by the backend pytest suite (real Postgres, two tenants).
+ * These specs assert (a) any admin — the e2e tenant is not a partner — mints a
+ * code from Organization → Join a partner, and (b) a workspace that is not a
+ * partner cannot adopt anyone, even with a valid code. The partner-side
+ * round-trip (attach, re-parent guard, single use, detach, self-adopt) is held
+ * by the backend pytest suite against two real tenants.
  */
 
-test.describe('/admin/partner provisioning (admin)', () => {
+test.describe('partner link provisioning (admin)', () => {
 	test.use({ storageState: { cookies: [], origins: [] } });
 
 	test.beforeEach(async ({ page }) => {
 		await signInAndWait(page);
 	});
 
-	test('admin sees the attach + link-code affordances and can mint a code', async ({ page }) => {
-		await page.goto('/admin/partner');
-		await expect(page.getByRole('heading', { name: 'Partner Admin' })).toBeVisible();
-
-		// The new provisioning affordances are present.
-		await expect(page.getByTestId('attach-child-btn')).toBeVisible({ timeout: 10_000 });
+	test('an admin mints a link code from Organization settings', async ({ page }) => {
+		await page.goto('/organization?section=partner-link');
+		await expect(page.getByRole('heading', { name: 'Join a partner' })).toBeVisible();
 		await expect(page.getByTestId('link-code-panel')).toBeVisible();
 
-		// Minting a code (this workspace consenting to be a child) surfaces an
-		// opaque code in the UI — the dev signing key is set in .env.development.
-		await page.getByRole('button', { name: 'Generate link code' }).click();
-		const minted = page.getByTestId('minted-link-code');
-		await expect(minted).toBeVisible({ timeout: 10_000 });
-		await expect(minted.locator('.code-value')).not.toBeEmpty();
+		// The dev signing key is set in .env.development.
+		const generate = page.getByRole('button', { name: 'Generate link code' });
+		await generate.click();
+		// Shown once in the shared SecretReveal dialog: focus moves into it, the
+		// copy is acknowledged, and the code leaves the page on Done.
+		const dialog = page.getByRole('dialog', { name: 'New link code' });
+		await expect(dialog).toBeVisible();
+		const minted = dialog.getByTestId('minted-link-code');
+		await expect(minted).not.toBeEmpty();
+		await expect(dialog.locator(':focus')).toHaveCount(1);
+		await dialog.getByRole('button', { name: 'Done' }).click();
+		await expect(page.getByTestId('minted-link-code')).toHaveCount(0);
+		await expect(generate).toBeFocused();
 	});
 
-	test('attaching a non-consenting (garbage) code is rejected — no link created', async ({
-		page
-	}) => {
-		// The privilege boundary: without a valid child-issued code, a partner
-		// cannot adopt anyone. A forged/garbage code is an opaque 400.
-		const token = await page.evaluate(() => localStorage.getItem('auth_token'));
-		const resp = await page.request.post(`${API_BASE}/api/partner/children`, {
-			headers: {
-				Authorization: `Bearer ${token}`,
-				'X-Tenant-Slug': currentTenantSlug(),
-				'Content-Type': 'application/json'
-			},
-			data: { link_code: 'totally.bogus' }
-		});
-		expect(resp.status()).toBe(400);
-
-		// The caller still administers no children (no silent adoption happened).
-		const overview = await page.request.get(`${API_BASE}/api/partner`, {
-			headers: {
-				Authorization: `Bearer ${token}`,
-				'X-Tenant-Slug': currentTenantSlug()
-			}
-		});
-		expect(overview.status()).toBe(200);
-		const body = (await overview.json()) as { children: unknown[] };
-		expect(body.children).toEqual([]);
+	test('a refused mint is stated from its code, not the server English', async ({ page }) => {
+		await page.route(
+			(url) => url.pathname === '/api/organization/partner-link-code',
+			(route) =>
+				route.fulfill({
+					status: 503,
+					json: {
+						detail: {
+							code: 'partner_linking_disabled',
+							message: 'server English',
+							params: {}
+						}
+					}
+				})
+		);
+		await page.goto('/organization?section=partner-link');
+		const generate = page.getByRole('button', { name: 'Generate link code' });
+		await generate.click();
+		const sentence =
+			'Partner linking is not enabled on this platform yet, so no link code can be generated. Contact support.';
+		await expect(page.getByTestId('partner-link-failure')).toHaveText(sentence);
+		await expect(generate).toHaveAccessibleDescription(sentence);
+		await expect(page.getByTestId('minted-link-code')).toHaveCount(0);
 	});
 
-	test('a self-minted code cannot attach the workspace to itself', async ({ page }) => {
-		// Mint a code for THIS org, then try to redeem it as the same org. A
-		// self-FK loop is nonsensical — the backend rejects it with a 400.
+	test('a workspace that is not a partner cannot redeem a code', async ({ page }) => {
 		const token = await page.evaluate(() => localStorage.getItem('auth_token'));
 		const headers = {
 			Authorization: `Bearer ${token}`,
 			'X-Tenant-Slug': currentTenantSlug(),
 			'Content-Type': 'application/json'
 		};
-		const mint = await page.request.post(`${API_BASE}/api/partner/link-code`, {
+		const mint = await page.request.post(`${API_BASE}/api/organization/partner-link-code`, {
 			headers,
 			data: {}
 		});
@@ -88,11 +86,13 @@ test.describe('/admin/partner provisioning (admin)', () => {
 			headers,
 			data: { link_code }
 		});
-		expect(attach.status()).toBe(400);
+		expect(attach.status()).toBe(403);
+		const body = (await attach.json()) as { detail: { code: string } };
+		expect(body.detail.code).toBe('partner_capability_required');
 	});
 });
 
-test.describe('/admin/partner provisioning (clerk — not authorized)', () => {
+test.describe('partner link provisioning (clerk — not authorized)', () => {
 	test.use({ storageState: { cookies: [], origins: [] } });
 
 	test('a clerk cannot mint a link code or attach a child (403)', async ({ page, tenantClerk }) => {
@@ -103,7 +103,7 @@ test.describe('/admin/partner provisioning (clerk — not authorized)', () => {
 			'X-Tenant-Slug': currentTenantSlug(),
 			'Content-Type': 'application/json'
 		};
-		const mint = await page.request.post(`${API_BASE}/api/partner/link-code`, {
+		const mint = await page.request.post(`${API_BASE}/api/organization/partner-link-code`, {
 			headers,
 			data: {}
 		});

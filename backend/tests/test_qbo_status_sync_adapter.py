@@ -15,6 +15,7 @@ from datetime import UTC, date, datetime
 from decimal import Decimal
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import pytest
 
 from app.services import erp_oauth
@@ -23,11 +24,15 @@ from app.services.erp_adapters.base import (
     BILL_PAYMENT_VOIDED,
     PAYMENT_ACCOUNT_NOT_MAPPED,
     PAYMENT_EXCEEDS_BALANCE,
+    DiscountCreditPayload,
     ErpBillState,
     ErpListingIncomplete,
     PaymentPayload,
 )
-from app.services.erp_adapters.quickbooks_online import QuickBooksOnlineAdapter
+from app.services.erp_adapters.quickbooks_online import (
+    CURRENCY_MISMATCH,
+    QuickBooksOnlineAdapter,
+)
 from app.utils.json_money import dumps_exact_json
 
 REALM = "9130"
@@ -67,6 +72,14 @@ class _Qbo:
         self.cdc: dict = {"CDCResponse": [{"QueryResponse": [{"Bill": []}, {"BillPayment": []}]}]}
         self.post_answer: MagicMock | None = None
         self.next_id = 900
+        self.vendor_credits: dict[str, dict] = {}
+        self.fail_apply = False
+        self.fail_credit_delete = False
+        #: Whether a repeated ``requestid`` on a vendorcredit create replays the
+        #: first answer. Intuit documents replay for creates generally, not
+        #: for vendorcredit or for how long (decisions §577), so the retry
+        #: must not depend on it.
+        self.replay_credit_create = True
 
     def bill(self, bill_id="501", total="100.00", balance=None, note=f"FeohLedger {CORR}", **kw):
         self.bills[bill_id] = {
@@ -113,8 +126,27 @@ class _Qbo:
         if path.startswith("billpayment/"):
             record = self.payments.get(path.split("/", 1)[1])
             return _resp(200, {"BillPayment": record}) if record else _gone()
+        if path.startswith("vendorcredit"):
+            return self._vendor_credit(method, path, params, content)
         if method == "POST" and path == "billpayment":
             body = json.loads(content, parse_float=Decimal)
+            if (params or {}).get("operation") == "delete":
+                record = self.payments.pop(body["Id"])
+                for line in record["Line"]:
+                    for link in line["LinkedTxn"]:
+                        if link["TxnType"] == "Bill":
+                            bill = self.bills[link["TxnId"]]
+                            bill["Balance"] += line["Amount"]
+                            bill["LinkedTxn"] = [
+                                t for t in bill["LinkedTxn"] if t["TxnId"] != body["Id"]
+                            ]
+                return _resp(200, {"BillPayment": {"Id": body["Id"], "status": "Deleted"}})
+            if any(
+                t["TxnType"] == "VendorCredit"
+                for line in body.get("Line") or []
+                for t in line["LinkedTxn"]
+            ):
+                return self._apply_credit(body, params)
             if (params or {}).get("include") == "void":
                 record = self.payments[body["Id"]]
                 bill_id = record["Line"][0]["LinkedTxn"][0]["TxnId"]
@@ -136,6 +168,44 @@ class _Qbo:
             self.replays[rid] = {"BillPayment": self.payments[pid]}
             return _resp(200, {"BillPayment": self.payments[pid]})
         raise AssertionError(f"unexpected {method} {url}")
+
+    # VendorCredit and its $0 BillPayment application (decisions §575).
+    def _vendor_credit(self, method, path, params, content):
+        if method == "GET":
+            record = self.vendor_credits.get(path.split("/", 1)[1])
+            return _resp(200, {"VendorCredit": record}) if record else _gone()
+        body = json.loads(content, parse_float=Decimal)
+        if (params or {}).get("operation") == "delete":
+            if self.fail_credit_delete:
+                return _resp(500, {"Fault": {"Error": [{"code": "6000"}]}})
+            self.vendor_credits.pop(body["Id"])
+            return _resp(200, {"VendorCredit": {"Id": body["Id"], "status": "Deleted"}})
+        rid = (params or {}).get("requestid")
+        if self.replay_credit_create and rid in self.replays:
+            return _resp(200, self.replays[rid])
+        vid = f"vc-{len(self.vendor_credits) + 1}"
+        self.vendor_credits[vid] = {**body, "Id": vid, "SyncToken": "0"}
+        self.replays[rid] = {"VendorCredit": self.vendor_credits[vid]}
+        return _resp(200, self.replays[rid])
+
+    def _apply_credit(self, body, params):
+        if self.fail_apply:
+            return _resp(400, {"Fault": {"Error": [{"code": "6000", "element": "Line"}]}})
+        rid = (params or {}).get("requestid")
+        if rid in self.replays:
+            return _resp(200, self.replays[rid])
+        assert body["TotalAmt"] == 0
+        pid = str(self.next_id)
+        self.next_id += 1
+        self.payments[pid] = {**body, "Id": pid, "SyncToken": "0"}
+        for line in body["Line"]:
+            for link in line["LinkedTxn"]:
+                if link["TxnType"] == "Bill":
+                    bill = self.bills[link["TxnId"]]
+                    bill["Balance"] -= line["Amount"]
+                    bill["LinkedTxn"].append({"TxnId": pid, "TxnType": "BillPaymentCheck"})
+        self.replays[rid] = {"BillPayment": self.payments[pid]}
+        return _resp(200, self.replays[rid])
 
     def posts(self):
         return [
@@ -845,3 +915,305 @@ def test_an_erp_without_status_sync_answers_fail_closed_by_default():
     assert asyncio.run(adapter.void_payment(_payload())).success is False
     assert asyncio.run(adapter.bills_for_payment("9")) == []
     assert asyncio.run(adapter.changed_bills(datetime(2026, 10, 1, tzinfo=UTC))) == []
+
+
+# ---------------------------------------------------------------------------
+# early-payment discount booked as a VendorCredit (decisions §575)
+
+
+def _credit(**overrides) -> DiscountCreditPayload:
+    base = dict(
+        payment_id=PAYMENT_ID,
+        bill_id="501",
+        amount=Decimal("2.00"),
+        currency="USD",
+        credit_on=date(2026, 10, 2),
+        discount_account_erp_id="88",
+        pay_from_account_erp_id="35",
+    )
+    base.update(overrides)
+    return DiscountCreditPayload(**base)
+
+
+def _discounted(qbo: _Qbo) -> dict:
+    bill = qbo.bill()
+    assert _run(qbo, lambda: _adapter().post_payment(_payload(amount=Decimal("98.00")))).success
+    assert bill["Balance"] == Decimal("2.00")
+    return bill
+
+
+def _bodies(qbo: _Qbo, path: str) -> list[dict]:
+    return [
+        json.loads(c["content"], parse_float=Decimal)
+        for c in qbo.calls
+        if c["method"] == "POST"
+        and c["url"].endswith(f"/{path}")
+        and not (c["params"] or {}).get("operation")
+    ]
+
+
+def test_the_discount_is_booked_as_a_vendor_credit_applied_to_the_bill():
+    qbo = _Qbo()
+    bill = _discounted(qbo)
+    result = _run(qbo, lambda: _adapter().post_discount_credit(_credit()))
+    assert result.success, result.message
+    assert result.erp_document_id == "vc-1" and result.bill_balance_after == Decimal("0")
+    [credit] = _bodies(qbo, "vendorcredit")
+    assert credit["VendorRef"] == {"value": "56"}
+    assert credit["PrivateNote"] == f"FeohLedger discount {PAYMENT_ID}"
+    assert credit["CurrencyRef"] == {"value": "USD"}
+    assert credit["Line"] == [
+        {
+            "Amount": Decimal("2.00"),
+            "DetailType": "AccountBasedExpenseLineDetail",
+            "Description": "Early-payment discount",
+            "AccountBasedExpenseLineDetail": {"AccountRef": {"value": "88"}},
+        }
+    ]
+    apply = _bodies(qbo, "billpayment")[-1]
+    assert apply["TotalAmt"] == 0
+    assert [line["LinkedTxn"] for line in apply["Line"]] == [
+        [{"TxnId": "501", "TxnType": "Bill"}],
+        [{"TxnId": "vc-1", "TxnType": "VendorCredit"}],
+    ]
+    # Our payment plus our credit are ours: not news to the status sync, and
+    # the $0 application is never mistaken for a voided write-back of ours.
+    report = _run(qbo, lambda: _adapter().bill_report("501"))
+    assert report.state is ErpBillState.paid
+    assert report.paid_only_by_us and not report.reduced_outside
+    assert bill["Balance"] == 0
+    replay = _run(qbo, lambda: _adapter().post_payment(_payload(amount=Decimal("98.00"))))
+    assert replay.success
+
+
+def test_a_replay_of_the_discount_credit_books_nothing_twice():
+    qbo = _Qbo()
+    _discounted(qbo)
+    first = _run(qbo, lambda: _adapter().post_discount_credit(_credit()))
+    again = _run(qbo, lambda: _adapter().post_discount_credit(_credit()))
+    assert again.success and again.erp_document_id == first.erp_document_id
+    assert len(_bodies(qbo, "vendorcredit")) == 1 and len(qbo.vendor_credits) == 1
+
+
+def test_a_credit_created_but_not_applied_is_applied_once_on_retry():
+    """The failed apply names the credit; the write-back records it and the
+    retry applies THAT credit by id. Intuit's ``requestid`` replay is not
+    relied on: the double here creates a fresh credit for a repeated key
+    (decisions §577)."""
+    qbo = _Qbo()
+    qbo.replay_credit_create = False
+    bill = _discounted(qbo)
+    qbo.fail_apply = True
+    failed = _run(qbo, lambda: _adapter().post_discount_credit(_credit()))
+    assert not failed.success and not failed.not_posted
+    assert failed.erp_document_id == "vc-1"
+    qbo.fail_apply = False
+    retried = _run(
+        qbo, lambda: _adapter().post_discount_credit(_credit(credit_id=failed.erp_document_id))
+    )
+    assert retried.success and retried.erp_document_id == "vc-1"
+    assert len(qbo.vendor_credits) == 1 and len(_bodies(qbo, "vendorcredit")) == 1
+    assert bill["Balance"] == 0
+
+
+def test_an_unapplied_credit_is_not_found_through_the_bill():
+    """Why a recorded credit with no known id goes to a person (decisions
+    §579): ``find_discount_credit`` reads the bill's applying BillPayments, so
+    a VendorCredit whose create answer was lost and that nothing applied is
+    never found there — a miss is not proof none stands, and the write-back
+    holds the record rather than create again."""
+    qbo = _Qbo()
+    _discounted(qbo)
+    qbo.fail_apply = True
+    failed = _run(qbo, lambda: _adapter().post_discount_credit(_credit()))
+    assert failed.erp_document_id == "vc-1" and "vc-1" in qbo.vendor_credits
+    assert _run(qbo, lambda: _adapter().find_discount_credit(_credit())) is None
+
+
+def test_a_recorded_credit_someone_deleted_is_not_booked_again():
+    qbo = _Qbo()
+    _discounted(qbo)
+    qbo.fail_apply = True
+    failed = _run(qbo, lambda: _adapter().post_discount_credit(_credit()))
+    qbo.fail_apply = False
+    qbo.vendor_credits.clear()
+    retried = _run(qbo, lambda: _adapter().post_discount_credit(_credit(credit_id="vc-1")))
+    assert not retried.success and retried.refusal_code == BILL_PAYMENT_VOIDED
+    assert retried.refusal_params == {"document": "discount_credit"}
+    assert failed.erp_document_id == "vc-1" and len(_bodies(qbo, "vendorcredit")) == 1
+
+
+def test_a_void_that_deleted_the_application_but_not_the_credit_finishes_by_id():
+    qbo = _Qbo()
+    bill = _discounted(qbo)
+    _run(qbo, lambda: _adapter().post_discount_credit(_credit()))
+    credit_id = _run(qbo, lambda: _adapter().find_discount_credit(_credit()))
+    assert credit_id == "vc-1"
+    qbo.fail_credit_delete = True
+    first = _run(qbo, lambda: _adapter().void_discount_credit(_credit(credit_id=credit_id)))
+    assert not first.success and first.erp_document_id == "vc-1"
+    # The application is gone, so the bill no longer leads to the credit…
+    assert _run(qbo, lambda: _adapter().find_discount_credit(_credit())) is None
+    assert "vc-1" in qbo.vendor_credits and bill["Balance"] == Decimal("2.00")
+    qbo.fail_credit_delete = False
+    # …and without the recorded id the retry would report success over it.
+    retried = _run(qbo, lambda: _adapter().void_discount_credit(_credit(credit_id=credit_id)))
+    assert retried.success and retried.erp_document_id == "vc-1"
+    assert qbo.vendor_credits == {}
+
+
+def test_an_unapplied_credit_is_deleted_by_its_recorded_id_on_void():
+    qbo = _Qbo()
+    _discounted(qbo)
+    qbo.fail_apply = True
+    failed = _run(qbo, lambda: _adapter().post_discount_credit(_credit()))
+    voided = _run(
+        qbo, lambda: _adapter().void_discount_credit(_credit(credit_id=failed.erp_document_id))
+    )
+    assert voided.success and qbo.vendor_credits == {}
+
+
+def test_voiding_deletes_the_application_and_the_credit_once():
+    qbo = _Qbo()
+    bill = _discounted(qbo)
+    _run(qbo, lambda: _adapter().post_discount_credit(_credit()))
+    voided = _run(qbo, lambda: _adapter().void_discount_credit(_credit()))
+    assert voided.success and voided.erp_document_id == "vc-1"
+    assert qbo.vendor_credits == {} and bill["Balance"] == Decimal("2.00")
+    again = _run(qbo, lambda: _adapter().void_discount_credit(_credit()))
+    assert again.success and again.erp_document_id is None
+
+
+@pytest.mark.parametrize(
+    ("overrides", "code"),
+    [
+        ({"currency": "EUR"}, CURRENCY_MISMATCH),
+        ({"amount": Decimal("2.01")}, PAYMENT_EXCEEDS_BALANCE),
+        ({"discount_account_erp_id": None}, PAYMENT_ACCOUNT_NOT_MAPPED),
+    ],
+)
+def test_the_discount_credit_refuses_before_writing(overrides, code):
+    qbo = _Qbo()
+    _discounted(qbo)
+    result = _run(qbo, lambda: _adapter().post_discount_credit(_credit(**overrides)))
+    assert not result.success and result.refusal_code == code and result.not_posted
+    assert not _bodies(qbo, "vendorcredit")
+
+
+# ---------------------------------------------------------------------------
+# decisions §582: what a failure says it left, and a recorded credit not ours
+
+
+def _failing(qbo: _Qbo, match, answer):
+    """Answer every call ``match(method, url)`` picks with ``answer`` (a
+    response, or an exception to raise) instead of the double's own."""
+    real = qbo.request
+
+    async def request(method, url, params=None, content=None, headers=None):
+        if match(method, url):
+            if isinstance(answer, BaseException):
+                qbo.calls.append({"method": method, "url": url, "params": params})
+                raise answer
+            return answer
+        return await real(method, url, params=params, content=content, headers=headers)
+
+    qbo.request = request
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [_resp(503, {}), httpx.ConnectError("down")],
+    ids=["bill_read_5xx", "network"],
+)
+def test_a_failure_before_the_credit_create_is_not_posted(answer):
+    """A transient failure reading the bill sent no create: ``not_posted``, so
+    the write-back drops its reservation and retries, instead of keeping a
+    ``credit_id: null`` record that stalls as "unidentified" (§582)."""
+    qbo = _Qbo()
+    _discounted(qbo)
+    _failing(qbo, lambda m, u: m == "GET" and "/bill/" in u, answer)
+    result = _run(qbo, lambda: _adapter().post_discount_credit(_credit()))
+    assert not result.success and result.not_posted
+    assert not _bodies(qbo, "vendorcredit") and qbo.vendor_credits == {}
+
+
+def test_a_token_refresh_failure_before_the_create_is_not_posted():
+    qbo = _Qbo()
+    _discounted(qbo)
+    with patch.object(
+        QuickBooksOnlineAdapter,
+        "access_token",
+        AsyncMock(side_effect=erp_oauth.ErpTokenRefreshError("quickbooks_online", "unreachable")),
+    ):
+        result = _run(qbo, lambda: _adapter().post_discount_credit(_credit()))
+    assert not result.success and result.not_posted
+    assert not _bodies(qbo, "vendorcredit")
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        erp_oauth.ErpTokenRefreshError("quickbooks_online", "unreachable"),
+        erp_oauth.ErpNotConnectedError("quickbooks_online"),
+    ],
+    ids=["refresh_failed", "not_connected"],
+)
+def test_a_token_failure_on_the_create_call_is_not_posted(error):
+    """The create was answered 401 and the refresh failed: QuickBooks never
+    took it, so ``not_posted`` even though the request had gone out (§583).
+    Kept not-``not_posted`` it would leave a ``credit_id: null`` record that
+    stalls as "unidentified" for a credit that does not exist."""
+    qbo = _Qbo()
+    _discounted(qbo)
+    _failing(qbo, lambda m, u: m == "POST" and u.endswith("/vendorcredit"), _resp(401, {}))
+
+    async def token(provider, config, rejected_token=None):
+        if rejected_token is not None:
+            raise error
+        return "tok-1"
+
+    with patch.object(erp_oauth, "get_access_token", new=token):
+        result = _run(qbo, lambda: _adapter().post_discount_credit(_credit()))
+    assert not result.success and result.not_posted
+    assert qbo.vendor_credits == {}
+
+
+def test_a_create_whose_answer_is_lost_is_not_not_posted():
+    """Once the create is sent, a lost answer may stand in QuickBooks."""
+    qbo = _Qbo()
+    _discounted(qbo)
+    _failing(
+        qbo,
+        lambda m, u: m == "POST" and u.endswith("/vendorcredit"),
+        httpx.ReadTimeout("lost"),
+    )
+    result = _run(qbo, lambda: _adapter().post_discount_credit(_credit()))
+    assert not result.success and not result.not_posted
+
+
+def test_a_recorded_credit_that_is_not_ours_is_held_not_dropped_on_post():
+    qbo = _Qbo()
+    _discounted(qbo)
+    qbo.fail_apply = True
+    failed = _run(qbo, lambda: _adapter().post_discount_credit(_credit()))
+    qbo.fail_apply = False
+    qbo.vendor_credits["vc-1"]["PrivateNote"] = "someone else's credit"
+    retried = _run(qbo, lambda: _adapter().post_discount_credit(_credit(credit_id="vc-1")))
+    assert not retried.success and retried.refusal_code != BILL_PAYMENT_VOIDED
+    assert "discount_credit_not_ours" in retried.message and not retried.not_posted
+    assert retried.erp_document_id == failed.erp_document_id == "vc-1"
+    assert len(_bodies(qbo, "vendorcredit")) == 1
+
+
+def test_a_void_refuses_a_recorded_credit_that_is_not_ours():
+    """Before §582 a marker mismatch read as "gone", and the void reported
+    success over a credit it never deleted."""
+    qbo = _Qbo()
+    _discounted(qbo)
+    qbo.fail_apply = True
+    _run(qbo, lambda: _adapter().post_discount_credit(_credit()))
+    qbo.vendor_credits["vc-1"]["PrivateNote"] = "someone else's credit"
+    result = _run(qbo, lambda: _adapter().void_discount_credit(_credit(credit_id="vc-1")))
+    assert not result.success and result.erp_document_id == "vc-1"
+    assert "discount_credit_not_ours" in result.message
+    assert "vc-1" in qbo.vendor_credits
