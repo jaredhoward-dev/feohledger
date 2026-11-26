@@ -585,6 +585,17 @@ class XeroAdapter(OAuthErpAdapter):
                     # (§587), when it is adopted as below, total included.
                     return erp_refusal(PROVIDER, ERP_BILL_KEY_SHARED)
                 if _decimal(existing.get("Total")) == payload.amount:
+                    # The same figure in another currency is another bill:
+                    # adopting it would book this invoice's amount in the
+                    # wrong currency. A bill or payload that states none is
+                    # not known to match, so it is refused too, coded
+                    # (decisions §590). Not ``not_posted``: the bill found may
+                    # be an earlier attempt of ours.
+                    bill_currency = iso_currency_or_none(existing.get("CurrencyCode"))
+                    if bill_currency is None or bill_currency != iso_currency_or_none(
+                        payload.currency
+                    ):
+                        return erp_refusal(PROVIDER, CURRENCY_MISMATCH)
                     return ErpPostResult(
                         success=True,
                         erp_document_id=existing.get("InvoiceID"),

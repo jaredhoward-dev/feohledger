@@ -540,6 +540,7 @@ def test_existing_bill_with_same_total_short_circuits(token):
         "InvoiceNumber": "SUP-1001",
         "Type": "ACCPAY",
         "Total": 1150.0,
+        "CurrencyCode": "ZAR",
     }
     with patch("httpx.AsyncClient") as cm:
         client = _client(cm)
@@ -610,6 +611,7 @@ def test_the_confirmed_bill_on_a_shared_key_is_adopted_as_any_adoption(token, to
     shared key, and only at the approved total, as an unshared adoption is."""
     existing = {"InvoiceID": "inv-mine", "InvoiceNumber": "SUP-1001", "Type": "ACCPAY"}
     existing["Total"] = total
+    existing["CurrencyCode"] = "ZAR"
     with patch("httpx.AsyncClient") as cm:
         client = _client(cm)
         client.get = _get_router(lookup=_resp(200, {"Invoices": [existing]}))
@@ -623,6 +625,35 @@ def test_the_confirmed_bill_on_a_shared_key_is_adopted_as_any_adoption(token, to
         assert result.erp_document_id == "inv-mine"
     else:
         assert result.refusal_code == "duplicate_document_number"
+    client.put.assert_not_awaited()
+
+
+@pytest.mark.parametrize("confirmed", [None, "inv-old"], ids=["unshared", "confirmed"])
+@pytest.mark.parametrize(
+    "currency", ["USD", None, "", "zar?"], ids=["other", "absent", "blank", "bad"]
+)
+def test_a_bill_at_the_same_total_in_another_currency_is_never_adopted(token, currency, confirmed):
+    """The same figure in another currency, or a bill stating none, is not
+    known to be this invoice's bill: refused ``currency_mismatch``, coded,
+    nothing created, never adopted — confirmed or not (decisions §590)."""
+    existing = {"InvoiceID": "inv-old", "InvoiceNumber": "SUP-1001", "Type": "ACCPAY"}
+    existing["Total"] = 1150.0
+    if currency is not None:
+        existing["CurrencyCode"] = currency
+    with patch("httpx.AsyncClient") as cm:
+        client = _client(cm)
+        client.get = _get_router(lookup=_resp(200, {"Invoices": [existing]}))
+        client.put = AsyncMock(side_effect=AssertionError("must not create a second bill"))
+        client.post = AsyncMock(side_effect=AssertionError("must not write"))
+        result = _run(
+            _adapter().post_invoice(
+                _payload(bill_key_shared=confirmed is not None, confirmed_bill_id=confirmed)
+            )
+        )
+    assert result.success is False
+    assert result.refusal_code == "currency_mismatch"
+    assert result.erp_document_id is None
+    assert result.not_posted is False
     client.put.assert_not_awaited()
 
 
