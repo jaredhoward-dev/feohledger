@@ -652,8 +652,8 @@ test.describe('/organization ERP connection', () => {
 			await card.locator('select[name="book_discount_as_credit"]').selectOption('on');
 			const failed = card.getByTestId('erp-picker-discount_credit_account-failed');
 			await expect(failed).toContainText("Couldn't load your chart of accounts.");
-			// `ui/LoadError`'s own button, which reads `common.retry` ("Retry") —
-			// not the "Try again" of the panel's catalogue failure (`erp-load-failed`).
+			// `ui/LoadError`'s own button, which reads `common.retry` ("Retry"), as
+			// the panel's catalogue failure (`erp-load-failed`) does too.
 			await failed.getByRole('button', { name: 'Retry', exact: true }).click();
 			await expect(failed).toHaveCount(0);
 
@@ -670,7 +670,7 @@ test.describe('/organization ERP connection', () => {
 		}
 	});
 
-	test('a failed ERP list load offers Try again', async ({ page }) => {
+	test('a failed ERP list load offers Retry', async ({ page }) => {
 		let failures = 1;
 		await page.route(
 			(url) => url.pathname === '/api/organization/erp/providers',
@@ -686,7 +686,7 @@ test.describe('/organization ERP connection', () => {
 		const card = panel(page);
 		const failed = card.getByTestId('erp-load-failed');
 		await expect(failed).toContainText("Couldn't load the ERP list.");
-		await failed.getByRole('button', { name: 'Try again' }).click();
+		await failed.getByRole('button', { name: 'Retry', exact: true }).click();
 		await expect(card.getByTestId('erp-provider-select')).toBeVisible();
 		await expect(failed).toHaveCount(0);
 	});
