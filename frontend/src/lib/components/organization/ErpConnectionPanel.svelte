@@ -869,10 +869,7 @@
 		     needs no configuration. -->
 		<PlanUpgradeNotice feature={FEATURE_ERP_INTEGRATIONS} testId="erp-plan-upgrade" />
 	{:else if catalogError}
-		<div class="load-failed" role="alert" data-testid="erp-load-failed">
-			<p class="card-hint failure-text">{m('org.erp.loadFailed')}</p>
-			<button type="button" class="btn-test" onclick={loadCatalog}>{m('common.tryAgain')}</button>
-		</div>
+		<LoadError message={m('org.erp.loadFailed')} onretry={loadCatalog} testId="erp-load-failed" />
 	{:else if !catalog}
 		<LoadingState label={m('org.erp.loading')} />
 	{:else}
@@ -1237,17 +1234,6 @@
 		align-items: center;
 		flex-wrap: wrap;
 		gap: 12px;
-	}
-
-	.load-failed {
-		display: flex;
-		align-items: center;
-		flex-wrap: wrap;
-		gap: 12px;
-	}
-
-	.load-failed .card-hint {
-		margin: 0;
 	}
 
 	.byo {

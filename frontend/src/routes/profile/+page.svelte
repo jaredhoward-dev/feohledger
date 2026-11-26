@@ -14,6 +14,7 @@
 	import DelegationPanel from '#lib/components/profile/DelegationPanel.svelte';
 	import { SUPPORTED_LOCALES, LOCALE_LABELS, type Locale } from '#lib/i18n/locale.ts';
 	import { currentLocale, setLocale, m } from '#lib/i18n/store.svelte.ts';
+	import LoadError from '#lib/components/ui/LoadError.svelte';
 	import LoadingState from '#lib/components/ui/LoadingState.svelte';
 	import type { MessageKey } from '#lib/i18n/messages.ts';
 	import { notificationStore } from '#lib/stores/notifications.svelte.ts';
@@ -985,17 +986,12 @@
 								{/each}
 							</ul>
 						{:else if passkeysError}
-							<p class="warn">{m('profile.passkeys.loadFailed')}</p>
-							<div class="actions">
-								<button
-									type="button"
-									class="secondary"
-									disabled={passkeysBusy}
-									onclick={retryPasskeys}
-								>
-									{passkeysBusy ? m('common.retrying') : m('common.tryAgain')}
-								</button>
-							</div>
+							<LoadError
+								message={m('profile.passkeys.loadFailed')}
+								onretry={retryPasskeys}
+								retrying={passkeysBusy}
+								testId="profile-passkeys-load-failed"
+							/>
 						{:else if passkeysLoaded}
 							<div class="status disabled">{m('profile.passkeys.none')}</div>
 						{/if}
@@ -1036,12 +1032,12 @@
 					{#if !sessionsLoaded}
 						<LoadingState />
 					{:else if sessionsError}
-						<p class="warn">{m('profile.sessions.loadFailed')}</p>
-						<div class="actions">
-							<button type="button" class="secondary" disabled={sessionBusy} onclick={retrySessions}>
-								{sessionBusy ? m('common.retrying') : m('common.tryAgain')}
-							</button>
-						</div>
+						<LoadError
+							message={m('profile.sessions.loadFailed')}
+							onretry={retrySessions}
+							retrying={sessionBusy}
+							testId="profile-sessions-load-failed"
+						/>
 					{:else if sessions && sessions.length > 0}
 						<ul class="entry-list">
 							{#each sessions as s (s.id)}
@@ -1157,12 +1153,12 @@
 							</tbody>
 						</table>
 					{:else}
-						<p class="warn">{m('profile.notifications.loadFailed')}</p>
-						<div class="actions">
-							<button type="button" class="secondary" disabled={prefsBusy} onclick={retryPrefs}>
-								{prefsBusy ? m('common.retrying') : m('common.tryAgain')}
-							</button>
-						</div>
+						<LoadError
+							message={m('profile.notifications.loadFailed')}
+							onretry={retryPrefs}
+							retrying={prefsBusy}
+							testId="profile-notifications-load-failed"
+						/>
 					{/if}
 				</section>
 			{/if}
