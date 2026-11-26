@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import uuid
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -113,6 +113,9 @@ async def test_reject_and_resubmit_loop_round_trips():
     resubmit" cycle. Pin the loop and assert audit captures both
     legs."""
     db = AsyncMock()
+    # The reject leg withdraws any Xero bill confirmation under the
+    # instance's row lock (decisions §588): no instance here, so nothing.
+    db.execute.return_value = MagicMock(scalar_one_or_none=MagicMock(return_value=None))
     invoice = _invoice(InvoiceStatus.ready_for_review)
     recorder = _AuditRecorder()
 
