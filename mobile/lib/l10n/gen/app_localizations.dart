@@ -5826,6 +5826,44 @@ abstract class AppLocalizations {
     String amount,
   );
 
+  /// No description provided for @exceptionDescriptionErpDiscountCreditPending.
+  ///
+  /// In en, this message translates to:
+  /// **'{erp} recorded this invoice\'s payment, but the bill still shows {amount} open there. FeohLedger booked credit {credit} for the early-payment discount and will apply it, so don\'t book another.'**
+  String exceptionDescriptionErpDiscountCreditPending(
+    String erp,
+    String amount,
+    String credit,
+  );
+
+  /// No description provided for @exceptionDescriptionErpDiscountCreditPendingUnnamed.
+  ///
+  /// In en, this message translates to:
+  /// **'Your ERP recorded this invoice\'s payment, but the bill still shows {amount} open there. FeohLedger booked credit {credit} for the early-payment discount and will apply it, so don\'t book another.'**
+  String exceptionDescriptionErpDiscountCreditPendingUnnamed(
+    String amount,
+    String credit,
+  );
+
+  /// No description provided for @exceptionDescriptionErpDiscountCreditPendingUnidentified.
+  ///
+  /// In en, this message translates to:
+  /// **'{erp} recorded this invoice\'s payment, but the bill still shows {amount} open there. FeohLedger may have booked a credit for this discount, so check for “{marker}” before booking one.'**
+  String exceptionDescriptionErpDiscountCreditPendingUnidentified(
+    String erp,
+    String amount,
+    String marker,
+  );
+
+  /// No description provided for @exceptionDescriptionErpDiscountCreditPendingUnidentifiedUnnamed.
+  ///
+  /// In en, this message translates to:
+  /// **'Your ERP recorded this invoice\'s payment, but the bill still shows {amount} open there. FeohLedger may have booked a credit for this discount, so check for “{marker}” before booking one.'**
+  String exceptionDescriptionErpDiscountCreditPendingUnidentifiedUnnamed(
+    String amount,
+    String marker,
+  );
+
   /// No description provided for @exceptionDescriptionErpPaymentVoidWritebackFailed.
   ///
   /// In en, this message translates to:

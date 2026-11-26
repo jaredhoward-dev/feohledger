@@ -3944,6 +3944,40 @@ class AppLocalizationsEn extends AppLocalizations {
   }
 
   @override
+  String exceptionDescriptionErpDiscountCreditPending(
+    String erp,
+    String amount,
+    String credit,
+  ) {
+    return '$erp recorded this invoice\'s payment, but the bill still shows $amount open there. FeohLedger booked credit $credit for the early-payment discount and will apply it, so don\'t book another.';
+  }
+
+  @override
+  String exceptionDescriptionErpDiscountCreditPendingUnnamed(
+    String amount,
+    String credit,
+  ) {
+    return 'Your ERP recorded this invoice\'s payment, but the bill still shows $amount open there. FeohLedger booked credit $credit for the early-payment discount and will apply it, so don\'t book another.';
+  }
+
+  @override
+  String exceptionDescriptionErpDiscountCreditPendingUnidentified(
+    String erp,
+    String amount,
+    String marker,
+  ) {
+    return '$erp recorded this invoice\'s payment, but the bill still shows $amount open there. FeohLedger may have booked a credit for this discount, so check for “$marker” before booking one.';
+  }
+
+  @override
+  String exceptionDescriptionErpDiscountCreditPendingUnidentifiedUnnamed(
+    String amount,
+    String marker,
+  ) {
+    return 'Your ERP recorded this invoice\'s payment, but the bill still shows $amount open there. FeohLedger may have booked a credit for this discount, so check for “$marker” before booking one.';
+  }
+
+  @override
   String exceptionDescriptionErpPaymentVoidWritebackFailed(String erp) {
     return '$erp still shows this bill paid by a payment that was voided in FeohLedger, because voiding it in the ERP failed. Void that payment in the ERP so the books agree.';
   }

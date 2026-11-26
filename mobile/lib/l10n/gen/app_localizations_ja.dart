@@ -3777,6 +3777,40 @@ class AppLocalizationsJa extends AppLocalizations {
   }
 
   @override
+  String exceptionDescriptionErpDiscountCreditPending(
+    String erp,
+    String amount,
+    String credit,
+  ) {
+    return '$erp はこの請求書の支払いを記録しましたが、請求書にはまだ $amount の未決済残高が表示されています。FeohLedger は早期支払割引のクレジット $credit を計上済みで、これから適用します。別のクレジットは計上しないでください。';
+  }
+
+  @override
+  String exceptionDescriptionErpDiscountCreditPendingUnnamed(
+    String amount,
+    String credit,
+  ) {
+    return 'ご利用の ERP はこの請求書の支払いを記録しましたが、請求書にはまだ $amount の未決済残高が表示されています。FeohLedger は早期支払割引のクレジット $credit を計上済みで、これから適用します。別のクレジットは計上しないでください。';
+  }
+
+  @override
+  String exceptionDescriptionErpDiscountCreditPendingUnidentified(
+    String erp,
+    String amount,
+    String marker,
+  ) {
+    return '$erp はこの請求書の支払いを記録しましたが、請求書にはまだ $amount の未決済残高が表示されています。FeohLedger がこの割引のクレジットを計上している可能性があります。クレジットを計上する前に「$marker」を検索してください。';
+  }
+
+  @override
+  String exceptionDescriptionErpDiscountCreditPendingUnidentifiedUnnamed(
+    String amount,
+    String marker,
+  ) {
+    return 'ご利用の ERP はこの請求書の支払いを記録しましたが、請求書にはまだ $amount の未決済残高が表示されています。FeohLedger がこの割引のクレジットを計上している可能性があります。クレジットを計上する前に「$marker」を検索してください。';
+  }
+
+  @override
   String exceptionDescriptionErpPaymentVoidWritebackFailed(String erp) {
     return '$erp では、FeohLedger で無効化された支払いによってこの請求書がまだ支払済みと表示されています。ERP での無効化に失敗したためです。帳簿を一致させるため、ERP でその支払いを無効化してください。';
   }

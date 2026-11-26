@@ -3968,6 +3968,40 @@ class AppLocalizationsPt extends AppLocalizations {
   }
 
   @override
+  String exceptionDescriptionErpDiscountCreditPending(
+    String erp,
+    String amount,
+    String credit,
+  ) {
+    return '$erp registrou o pagamento desta fatura, mas ela ainda mostra $amount em aberto lá. O FeohLedger lançou o crédito $credit referente ao desconto por pagamento antecipado e vai aplicá-lo, então não lance outro.';
+  }
+
+  @override
+  String exceptionDescriptionErpDiscountCreditPendingUnnamed(
+    String amount,
+    String credit,
+  ) {
+    return 'Seu ERP registrou o pagamento desta fatura, mas ela ainda mostra $amount em aberto lá. O FeohLedger lançou o crédito $credit referente ao desconto por pagamento antecipado e vai aplicá-lo, então não lance outro.';
+  }
+
+  @override
+  String exceptionDescriptionErpDiscountCreditPendingUnidentified(
+    String erp,
+    String amount,
+    String marker,
+  ) {
+    return '$erp registrou o pagamento desta fatura, mas ela ainda mostra $amount em aberto lá. O FeohLedger pode ter lançado um crédito para este desconto, então procure “$marker” antes de lançar um.';
+  }
+
+  @override
+  String exceptionDescriptionErpDiscountCreditPendingUnidentifiedUnnamed(
+    String amount,
+    String marker,
+  ) {
+    return 'Seu ERP registrou o pagamento desta fatura, mas ela ainda mostra $amount em aberto lá. O FeohLedger pode ter lançado um crédito para este desconto, então procure “$marker” antes de lançar um.';
+  }
+
+  @override
   String exceptionDescriptionErpPaymentVoidWritebackFailed(String erp) {
     return '$erp ainda mostra esta fatura como paga por um pagamento que foi estornado no FeohLedger, porque o estorno no ERP falhou. Estorne esse pagamento no ERP para que os livros confiram.';
   }
@@ -9142,6 +9176,40 @@ class AppLocalizationsPtBr extends AppLocalizationsPt {
     String amount,
   ) {
     return 'Seu ERP registrou o pagamento desta fatura, mas ela ainda mostra $amount em aberto lá (um desconto ou crédito aplicado no FeohLedger). Feche a diferença no ERP.';
+  }
+
+  @override
+  String exceptionDescriptionErpDiscountCreditPending(
+    String erp,
+    String amount,
+    String credit,
+  ) {
+    return '$erp registrou o pagamento desta fatura, mas ela ainda mostra $amount em aberto lá. O FeohLedger lançou o crédito $credit referente ao desconto por pagamento antecipado e vai aplicá-lo, então não lance outro.';
+  }
+
+  @override
+  String exceptionDescriptionErpDiscountCreditPendingUnnamed(
+    String amount,
+    String credit,
+  ) {
+    return 'Seu ERP registrou o pagamento desta fatura, mas ela ainda mostra $amount em aberto lá. O FeohLedger lançou o crédito $credit referente ao desconto por pagamento antecipado e vai aplicá-lo, então não lance outro.';
+  }
+
+  @override
+  String exceptionDescriptionErpDiscountCreditPendingUnidentified(
+    String erp,
+    String amount,
+    String marker,
+  ) {
+    return '$erp registrou o pagamento desta fatura, mas ela ainda mostra $amount em aberto lá. O FeohLedger pode ter lançado um crédito para este desconto, então procure “$marker” antes de lançar um.';
+  }
+
+  @override
+  String exceptionDescriptionErpDiscountCreditPendingUnidentifiedUnnamed(
+    String amount,
+    String marker,
+  ) {
+    return 'Seu ERP registrou o pagamento desta fatura, mas ela ainda mostra $amount em aberto lá. O FeohLedger pode ter lançado um crédito para este desconto, então procure “$marker” antes de lançar um.';
   }
 
   @override

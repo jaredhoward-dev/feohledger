@@ -3413,6 +3413,56 @@
       }
     }
   },
+  "exceptionDescriptionErpDiscountCreditPending": "{erp} recorded this invoice's payment, but the bill still shows {amount} open there. FeohLedger booked credit {credit} for the early-payment discount and will apply it, so don't book another.",
+  "@exceptionDescriptionErpDiscountCreditPending": {
+    "placeholders": {
+      "erp": {
+        "type": "String"
+      },
+      "amount": {
+        "type": "String"
+      },
+      "credit": {
+        "type": "String"
+      }
+    }
+  },
+  "exceptionDescriptionErpDiscountCreditPendingUnnamed": "Your ERP recorded this invoice's payment, but the bill still shows {amount} open there. FeohLedger booked credit {credit} for the early-payment discount and will apply it, so don't book another.",
+  "@exceptionDescriptionErpDiscountCreditPendingUnnamed": {
+    "placeholders": {
+      "amount": {
+        "type": "String"
+      },
+      "credit": {
+        "type": "String"
+      }
+    }
+  },
+  "exceptionDescriptionErpDiscountCreditPendingUnidentified": "{erp} recorded this invoice's payment, but the bill still shows {amount} open there. FeohLedger may have booked a credit for this discount, so check for “{marker}” before booking one.",
+  "@exceptionDescriptionErpDiscountCreditPendingUnidentified": {
+    "placeholders": {
+      "erp": {
+        "type": "String"
+      },
+      "amount": {
+        "type": "String"
+      },
+      "marker": {
+        "type": "String"
+      }
+    }
+  },
+  "exceptionDescriptionErpDiscountCreditPendingUnidentifiedUnnamed": "Your ERP recorded this invoice's payment, but the bill still shows {amount} open there. FeohLedger may have booked a credit for this discount, so check for “{marker}” before booking one.",
+  "@exceptionDescriptionErpDiscountCreditPendingUnidentifiedUnnamed": {
+    "placeholders": {
+      "amount": {
+        "type": "String"
+      },
+      "marker": {
+        "type": "String"
+      }
+    }
+  },
   "exceptionDescriptionErpPaymentVoidWritebackFailed": "{erp} still shows this bill paid by a payment that was voided in FeohLedger, because voiding it in the ERP failed. Void that payment in the ERP so the books agree.",
   "@exceptionDescriptionErpPaymentVoidWritebackFailed": {
     "placeholders": {

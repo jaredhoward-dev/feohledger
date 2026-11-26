@@ -149,6 +149,47 @@ describe('exceptionDescriptionText', () => {
 		expect(out?.summary).not.toContain('{amount}');
 	});
 
+	// Decisions §585: while a discount credit of ours may stand, the open
+	// balance names it (or the marker to look for) instead of asking a person
+	// to close the difference, which would book the discount twice.
+	it('localizes the pending discount credit, naming the credit', () => {
+		const out = exceptionDescriptionText(
+			{
+				description: 'QuickBooks Online recorded this invoice’s payment, but …',
+				description_code: 'exception.erp_discount_credit_pending',
+				description_params: {
+					erp: 'QuickBooks Online',
+					amount: '2.00',
+					currency: 'EUR',
+					credit: 'VC-7'
+				}
+			},
+			translateDe
+		);
+		expect(out?.summary).toMatch(/^QuickBooks Online hat die Zahlung /);
+		expect(out?.summary).toContain('Gutschrift VC-7');
+		expect(out?.summary).toContain('€2.00');
+		expect(out?.summary).not.toContain('Gleichen Sie die Differenz');
+	});
+
+	it('localizes the unidentified discount credit, naming the marker to check for', () => {
+		const out = exceptionDescriptionText(
+			{
+				description: 'Your ERP recorded this invoice’s payment, but …',
+				description_code: 'exception.erp_discount_credit_pending_unidentified_unnamed',
+				description_params: {
+					amount: '2.00',
+					currency: 'EUR',
+					marker: 'FeohLedger discount 3f2b'
+				}
+			},
+			translateDe
+		);
+		expect(out?.summary).toMatch(/^Ihr ERP hat die Zahlung /);
+		expect(out?.summary).toContain('„FeohLedger discount 3f2b“');
+		expect(out?.summary).not.toContain('{marker}');
+	});
+
 	it('localizes the sync-back failure, which names no ERP', () => {
 		const out = exceptionDescriptionText(
 			{

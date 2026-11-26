@@ -3969,6 +3969,40 @@ class AppLocalizationsEs extends AppLocalizations {
   }
 
   @override
+  String exceptionDescriptionErpDiscountCreditPending(
+    String erp,
+    String amount,
+    String credit,
+  ) {
+    return '$erp registró el pago de esta factura, pero allí la factura sigue mostrando $amount pendientes. FeohLedger registró el abono $credit por el descuento por pronto pago y lo aplicará, así que no registre otro.';
+  }
+
+  @override
+  String exceptionDescriptionErpDiscountCreditPendingUnnamed(
+    String amount,
+    String credit,
+  ) {
+    return 'Su ERP registró el pago de esta factura, pero allí la factura sigue mostrando $amount pendientes. FeohLedger registró el abono $credit por el descuento por pronto pago y lo aplicará, así que no registre otro.';
+  }
+
+  @override
+  String exceptionDescriptionErpDiscountCreditPendingUnidentified(
+    String erp,
+    String amount,
+    String marker,
+  ) {
+    return '$erp registró el pago de esta factura, pero allí la factura sigue mostrando $amount pendientes. FeohLedger puede haber registrado un abono por este descuento, así que busque «$marker» antes de registrar uno.';
+  }
+
+  @override
+  String exceptionDescriptionErpDiscountCreditPendingUnidentifiedUnnamed(
+    String amount,
+    String marker,
+  ) {
+    return 'Su ERP registró el pago de esta factura, pero allí la factura sigue mostrando $amount pendientes. FeohLedger puede haber registrado un abono por este descuento, así que busque «$marker» antes de registrar uno.';
+  }
+
+  @override
   String exceptionDescriptionErpPaymentVoidWritebackFailed(String erp) {
     return '$erp sigue mostrando esta factura como pagada mediante un pago que se anuló en FeohLedger, porque no se pudo anular en el ERP. Anule ese pago en el ERP para que los libros cuadren.';
   }

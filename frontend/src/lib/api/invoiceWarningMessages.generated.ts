@@ -251,6 +251,14 @@ export const INVOICE_WARNING_MESSAGE_KEYS = {
 	'exception.erp_payment_writeback_balance_open': 'exceptions.description.erpPaymentWritebackBalanceOpen',
 	// Your ERP recorded this invoice's payment, but the bill still shows {amount} {currency} open there (a discount or credit taken in FeohLedger). Close the difference in the ERP.
 	'exception.erp_payment_writeback_balance_open_unnamed': 'exceptions.description.erpPaymentWritebackBalanceOpenUnnamed',
+	// {erp} recorded this invoice's payment, but the bill still shows {amount} {currency} open there. FeohLedger booked credit {credit} for the early-payment discount and will apply it, so don't book another.
+	'exception.erp_discount_credit_pending': 'exceptions.description.erpDiscountCreditPending',
+	// Your ERP recorded this invoice's payment, but the bill still shows {amount} {currency} open there. FeohLedger booked credit {credit} for the early-payment discount and will apply it, so don't book another.
+	'exception.erp_discount_credit_pending_unnamed': 'exceptions.description.erpDiscountCreditPendingUnnamed',
+	// {erp} recorded this invoice's payment, but the bill still shows {amount} {currency} open there. FeohLedger may have booked a credit for this discount, so check for “{marker}” before booking one.
+	'exception.erp_discount_credit_pending_unidentified': 'exceptions.description.erpDiscountCreditPendingUnidentified',
+	// Your ERP recorded this invoice's payment, but the bill still shows {amount} {currency} open there. FeohLedger may have booked a credit for this discount, so check for “{marker}” before booking one.
+	'exception.erp_discount_credit_pending_unidentified_unnamed': 'exceptions.description.erpDiscountCreditPendingUnidentifiedUnnamed',
 	// {erp} still shows this bill paid by a payment that was voided in FeohLedger, because voiding it in the ERP failed. Void that payment in the ERP so the books agree.
 	'exception.erp_payment_void_writeback_failed': 'exceptions.description.erpPaymentVoidWritebackFailed',
 	// Your ERP still shows this bill paid by a payment that was voided in FeohLedger, because voiding it in the ERP failed. Void that payment in the ERP so the books agree.
@@ -469,6 +477,10 @@ export const INVOICE_WARNING_PARAM_KINDS = {
 	'exception.erp_payment_writeback_failed_unnamed': {},
 	'exception.erp_payment_writeback_balance_open': { erp: 'text', amount: 'money', currency: 'currency' },
 	'exception.erp_payment_writeback_balance_open_unnamed': { amount: 'money', currency: 'currency' },
+	'exception.erp_discount_credit_pending': { erp: 'text', amount: 'money', currency: 'currency', credit: 'text' },
+	'exception.erp_discount_credit_pending_unnamed': { amount: 'money', currency: 'currency', credit: 'text' },
+	'exception.erp_discount_credit_pending_unidentified': { erp: 'text', amount: 'money', currency: 'currency', marker: 'text' },
+	'exception.erp_discount_credit_pending_unidentified_unnamed': { amount: 'money', currency: 'currency', marker: 'text' },
 	'exception.erp_payment_void_writeback_failed': { erp: 'text' },
 	'exception.erp_payment_void_writeback_failed_unnamed': {},
 	'exception.erp_discount_credit_stalled': { erp: 'text' },

@@ -3978,6 +3978,40 @@ class AppLocalizationsFr extends AppLocalizations {
   }
 
   @override
+  String exceptionDescriptionErpDiscountCreditPending(
+    String erp,
+    String amount,
+    String credit,
+  ) {
+    return '$erp a enregistré le paiement de cette facture, mais elle y affiche encore $amount restant dû. FeohLedger a comptabilisé l\'avoir $credit pour l\'escompte pour paiement anticipé et l\'imputera : n\'en comptabilisez pas un autre.';
+  }
+
+  @override
+  String exceptionDescriptionErpDiscountCreditPendingUnnamed(
+    String amount,
+    String credit,
+  ) {
+    return 'Votre ERP a enregistré le paiement de cette facture, mais elle y affiche encore $amount restant dû. FeohLedger a comptabilisé l\'avoir $credit pour l\'escompte pour paiement anticipé et l\'imputera : n\'en comptabilisez pas un autre.';
+  }
+
+  @override
+  String exceptionDescriptionErpDiscountCreditPendingUnidentified(
+    String erp,
+    String amount,
+    String marker,
+  ) {
+    return '$erp a enregistré le paiement de cette facture, mais elle y affiche encore $amount restant dû. FeohLedger a peut-être comptabilisé un avoir pour cet escompte : recherchez « $marker » avant d\'en comptabiliser un.';
+  }
+
+  @override
+  String exceptionDescriptionErpDiscountCreditPendingUnidentifiedUnnamed(
+    String amount,
+    String marker,
+  ) {
+    return 'Votre ERP a enregistré le paiement de cette facture, mais elle y affiche encore $amount restant dû. FeohLedger a peut-être comptabilisé un avoir pour cet escompte : recherchez « $marker » avant d\'en comptabiliser un.';
+  }
+
+  @override
   String exceptionDescriptionErpPaymentVoidWritebackFailed(String erp) {
     return '$erp affiche toujours cette facture comme payée par un paiement annulé dans FeohLedger, car son annulation dans l\'ERP a échoué. Annulez ce paiement dans l\'ERP pour que les comptes concordent.';
   }

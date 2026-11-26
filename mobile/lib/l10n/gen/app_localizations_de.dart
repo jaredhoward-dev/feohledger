@@ -3963,6 +3963,40 @@ class AppLocalizationsDe extends AppLocalizations {
   }
 
   @override
+  String exceptionDescriptionErpDiscountCreditPending(
+    String erp,
+    String amount,
+    String credit,
+  ) {
+    return '$erp hat die Zahlung dieser Rechnung erfasst, aber dort sind noch $amount offen. FeohLedger hat die Gutschrift $credit für das Skonto gebucht und wird sie verrechnen – buchen Sie keine weitere.';
+  }
+
+  @override
+  String exceptionDescriptionErpDiscountCreditPendingUnnamed(
+    String amount,
+    String credit,
+  ) {
+    return 'Ihr ERP hat die Zahlung dieser Rechnung erfasst, aber dort sind noch $amount offen. FeohLedger hat die Gutschrift $credit für das Skonto gebucht und wird sie verrechnen – buchen Sie keine weitere.';
+  }
+
+  @override
+  String exceptionDescriptionErpDiscountCreditPendingUnidentified(
+    String erp,
+    String amount,
+    String marker,
+  ) {
+    return '$erp hat die Zahlung dieser Rechnung erfasst, aber dort sind noch $amount offen. FeohLedger hat für dieses Skonto möglicherweise eine Gutschrift gebucht – suchen Sie nach „$marker“, bevor Sie eine buchen.';
+  }
+
+  @override
+  String exceptionDescriptionErpDiscountCreditPendingUnidentifiedUnnamed(
+    String amount,
+    String marker,
+  ) {
+    return 'Ihr ERP hat die Zahlung dieser Rechnung erfasst, aber dort sind noch $amount offen. FeohLedger hat für dieses Skonto möglicherweise eine Gutschrift gebucht – suchen Sie nach „$marker“, bevor Sie eine buchen.';
+  }
+
+  @override
   String exceptionDescriptionErpPaymentVoidWritebackFailed(String erp) {
     return '$erp zeigt diese Rechnung weiterhin als bezahlt an – durch eine Zahlung, die in FeohLedger storniert wurde, deren Stornierung im ERP aber fehlgeschlagen ist. Stornieren Sie diese Zahlung im ERP, damit die Bücher übereinstimmen.';
   }
