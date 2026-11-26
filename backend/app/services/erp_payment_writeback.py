@@ -409,15 +409,13 @@ async def write_back_payment(
                     payment_run_id=payment.payment_run_id,
                 )
             if balance_after is not None and balance_after > 0:
+                standing = await _standing_credit(db, adapter, invoice.id, payment.id, kept, credit)
                 await open_erp_reconciliation_exception(
                     db,
                     invoice,
                     org_id=invoice.organization_id,
-                    finding=erp_finding(
-                        "erp_payment_writeback_balance_open",
-                        adapter.erp_type,
-                        amount=balance_after,
-                        currency=invoice.currency,
+                    finding=_balance_open_finding(
+                        adapter.erp_type, payment.id, standing, balance_after, invoice.currency
                     ),
                     erp_report=_writeback_report(
                         ERP_REPORT_WRITEBACK_BALANCE_OPEN,
@@ -452,9 +450,9 @@ async def write_back_payment(
                         **(
                             {
                                 "discount_credit_pending": True,
-                                "discount_credit_document_id": kept.get("credit_id"),
+                                "discount_credit_document_id": standing.get("credit_id"),
                             }
-                            if kept is not None
+                            if standing is not None
                             else {}
                         ),
                     ),
@@ -770,6 +768,71 @@ DISCOUNT_CREDIT_NOT_OURS = "discount_credit_not_ours"
 def _pending_record(state: dict | None, payment_id) -> dict | None:
     record = ((state or {}).get(PENDING_CREDITS_KEY) or {}).get(str(payment_id))
     return dict(record) if isinstance(record, dict) else None
+
+
+async def _standing_credit(
+    db: AsyncSession,
+    adapter: ErpAdapter,
+    invoice_id: uuid.UUID,
+    payment_id: uuid.UUID,
+    kept: dict | None,
+    credit: ErpPostResult | None,
+) -> dict | None:
+    """The record of a discount credit of ours that may stand on the bill while
+    it shows a balance open (decisions §585): the one this attempt kept, or —
+    when this attempt made none (another process holds the record's claim, or
+    it is exhausted) — the record as it is now. None: no credit of ours can
+    exist, so the open balance is the bookkeeper's to close."""
+    if kept is not None:
+        return kept
+    if credit is not None or getattr(adapter, "supports_discount_credit", False) is not True:
+        return None
+    return _pending_record(await _state_data(db, invoice_id), payment_id)
+
+
+def _balance_open_finding(
+    erp_type: str | None,
+    payment_id: uuid.UUID,
+    standing: dict | None,
+    amount: Decimal,
+    currency: str | None,
+) -> dict:
+    """The open-balance sentence. While a credit of ours may stand it must not
+    ask anyone to close the difference — a person would book the discount a
+    second time (decisions §585):
+
+    * no record → ``erp_payment_writeback_balance_open`` ("close the difference");
+    * a record by id that FeohLedger will finish → ``erp_discount_credit_pending``
+      naming the credit ("don't book another");
+    * a record FeohLedger cannot finish alone (no id, retries exhausted, the id
+      not ours — the cases the stall flag also opens for) →
+      ``erp_discount_credit_pending_unidentified`` naming the marker to check for.
+    """
+    if standing is None:
+        return erp_finding(
+            "erp_payment_writeback_balance_open", erp_type, amount=amount, currency=currency
+        )
+    credit_id = standing.get("credit_id")
+    finishes = (
+        credit_id
+        and not standing.get("exhausted")
+        and not str(standing.get("outcome") or "").endswith(DISCOUNT_CREDIT_NOT_OURS)
+    )
+    if finishes:
+        return erp_finding(
+            "erp_discount_credit_pending",
+            erp_type,
+            amount=amount,
+            currency=currency,
+            credit=str(credit_id),
+        )
+    return erp_finding(
+        "erp_discount_credit_pending_unidentified",
+        erp_type,
+        amount=amount,
+        currency=currency,
+        marker=f"FeohLedger discount {payment_id}",
+    )
 
 
 def _claim_live(record: dict, now) -> bool:

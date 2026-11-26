@@ -910,6 +910,21 @@ _ERP_NAMED_SENTENCES: dict[str, str] = {
         "recorded this invoice's payment, but the bill still shows {amount} {currency} open "
         "there (a discount or credit taken in FeohLedger). Close the difference in the ERP."
     ),
+    # The same open balance while a discount credit of ours may stand there
+    # (decisions §585): the opt-in's credit is recorded and FeohLedger finishes
+    # it, so the sentence must not ask anyone to book the difference again.
+    "erp_discount_credit_pending": (
+        "recorded this invoice's payment, but the bill still shows {amount} {currency} open "
+        "there. FeohLedger booked credit {credit} for the early-payment discount and will "
+        "apply it, so don't book another."
+    ),
+    # Its twin for a credit whose id FeohLedger never learned (§579): it may
+    # stand, found only by the marker it carries.
+    "erp_discount_credit_pending_unidentified": (
+        "recorded this invoice's payment, but the bill still shows {amount} {currency} open "
+        "there. FeohLedger may have booked a credit for this discount, so check for "
+        "“{marker}” before booking one."
+    ),
     "erp_payment_void_writeback_failed": (
         "still shows this bill paid by a payment that was voided in FeohLedger, because "
         "voiding it in the ERP failed. Void that payment in the ERP so the books agree."
@@ -928,6 +943,12 @@ _ERP_NAMED_SENTENCES: dict[str, str] = {
 #: Params a named sentence carries besides ``erp`` (both twins carry them).
 _ERP_NAMED_PARAMS: dict[str, dict[str, ParamKind]] = {
     "erp_payment_writeback_balance_open": {"amount": "money", "currency": "currency"},
+    "erp_discount_credit_pending": {"amount": "money", "currency": "currency", "credit": "text"},
+    "erp_discount_credit_pending_unidentified": {
+        "amount": "money",
+        "currency": "currency",
+        "marker": "text",
+    },
 }
 
 _DISPATCH_STOPPED_TAIL = (
