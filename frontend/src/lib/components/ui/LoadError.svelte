@@ -22,7 +22,8 @@
 	 *   the reader was waiting for. Focus follows what Retry did to this block,
 	 *   never a guess made before it ran (WCAG 2.4.3):
 	 *   - The caller **unmounts** it (clears its error flag to show its loading
-	 *     line, now or when the retry lands): the focused button vanishes and
+	 *     line, at once or only when the retry lands — a `MutationObserver`
+	 *     catches the late case): the focused button vanishes and
 	 *     focus would fall to `<body>`, back at the top of the document. So once
 	 *     the button is gone, and only if focus really was lost with it, focus
 	 *     moves to the enclosing `<main>` (the layout's skip-link target, already
@@ -99,6 +100,10 @@
 		return active === null || active === document.body;
 	}
 
+	/** Watches for the block unmounting after the retry call returned (a
+	 *  caller that clears its error flag only when the retry lands). */
+	let unmountWatch: MutationObserver | null = null;
+
 	async function retry(e: MouseEvent) {
 		if (retrying) return;
 		const button = e.currentTarget as HTMLElement;
@@ -107,18 +112,30 @@
 			? null
 			: button.closest<HTMLElement>('[role="dialog"], main');
 		const before = attempt;
+		unmountWatch?.disconnect();
+		unmountWatch = null;
 		const result = onretry();
 		await tick();
 		if (!button.isConnected) {
 			if (focusLost()) container?.focus();
 			return;
 		}
+		if (container) {
+			// Still mounted: focus stays on the button for now. Whenever the
+			// block does go, put focus where the next Tab continues.
+			const watch = new MutationObserver(() => {
+				if (button.isConnected) return;
+				watch.disconnect();
+				if (unmountWatch === watch) unmountWatch = null;
+				if (focusLost()) container.focus();
+			});
+			watch.observe(container, { childList: true, subtree: true });
+			unmountWatch = watch;
+		}
 		if (!(result instanceof Promise)) return;
 		await result.catch(() => {});
 		await tick();
-		if (!button.isConnected) {
-			if (focusLost()) container?.focus();
-		} else if (attempt === before) {
+		if (button.isConnected && attempt === before) {
 			// Still here once the retry settled: it failed again. A caller that
 			// drives `retrying` was already counted by the effect.
 			attempt += 1;
