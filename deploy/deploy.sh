@@ -95,15 +95,21 @@ if [ "$DO_PULL" = 1 ]; then
 	exec ./deploy.sh --no-pull ${SCOPE[@]+"${SCOPE[@]}"}
 fi
 
-# Secrets: fetch the current ciphertext from S3 (lib.sh feoh_fetch_secrets —
-# a failed or refused fetch stops here with the old file and .env untouched),
-# then decrypt it to .env and check it before it replaces the current one
-# (decrypt-env.sh — also runnable on its own). Everything this script writes
-# from here on is owner-only.
+# Secrets: fetch the current ciphertext from S3 and STAGE it (lib.sh
+# feoh_fetch_secrets — a failed or refused fetch stops here with the old file
+# and .env untouched), decrypt the staged file to .env and check it before it
+# replaces the current one (decrypt-env.sh — also runnable on its own, on
+# prod.sops.yaml), and only then move it into place as prod.sops.yaml and raise
+# the replay floor (feoh_commit_secrets). A staged file decrypt-env.sh refuses —
+# a MAC that fails, a missing var — is deleted on exit, so the VM keeps the
+# last file that worked. Everything this script writes from here on is
+# owner-only.
 umask 077
+trap feoh_discard_staged_secrets EXIT
 feoh_fetch_secrets "$ALLOW_SECRETS_ROLLBACK" || die "secrets fetch failed (above) — nothing was deployed."
-./decrypt-env.sh
-feoh_record_secrets_applied || die "could not record the applied secrets version in deploy/.secrets-applied."
+./decrypt-env.sh "${FEOH_SECRETS_STAGED:-$FEOH_SECRETS_KEY}" ||
+	die "decrypt-env.sh refused the secrets file (above) — prod.sops.yaml, .env and the replay floor are unchanged; nothing was deployed."
+feoh_commit_secrets || die "could not move the accepted secrets file into place or record it in deploy/.secrets-applied."
 
 # Local Postgres container or external database (RDS)? Decided once, from the
 # .env just written (deploy/lib.sh) — it picks the compose profile below.

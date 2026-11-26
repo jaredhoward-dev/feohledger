@@ -768,11 +768,12 @@ printf 200
 
 # The S3 side of secrets delivery (lib.sh feoh_fetch_secrets): get-object
 # copies $S3_OBJECT to its last argument and prints $S3_VERSION, as
-# `--query VersionId --output text` would. STUB_FAIL=get-object fails it.
+# `--query VersionId --output text` would. STUB_FAIL=get-object fails it, with
+# $AWS_STDERR on stderr the way the real CLI reports (which can name the bucket).
 DEPLOY_AWS_STUB = """#!/bin/sh
 printf 'aws %s\\n' "$*" >> "$STUB_DIR/calls"
 if [ -n "${STUB_FAIL:-}" ]; then
-  case "$*" in *"$STUB_FAIL"*) exit 1 ;; esac
+  case "$*" in *"$STUB_FAIL"*) printf '%s\\n' "${AWS_STDERR:-}" >&2; exit 254 ;; esac
 fi
 case "$*" in
   *"s3api get-object"*)
@@ -819,9 +820,15 @@ class Stack:
         _with_stub(root, "aws", DEPLOY_AWS_STUB)
         self.fixture = root / "s3-object.yaml"
         self.fixture.write_text(sops_fixture("2026-11-20T10:00:00Z"))
+        # The stand-in decrypt-env.sh records the file it was handed (and a copy
+        # of it), and refuses it when DECRYPT_FAIL is set — as the real one does
+        # on a MAC that fails or a missing var — before writing any .env.
         decrypt = self.deploy / "decrypt-env.sh"
         decrypt.write_text(
-            "#!/bin/sh\nprintf 'APP_DOMAIN=app.example.com\\nAPI_DOMAIN=api.example.com\\n"
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" > \"$STUB_DIR/decrypt_args\"\n"
+            "cp \"$1\" \"$STUB_DIR/decrypt_input\"\n"
+            "[ -z \"${DECRYPT_FAIL:-}\" ] || { echo 'decrypt-env.sh: Cannot decrypt MAC' >&2; exit 1; }\n"
+            "printf 'APP_DOMAIN=app.example.com\\nAPI_DOMAIN=api.example.com\\n"
             "POSTGRES_PASSWORD=x\\nFEOH_SIGNUP_ENABLED=false\\n"
             "FEOH_HCAPTCHA_SECRET=x\\nFEOH_HCAPTCHA_SITEKEY=site-key-1\\n' > .env\n"
         )
@@ -836,7 +843,9 @@ class Stack:
         self.hosts = self.deploy / "tenants.caddy"
         self.version = "v3.example-Version_id"
 
-    def run(self, *args: str, fail: str = "") -> subprocess.CompletedProcess[str]:
+    def run(
+        self, *args: str, fail: str = "", extra_env: dict[str, str] | None = None
+    ) -> subprocess.CompletedProcess[str]:
         (self.root / "calls").write_text("")
         (self.root / "curl_calls").write_text("")
         return subprocess.run(
@@ -852,6 +861,7 @@ class Stack:
                 "STUB_FAIL": fail,
                 "S3_OBJECT": str(self.fixture),
                 "S3_VERSION": self.version,
+                **(extra_env or {}),
             },
         )
 
@@ -981,7 +991,7 @@ def test_a_deploy_fetches_the_secrets_before_decrypting_and_logs_only_metadata(
     fetch = next(c for c in calls if "s3api get-object" in c)
     assert "--bucket feoh-secrets-test --key prod.sops.yaml" in fetch
     assert (stack.deploy / "prod.sops.yaml").read_text() == stack.fixture.read_text()
-    assert "S3 version v3.example-Version_id, sops lastmodified 2026-11-20T10:00:00Z" in (
+    assert "S3 version v3.example-Version_id, sops lastmodified 2026-11-20T10:00:00Z (staged" in (
         result.stdout
     )
     # The run log is public: no key name from the file may reach it.
@@ -1002,6 +1012,72 @@ def test_a_failed_fetch_stops_the_deploy_and_keeps_the_old_file(stack: Stack) ->
     assert (stack.deploy / ".env").read_text() == "OLD=1\n"
     assert not any("build api" in c for c in stack.calls()), "the deploy went on without secrets"
     assert not list(stack.deploy.glob("prod.sops.yaml.fetch.*"))
+
+
+def test_a_failed_fetch_never_prints_the_aws_cli_error_text(stack: Stack) -> None:
+    """The deploy log is public (vm-deploy prints its tail), and the CLI's error
+    can carry the bucket's URL. Only a fixed message, the exit code and a coarse
+    class parsed from the error code reach it; the captured text is deleted."""
+    stderr = (
+        "\nAn error occurred (AccessDenied) when calling the GetObject operation: "
+        "Access Denied for https://feoh-secrets-test.s3.us-east-1.amazonaws.com/prod.sops.yaml"
+    )
+
+    result = stack.run(fail="get-object", extra_env={"AWS_STDERR": stderr})
+
+    assert result.returncode != 0
+    out = result.stdout + result.stderr
+    assert "feoh-secrets-test" not in out
+    assert "amazonaws.com" not in out
+    assert "(aws exited 254: AccessDenied)" in result.stderr
+    assert not list(stack.deploy.glob("prod.sops.yaml.fetch*")), "a temp file was left behind"
+
+
+def test_an_unrecognised_aws_error_is_reported_by_class_only(stack: Stack) -> None:
+    stderr = "Could not connect to the endpoint URL: https://feoh-secrets-test.s3.amazonaws.com/"
+
+    result = stack.run(fail="get-object", extra_env={"AWS_STDERR": stderr})
+
+    assert "feoh-secrets-test" not in result.stdout + result.stderr
+    assert "(aws exited 254: network)" in result.stderr
+
+
+def test_a_fetched_file_decrypt_env_refuses_never_replaces_the_working_one(stack: Stack) -> None:
+    """decrypt-env.sh is handed the STAGED file; only once it accepts it does
+    prod.sops.yaml change. On a refusal the old file, .env and the replay floor
+    stay, and the staged copy is gone."""
+    before = (stack.deploy / "prod.sops.yaml").read_text()
+    (stack.deploy / ".env").write_text("OLD=1\n")
+    (stack.deploy / ".secrets-applied").write_text("2026-11-01T00:00:00Z\n")
+
+    result = stack.run(extra_env={"DECRYPT_FAIL": "1"})
+
+    assert result.returncode != 0
+    assert "decrypt-env.sh refused the secrets file" in result.stderr
+    handed = (stack.root / "decrypt_args").read_text().strip()
+    assert handed.startswith("prod.sops.yaml.fetch."), handed
+    assert (stack.root / "decrypt_input").read_text() == stack.fixture.read_text()
+    assert (stack.deploy / "prod.sops.yaml").read_text() == before
+    assert (stack.deploy / ".env").read_text() == "OLD=1\n"
+    assert (stack.deploy / ".secrets-applied").read_text().strip() == "2026-11-01T00:00:00Z"
+    assert not list(stack.deploy.glob("prod.sops.yaml.fetch*")), "the staged file was left behind"
+    assert not any("build api" in c for c in stack.calls())
+
+
+def test_an_accepted_file_is_decrypted_from_the_stage_then_moved_into_place(stack: Stack) -> None:
+    result = stack.run()
+
+    assert result.returncode == 0, result.stderr
+    assert (stack.root / "decrypt_args").read_text().strip().startswith("prod.sops.yaml.fetch.")
+    assert (stack.deploy / "prod.sops.yaml").read_text() == stack.fixture.read_text()
+    assert not list(stack.deploy.glob("prod.sops.yaml.fetch*"))
+
+
+def test_without_delivery_decrypt_env_reads_the_file_already_here(stack: Stack) -> None:
+    (stack.deploy / "secrets-bucket").unlink()
+    result = stack.run()
+    assert result.returncode == 0, result.stderr
+    assert (stack.root / "decrypt_args").read_text().strip() == "prod.sops.yaml"
 
 
 def test_an_older_secrets_file_is_refused_as_a_replay(stack: Stack) -> None:
@@ -1040,7 +1116,7 @@ def test_the_same_or_a_newer_secrets_file_is_accepted(stack: Stack) -> None:
     "body, why",
     [
         ("FEOH_FAKE_ONE: plaintext\n", "not sops ciphertext"),
-        ("FEOH_FAKE_ONE: ENC[x]\nsops:\n    version: 3.9.0\n", "no readable sops lastmodified"),
+        ("FEOH_FAKE_ONE: ENC[x]\nsops:\n    version: 3.9.0\n", "no single readable sops lastmodified"),
     ],
 )
 def test_a_file_that_is_not_sops_ciphertext_is_refused(stack: Stack, body: str, why: str) -> None:
@@ -1084,6 +1160,78 @@ def test_deploy_sh_fetches_under_the_lock_and_before_decrypting() -> None:
     code = _code()
     assert code.index("flock -n 9") < code.index("feoh_fetch_secrets")
     assert code.index("feoh_fetch_secrets") < code.index("./decrypt-env.sh")
-    assert code.index("./decrypt-env.sh") < code.index("feoh_record_secrets_applied")
+    assert code.index("./decrypt-env.sh") < code.index("feoh_commit_secrets")
+    assert code.index("trap feoh_discard_staged_secrets EXIT") < code.index("feoh_fetch_secrets")
     ignored = (DEPLOY / ".gitignore").read_text().splitlines()
     assert {"secrets-bucket", ".secrets-applied", "prod.sops.yaml.fetch.*"} <= set(ignored)
+
+
+# ── The replay guard's reliance on sops' MAC (docs/decisions.md §591) ────────
+#
+# The guard orders files by `sops.lastmodified`, which infra-secrets' CI could
+# edit. It may, because sops authenticates that field: EncryptTree encrypts the
+# file's MAC with AES-GCM using lastmodified.Format(time.RFC3339) as the
+# additional data, and DecryptTree refuses the file ("Cannot decrypt MAC",
+# MacMismatch) when it does not decrypt — getsops/sops@5032a7184f1a,
+# cmd/sops/common/common.go; stores/stores.go parses the field with
+# time.RFC3339. So an edited lastmodified fails decrypt-env.sh, and the staged
+# file is discarded (test above). No real sops runs here; what these pin is the
+# part of that reliance this repo owns: only a value whose every byte the AAD
+# covers is accepted (RFC 3339 re-formatting drops a fraction and keeps an
+# offset, so neither may appear), and only one unambiguous field is read, so
+# this reader and sops' YAML parser cannot be shown different lines.
+
+
+def _lastmodified(tmp_path: Path, body: str) -> str:
+    f = tmp_path / "f.yaml"
+    f.write_text(body)
+    result = _lib(f'feoh_sops_lastmodified "{f}"', tmp_path)
+    assert result.returncode == 0, result.stderr
+    return result.stdout.strip()
+
+
+def test_the_lastmodified_sops_writes_is_read(tmp_path: Path) -> None:
+    assert _lastmodified(tmp_path, sops_fixture("2026-11-20T10:00:00Z")) == "2026-11-20T10:00:00Z"
+    single = sops_fixture("2026-11-20T10:00:00Z").replace('"2026-11-20T10:00:00Z"', "'2026-11-20T10:00:00Z'")
+    assert _lastmodified(tmp_path, single) == "2026-11-20T10:00:00Z"
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "2026-11-20T10:00:00.999Z",  # a fraction the MAC's AAD drops
+        "2026-11-20T23:00:00+13:00",  # an offset: same instant, different string
+        "2026-11-20 10:00:00Z",
+        "2026-11-20T10:00:00z",
+    ],
+)
+def test_a_lastmodified_the_mac_does_not_cover_byte_for_byte_is_unreadable(
+    tmp_path: Path, value: str
+) -> None:
+    assert _lastmodified(tmp_path, sops_fixture(value)) == ""
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        # a second lastmodified, nested where sops' parser would not read it
+        lambda b: b.replace(
+            "          enc: ZmFrZQ==\n",
+            '          enc: ZmFrZQ==\n          lastmodified: "2099-01-01T00:00:00Z"\n',
+        ),
+        # two sops blocks
+        lambda b: b + "sops:\n    lastmodified: \"2099-01-01T00:00:00Z\"\n",
+        # a second YAML document
+        lambda b: b + "---\nsops:\n    lastmodified: \"2099-01-01T00:00:00Z\"\n",
+        # trailing content after the value
+        lambda b: b.replace('lastmodified: "2026-11-20T10:00:00Z"', 'lastmodified: "2026-11-20T10:00:00Z" x'),
+    ],
+)
+def test_an_ambiguous_lastmodified_is_unreadable(tmp_path: Path, mutate) -> None:
+    assert _lastmodified(tmp_path, mutate(sops_fixture("2026-11-20T10:00:00Z"))) == ""
+
+
+def test_the_lib_names_the_sops_source_it_relies_on() -> None:
+    lib = LIB_SH.read_text()
+    assert "getsops/sops@5032a7184f1a" in lib
+    assert "DecryptTree" in lib and "as the additional authenticated data" in lib
