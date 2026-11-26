@@ -652,7 +652,9 @@ test.describe('/organization ERP connection', () => {
 			await card.locator('select[name="book_discount_as_credit"]').selectOption('on');
 			const failed = card.getByTestId('erp-picker-discount_credit_account-failed');
 			await expect(failed).toContainText("Couldn't load your chart of accounts.");
-			await failed.getByRole('button', { name: 'Try again' }).click();
+			// `ui/LoadError`'s own button, which reads `common.retry` ("Retry") —
+			// not the "Try again" of the panel's catalogue failure (`erp-load-failed`).
+			await failed.getByRole('button', { name: 'Retry', exact: true }).click();
 			await expect(failed).toHaveCount(0);
 
 			const status = card.getByTestId('erp-picker-discount_credit_account-status');
