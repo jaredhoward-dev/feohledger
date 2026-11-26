@@ -116,6 +116,7 @@ from app.services.erp_payment_writeback import (
     PENDING_CREDITS_KEY,
     PENDING_VOID_CREDITS_KEY,
     PENDING_VOIDS_KEY,
+    PENDING_WRITES_KEY,
 )
 from app.services.gl_chart import refuse_gl_codes_outside_chart
 from app.services.gl_recode import RecodeFilter, bulk_recode_gl
@@ -2508,7 +2509,7 @@ def _delete_claim_refusal(claim: str) -> dict:
 #: A voided payment returns the invoice to `approved`, so it is deletable, while
 #: the ERP side of the void (or of a discount credit) may still be unfinished:
 #: `WorkflowInstance.state_data` holds the payment ids the status-sync sweep has
-#: yet to reverse or apply (`erp_payment_writeback`'s three pending maps). The
+#: yet to reverse, apply or record (`erp_payment_writeback`'s four pending maps). The
 #: cascade deletes that instance, and the BillPayment / VendorCredit would stand
 #: in the ERP with nothing left to finish or report them (decisions §580).
 INVOICE_DELETE_ERP_REVERSAL_PENDING = "invoice_delete_erp_reversal_pending"
@@ -2517,7 +2518,14 @@ _DELETE_ERP_REVERSAL_MESSAGE = (
     "credit is still being booked there. Wait for the ERP sync to finish it, or resolve "
     "the ERP exception on this invoice, before deleting the invoice."
 )
-_ERP_PENDING_KEYS = (PENDING_VOIDS_KEY, PENDING_VOID_CREDITS_KEY, PENDING_CREDITS_KEY)
+_ERP_PENDING_KEYS = (
+    PENDING_VOIDS_KEY,
+    PENDING_VOID_CREDITS_KEY,
+    PENDING_CREDITS_KEY,
+    # A payment write whose outcome was never recorded: our BillPayment may
+    # stand on the bill with nothing else naming it (decisions §584).
+    PENDING_WRITES_KEY,
+)
 
 #: Any outbound PEPPOL transmission not `failed` (`sending` counts: its outcome
 #: is unknown) is the local record of an e-invoice the receiver may hold. A

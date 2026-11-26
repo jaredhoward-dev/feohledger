@@ -2096,7 +2096,11 @@ async def sync_org(org: Organization, *, now: datetime, result: StatusSyncResult
         scope_gaps,
         update_connection_metadata,
     )
-    from app.services.erp_payment_writeback import resume_pending_credits, resume_pending_voids
+    from app.services.erp_payment_writeback import (
+        resume_pending_credits,
+        resume_pending_voids,
+        resume_pending_writes,
+    )
 
     oauth_meta = ((org.settings or {}).get("erp") or {}).get("oauth") or {}
     erp_config = await _resolved_erp(org)
@@ -2146,6 +2150,9 @@ async def sync_org(org: Organization, *, now: datetime, result: StatusSyncResult
     result.bills_read += len(set(bill_ids))
     if bill_ids:
         result.invoices_changed += await sync_bills(org, bill_ids, event_id=None)
+    # A payment write whose outcome went unrecorded (decisions §584) first: a
+    # void it re-arms is then voided in this same pass.
+    await resume_pending_writes(org)
     result.voids_pending += await resume_pending_voids(org)
     # A discount credit created but not applied (decisions §577) is applied
     # after the voids, so a voided payment's credit is reversed, never applied.
