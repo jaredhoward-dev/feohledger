@@ -14,7 +14,7 @@ the labels that need explaining. Reasoning: `docs/decisions.md` §244.
 | Glossary (topic filter `?topic=`, entries anchored `#<id>`) | `routes/help/glossary/+page.svelte` |
 | Page by page — every sidebar page + the account pages, marked when the reader's role can't open them | `routes/help/pages/+page.svelte` |
 | Search (`?q=`, live from the shell's search box) | `routes/help/search/+page.svelte` |
-| Shell — search box + contents column (folds behind a button under 900px) | `routes/help/+layout.svelte`, `components/help/HelpNav.svelte` |
+| Shell — search box + contents column (folds behind a button below 1024px — `xl`, `lib/breakpoints.ts`) | `routes/help/+layout.svelte`, `components/help/HelpNav.svelte` |
 
 Content, all under `src/lib/help/`:
 
