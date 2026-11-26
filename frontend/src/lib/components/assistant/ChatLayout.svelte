@@ -6,12 +6,12 @@
 	 * side rail (usage, history, options) beside a chat pane whose message log
 	 * scrolls on its own and whose composer sits under it.
 	 *
-	 * Below 720px the rail does not stack above the chat: it would push the
+	 * At or below 768px (`lg`, `lib/breakpoints.ts`) the rail does not stack above the chat: it would push the
 	 * composer off a phone's first screen. It collapses behind a one-line
 	 * disclosure button instead, so the chat pane and its composer follow the
 	 * page header directly. The button precedes the rail in the DOM, so focus
 	 * order follows the visual order whether the rail is open or not, and the
-	 * rail is never re-ordered with CSS. Above 720px the button is `display: none`
+	 * rail is never re-ordered with CSS. Above 768px the button is `display: none`
 	 * and the rail is always shown.
 	 */
 	type Props = {
@@ -117,7 +117,7 @@
 		padding: 20px;
 	}
 
-	@media (max-width: 720px) {
+	@media (max-width: 768px) {
 		.chat-layout {
 			grid-template-columns: minmax(0, 1fr);
 			gap: 10px;

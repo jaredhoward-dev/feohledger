@@ -282,12 +282,13 @@
 	   corners and side borders would draw a box around the whole screen. Drop
 	   them and let the document run edge to edge; the gutter is unchanged, which
 	   is what keeps the 320px reflow behaviour identical to before. */
-	/* 52rem (832px) is where the sheet at its widest — the 46rem measure plus a
-	   28px gutter each side, 792px — first fits with room around it. Both
+	/* 1024px (the scale's `xl`, `lib/breakpoints.ts`) is the first step at which
+	   the sheet at its widest — the 46rem measure plus a 28px gutter each side,
+	   792px — fits with room around it (it was 52rem before the scale, §590). Both
 	   queries turn at the same number on purpose: a card that is rounded and
 	   bordered while still touching both window edges is the in-between state
 	   that looks like a mistake. */
-	@media (max-width: 52rem) {
+	@media (max-width: 1024px) {
 		.legal-sheet {
 			margin-top: 0;
 			border-inline: 0;
@@ -299,7 +300,7 @@
 		}
 	}
 
-	@media (min-width: 52rem) {
+	@media (min-width: 1024px) {
 		.legal-root {
 			--legal-gutter: 28px;
 		}
@@ -307,7 +308,7 @@
 
 	/* A DOCUMENT — never the index — grows by exactly the contents rail at the
 	   width where `lib/legal/LegalPage.svelte` pins that rail beside the text.
-	   72rem has to match the `min-width` query and `RAIL_QUERY` in that file;
+	   1200px (`2xl`) has to match the `min-width` query and `RAIL_QUERY` in that file;
 	   all three turn together or the rail lands in a column that is not there.
 
 	   `:has()` rather than a prop or a class the page sets, because the sheet is
@@ -319,7 +320,7 @@
 	   The measure itself does not move. 46rem stays 46rem and the rail plus its
 	   gap are added beside it, so every line length, every contrast pair and the
 	   e2e assertion that pins the reading column are all unchanged (#433). */
-	@media (min-width: 72rem) {
+	@media (min-width: 1200px) {
 		.legal-sheet:has(:global(.legal-shell)) {
 			max-width: calc(
 				46rem + var(--legal-contents-rail) + var(--legal-contents-gap) + 2 * var(--legal-gutter)

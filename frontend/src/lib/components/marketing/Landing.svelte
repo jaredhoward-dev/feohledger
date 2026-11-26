@@ -607,7 +607,7 @@
 			border-bottom: 1px solid var(--hairline);
 		}
 	}
-	@media (max-width: 760px) {
+	@media (max-width: 768px) {
 		.nav {
 			padding: 14px 20px;
 		}
@@ -663,7 +663,7 @@
 	   menu toggle; Sign in moves into the menu. "Iniciar sesión" beside
 	   "Empezar gratis" does not fit 320px, and a label that did would be a
 	   worse label. Measured in every locale by landing.spec.ts. */
-	@media (max-width: 359px) {
+	@media not all and (min-width: 360px) {
 		.nav-end .nav-signin {
 			display: none;
 		}
@@ -682,10 +682,10 @@
 		gap: 64px;
 		align-items: center;
 	}
-	@media (max-width: 960px) {
+	@media (max-width: 1024px) {
 		.hero { grid-template-columns: 1fr; gap: 48px; margin-bottom: 64px; }
 	}
-	@media (max-width: 600px) {
+	@media (max-width: 640px) {
 		.hero { padding: 24px 20px; }
 	}
 	.eyebrow {
@@ -828,7 +828,7 @@
 		background: color-mix(in srgb, var(--surface) 40%, transparent);
 		box-shadow: var(--shadow-card);
 	}
-	@media (max-width: 760px) {
+	@media (max-width: 768px) {
 		.stats { grid-template-columns: repeat(2, 1fr); margin-bottom: 80px; }
 	}
 	.stat {
@@ -880,10 +880,10 @@
 		grid-template-columns: repeat(3, 1fr);
 		gap: 18px;
 	}
-	@media (max-width: 960px) {
+	@media (max-width: 1024px) {
 		.feature-grid { grid-template-columns: repeat(2, 1fr); }
 	}
-	@media (max-width: 620px) {
+	@media (max-width: 640px) {
 		.feature-grid { grid-template-columns: 1fr; }
 	}
 	.feature {
@@ -944,7 +944,7 @@
 		grid-template-columns: repeat(3, 1fr);
 		gap: 20px;
 	}
-	@media (max-width: 800px) {
+	@media (max-width: 768px) {
 		.steps { grid-template-columns: 1fr; }
 	}
 	.step {
@@ -1004,7 +1004,7 @@
 		align-items: center;
 		margin-bottom: 48px;
 	}
-	@media (max-width: 900px) {
+	@media (max-width: 1024px) {
 		.tally-intro { grid-template-columns: 1fr; gap: 28px; }
 	}
 	.tally-copy h2 {
@@ -1042,7 +1042,7 @@
 		grid-template-columns: repeat(2, 1fr);
 		gap: 18px;
 	}
-	@media (max-width: 760px) {
+	@media (max-width: 768px) {
 		.diff-grid { grid-template-columns: 1fr; }
 	}
 	.diff {

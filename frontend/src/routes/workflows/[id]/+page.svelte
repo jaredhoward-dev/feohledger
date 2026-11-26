@@ -1346,7 +1346,7 @@
 		color: var(--text-muted);
 	}
 
-	@media (max-width: 1100px) {
+	@media (max-width: 1200px) {
 		.editor {
 			grid-template-columns: 1fr;
 		}

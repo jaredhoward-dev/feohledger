@@ -1,3 +1,20 @@
+/* ── Viewport breakpoints ────────────────────────────────────────────────
+   Every `@media` width query in `src/` uses one of these, in px, and nothing
+   else (decisions §590; `src/lib/breakpoints.ts` is the source of truth and
+   `breakpoints.test.ts` fails CI on any other value):
+
+     2xs  360   phones under 360 → `not all and (min-width: 360px)`
+     xs   400   small phones
+     sm   480   phones: single-column forms and dialogs
+     md   640   large phones: form grids and button rows stack
+     lg   768   the app shell's NARROW step — sidebar icon rail, half gutter
+     xl  1024   two-pane layouts start (settings rail, auth panel, help rail)
+     2xl 1200   widest multi-column layouts (legal contents rail)
+
+   They are not custom properties because a `var()` cannot appear in a
+   `@media` condition, and the build has no `@custom-media` step. The
+   supported floor is 320px (WCAG 1.4.10): not a breakpoint, the width every
+   route must still reflow at (`tests-e2e/a11y/reflow.spec.ts`). */
 :root {
 	font-family: system-ui, -apple-system, sans-serif;
 	/* Tells the UA to render native form controls (checkboxes, selects,
@@ -757,7 +774,7 @@ input[type='week']:hover::-webkit-calendar-picker-indicator {
 	gap: 18px;
 	min-height: 100vh;
 }
-@media (max-width: 700px) {
+@media (max-width: 768px) {
 	.workspace {
 		padding: 20px 14px 32px;
 	}
@@ -1543,7 +1560,7 @@ html.has-bulk-bar body {
 	padding-top: 14px;
 	border-top: 1px solid var(--border);
 }
-@media (max-width: 600px) {
+@media (max-width: 640px) {
 	.org-panel .form-grid {
 		grid-template-columns: 1fr;
 	}

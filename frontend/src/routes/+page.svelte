@@ -874,7 +874,7 @@
 	}
 
 	/* Single column on narrow viewports so the two-up charts reflow. */
-	@media (max-width: 700px) {
+	@media (max-width: 768px) {
 		.charts-grid {
 			grid-template-columns: 1fr;
 		}

@@ -496,7 +496,7 @@
 		flex-shrink: 0;
 	}
 
-	@media (max-width: 600px) {
+	@media (max-width: 640px) {
 
 		.sso-register {
 			grid-template-columns: 1fr;
