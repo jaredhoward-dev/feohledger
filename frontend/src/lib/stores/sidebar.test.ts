@@ -1,5 +1,6 @@
-import { beforeEach, describe, expect, it } from 'vitest';
-import { sidebar } from './sidebar.svelte.ts';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { SHELL_NARROW_QUERY } from '#lib/breakpoints.ts';
+import { createSidebarStore, sidebar } from './sidebar.svelte.ts';
 
 /**
  * The shell sidebar's state (decisions §590, #635 finding 39). At or below the
@@ -86,5 +87,53 @@ describe('sidebar store', () => {
 		expect(sidebar.collapsed).toBe(true);
 		sidebar.toggle();
 		expect(sidebar.collapsed).toBe(false);
+	});
+});
+
+/**
+ * `narrow` is seeded from `matchMedia` when the store is created. Left to the
+ * root layout's effect, which runs after the first paint, a phone drew the
+ * 220px panel for a frame before collapsing to the rail.
+ */
+describe('sidebar store seeding', () => {
+	afterEach(() => {
+		vi.unstubAllGlobals();
+	});
+
+	function stubViewport(narrow: boolean) {
+		const matchMedia = vi.fn((query: string) => ({ matches: narrow, media: query }));
+		vi.stubGlobal('window', { matchMedia });
+		return matchMedia;
+	}
+
+	it('starts as the rail when the viewport is already narrow', () => {
+		const matchMedia = stubViewport(true);
+		const store = createSidebarStore();
+		expect(matchMedia).toHaveBeenCalledWith(SHELL_NARROW_QUERY);
+		expect(store.narrow).toBe(true);
+		expect(store.collapsed).toBe(true);
+		expect(store.overlay).toBe(false);
+	});
+
+	it('starts as the expanded panel when the viewport is wide', () => {
+		stubViewport(false);
+		const store = createSidebarStore();
+		expect(store.narrow).toBe(false);
+		expect(store.collapsed).toBe(false);
+	});
+
+	it('the layout\'s first setNarrow with the seeded value changes nothing', () => {
+		stubViewport(true);
+		const store = createSidebarStore();
+		store.toggle();
+		store.setNarrow(true);
+		expect(store.overlay).toBe(true);
+	});
+
+	it('falls back to wide where there is no matchMedia', () => {
+		vi.stubGlobal('window', {});
+		expect(createSidebarStore().narrow).toBe(false);
+		vi.stubGlobal('window', undefined);
+		expect(createSidebarStore().narrow).toBe(false);
 	});
 });
