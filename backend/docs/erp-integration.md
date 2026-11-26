@@ -1037,7 +1037,7 @@ included, under `erp_integrations`, §281).
 | Key | ERP | Regions | Auth |
 |---|---|---|---|
 | `quickbooks_online` | QuickBooks Online | US | OAuth (optional BYO app; `environment`) |
-| `xero` | Xero | US, ZA | OAuth (optional BYO app; `bill_status`, `default_tax_type`) |
+| `xero` | Xero | US, ZA, GB | OAuth (optional BYO app; `bill_status`, `default_tax_type`) |
 | `sage_accounting` | Sage Business Cloud Accounting (v3.1: UK, IE, CA, DE, ES, FR; the US product was retired 2024-12-31) | GB | OAuth (optional BYO app) |
 | `sage_accounting_za` | Sage Business Cloud Accounting (South Africa) | ZA | API key + Sage login + company |
 | `blackbaud_fe_nxt` | Blackbaud Financial Edge NXT | US | OAuth (optional BYO app + SKY API subscription key) |
