@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # Decrypt the VM's secrets file into deploy/.env, and check it before it
 # replaces the one already there. deploy.sh runs this on every deploy; run it
-# on its own after copying in a new or edited secrets file, to find a problem
-# before a deploy does.
+# on its own to re-check the file the last deploy fetched.
 #
-# deploy/prod.sops.yaml is a copy of infra-secrets/feohledger/prod.sops.yaml:
+# deploy/prod.sops.yaml is the copy of infra-secrets/feohledger/prod.sops.yaml
+# that deploy.sh last fetched from S3 (lib.sh feoh_fetch_secrets) —
 # flat YAML whose keys are the env var names (template:
 # deploy/prod.sops.yaml.example). sops converts it to the dotenv that compose's
 # env_file and the other deploy scripts read (docs/decisions.md §171).
@@ -19,7 +19,7 @@ die() {
 }
 
 command -v sops >/dev/null || die "'sops' not installed — run deploy/bootstrap-vm.sh first."
-[ -f prod.sops.yaml ] || die "prod.sops.yaml missing — copy infra-secrets/feohledger/prod.sops.yaml here (template: deploy/prod.sops.yaml.example; see deploy/README.md)."
+[ -f prod.sops.yaml ] || die "prod.sops.yaml missing — deploy.sh fetches it from the secrets bucket (deploy/README.md § Secrets; template: deploy/prod.sops.yaml.example)."
 
 # Decrypt fresh on every run (KMS access via the instance profile) into a temp
 # file, check that, and only then move it into place. `sops -d >.env` would

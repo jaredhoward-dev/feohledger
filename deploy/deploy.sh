@@ -11,13 +11,18 @@
 # workflow builds it in CI and publishes it to S3 + CloudFront after this
 # script succeeds (.github/workflows/vm-deploy.yml, deploy/publish-frontend.sh).
 #
-# Usage: deploy.sh [--no-pull | --ref <sha>] [--backend-only]
+# Usage: deploy.sh [--no-pull | --ref <sha>] [--backend-only] [--allow-secrets-rollback]
 #
 # --ref <sha> deploys exactly that commit, which must be on origin/main — what a
 # published release runs over SSM (.github/workflows/vm-deploy.yml,
 # infra/deploy.tf). Without it, main's tip. --backend-only is what every deploy
 # is now; it is still accepted, and handed on when the script re-runs itself,
 # so a rollback to an older commit keeps the meaning it had there.
+#
+# Secrets come from S3 on every run (lib.sh feoh_fetch_secrets, docs/decisions.md
+# §591): the ciphertext infra-secrets' CI uploaded is fetched under the deploy
+# lock before it is decrypted. --allow-secrets-rollback accepts a file OLDER than
+# the one last applied, which is otherwise refused as a possible replay.
 set -euo pipefail
 cd "$(dirname "$0")"
 REPO_ROOT=$(cd .. && pwd)
@@ -30,9 +35,9 @@ die() {
 	exit 1
 }
 
-USAGE="usage: deploy.sh [--no-pull | --ref <sha>] [--backend-only]"
-DO_PULL=1 REF=""
-SCOPE=() # the build-scope flags, handed on unchanged when the script re-runs itself
+USAGE="usage: deploy.sh [--no-pull | --ref <sha>] [--backend-only] [--allow-secrets-rollback]"
+DO_PULL=1 REF="" ALLOW_SECRETS_ROLLBACK=0
+SCOPE=() # the flags handed on unchanged when the script re-runs itself
 while [ $# -gt 0 ]; do
 	case "$1" in
 	--no-pull) DO_PULL=0 ;;
@@ -43,6 +48,10 @@ while [ $# -gt 0 ]; do
 		;;
 	--ref=*) REF=${1#--ref=} ;;
 	--backend-only) SCOPE+=("$1") ;;
+	--allow-secrets-rollback)
+		ALLOW_SECRETS_ROLLBACK=1
+		SCOPE+=("$1")
+		;;
 	--frontend-only)
 		die "--frontend-only: the VM no longer builds or serves the SPA (docs/decisions.md §364). It ships to S3 + CloudFront from the release workflow; to publish one by hand, see deploy/README.md § The SPA on S3 + CloudFront."
 		;;
@@ -54,7 +63,7 @@ done
 	die "--ref and --no-pull contradict each other: --ref checks a commit out. $USAGE"
 
 # ── Preflight — fail with a clear message before doing any work ──────────────
-for cmd in docker sops git flock curl python3; do
+for cmd in docker sops git flock curl python3 aws; do
 	command -v "$cmd" >/dev/null || die "'$cmd' not installed — run deploy/bootstrap-vm.sh first."
 done
 docker compose version >/dev/null 2>&1 || die "docker compose plugin missing — run deploy/bootstrap-vm.sh first."
@@ -67,7 +76,6 @@ COMPOSE_RUNNING="v$(docker compose version --short 2>/dev/null | sed 's/^v//')"
 [ "$COMPOSE_RUNNING" = "$COMPOSE_PIN" ] ||
 	echo "WARN: docker compose here is ${COMPOSE_RUNNING}, but bootstrap-vm.sh pins ${COMPOSE_PIN} — the version CI checks deploy/ with. Re-run ./bootstrap-vm.sh to converge." >&2
 docker info >/dev/null 2>&1 || die "cannot talk to the docker daemon — is it running, and are you in the docker group? (log out/in after bootstrap-vm.sh)"
-[ -f prod.sops.yaml ] || die "prod.sops.yaml missing — copy infra-secrets/feohledger/prod.sops.yaml here (template: deploy/prod.sops.yaml.example; see deploy/README.md)."
 
 # One deploy at a time on this VM: a release deploy over SSM and a manual run
 # from a Session Manager shell would otherwise build and migrate over each
@@ -87,11 +95,15 @@ if [ "$DO_PULL" = 1 ]; then
 	exec ./deploy.sh --no-pull ${SCOPE[@]+"${SCOPE[@]}"}
 fi
 
-# Secrets: decrypt prod.sops.yaml to .env and check it before it replaces the
-# current one (decrypt-env.sh — also runnable on its own). Everything this
-# script writes from here on is owner-only.
+# Secrets: fetch the current ciphertext from S3 (lib.sh feoh_fetch_secrets —
+# a failed or refused fetch stops here with the old file and .env untouched),
+# then decrypt it to .env and check it before it replaces the current one
+# (decrypt-env.sh — also runnable on its own). Everything this script writes
+# from here on is owner-only.
 umask 077
+feoh_fetch_secrets "$ALLOW_SECRETS_ROLLBACK" || die "secrets fetch failed (above) — nothing was deployed."
 ./decrypt-env.sh
+feoh_record_secrets_applied || die "could not record the applied secrets version in deploy/.secrets-applied."
 
 # Local Postgres container or external database (RDS)? Decided once, from the
 # .env just written (deploy/lib.sh) — it picks the compose profile below.
