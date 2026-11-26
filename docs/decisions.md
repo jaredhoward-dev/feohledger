@@ -30870,3 +30870,99 @@ flag carries the reason as `discount_credit_failure`.
   - the stall flag is one per payment and reason.
 - `test_qbo_status_sync_adapter.py`: a refresh failure or a lost connection on
   the create call (after a 401) is `not_posted`.
+
+## 584. The payment write is reserved before it is sent; a discount credit edited in the ERP no longer holds its payment's void; a failing void is audited on change and capped (§581 / §582 follow-ups, round 50)
+
+Two follow-ups from rounds 48–49, both on the payment write-back.
+
+**1. Reserve → call → record for the payment write itself.** §581 re-arms a
+void that raced the write, in the transaction that records the outcome. If
+that transaction rolled back, the re-arm went with it; a write-back re-run
+skips a voided payment, so our BillPayment stood on a voided payment's bill
+with nothing left to find it. Now `write_back_payment` commits
+`state_data.erp_payment_writes_pending[<payment id>]` (`token`, `bill_id`,
+`attempts`, `claimed_until`) under §581's lock order (invoice `FOR KEY SHARE`,
+then the instance), after re-reading the payment there, **before**
+`post_payment`. The outcome's transaction clears it, success or failure, but
+only while it still names that attempt's token. A record left behind is the
+status-sync sweep's: `resume_pending_writes` runs before
+`resume_pending_voids` and, once the claim has lapsed:
+- **voided** (or any status but `completed`): re-arms the void
+  (`_rearm_void_if_voided`, with a fresh §582 token) and drops the record in
+  one transaction, so the same pass voids what was written. A void finding
+  nothing is a no-op;
+- **completed**: runs the write-back again. The adapters' write looks up our
+  earlier payment by its id before it creates (QuickBooks `PrivateNote`,
+  Xero `Reference`, NetSuite `externalId`), and the create carries the
+  payment id as `requestid` / `Idempotency-Key`. So a write that went out is
+  found and recorded, and one that never went out is sent once. Pinned by
+  `test_post_payment_is_idempotent_on_the_payment_id` (QuickBooks) and
+  `test_post_payment_on_retry_finds_its_own_payment_and_writes_nothing` /
+  `test_a_payment_whose_answer_was_lost_is_found_on_retry_not_posted_twice`
+  (Xero).
+- A live claim or `exhausted` record sends nothing (a manual re-run too).
+  `MAX_WRITE_ATTEMPTS` (12, as §579) counts reservations; reaching it audits
+  `payment.erp_post_failed` with `retries_exhausted` and opens a
+  `payment_writeback_failed` flag (`failure: retries_exhausted`), once.
+- The invoice delete door counts the key in `_ERP_PENDING_KEYS`: while it
+  stands, a BillPayment of ours may be on the bill with nothing else naming
+  it. Its message is unchanged (the only deletable case is a voided payment,
+  which is a reversal).
+- **Kept, not dropped, when the bill is outside the connected company** (a
+  reconnect to another realm): nothing can be written or found under it, and
+  a pending void is kept in that case too.
+- **Rejected again: relying on the re-check alone** (§581 #7). It closes the
+  race only when the outcome commits.
+
+Found on the way: when recording the outcome failed, the handler logged
+`payment.id` after `db.rollback()` had expired the row. The lazy load raised
+`MissingGreenlet` out of this never-raising function, and `payment_erp_sync`
+then flagged `payment_sync_back_failed` on a payment that had synced. The id
+is now read before anything is sent.
+
+**2. A discount credit edited in the ERP no longer holds its payment's void.**
+Since §582 a recorded credit that reads back without our marker is refused
+`discount_credit_not_ours`, and §575 reverses the credit before the payment,
+so the payment's void stopped there every pass: our whole BillPayment ($98)
+stayed on a voided payment's bill when only the credit ($2) was in doubt, and
+`payment.erp_void_failed` was audited every pass. The operator delegated the
+call, and for this one refusal the void now calls `void_payment` anyway, a
+narrowing of §575's credit-first order:
+- `payment.erp_voided` carries `discount_credit_held: <id>`;
+- every entry naming the credit is kept (`erp_discount_credits_pending`,
+  `erp_discount_credit_voids_pending`, `erp_discount_credits_booked`), and
+  the `discount_credit_stalled` flag (`reason: discount_credit_not_ours`,
+  §583's per-payment-and-reason dedupe) names it;
+- the void reports success, since the payment's part is done and the credit
+  has its own flag.
+- **Why only this refusal:** every other credit failure may be ours and
+  transient, and voiding the payment first would leave a credit of ours
+  allocated to a bill with no payment beside it (§575). A credit that is not
+  ours is a person's document now, and nothing we do to it is safe.
+- **Residual:** its kept entries keep the invoice undeletable, as a §582
+  held record already does. A credit in doubt is not erased with its invoice.
+
+**3. A failing void is audited on change and capped.** Each failed pass
+records `state_data.erp_payment_void_attempts[<payment id>]` (`outcome`: the
+document, payment or discount credit, plus the refusal code or message;
+`attempts`; `last_attempt`). `payment.erp_void_failed` is audited only when
+the outcome changes or the cap is reached, and it carries `attempts`. At
+`MAX_VOID_ATTEMPTS` (12) the record is `exhausted` and no pass calls the ERP
+for it. A write-back re-arm resets the count: it is new work, and it must void
+what was just written. A finished void clears the entry.
+
+**Tests.** Each fails on the code before this entry.
+- `test_erp_payment_writeback.py`:
+  - the write is reserved before the call and cleared on its outcome;
+  - an outcome rollback after a successful post with a concurrent void: the
+    next pass re-arms, and BP-9 is voided;
+  - a write that died before the call is posted once by the next pass, and
+    nothing is sent under a live claim;
+  - a write whose outcome is never recorded stops at the cap;
+  - a not-ours credit: the payment void proceeds, the credit stays recorded
+    and flagged, and there is one audit row over two failing passes;
+  - a failing void is audited on change and stops at the cap, and a re-arm
+    restarts it;
+  - the lost first credit recording opens no `payment_sync_back_failed` flag.
+- `test_invoice_delete_cascade.py`: the delete is refused while
+  `erp_payment_writes_pending` holds an entry.

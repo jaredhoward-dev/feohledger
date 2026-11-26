@@ -1324,32 +1324,6 @@ user-visible halves still open.
 
 ### Surfaced by rounds 48–49 (2026-11-25, round PR #772, decisions §563–§583)
 
-- [ ] **(c) A discount credit edited in the ERP blocks its payment's void
-      indefinitely.** Since §582 a recorded credit that reads back without
-      our marker is refused `discount_credit_not_ours` and held (flagged),
-      and §575 reverses the credit before the payment — so the payment's
-      ERP void retries every sweep and our BillPayment stays on a voided
-      payment's bill (the ERP misstates $98 where only the $2 credit is in
-      doubt). No money moves: a re-pay's write-back refuses to overpay.
-      **Durable fix:** for this one refusal, void the payment anyway and keep
-      the credit recorded and flagged on its own — a narrowing of §575 that
-      needs its own decisions entry; also stop auditing
-      `payment.erp_void_failed` on every pass (audit on change, as §579 did
-      for credits). **Trigger:** the first `discount_credit_not_ours` flag in
-      production, or the next change to the void order.
-
-- [ ] **(c) A void that races the payment write-back can still leave our
-      BillPayment on a voided payment's bill if recording the outcome fails.**
-      §581 re-reads the payment after `post_payment` and re-arms its void in the
-      transaction that records the outcome; if that transaction itself rolls
-      back, the re-arm is lost and a write-back re-run skips the voided payment,
-      so nothing reverses our BillPayment. **Durable fix:** reserve → call →
-      record for the payment write itself (a pending-payment-write record
-      committed before `post_payment`, cleared on the recorded outcome), as
-      §581 did for the discount credit. **Trigger:** the first
-      `payment.erp_voided`-less voided payment found with a BillPayment in the
-      ERP, or the next change to `write_back_payment`.
-
 - [ ] **(c) Deleting an invoice received over PEPPOL erases its inbound
       transmission record.** §580 refuses deleting an invoice with a
       non-`failed` *outbound* transmission (a sent e-invoice is corrected by a
