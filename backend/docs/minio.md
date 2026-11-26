@@ -80,6 +80,33 @@ Consequences for callers:
   leave the event-loop thread, and AST-scans `app/` for any module issuing a raw
   `put_object` / `get_object` / `delete_object` outside the chokepoint.
 
+## Key layout, and how objects leave
+
+Every key begins with the owning organisation's id
+(`tests/test_storage_prefix_ownership.py`). An invoice's objects all sit in two
+folders: `{org}/{invoice}/` (the document from every channel, every superseded
+version, a received PEPPOL payload `peppol-inbound.xml`) and
+`{org}/chat/{invoice}/{message}/` (chat attachments). Other owners have a named
+segment: `contracts/`, `expenses/`, `tax-forms/` and `w9/`,
+`vendor-statements/`, `positive-pay/`.
+
+Objects are deleted by: the owning row's own delete path (Positive Pay,
+vendor statements); erasure (`services/privacy_documents`); the retention
+sweep (Positive Pay expiry); a tenant deletion (`delete_prefix("{org}/")`); and
+an invoice delete, which queues both invoice folders in
+`pending_object_deletions` and empties them after commit, with the retention
+sweep retrying failures and paging through the bucket for invoice folders no
+live row owns (`services/invoice_objects`, `docs/decisions.md` §592). The
+traversal helpers (`delete_prefix`, `list_child_prefixes`,
+`newest_object_time`) refuse an empty or slash-less prefix and run off the
+event loop like the three primitives.
+
+Locally MinIO has no Object Lock, so a delete removes the object. The deployed
+bucket is versioned with a GOVERNANCE default retention (`infra/s3.tf`): a
+delete writes a delete marker, the app can no longer read the object, and the
+locked version is reaped by the noncurrent-version lifecycle rule once its
+lock lapses.
+
 ## Using boto3
 
 `services/storage` interacts with MinIO using the standard AWS `boto3` SDK.
