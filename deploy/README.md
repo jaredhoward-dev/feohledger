@@ -244,6 +244,23 @@ already has open:
 Nothing is deleted on the way in, because an open page lazy-loads chunks from
 the build it started on.
 
+`smoke-frontend.sh` then asks the distribution's own domain, the apex and a
+tenant host (`smoke-check.<apex>`), each through public DNS:
+
+- `_app/version.json` is byte-for-byte this build's, so the edge is not serving
+  the previous release from cache;
+- `/`, a reload of a tenant route with its URL state
+  (`/invoices?status=ready_for_review`) and a deep link with a dotted segment
+  each return this build's `index.html` with a 200 — the SPA fallback;
+- a missing `/_app/immutable/…` file is a 404 and not the SPA shell (not
+  `text/html`, not `index.html`'s bytes), which is what a CloudFront custom
+  error response mapping 404 to `/index.html` would serve. `infra/tests/`
+  refuses such a response at plan time too;
+- HSTS is set.
+
+It is curl, not Playwright: every check is one response's status, content type
+or body (`docs/decisions.md` §589).
+
 The apex and tenant hosts must answer from CloudFront: the smoke step fails if
 the apex lacks CloudFront's `x-amz-cf-id` header, because since
 `docs/decisions.md` §364 this VM serves no SPA to fall back on.

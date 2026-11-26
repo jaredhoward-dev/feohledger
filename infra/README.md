@@ -445,8 +445,10 @@ are in the repo root with `AWS_PROFILE=feohledger`.
    `gh variable set FRONTEND_PUBLISH_ENABLED --repo jaredhoward-dev/feohledger --body true`.
 5. **Publish a release** and approve it. After the VM step the job uploads the
    build, waits for the invalidation, and smoke-checks the distribution's
-   `*.cloudfront.net` name: this build's `version.json`, the SPA on `/` and on a
-   dotted deep link, a 404 for a missing asset, and HSTS.
+   `*.cloudfront.net` name: this build's `version.json`, the SPA on `/`, on a
+   tenant-route reload with its query string and on a dotted deep link, a 404
+   that is not the SPA shell for a missing asset, and HSTS (after the cutover
+   the apex and a tenant host get the same checks).
    `deploy/smoke-frontend.sh` runs the same checks by hand.
 6. **Try a tenant flow on the CloudFront hostname** before moving DNS. The
    `*.cloudfront.net` name carries no tenant, so the app shows the marketing

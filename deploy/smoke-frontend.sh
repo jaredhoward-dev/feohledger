@@ -8,11 +8,23 @@
 # For every origin:
 #   - /_app/version.json is byte-for-byte the build's own (so the edge is not
 #     serving the previous release from cache);
-#   - / and a deep link whose last segment contains a dot both return the SPA's
-#     index.html with 200 — the dotted segment is the case an "extensionless
-#     paths only" fallback rule gets wrong (infra/cloudfront/spa-router.js);
-#   - a missing hashed asset is a 404, not index.html with a 200;
+#   - /, a reload of a real tenant route with its URL state
+#     (/invoices?status=…), and a deep link whose last segment contains a dot
+#     all return the SPA's index.html with 200 — the dotted segment is the case
+#     an "extensionless paths only" fallback rule gets wrong
+#     (infra/cloudfront/spa-router.js), the query string the case a rewrite
+#     that folds it into the path gets wrong;
+#   - a missing hashed asset is a 404 that is NOT the SPA shell: neither
+#     index.html with a 200 nor index.html under a 404 status (what a
+#     custom_error_response mapping 404 to /index.html would serve, and what a
+#     browser then parses as a broken script);
 #   - HSTS is set.
+#
+# vm-deploy.yml passes the distribution's own domain, the apex and a tenant
+# host (smoke-check.<apex>), so the tenant-route reload runs on a tenant
+# subdomain. curl, not Playwright: each check is the status, content type or
+# body of one HTTP response, which a browser would only observe less directly
+# (docs/decisions.md §589).
 set -euo pipefail
 
 die() {
@@ -52,7 +64,7 @@ for origin in "$@"; do
 		fail "/_app/version.json is $(cat "$work/body"), expected ${want_version} — the edge is not serving this build"
 	fi
 
-	for path in / /smoke-check/route.with.dots; do
+	for path in / '/invoices?status=ready_for_review' /smoke-check/route.with.dots; do
 		fetch "${origin}${path}"
 		if [ "$status" != 200 ]; then
 			fail "${path}: HTTP ${status}, expected the SPA with 200"
@@ -69,6 +81,8 @@ for origin in "$@"; do
 	fetch "${origin}/_app/immutable/feoh-smoke-missing.js"
 	if [ "$status" != 404 ]; then
 		fail "a missing hashed asset returned HTTP ${status}, expected 404"
+	elif grep -qi '^content-type: text/html' "$work/headers" || cmp -s "$work/body" "$build/index.html"; then
+		fail "a missing hashed asset returned 404 with the SPA shell, expected the origin's own not-found (a custom error response mapping 404 to /index.html?)"
 	fi
 done
 

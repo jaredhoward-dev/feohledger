@@ -29431,3 +29431,49 @@ unaffected card still cancels); `test_card_money_path_regression.py` (the
 return); `test_qbo_status_sync_adapter.py` (a re-sync with a changed amount
 posts no second BillPayment); `test_provider_credentials.py` (the `whsec_`
 refusal and the per-provider acceptance).
+
+## 589. The deployed-URL SPA smoke stays curl, and now proves a tenant-route reload and that a missing asset's 404 is not the shell (#582, round 51)
+
+**Context.** #582's last open box asked for "a Playwright smoke run against the
+deployed URL (or a preview distribution), covering deep-link reload on a tenant
+route (SPA fallback) and a missing `/_app/...` asset returning 404, not
+`index.html`". `deploy/smoke-frontend.sh` (§278) already ran after every
+publish, through public DNS, against the distribution's own domain, the apex
+and the synthetic tenant host `smoke-check.<apex>`. Two holes remained:
+
+* its deep links were `/` and `/smoke-check/route.with.dots`; neither is a route
+  a tenant user reloads, and neither carries URL state, so a router rewrite
+  that folded the query string into the path would pass;
+* its missing-asset check asserted only the status. A CloudFront custom error
+  response mapping 404 → `/index.html` with `response_code = 404` keeps the 404
+  and serves the SPA shell; the check passed it, and the browser would then
+  parse HTML as a script.
+
+`infra/frontend.tf` has no custom error response today (the router function is
+the only fallback, §278), so there was no bug at the source; the gap was in
+what would catch one.
+
+**Decision.** Extend `smoke-frontend.sh`, not add Playwright:
+
+* every origin also gets `/invoices?status=ready_for_review` and must return
+  this build's `index.html` with a 200 — the tenant-route reload, run on a
+  tenant subdomain because `vm-deploy.yml` passes `smoke-check.<apex>`;
+* a missing `/_app/immutable/…` file must be a 404 whose body is neither
+  `text/html` nor `index.html`'s bytes;
+* `infra/tests/guardrails.tftest.hcl` refuses any `custom_error_response` on the
+  distribution at plan time, so the shape the smoke catches after a deploy is
+  also refused before one.
+
+**Why curl.** Each property in the box is the status, content type or body of
+one HTTP response. A browser observes the same response less directly (a
+reload renders the page; a 404'd script shows only as a console error), and
+Playwright on the deploy runner would add a browser download and a second
+toolchain to the approved job for no extra signal. What a browser alone would
+prove — that the shell hydrates and the route renders — is the e2e suite's job
+against the same build, not the edge's.
+
+**Tests.** `backend/tests/test_frontend_publish.py` runs the script against a
+stubbed `curl` (a tenant-route reload that 404s fails; a missing asset served
+as the shell under a 404 fails; the passing run asks for the tenant route on
+every origin); the new tftest assertion was checked to fail with a 404 →
+`/index.html` error response added.

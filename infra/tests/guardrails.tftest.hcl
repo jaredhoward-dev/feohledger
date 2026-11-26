@@ -8,6 +8,7 @@
 # input guards, and the release-deploy grant (deploy.tf): one document, one
 # instance, one sha-shaped parameter; and the SPA stack (frontend.tf): a bucket
 # only this distribution reads, the platform certificate on the apex + wildcard,
+# the router as the only SPA fallback (no custom error responses),
 # a publish grant scoped to that bucket and distribution, a missing-asset alarm
 # on the 404 rate with the monitoring subscription that publishes that metric,
 # and DNS that stays on
@@ -1190,6 +1191,11 @@ run "distribution_serves_the_apex_and_every_tenant_on_the_platform_certificate" 
       f.event_type == "viewer-request"
     ])
     error_message = "The SPA router must run on viewer-request, or every deep link 404s."
+  }
+
+  assert {
+    condition     = length(aws_cloudfront_distribution.frontend.custom_error_response) == 0
+    error_message = "No custom error responses: mapping a 403/404 to /index.html would serve the SPA shell for a missing /_app/ asset (deploy/smoke-frontend.sh checks the same at the edge; docs/decisions.md §589). The router function is the SPA fallback."
   }
 
   assert {
