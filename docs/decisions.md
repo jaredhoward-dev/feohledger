@@ -29654,8 +29654,9 @@ values in the container config either way.
 
 **Not verified here.** Everything that needs AWS: the apply, the OIDC handshake
 from a private repo on the Free plan, the first upload, and the live sops key
-policy after the baseline re-apply. sops' `lastmodified` format is assumed to be
-RFC 3339 UTC (`…Z`); anything else is refused, fail-closed.
+policy after the baseline re-apply. sops' `lastmodified` format is RFC 3339 UTC
+(`…Z`), confirmed from the sops source in the review fixes below; anything else
+is refused, fail-closed.
 
 **Tests.** `infra/tests/guardrails.tftest.hcl` (the upload role's one subject,
 its one-key put and no KMS, the bucket's versioning, public-access block,
@@ -29675,6 +29676,84 @@ uses the `prod.sops.yaml` already on the VM and logs that plainly. Its presence
 switches the fetch on for good; an empty file, a bad name or a failed fetch
 still aborts. This is not a silent fallback: the log line names the state, and
 removing the file is a deliberate act on the VM.
+
+**Review fixes (round 51).** Seven findings from reviewing #735, each fixed with
+a test that failed before:
+
+- *The aws CLI's error text could reach the public log.* `get-object`'s stderr
+  can carry the bucket's URL and vm-deploy prints the log's tail. It now goes to
+  an owner-only temp file in `deploy/`, is reduced to the exit code and a fixed
+  class (`feoh_aws_error_class`: a known S3 error code such as `AccessDenied` or
+  `NoSuchKey`, else `no credentials` / `network` / `unclassified`), and is
+  deleted. Nothing of the CLI's own words is printed.
+- *Is `lastmodified` safe to order by? Yes — sops authenticates it.* Checked in
+  the source, getsops/sops at `5032a7184f1a1cac0f8cf3bc6b680b339a500395`:
+  `cmd/sops/common/common.go` `EncryptTree` sets `LastModified =
+  time.Now().UTC()` and encrypts the MAC with
+  `Cipher.Encrypt(mac, dataKey, LastModified.Format(time.RFC3339))` — the
+  timestamp is the AES-GCM additional data — and `DecryptTree` decrypts the MAC
+  with the same AAD and, unless `--ignore-mac` (decrypt-env.sh never passes it),
+  fails with "Cannot decrypt MAC" (`codes.MacMismatch`); `stores/stores.go`
+  parses the field with `time.Parse(time.RFC3339, …)`. So an uploader without the
+  key cannot move a genuine file's `lastmodified` forward: the decrypt fails and
+  the file is discarded (next bullet). No serial inside the payload was added;
+  it would buy nothing the MAC does not already give. Two gaps the
+  parse-then-format leaves are closed on our side, because the AAD covers the
+  *parsed instant*, not the bytes the awk reads: `feoh_sops_lastmodified`
+  accepts only `YYYY-MM-DDTHH:MM:SSZ` (what sops writes; a fraction is dropped by
+  `Format(RFC3339)` and an offset would let the same instant read as a
+  different string), and only when it is the one `lastmodified` in the file, a
+  direct child of the one `sops:` block, in a single YAML document — so the awk
+  and sops' YAML parser cannot be shown different lines. Pinned in
+  `test_deploy_release.py`, which also checks `lib.sh` still names the source
+  it relies on.
+- *A fetched file replaced `prod.sops.yaml` before it was proven to decrypt.*
+  `feoh_fetch_secrets` now only stages it (`FEOH_SECRETS_STAGED`);
+  `decrypt-env.sh` takes an optional file name in `deploy/` (default
+  `prod.sops.yaml`, so it still runs standalone; a path or option is refused);
+  `deploy.sh` hands it the staged file and `feoh_commit_secrets` moves it into
+  place and raises the replay floor only after it is accepted. A refused file
+  is removed by an EXIT trap, leaving the last working file, `.env` and the
+  floor as they were.
+- *Any principal with a broad `s3:*` could erase history or loosen the
+  bucket.* A `OnlyTerraformAdministers` Deny on `s3:DeleteObject`,
+  `s3:DeleteObjectVersion`, `s3:PutBucketVersioning`,
+  `s3:PutLifecycleConfiguration`, `s3:PutBucketPolicy` and
+  `s3:DeleteBucketPolicy` for every principal whose ARN is not like the apply
+  principal's. The repo had no existing pattern naming that principal (the
+  backups bucket relies on Object Lock, not a principal deny); `infra/README.md`
+  documents applying as the Identity Center `AdministratorAccess` role, so that
+  is the default, matched by its `aws-reserved/sso.amazonaws.com/` path with a
+  wildcard for the hash Identity Center appends, and
+  `terraform_admin_principal_arn_patterns` overrides it. The break-glass is
+  the account root: S3 lets the bucket owner's root principal Get/Put/Delete a
+  bucket policy that explicitly denies it (S3 API Reference, PutBucketPolicy
+  § Permissions, read 2026-11-25). Noncurrent-version expiry is S3's own
+  lifecycle action, not a principal's call, so the 30-version bound still runs.
+- *Plaintext could ride in a comment.* sops encrypts YAML comments by default
+  (`sops.go` `shouldBeEncrypted`, comments emitted as
+  `#ENC[AES256_GCM,…,type:comment]`); a plaintext one appears only through
+  `unencrypted_comment_regex` or a hand edit. infra-secrets'
+  `check-sops-ciphertext.py` now refuses any comment that is not an encrypted
+  one, any comment in the sops block (sops writes none there), and any entry
+  directly under `sops:` that is not sops metadata — with a synthetic-fixture
+  self-test the upload workflow runs first.
+- *Any workflow on infra-secrets' main could assume the upload role.* The trust
+  now also requires `token.actions.githubusercontent.com:job_workflow_ref` =
+  `<infra_secrets_repository>/.github/workflows/feohledger-upload.yml@refs/heads/main`.
+  AWS accepts `job_workflow_ref` as a GitHub trust key (IAM User Guide,
+  "Available keys for AWS OIDC federation", read 2026-11-25), so no sub-claim
+  customisation — a setting on infra-secrets shared by every role trusting it —
+  was needed. GitHub documents the claim for reusable workflows; for a
+  top-level job it is the job's own workflow path and ref, which is what is
+  pinned. That is not verified against a live token here: if the claim were
+  absent or different, `StringEquals` fails closed and the first upload is
+  refused (deploy/README.md owner step 3 says what that error means), and the
+  fallback is the sub pin alone. `infra_secrets_repository` is a new variable,
+  set in `prod.tfvars.sops`.
+- *The absent-file fallback should not outlive the rollout.* Tracked in
+  `docs/followups.md` (c): make the fetch mandatory once the first release log
+  shows `==> secrets: S3 version`.
 
 ## 592. A deleted invoice's documents leave object storage through an outbox, and an orphan scan reaches what no row names (follow-up from §586, round 51)
 

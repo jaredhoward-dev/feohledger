@@ -35,7 +35,7 @@ The whole flow is four commands on a fresh VM:
 | `db-role-cutover.sh` | One-shot, idempotent move of the app off the RDS master onto the `feoh_app` role (IAM auth, `CREATEDB`, owner of every app database — § Database role, `docs/decisions.md` §310). Runs as the master; `--check` reports, `--verify-login` proves the app role signs in with a token. SQL in `sql/`. |
 | `backup.sh` | Nightly pg dumps (globals + control plane + every `feoh_*` DB) streamed to S3. Cron installed by bootstrap. On RDS these are the long-retention, provider-independent copy beside RDS's automated backups + PITR (globals with `--no-role-passwords`); in container mode they are the whole DR story. Optional `BACKUP_PING_URL` heartbeat (healthchecks.io-style) so silent failures get noticed. Fails, without pinging, if the server's database list does not include the control plane `feohledger` — an empty list used to report success. |
 | `restore.sh` | Streams a night's dumps back from S3 — each DB via `pg_restore --create` (skips existing DBs unless `--force`). Container mode replays globals first; on RDS it skips them and restores with `--no-owner --no-acl` so everything belongs to the master user. Stops the api for the duration, rolls the stack back up after. Test it once against a scratch stack. On RDS, a point-in-time restore is the first choice (`docs/minimal-deployment.md` § Point-in-time restore). A logical restore on RDS runs as the master (break-glass, § Database role) and refuses the IAM app role, which cannot recreate pgvector. |
-| `decrypt-env.sh` | Decrypts `prod.sops.yaml` to `.env` and checks it — required keys, JWT key strength, the payee fingerprint key (its own, at least 32 chars), values compose's `env_file` would silently rewrite, and the database mode (RDS: a URL `lib.sh` can parse, `PGSSLMODE` `verify-full`, and either a password or `FEOH_DATABASE_IAM_AUTH` true — never both; container: `POSTGRES_PASSWORD`, no TLS mode it cannot serve) — before it replaces the current `.env`. `deploy.sh` runs it; run it on its own to check a new secrets file without deploying. |
+| `decrypt-env.sh` | Decrypts `prod.sops.yaml` to `.env` and checks it — required keys, JWT key strength, the payee fingerprint key (its own, at least 32 chars), values compose's `env_file` would silently rewrite, and the database mode (RDS: a URL `lib.sh` can parse, `PGSSLMODE` `verify-full`, and either a password or `FEOH_DATABASE_IAM_AUTH` true — never both; container: `POSTGRES_PASSWORD`, no TLS mode it cannot serve) — before it replaces the current `.env`. `deploy.sh` runs it on the fetched file, staged (`decrypt-env.sh <file>`), and moves that over `prod.sops.yaml` only if it passes; run it on its own (no argument: `prod.sops.yaml`) to check a secrets file without deploying. |
 | `prod.sops.yaml.example` | Template for the VM's secrets file: flat YAML keyed by env var name, every value quoted. The encrypted original lives in `infra-secrets` (`docs/decisions.md` §171). |
 
 ## Before the VM (once per project)
@@ -88,15 +88,23 @@ changes `feohledger/prod.sops.yaml` uploads its ciphertext to the secrets
 bucket; the next gated deploy applies it:
 
 - `deploy.sh` fetches the current version under its deploy lock
-  (`lib.sh` `feoh_fetch_secrets`), to a 0600 temp file in `deploy/`, and moves
-  it over `prod.sops.yaml` only once it is sops ciphertext with a readable
-  `lastmodified`. A failed or refused fetch stops the deploy with the old file
-  and `.env` untouched.
+  (`lib.sh` `feoh_fetch_secrets`) and **stages** it as a 0600 temp file in
+  `deploy/` once it is sops ciphertext with one readable `lastmodified`. It
+  hands the staged file to `decrypt-env.sh <file>`, and moves it over
+  `prod.sops.yaml` only once that accepts it (`feoh_commit_secrets`). A failed
+  or refused fetch, or a file `decrypt-env.sh` refuses (a MAC that fails, a
+  missing var), stops the deploy with the old `prod.sops.yaml`, `.env` and
+  replay floor untouched, and the staged file deleted.
 - It logs the S3 version id and the sops `lastmodified`, nothing else — the run
-  log is public.
+  log is public. A failed `aws` call's own error text (which can name the
+  bucket's URL) never reaches it: only the exit code and a coarse class
+  (`AccessDenied`, `NoSuchKey`, `no credentials`, `network`, …).
 - **Replay guard:** a file whose `lastmodified` is older than the one last
   applied (`deploy/.secrets-applied`) is refused. A deliberate rollback is
   `./deploy.sh --no-pull --allow-secrets-rollback` from a Session Manager shell.
+  The guard may trust that field because sops authenticates it: it is the
+  additional data of the MAC's AES-GCM encryption, so an edited one fails the
+  decrypt (`docs/decisions.md` §591 cites the sops source).
 - **A secrets-only change** (an emergency rotation too) goes live by running
   **Deploy to the VM** by hand from the tag of the live release and approving
   it: the same code redeploys on the new secrets. infra-secrets' CI can only
@@ -112,17 +120,26 @@ untouched.
 
 ### Owner steps (once, in this order)
 
-1. Add `secrets_bucket_name` and `infra_secrets_oidc_sub_prefix` to
+1. Add `secrets_bucket_name`, `infra_secrets_oidc_sub_prefix` and
+   `infra_secrets_repository` (`<owner>/<name>`) to
    `infra-secrets/feohledger/prod.tfvars.sops` (`../infra/terraform.tfvars.example`
-   shows both; read the prefix with
+   shows them; read the prefix with
    `gh api repos/<owner>/infra-secrets/actions/oidc/customization/sub --jq .sub_claim_prefix`),
-   then plan and apply `infra/` (`../infra/README.md` § Applying).
+   then plan and apply `infra/` (`../infra/README.md` § Applying) as the
+   Identity Center `AdministratorAccess` role — the bucket policy leaves
+   deleting versions and changing versioning, the lifecycle or the policy to
+   that role alone (`terraform_admin_principal_arn_patterns` if you apply as
+   another).
 2. In infra-secrets, set the repository **variables**
    `FEOHLEDGER_SECRETS_BUCKET` (`terraform output -raw secrets_bucket`) and
    `FEOHLEDGER_SECRETS_UPLOAD_ROLE_ARN` (`terraform output -raw secrets_upload_role_arn`),
    and merge the `feohledger-upload.yml` workflow there.
 3. First upload: run that workflow by hand on `main` (it has
    `workflow_dispatch`), or merge any change to the file. Check it went green.
+   The role trusts only that workflow file on `main` (GitHub's
+   `job_workflow_ref` claim); a `Not authorized to perform
+   sts:AssumeRoleWithWebIdentity` here means the claim did not match — check
+   `infra_secrets_repository` and the workflow's file name.
 4. On the VM, from a Session Manager shell:
    `echo '<the secrets_bucket output>' > ~/feohledger/deploy/secrets-bucket`.
 5. Delete every version of the old `transfer/prod.sops.yaml` from the backups

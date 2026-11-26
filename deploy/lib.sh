@@ -482,41 +482,101 @@ FEOH_SECRETS_KEY=prod.sops.yaml
 FEOH_SECRETS_BUCKET_FILE=secrets-bucket
 # The sops `lastmodified` of the last file decrypt-env.sh accepted.
 FEOH_SECRETS_APPLIED_FILE=.secrets-applied
+# Set by feoh_fetch_secrets: the fetched file, staged beside prod.sops.yaml
+# until decrypt-env.sh accepts it (feoh_commit_secrets) or the deploy stops
+# (feoh_discard_staged_secrets).
+FEOH_SECRETS_STAGED=""
 
 # feoh_sops_lastmodified <file> prints the `lastmodified` of the file's
-# top-level `sops:` block, or nothing. Metadata only: no key, no value.
+# top-level `sops:` block, or nothing when that cannot be read unambiguously.
+# Metadata only: no key, no value.
+#
+# Why the replay guard may trust this field (docs/decisions.md §591): sops
+# encrypts the file's MAC with AES-GCM using `lastmodified` — re-formatted as
+# RFC 3339 — as the additional authenticated data, and `sops -d` refuses the
+# file when that MAC does not decrypt ("Cannot decrypt MAC", exit
+# MacMismatch). getsops/sops@5032a7184f1a, cmd/sops/common/common.go
+# EncryptTree / DecryptTree; stores/stores.go parses it with time.RFC3339. So a
+# file whose lastmodified was edited fails decrypt-env.sh, and the staged file
+# is discarded. Two gaps that re-formatting leaves are closed here, because
+# what the AAD covers is the PARSED time, not these bytes: the value must be
+# exactly YYYY-MM-DDTHH:MM:SSZ (what sops writes: time.Now().UTC()), so no
+# fraction or offset can change the string without changing the time; and it
+# must be the one `lastmodified` in the file, a direct child of the one `sops:`
+# block, in a single YAML document, so this awk and sops' YAML parser read the
+# same line.
 feoh_sops_lastmodified() {
 	awk '
-		/^sops:[[:space:]]*$/ { in_sops = 1; next }
+		/^(---|\.\.\.)([[:space:]]|$)/ { bad = 1 }
+		/^sops:[[:space:]]*$/ { blocks++; in_sops = 1; ind = -1; next }
 		in_sops && /^[^[:space:]#]/ { in_sops = 0 }
-		in_sops && $1 == "lastmodified:" {
-			v = $2
-			gsub(/["\047]/, "", v)
+		$1 == "lastmodified:" { count++ }
+		in_sops && /^[[:space:]]+[^[:space:]#]/ {
+			match($0, /^[[:space:]]+/)
+			if (ind < 0) ind = RLENGTH
+			if (RLENGTH == ind && $1 == "lastmodified:") { v = $2; n = NF }
+		}
+		END {
+			if (bad || blocks != 1 || count != 1 || n != 2) exit
+			if (v ~ /^"[^"\047]*"$/ || v ~ /^\047[^"\047]*\047$/) v = substr(v, 2, length(v) - 2)
+			if (v !~ /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]Z$/) exit
 			print v
-			exit
 		}
 	' "$1" 2>/dev/null || true
 }
 
-# feoh_fetch_secrets [allow-rollback] replaces deploy/prod.sops.yaml with the
-# bucket's current version, and sets FEOH_SECRETS_LASTMODIFIED for
-# feoh_record_secrets_applied. Any failure returns non-zero BEFORE the old file
-# is touched, so the old file and deploy/.env stay as they were.
+# feoh_aws_error_class <stderr-file> prints a coarse, fixed class for an aws CLI
+# failure — the S3 error code when it is one of a known few, else a fixed word.
+# Never the CLI's own text: it can carry the bucket's URL, and the deploy log is
+# public (vm-deploy.yml prints its tail).
+feoh_aws_error_class() {
+	local code
+	code=$(sed -n 's/.*An error occurred (\([A-Za-z]*\)).*/\1/p' "$1" 2>/dev/null | head -n 1)
+	case "$code" in
+	AccessDenied | NoSuchKey | NoSuchBucket | ExpiredToken | InvalidToken | \
+		InvalidAccessKeyId | SignatureDoesNotMatch | SlowDown | InternalError | \
+		ServiceUnavailable | RequestTimeout | 403 | 404)
+		echo "$code"
+		return 0
+		;;
+	esac
+	if grep -q 'Unable to locate credentials' "$1" 2>/dev/null; then
+		echo "no credentials"
+	elif grep -qE 'Could not connect|Connect timeout|Read timeout' "$1" 2>/dev/null; then
+		echo "network"
+	else
+		echo "unclassified"
+	fi
+}
+
+# feoh_fetch_secrets [allow-rollback] fetches the bucket's current version and
+# STAGES it beside deploy/prod.sops.yaml (FEOH_SECRETS_STAGED), setting
+# FEOH_SECRETS_LASTMODIFIED for feoh_commit_secrets. Nothing replaces
+# prod.sops.yaml here: deploy.sh hands the staged file to decrypt-env.sh, and
+# only once that accepts it does feoh_commit_secrets move it into place. Any
+# failure returns non-zero with the staged file removed, so the old file,
+# deploy/.env and the replay floor stay as they were.
 #
 # It logs the S3 version id and the sops lastmodified only — the deploy log is
-# public (vm-deploy.yml prints its tail), so never a key name.
+# public (vm-deploy.yml prints its tail), so never a key name, and never the aws
+# CLI's own error text, which can carry the bucket's URL: that goes to an
+# owner-only temp file, reduced to a fixed class (feoh_aws_error_class), and
+# deleted.
 #
 # The replay guard: infra-secrets' CI holds no KMS, so it cannot forge a file
 # sops accepts, but it could re-upload an older, genuine one (a revoked key
 # brought back). A file whose lastmodified is older than the last one applied is
-# refused unless allow-rollback is 1 (deploy.sh --allow-secrets-rollback).
+# refused unless allow-rollback is 1 (deploy.sh --allow-secrets-rollback). The
+# field is authenticated by the sops MAC (feoh_sops_lastmodified above).
 feoh_fetch_secrets() {
-	local allow_rollback=${1:-0} bucket tmp version new old=""
+	local allow_rollback=${1:-0} bucket tmp err version new old="" rc=0 class
+	FEOH_SECRETS_STAGED=""
 	# A VM where delivery is not set up yet (no bucket file at all — the owner
 	# steps in deploy/README.md § Secrets delivery are not done) keeps the copy
 	# it already has, said plainly in the log, so merging this never stops a
 	# release on infrastructure nobody has applied. Once the file exists the
 	# fetch is mandatory: an empty file, a bad name or a failed fetch aborts.
+	# (docs/followups.md: drop this fallback once every VM fetches.)
 	if [ ! -e "$FEOH_SECRETS_BUCKET_FILE" ]; then
 		echo "==> secrets: delivery is not set up on this VM (no deploy/${FEOH_SECRETS_BUCKET_FILE}); using the ${FEOH_SECRETS_KEY} already here (deploy/README.md § Secrets delivery)."
 		return 0
@@ -534,12 +594,20 @@ feoh_fetch_secrets() {
 		echo "secrets: could not create a temp file in deploy/." >&2
 		return 1
 	}
-	if ! version=$(aws s3api get-object --bucket "$bucket" --key "$FEOH_SECRETS_KEY" \
-		--query VersionId --output text "$tmp"); then
+	err=$(umask 077 && mktemp "${FEOH_SECRETS_KEY}.fetch.err.XXXXXX") || {
 		rm -f "$tmp"
-		echo "secrets: could not fetch the secrets ciphertext from S3 — the deploy stops here; prod.sops.yaml and .env are unchanged." >&2
+		echo "secrets: could not create a temp file in deploy/." >&2
+		return 1
+	}
+	version=$(aws s3api get-object --bucket "$bucket" --key "$FEOH_SECRETS_KEY" \
+		--query VersionId --output text "$tmp" 2>"$err") || rc=$?
+	if [ "$rc" != 0 ]; then
+		class=$(feoh_aws_error_class "$err")
+		rm -f "$tmp" "$err"
+		echo "secrets: could not fetch the secrets ciphertext from S3 (aws exited ${rc}: ${class}) — the deploy stops here; prod.sops.yaml and .env are unchanged." >&2
 		return 1
 	fi
+	rm -f "$err"
 	if ! [[ "$version" =~ ^[A-Za-z0-9._-]+$ ]] || [ "$version" = None ] || [ "$version" = null ]; then
 		rm -f "$tmp"
 		echo "secrets: S3 returned no version id — is versioning on for the secrets bucket? Nothing was changed." >&2
@@ -551,9 +619,9 @@ feoh_fetch_secrets() {
 		return 1
 	fi
 	new=$(feoh_sops_lastmodified "$tmp")
-	if ! [[ "$new" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\.[0-9]+)?Z$ ]]; then
+	if [ -z "$new" ]; then
 		rm -f "$tmp"
-		echo "secrets: S3 version ${version} has no readable sops lastmodified — refused; nothing was changed." >&2
+		echo "secrets: S3 version ${version} has no single readable sops lastmodified (YYYY-MM-DDTHH:MM:SSZ) — refused; nothing was changed." >&2
 		return 1
 	fi
 	[ -f "$FEOH_SECRETS_APPLIED_FILE" ] && old=$(head -n 1 "$FEOH_SECRETS_APPLIED_FILE" | tr -d '[:space:]')
@@ -566,14 +634,28 @@ feoh_fetch_secrets() {
 		fi
 		echo "WARN: secrets rollback allowed: applying ${new}, older than ${old}." >&2
 	fi
-	mv -f "$tmp" "$FEOH_SECRETS_KEY"
-	echo "==> secrets: S3 version ${version}, sops lastmodified ${new}"
+	echo "==> secrets: S3 version ${version}, sops lastmodified ${new} (staged; applied once decrypt-env.sh accepts it)"
+	FEOH_SECRETS_STAGED=$tmp
 	FEOH_SECRETS_LASTMODIFIED=$new
 }
 
-# feoh_record_secrets_applied records the lastmodified feoh_fetch_secrets
-# fetched, once decrypt-env.sh has accepted the file — the replay guard's floor.
-feoh_record_secrets_applied() {
+# feoh_discard_staged_secrets removes a staged file decrypt-env.sh did not
+# accept (deploy.sh's EXIT trap), so the old prod.sops.yaml stays in place.
+feoh_discard_staged_secrets() {
+	if [ -n "${FEOH_SECRETS_STAGED:-}" ]; then
+		rm -f "$FEOH_SECRETS_STAGED"
+	fi
+	FEOH_SECRETS_STAGED=""
+}
+
+# feoh_commit_secrets, once decrypt-env.sh has accepted the staged file, moves
+# it into place as deploy/prod.sops.yaml and records its lastmodified — the
+# replay guard's floor. With nothing staged (delivery not set up) it is a no-op.
+feoh_commit_secrets() {
+	if [ -n "${FEOH_SECRETS_STAGED:-}" ]; then
+		mv -f "$FEOH_SECRETS_STAGED" "$FEOH_SECRETS_KEY" || return 1
+		FEOH_SECRETS_STAGED=""
+	fi
 	[ -n "${FEOH_SECRETS_LASTMODIFIED:-}" ] || return 0
 	printf '%s\n' "$FEOH_SECRETS_LASTMODIFIED" >"${FEOH_SECRETS_APPLIED_FILE}.tmp" &&
 		mv -f "${FEOH_SECRETS_APPLIED_FILE}.tmp" "$FEOH_SECRETS_APPLIED_FILE"

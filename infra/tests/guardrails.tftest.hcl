@@ -22,8 +22,10 @@
 # (backup_erasure.tf): each role trusts exactly one subject, runs only its own
 # documents on only the app VM, deletes only per-tenant dump versions, never the
 # control-plane dump, and the VM role still cannot delete a backup; and secrets
-# delivery (secrets_delivery.tf): infra-secrets' main alone may put the one
-# ciphertext key, with no KMS, and only the VM may read it.
+# delivery (secrets_delivery.tf): infra-secrets' main alone, from its one
+# upload workflow, may put the one ciphertext key, with no KMS; only the VM may
+# read it; and only the Terraform apply principal may delete versions or loosen
+# versioning, the lifecycle or the bucket policy.
 
 mock_provider "aws" {
   # A mocked policy document renders a random string, which the KMS key and
@@ -311,6 +313,7 @@ variables {
   github_oidc_sub_prefix        = "repo:example-owner@1/feohledger@2"
   secrets_bucket_name           = "feohledger-secrets-test"
   infra_secrets_oidc_sub_prefix = "repo:example-owner@1/infra-secrets@3"
+  infra_secrets_repository      = "example-owner/infra-secrets"
 }
 
 run "budget_alerts_every_address_on_actual_and_forecast" {
@@ -1655,8 +1658,9 @@ run "secrets_upload_role_trusts_only_infra_secrets_main" {
       ]) == toset([
       "token.actions.githubusercontent.com:aud=sts.amazonaws.com",
       "token.actions.githubusercontent.com:sub=repo:example-owner@1/infra-secrets@3:ref:refs/heads/main",
+      "token.actions.githubusercontent.com:job_workflow_ref=example-owner/infra-secrets/.github/workflows/feohledger-upload.yml@refs/heads/main",
     ])
-    error_message = "The upload role must trust exactly the STS audience and infra-secrets' main — never this repo, a branch or a pull request."
+    error_message = "The upload role must trust exactly the STS audience, infra-secrets' main, and the one upload workflow file there — never this repo, a branch, a pull request or another workflow."
   }
 }
 
@@ -1743,6 +1747,65 @@ run "secrets_bucket_denies_every_other_writer_and_reader" {
     ])
     error_message = "The secrets bucket must refuse plain HTTP."
   }
+
+  # Deleting versions, switching versioning or the lifecycle off, or rewriting
+  # this policy is the Terraform apply principal's alone (by default the
+  # Identity Center AdministratorAccess role). Matched by ArnNotLike on the
+  # principal's ARN, over the bucket AND its objects.
+  assert {
+    condition = anytrue([
+      for s in data.aws_iam_policy_document.secrets_bucket.statement :
+      s.sid == "OnlyTerraformAdministers" && s.effect == "Deny"
+      && toset(s.actions) == toset([
+        "s3:DeleteObject", "s3:DeleteObjectVersion", "s3:PutBucketVersioning",
+        "s3:PutLifecycleConfiguration", "s3:PutBucketPolicy", "s3:DeleteBucketPolicy",
+      ])
+      && toset(s.resources) == toset(["arn:aws:s3:::feohledger-secrets-test", "arn:aws:s3:::feohledger-secrets-test/*"])
+      && toset([for pr in s.principals : "${pr.type}=${join(",", pr.identifiers)}"]) == toset(["AWS=*"])
+      && toset([for c in s.condition : "${c.test}:${c.variable}=${join(",", c.values)}"]) == toset([
+        "ArnNotLike:aws:PrincipalArn=arn:aws:iam::000000000000:role/aws-reserved/sso.amazonaws.com/*AWSReservedSSO_AdministratorAccess_*",
+      ])
+    ])
+    error_message = "The bucket policy must deny deleting objects or versions and changing versioning, the lifecycle or the policy to every principal but the Terraform apply principal."
+  }
+}
+
+run "secrets_bucket_admin_principal_is_overridable" {
+  command = plan
+
+  variables {
+    terraform_admin_principal_arn_patterns = ["arn:aws:iam::000000000000:role/terraform-apply"]
+  }
+
+  assert {
+    condition = anytrue([
+      for s in data.aws_iam_policy_document.secrets_bucket.statement :
+      s.sid == "OnlyTerraformAdministers" && anytrue([
+        for c in s.condition : toset(c.values) == toset(["arn:aws:iam::000000000000:role/terraform-apply"])
+      ])
+    ])
+    error_message = "terraform_admin_principal_arn_patterns must replace the default apply principal in the secrets bucket's admin deny."
+  }
+}
+
+run "secrets_bucket_admin_principal_must_be_an_iam_arn" {
+  command = plan
+
+  variables {
+    terraform_admin_principal_arn_patterns = ["*"]
+  }
+
+  expect_failures = [var.terraform_admin_principal_arn_patterns]
+}
+
+run "infra_secrets_repository_is_required_and_shaped" {
+  command = plan
+
+  variables {
+    infra_secrets_repository = "https://github.com/example-owner/infra-secrets"
+  }
+
+  expect_failures = [var.infra_secrets_repository]
 }
 
 run "app_vm_reads_only_the_secrets_key_and_never_writes_it" {

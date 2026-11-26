@@ -9,7 +9,13 @@
 # deploy/prod.sops.yaml.example). sops converts it to the dotenv that compose's
 # env_file and the other deploy scripts read (docs/decisions.md §171).
 #
-# Usage: decrypt-env.sh
+# Usage: decrypt-env.sh [<file>]
+#
+# <file> defaults to prod.sops.yaml. deploy.sh passes the file it just fetched
+# and staged beside it (lib.sh feoh_fetch_secrets), and moves that into place as
+# prod.sops.yaml only once this script has accepted it — so a fetched file
+# that fails here never replaces the one that worked. It must be a file name in
+# deploy/, not a path.
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -18,8 +24,14 @@ die() {
 	exit 1
 }
 
+[ $# -le 1 ] || die "usage: decrypt-env.sh [<file in deploy/>]"
+SRC=${1-prod.sops.yaml}
+case "$SRC" in
+"" | */* | -*) die "usage: decrypt-env.sh [<file in deploy/>] — a file name in deploy/, not a path." ;;
+esac
+
 command -v sops >/dev/null || die "'sops' not installed — run deploy/bootstrap-vm.sh first."
-[ -f prod.sops.yaml ] || die "prod.sops.yaml missing — deploy.sh fetches it from the secrets bucket (deploy/README.md § Secrets; template: deploy/prod.sops.yaml.example)."
+[ -f "$SRC" ] || die "${SRC} missing — deploy.sh fetches prod.sops.yaml from the secrets bucket (deploy/README.md § Secrets; template: deploy/prod.sops.yaml.example)."
 
 # Decrypt fresh on every run (KMS access via the instance profile) into a temp
 # file, check that, and only then move it into place. `sops -d >.env` would
@@ -29,7 +41,7 @@ command -v sops >/dev/null || die "'sops' not installed — run deploy/bootstrap
 # good run.
 umask 077
 trap 'rm -f .env.tmp' EXIT
-sops -d --input-type yaml --output-type dotenv prod.sops.yaml >.env.tmp
+sops -d --input-type yaml --output-type dotenv "$SRC" >.env.tmp
 
 # sops emits every value unquoted, and compose's env_file parser then rewrites
 # some without a word: an unquoted ` #` starts a comment (the rest of the value
