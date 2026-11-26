@@ -319,6 +319,7 @@ export const messages = {
 	'audit.action.requisition.updated': "Demande d'achat mise à jour",
 	'audit.action.retention.archived': "Enregistrements archivés selon la politique de conservation",
 	'audit.action.retention_policy.updated': "Politique de conservation mise à jour",
+	'audit.action.storage.objects_deleted': "Documents stockés des factures supprimées effacés",
 	'audit.action.role.created': "Rôle créé",
 	'audit.action.role.deleted': "Rôle supprimé",
 	'audit.action.role.updated': "Rôle mis à jour",

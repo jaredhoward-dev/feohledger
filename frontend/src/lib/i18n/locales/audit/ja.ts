@@ -319,6 +319,7 @@ export const messages = {
 	'audit.action.requisition.updated': "購買申請を更新",
 	'audit.action.retention.archived': "保持ポリシーに基づきアーカイブ",
 	'audit.action.retention_policy.updated': "保持ポリシーを更新",
+	'audit.action.storage.objects_deleted': "削除済み請求書の保存文書を削除",
 	'audit.action.role.created': "ロールを作成",
 	'audit.action.role.deleted': "ロールを削除",
 	'audit.action.role.updated': "ロールを更新",
