@@ -13,21 +13,30 @@
 	 *
 	 * Every string arrives already localized, so each caller keeps its own key
 	 * namespace. The button always reads `common.retry`: one label for one
- * situation, everywhere (a panel that said "Try again" sent a spec looking
- * for a button that did not exist).
+	 * situation, everywhere (a panel that said "Try again" sent a spec looking
+	 * for a button that did not exist).
 	 *
 	 * Two shapes:
 	 *
 	 * - **In a page** (no `heading`): `role="alert"`, because it replaces content
-	 *   the reader was waiting for. Retry unmounts this block — the caller clears
-	 *   its error flag to show its loading line — so the focused button vanishes
-	 *   and focus would fall to `<body>`, putting a keyboard user back at the top
-	 *   of the document. Focus moves to the enclosing `<main>` first (the
-	 *   layout's skip-link target, already `tabindex="-1"`), so the next Tab
-	 *   lands in the page content that replaces this (WCAG 2.4.3). Inside a
-	 *   dialog (`ui/Modal`, also `tabindex="-1"`) it is the dialog that takes
-	 *   focus instead: `<main>` is outside the focus trap, and focusing it would
-	 *   strand a keyboard user behind the open modal.
+	 *   the reader was waiting for. Focus follows what Retry did to this block,
+	 *   never a guess made before it ran (WCAG 2.4.3):
+	 *   - The caller **unmounts** it (clears its error flag to show its loading
+	 *     line, now or when the retry lands): the focused button vanishes and
+	 *     focus would fall to `<body>`, back at the top of the document. So once
+	 *     the button is gone, and only if focus really was lost with it, focus
+	 *     moves to the enclosing `<main>` (the layout's skip-link target, already
+	 *     `tabindex="-1"`) and the next Tab lands in the content that replaced
+	 *     this. Inside a dialog (`ui/Modal`, also `tabindex="-1"`) the dialog
+	 *     takes it instead: `<main>` is outside the focus trap.
+	 *   - The caller **keeps it mounted** through the retry (`retrying`, as the
+	 *     profile cards do): focus stays on the button the user pressed, which
+	 *     reads `common.retrying` meanwhile.
+	 *   A retry that fails again re-renders the message, so the alert is
+	 *   announced again instead of sitting on unchanged text (WCAG 4.1.3). For
+	 *   that the block counts attempts itself: `retrying` turning false while it
+	 *   is still mounted, or the promise `onretry` returned settling with it
+	 *   still mounted, is a repeated failure.
 	 * - **Replacing the whole screen** (`heading` given): a titled region whose
 	 *   heading the caller focuses through {@link focusHeading}, which is what a
 	 *   screen reader announces — so no `role="alert"` on top of it, which would
@@ -39,7 +48,7 @@
 	 * `actions` renders after Retry, for a second way out (the account panel's
 	 * Log out).
 	 */
-	import type { Snippet } from 'svelte';
+	import { tick, type Snippet } from 'svelte';
 	import { m } from '#lib/i18n/store.svelte.ts';
 
 	let {
@@ -52,7 +61,9 @@
 		testId
 	}: {
 		message: string;
-		onretry: () => void;
+		/** Run the retry. Return its promise when the block may stay mounted
+		 *  until it settles, so focus and the re-announcement follow the result. */
+		onretry: () => unknown;
 		/** A title for the failure. Omit inside a page; pass when this replaces the screen. */
 		heading?: string;
 		headingLevel?: 1 | 2 | 3;
@@ -72,15 +83,53 @@
 		headingEl?.focus();
 	}
 
-	function retry(e: MouseEvent) {
+	/** Bumped on each failed retry that leaves this block mounted; the message
+	 *  is keyed on it so the alert re-announces the same words. */
+	let attempt = $state(0);
+	let wasRetrying = false;
+	$effect(() => {
+		const now = retrying;
+		if (wasRetrying && !now) attempt += 1;
+		wasRetrying = now;
+	});
+
+	/** Focus was lost with the button (it unmounted while focused). */
+	function focusLost(): boolean {
+		const active = document.activeElement;
+		return active === null || active === document.body;
+	}
+
+	async function retry(e: MouseEvent) {
 		if (retrying) return;
-		if (!heading) (e.currentTarget as HTMLElement).closest<HTMLElement>('[role="dialog"], main')?.focus();
-		onretry();
+		const button = e.currentTarget as HTMLElement;
+		// Noted now: once the block unmounts the button has no ancestors left.
+		const container = heading
+			? null
+			: button.closest<HTMLElement>('[role="dialog"], main');
+		const before = attempt;
+		const result = onretry();
+		await tick();
+		if (!button.isConnected) {
+			if (focusLost()) container?.focus();
+			return;
+		}
+		if (!(result instanceof Promise)) return;
+		await result.catch(() => {});
+		await tick();
+		if (!button.isConnected) {
+			if (focusLost()) container?.focus();
+		} else if (attempt === before) {
+			// Still here once the retry settled: it failed again. A caller that
+			// drives `retrying` was already counted by the effect.
+			attempt += 1;
+		}
 	}
 </script>
 
 {#snippet body()}
-	<p class="message">{message}</p>
+	{#key attempt}
+		<p class="message">{message}</p>
+	{/key}
 	<div class="actions">
 		<button type="button" class="btn-primary" onclick={retry} aria-disabled={retrying || undefined}>
 			{retrying ? m('common.retrying') : m('common.retry')}
