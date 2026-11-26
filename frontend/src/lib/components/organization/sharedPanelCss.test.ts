@@ -5,7 +5,7 @@ import { extractStyleBlocks, parseRules, stripCssComments } from '../../a11y/css
 /**
  * The `/organization` panels share one form layout, declared once in
  * `app.css` under `.org-panel` (decisions §530). Before that each panel
- * carried a scoped copy, and a copy drifted: one panel lost the ≤600px rule
+ * carried a scoped copy, and a copy drifted: one panel lost the ≤600px rule (now ≤640px, §590)
  * that folds `.form-grid` to one column.
  *
  *   1. `app.css` declares each shared rule under `.org-panel`, including the
@@ -51,11 +51,11 @@ function classesIn(selector: string): string[] {
 	return [...selector.matchAll(/\.(-?[_a-zA-Z][\w-]*)/g)].map((m) => m[1]);
 }
 
-/** The body of `@media (max-width: 600px) { … }` blocks in a stylesheet. */
+/** The body of `@media (max-width: 640px) { … }` blocks in a stylesheet. */
 function phoneBlocks(css: string): string[] {
 	const out: string[] = [];
 	const clean = stripCssComments(css);
-	const re = /@media\s*\(max-width:\s*600px\)\s*\{/g;
+	const re = /@media\s*\(max-width:\s*640px\)\s*\{/g;
 	for (let m = re.exec(clean); m; m = re.exec(clean)) {
 		let depth = 1;
 		let i = m.index + m[0].length;
@@ -91,7 +91,7 @@ describe('organization panels share their form layout from app.css', () => {
 	it('app.css folds .form-grid to one column at phone width', () => {
 		const phone = phoneBlocks(appCss).flatMap((b) => parseRules(b));
 		const rule = phone.find((r) => r.selector === '.org-panel .form-grid');
-		expect(rule, 'the ≤600px .org-panel .form-grid rule').toBeDefined();
+		expect(rule, 'the ≤640px .org-panel .form-grid rule').toBeDefined();
 		expect(new Map(rule!.declarations).get('grid-template-columns')).toBe('1fr');
 	});
 
@@ -131,6 +131,6 @@ describe('organization panels share their form layout from app.css', () => {
 		expect(usesClass('<div class="form-grid-x">', 'form-grid')).toBe(false);
 		expect(usesClass('<div class="a form-grid">', 'form-grid')).toBe(true);
 		expect(usesClass('<label class:full-width={x}>', 'full-width')).toBe(true);
-		expect(phoneBlocks('@media (max-width: 600px) { .a { b: c; } }')).toEqual([' .a { b: c; } ']);
+		expect(phoneBlocks('@media (max-width: 640px) { .a { b: c; } }')).toEqual([' .a { b: c; } ']);
 	});
 });

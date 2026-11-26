@@ -218,7 +218,7 @@
 		to { opacity: 1; transform: translate3d(0, 0, 0) rotate(0); }
 	}
 
-	@media (max-width: 960px) {
+	@media (max-width: 1024px) {
 		.auth-shell {
 			grid-template-columns: 1fr;
 		}

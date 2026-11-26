@@ -291,7 +291,7 @@ The current build implements:
   the control that opened the dialog. Guarded by
   `frontend/src/lib/actions/modalInert.test.ts` and
   `frontend/tests-e2e/a11y/modal-inert.spec.ts`.
-- **The sidebar on a phone floats over the page** — at 700px and below the
+- **The sidebar on a phone floats over the page** — at 768px and below the
   sidebar is an icon rail, and expanding it opens the full panel as an overlay
   over an inert, dimmed page instead of squeezing the content to the ~100px a
   320px screen has left beside a pushed panel (SC 1.4.10). Focus moves into the

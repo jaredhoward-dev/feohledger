@@ -55,8 +55,8 @@ for (const size of [
 	{ width: 1000, height: 700 },
 	{ width: 1000, height: 560 },
 	{ width: 1280, height: 720 },
-	{ width: 961, height: 640 },
-	// Below 960px signup keeps the panel (`panelOnMobile`), stacked under the
+	{ width: 1025, height: 640 },
+	// At 1024px and below signup keeps the panel (`panelOnMobile`), stacked under the
 	// form and at its narrowest — and still clipping. `a11y/reflow.spec.ts`
 	// cannot see this: it measures page-level scroll, which a clip hides.
 	{ width: 375, height: 812 },

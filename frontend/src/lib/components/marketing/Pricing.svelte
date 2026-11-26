@@ -211,7 +211,7 @@
 		gap: 16px;
 		align-items: start;
 	}
-	@media (max-width: 1100px) {
+	@media (max-width: 1200px) {
 		.grid { grid-template-columns: repeat(2, 1fr); gap: 20px; }
 	}
 	@media (max-width: 640px) {

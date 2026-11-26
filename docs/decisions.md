@@ -29477,3 +29477,89 @@ stubbed `curl` (a tenant-route reload that 404s fails; a missing asset served
 as the shell under a 404 fails; the passing run asks for the tenant route on
 every origin); the new tftest assertion was checked to fail with a 404 →
 `/index.html` error response added.
+
+## 590. The supported viewport floor is 320px; width queries use one seven-step px scale with a CI guard; at the narrow step the sidebar is the icon rail with the reader's wide choice kept apart, section tabs scroll inside their row, and tables keep every column (#432, round 51)
+
+**Context.** #432 asked three product questions and found 42 width `@media`
+queries across 23 values (`700`, `720`, `760` and `768` were four answers to
+one question), three of them rem, and two more as JS `matchMedia` strings
+nothing could grep. The owner delegated the calls: the floor is **320px**
+(WCAG 2.2 SC 1.4.10, which `tests-e2e/a11y/reflow.spec.ts` already asserts for
+every route); below the narrow breakpoint the sidebar collapses to its icon
+state; dense tables keep horizontal scroll inside their container.
+
+**Floor.** 320px is the supported minimum, recorded in `frontend/CLAUDE.md` and
+`frontend/docs/ui-patterns.md` § Viewport floor and breakpoints. It is a
+floor, not a breakpoint; below it is unsupported and untested.
+
+**Scale, not tokens.** A `var()` cannot appear in a `@media` condition, and the
+build has no `@custom-media` step (no PostCSS / Lightning CSS config; adding
+one for this was not worth a dependency), so `--bp-*` custom properties would
+have been decoration. The scale is data in `src/lib/breakpoints.ts` — `2xs`
+360, `xs` 400, `sm` 480, `md` 640, `lg` 768, `xl` 1024, `2xl` 1200 — echoed in
+a comment at the top of `app.css`. JS queries are built from it
+(`SHELL_NARROW_QUERY`, `minWidth('xl')`, `minWidth('2xl')`), and
+`src/lib/breakpoints.test.ts` scans every `.svelte` / `.css` under `src/` and
+fails on any other `min-width` / `max-width` value, rem included. px only, so
+two queries compare at a glance; the three rem queries were converted (they
+now ignore a non-default browser font size, which none of them depended on
+for reflow — the floor test runs at the default). `@container` queries are
+out of scope: they measure a component, not the viewport. The one
+"below 360" query is written `not all and (min-width: 360px)`.
+
+**Mapping** (rule: round a `max-width` up — the narrow layout reaching a few
+more widths never costs reflow — and a `min-width` up — the wide layout
+waits until it fits; one exception named below):
+
+| was | now | what shifts |
+|-----|-----|-------------|
+| 359 | `not … (min-width: 360px)` | nothing |
+| 400, 480, 640, 768, 1024, 1200 | same | nothing |
+| 420 | 480 | password-strength meter stacks at 421–480 |
+| 520 | 640 | landing hero's stacked cards step halved at 521–640 |
+| 600, 620 | 640 | org/SSO/fraud form grids, landing hero padding and feature grid stack at 601–640 |
+| 700, 720, 760 | 768 | **shell narrow step**: icon rail, half gutter and section-tab gutter at 701–768 (iPad portrait now gets the rail); dashboard charts, help padding, chat rail disclosure, landing nav/stats/diff grid |
+| 800 | 768 | the exception — rounded down: landing "how it works" steps stay three-up at 769–800 |
+| 900, 960 | 1024 | auth shell single column, landing hero/feature/tally grids, help contents rail (min) now from 1024 |
+| 52rem (832) | 1024 | legal sheet is edge-to-edge up to 1024 and a card above it (768 would have drawn the card touching both window edges, the state its comment rules out) |
+| 60rem (960) | 1024 | settings rail on `/organization` and `/profile` beside the panel from 1024 |
+| 1100 | 1200 | pricing two-up and workflow editor one-up at 1101–1200 |
+| 72rem (1152) | 1200 | legal contents rail from 1200 (still new space, not taken from the 46rem measure) |
+
+**Sidebar.** The auto-collapse already existed (`+layout`'s `matchMedia`
+called `collapse()` on entering narrow), but it wrote the narrow state into
+the reader's one `collapsed` flag, so widening the window kept whatever the
+phone layout had forced. The store now holds two choices: the wide
+expand/collapse (`toggle()` on a wide viewport) and whether the panel is open
+on a narrow one (always closed on crossing into narrow). `collapsed` derives
+from whichever applies, so a reader who collapsed the panel on desktop finds
+it collapsed again after the window passes through phone width, and one who
+left it open finds it open. Opening the panel while narrow stays an
+**overlay** (#635 finding 39) — the icon rail is the default state below the
+step, the overlay is the reader's explicit request to see labels, so both of
+the owner's conditions hold. Rejected: dropping the overlay entirely (the
+labels would then be unreachable on a phone except as tooltips, which touch
+input never shows). Rail links now carry `aria-label` when collapsed (they
+had only `title`, a last-resort name source), matching the help and profile
+rows beside them; targets are 38px, above 2.5.8's 24px.
+
+**Section tabs.** The More menu already took tabs that do not fit, but it
+always leaves at least the active tab in the row, and at 320px one long label
+beside the More button could be wider than the row, which was
+`overflow: hidden` — the label was clipped. The row now scrolls on its main
+axis (`overflow-x: auto`, `overflow-y: hidden`): every item is a link, so the
+region is keyboard-reachable and focusing a tab scrolls it into view.
+
+**Tables.** No column dropping: which column an AP reader can do without is not
+a call a layout can make. `DataTable`'s `.grid-container` already scrolls and
+is a named, focusable region (`a11y/tableScrollRegion.test.ts`).
+
+**Tests.** `src/lib/breakpoints.test.ts` (the repo scan and the guard's own
+parsing); `src/lib/stores/sidebar.test.ts` (auto-collapse, overlay only when
+opened narrow, both wide choices restored after a narrow trip, idempotent
+`setNarrow`); `tests-e2e/a11y/sidebar-overlay.spec.ts` (the 768 / 769
+boundary, the restored collapsed choice, rail names and 24px targets at 320,
+section tabs scrolling at 320 on `/bank-reconciliation`);
+`organization/sharedPanelCss.test.ts` follows the 600 → 640 move;
+`signup/panel-layout.spec.ts`'s "just above the auth breakpoint" size moves
+961 → 1025.

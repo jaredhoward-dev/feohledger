@@ -186,7 +186,7 @@
 	.strength li.ok {
 		color: var(--success);
 	}
-	@media (max-width: 420px) {
+	@media (max-width: 480px) {
 		.strength {
 			grid-template-columns: 1fr;
 		}

@@ -203,9 +203,10 @@
 
 	/* ----------------------------- wide screens ---------------------------- */
 
-	/* 60rem is where the 46rem-ish panel column plus a 200px rail first fit
-	   side by side without squeezing the forms. */
-	@media (min-width: 60rem) {
+	/* 1024px (`xl`, `lib/breakpoints.ts`; it was 60rem before the scale) is
+	   where the 46rem-ish panel column plus a 200px rail fit side by side
+	   without squeezing the forms. */
+	@media (min-width: 1024px) {
 		.rail-toggle {
 			display: none;
 		}

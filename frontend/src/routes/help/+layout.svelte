@@ -2,7 +2,7 @@
 	/**
 	 * The help centre's shell, shared by every /help page: one search box over
 	 * the text, and the contents list (HelpNav) as a column beside it that stays
-	 * in view while you read. Below 900px the contents fold behind a "Help
+	 * in view while you read. Below 1024px (`xl`, `lib/breakpoints.ts`) the contents fold behind a "Help
 	 * contents" button under the search, and close again when you pick a page.
 	 *
 	 * Searching is live: typing on any help page goes to /help/search?q=…,
@@ -15,6 +15,7 @@
 	import { m } from '#lib/i18n/store.svelte.ts';
 	import { MediaQuery } from 'svelte/reactivity';
 	import HelpNav from '#lib/components/help/HelpNav.svelte';
+	import { minWidth } from '#lib/breakpoints.ts';
 
 	let { children }: { children: Snippet } = $props();
 
@@ -62,7 +63,7 @@
 	}
 
 	// One contents list in the document at a time, so its ids stay unique.
-	const wide = new MediaQuery('min-width: 900px');
+	const wide = new MediaQuery(minWidth('xl'));
 
 	let contentsOpen = $state(false);
 	$effect(() => {
@@ -163,12 +164,12 @@
 		margin-top: 28px;
 		container: help-main / inline-size;
 	}
-	@media (max-width: 700px) {
+	@media (max-width: 768px) {
 		.help-shell {
 			padding: 20px 14px 48px;
 		}
 	}
-	@media (min-width: 900px) {
+	@media (min-width: 1024px) {
 		.help-shell {
 			display: grid;
 			grid-template-columns: 15rem minmax(0, 1fr);

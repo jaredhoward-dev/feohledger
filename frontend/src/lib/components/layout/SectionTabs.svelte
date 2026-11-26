@@ -35,7 +35,8 @@
 	 *
 	 * Before the first measurement (`widths` empty, or stale after the tab list
 	 * changed) everything renders inline; `.section-tabs-row` is `overflow:
-	 * hidden`, so that pre-measure frame clips instead of widening the document.
+	 * hidden` on its cross axis and scrolls on its main one, so that pre-measure
+	 * frame scrolls inside the row instead of widening the document.
 	 */
 	/**
 	 * True once the off-screen row has been measured for THIS tab set, so the
@@ -235,20 +236,32 @@
 		align-items: stretch;
 	}
 
-	/* `min-width: 0` lets this flex child shrink below its content width, and
-	   `overflow: hidden` is the hard backstop: whatever the measurement says,
-	   the row can never widen the document into a horizontal scrollbar
-	   (WCAG 1.4.10 — the whole page used to scroll sideways here). */
+	/* `min-width: 0` lets this flex child shrink below its content width, so
+	   the row can never widen the document into a horizontal scrollbar (WCAG
+	   1.4.10 — the whole page used to scroll sideways here). The More menu
+	   takes every tab that does not fit, but it always leaves at least one —
+	   the active one — in the row, and at the 320px floor a single long label
+	   (a German one, or a section name beside the More button) can still be
+	   wider than what is left. The row SCROLLS sideways inside itself then,
+	   rather than clipping the label it cannot fit (decisions §590): every
+	   item in it is a link, so the region is keyboard-reachable and focusing a
+	   tab scrolls it into view. `overflow-y: hidden` keeps the scroll on one
+	   axis; the active indicator sits inside the tab (`bottom: 0`), so nothing
+	   is hung below the row for it to clip. */
 	.section-tabs-row {
 		display: flex;
 		gap: 4px;
 		min-width: 0;
 		flex: 1;
-		overflow: hidden;
+		overflow-x: auto;
+		overflow-y: hidden;
+		scrollbar-width: thin;
+		overscroll-behavior-x: contain;
 	}
 
 	.section-tab {
 		position: relative;
+		flex: none;
 		padding: 13px 14px;
 		color: var(--text-muted);
 		font-size: 0.88rem;
@@ -260,7 +273,7 @@
 	/* The indicator is a pseudo-element that grows from the centre, so the
 	   active tab reads as selected at a glance and the change of tab has a
 	   moment of motion; it never moves layout. It sits at `bottom: 0`, inside the
-	   tab, because `.section-tabs-row` is `overflow: hidden` and would clip
+	   tab, because `.section-tabs-row` clips its cross axis (`overflow-y: hidden`) and would clip
 	   anything hung below it over the strip's border. */
 	.section-tab::after {
 		content: '';
@@ -287,7 +300,7 @@
 		box-shadow: 0 0 10px var(--accent-glow);
 	}
 
-	@media (max-width: 700px) {
+	@media (max-width: 768px) {
 		.section-tabs-inner {
 			padding: 0 14px;
 		}
