@@ -309,7 +309,11 @@ unnamed (no `{erp}` twin; the adapter is in `erp_report`), with
 `settled_no_payment` and `source: poll` when the sweep read it (decisions
 §533). The payment write-back
 (`services/erp_payment_writeback`) and `services/payment_erp_sync`'s failed leg
-use the same family: `erp_payment_writeback_failed`,
+use the same family: `erp_payment_writeback_failed` (a refusal before any
+write: the bill still shows unpaid), `erp_payment_writeback_unconfirmed` (an
+unknown outcome, the attempts cap, or a record whose bill moved: `marker`
+(text) is the "FeohLedger payment <payment id>" to look for before recording
+one; decisions §590),
 `erp_payment_writeback_balance_open` (`amount` money + `currency`; only when
 no discount credit of ours can stand), `erp_discount_credit_pending` (the same
 open balance while our recorded credit `credit` (text) will be applied, so

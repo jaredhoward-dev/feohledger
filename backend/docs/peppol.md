@@ -407,7 +407,9 @@ recreate the invoice.
 
 A detached row is then governed by the `peppol_transmissions` retention class
 (`backend/docs/retention.md`): once its window, measured from receipt, has
-passed, the retention sweep deletes it. Every reader that lists transmissions
+passed, the retention sweep deletes it. From then on nothing dedupes that
+`message_id`: a redelivery of the same message would create a new invoice.
+Every reader that lists transmissions
 filters by an invoice id, so a detached row never appears on another invoice;
 `GET /peppol-transmissions` of the deleted invoice is a 404 like any other read
 of it. A detached row still counts as an e-invoice record for the workspace

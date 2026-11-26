@@ -31166,3 +31166,128 @@ only; a confirmation of another bill does not adopt), `test_erp_push_flow.py`,
 `test_sod_endpoint_wiring.py`, `test_audit_append_only.py`; vitest
 `erpOrphanBill.test.ts` (`confirmBillBody`), `codedRefusals.test.ts`; e2e
 `invoices/erp-bill-confirm.spec.ts` (typechecked, not run).
+
+## 590. An unknown payment write keeps its reservation; capped writes and voids are flagged and a person's resolve clears the cap; a bill confirmation is withdrawn once used, refuted or rejected; Xero adoption checks the currency (§584 / §585 / §587 review, round 50)
+
+A money-path review of §584–§587 found six gaps.
+
+**1. An unknown write outcome cleared its reservation (Critical).** §584's
+outcome transaction cleared `erp_payment_writes_pending` on any failure. A
+failure whose outcome is unknown (a network drop after the send, a 5xx on the
+read-back: `erp_http_failure` / `network_error`) may have left our
+BillPayment on the bill, and a void that committed meanwhile (its own ERP void
+finding nothing yet) was never re-armed: BP-9 stood on a voided payment's
+bill. Now the record is cleared on failure only when `result.not_posted` is
+True, the adapter's word that it refused before any write. Otherwise:
+- `_rearm_void_if_voided` runs on the failure branch too, as on success. If it
+  re-arms, the void owns whatever stands and the record is dropped (what
+  `resume_pending_writes` would do with a voided payment);
+- else the record is kept, its claim and token released and `unconfirmed:
+  true` set, so the next sweep (or a manual re-run) writes again. The
+  adapters' find-by-payment-id makes that a lookup when our payment stands;
+  attempts still count toward the cap.
+- Pinned: a stub that creates BP-9 and answers `network_error` while a void
+  lands: the next void pass voids BP-9.
+
+**2 and 3. A capped flag was a dead end, and the write's said the wrong
+thing.** At `MAX_VOID_ATTEMPTS` the void flag carried no `retries_exhausted`
+and was swallowed by the first failure's live row; nothing but a write-back
+re-arm cleared `exhausted`, which never happens for a voided payment. At the
+write cap the flag read `erp_payment_writeback_failed`, "the bill still shows
+as unpaid ... use Retry ERP sync": each capped attempt may have posted, and
+`_reserve_write` skips an `exhausted` record forever, so a bookkeeper
+following it might record the payment a second time. Now:
+- **A new sentence, `erp_payment_writeback_unconfirmed`** (`_unnamed` twin;
+  param `marker`, text: `FeohLedger payment <payment id>`): "may already show
+  this invoice's payment: FeohLedger sent it but could not confirm it was
+  recorded. Check the bill for a payment referenced “{marker}” before
+  recording one." It serves an unknown outcome, the write cap, and a record
+  whose bill moved (5). A definite pre-write refusal keeps
+  `erp_payment_writeback_failed`, which is then true. A different sentence is
+  a code of its own (§585's rule), in six web locales and seven ARBs,
+  regenerated.
+- **Their rows do not swallow each other.** The write flag's `erp_report`
+  carries `outcome: "unconfirmed"` (a string: the dedupe compares JSON text)
+  and dedupes on it, so a refusal's row and an unknown outcome's row are
+  separate. Each cap flag (`failure: retries_exhausted`, `attempts`) also
+  dedupes on `failure`, so it opens beside an earlier failure's live row.
+- **A person's resolve clears the cap.** `exception_lifecycle.record_decision`
+  calls `erp_payment_writeback.rearm_capped_on_resolve` for a person's
+  `resolve` of an `erp_reconciliation` row whose report is a capped write or
+  void. In the decision's transaction, under §581's lock order, it resets a
+  still-`exhausted` write record to `attempts: 0`, or drops the void's
+  attempts entry while the payment is still pending its void. The decision's
+  own append-only `exception.resolved` row carries `erp_retry_rearmed`
+  (`payment_write` / `payment_void`) and the payment id, so no new audit
+  action is needed.
+  - *Why resolve:* resolving is the person saying "I looked, try again"; the
+    sentence asked them to look for our payment first, and the retry's own
+    lookup by marker finds it if it stands.
+  - *Dismiss and agents leave the cap.* A dismiss says the person has taken
+    the ERP side over (recorded a payment by hand, say), where a retry could
+    post a second one. An agent never decides that.
+  - *Rejected: an endpoint of its own.* It would add a route, RBAC and UI for
+    what the queue's decision already records with actor and reason.
+  - *Residual:* a person who recorded a payment by hand without our marker and
+    then resolves (not dismisses) gets a second ERP payment. The sentence
+    tells them to look for ours first.
+
+**4. A bill confirmation could never be withdrawn.** `erp_confirmed_bill`
+survived a push refused `duplicate_document_number` on the confirmed bill,
+the invoice being rejected, and the push adopting or creating a different
+bill. `claimed_elsewhere` then refused the bill's real owner
+`erp_bill_claimed` forever. Now:
+- a push that adopts the confirmed bill drops the key silently (the bill of
+  record carries the claim from then on);
+- `withdraw_confirmation` removes it with an append-only
+  `invoice.erp_bill_confirmation_withdrawn` row (`erp_document_id`, `reason`)
+  when a push succeeds on another bill (`other_bill`), when a push carrying
+  the confirmation is refused `duplicate_document_number` (`total_changed`:
+  the person confirmed a figure the invoice no longer has), and at
+  `transition_invoice` to `rejected` (`invoice_rejected`, the transition's
+  actor);
+- labelled on `/audit` in six locales.
+- *Rejected: only an audited manual un-confirm.* Each of these events already
+  refutes the claim; waiting for a person to notice a blocked sharer leaves
+  the block in place meanwhile.
+- *Kept:* any other refusal (`erp_bill_key_shared`, a retry gate) keeps the
+  confirmation, as §587 decided.
+- A two-session test pins §587's serialization: A holds the per-bill lock
+  with its confirmation uncommitted, C's confirmation blocks on it, and once
+  A commits C gets `erp_bill_claimed` with nothing recorded.
+
+**5. Resume retried against the invoice's current bill, not the recorded
+one.** `_resume_one_write` checked only that the connection reached some bill.
+If the invoice now points at another bill (re-pushed, adopted another), a
+retry wrote against it, and the adapter's lookup for our earlier payment
+searched the wrong bill. Now a record whose `bill_id` differs from the bill
+the invoice points at is kept, never retried (by the sweep or by
+`_reserve_write` on a manual re-run), and flagged once with the unconfirmed
+sentence (`failure: bill_changed`, `erp_document_id` the recorded bill,
+`current_bill_id`).
+
+**6. Xero adoption ignored currency (pre-existing, widened by §587).** The
+pre-create match adopted a bill on the same supplier and number at the same
+total whatever its currency, and a confirmation made that a person's say-so.
+Now the bill's `CurrencyCode` must equal the payload's through
+`iso_currency_or_none`. A mismatch or a missing code is refused
+`currency_mismatch` (an existing refusal code), not `not_posted`, since the
+bill found may be an earlier attempt of ours. A different total is still
+`duplicate_document_number`, as before.
+
+**Tests.** Each fails on the code before this entry unless noted.
+- `test_erp_payment_writeback.py`:
+  - an unknown outcome with a racing void is voided by the next pass;
+  - an unknown outcome keeps the reservation, released, for the sweep;
+  - a definite refusal still clears it (a guard; passes before);
+  - the write cap opens its own unconfirmed row, a dismiss or an agent's
+    resolve leaves the cap, and a person's resolve re-arms it, audited;
+  - the void cap flag carries `retries_exhausted` and `attempts`, and a
+    resolve re-arms it;
+  - a pending write for another bill is kept and flagged once, not retried.
+- `test_erp_bill_confirm.py`: the two-session lock test; withdrawal on
+  another bill, on a changed-total refusal and on rejection (after which the
+  real owner confirms); a used confirmation is dropped silently; another
+  refusal keeps it.
+- `test_erp_xero_adapter.py`: the same total in another currency, or none, is
+  refused `currency_mismatch`, confirmed or not.
