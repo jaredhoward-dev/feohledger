@@ -72,7 +72,7 @@ CONFIRM_VERDICT_KEY = "erp_bill_confirm_refusal"
 
 #: Audit action for the confirmation (the lookup reuses the orphan lookup's).
 ACTION_INVOICE_ERP_BILL_CONFIRMED = "invoice.erp_bill_confirmed"
-#: Audit action when a confirmation stops standing (decisions §590): its
+#: Audit action when a confirmation stops standing (decisions §588): its
 #: invoice adopted or created another bill, the push refused the confirmed
 #: bill for a changed total, or the invoice was rejected.
 ACTION_INVOICE_ERP_BILL_CONFIRMATION_WITHDRAWN = "invoice.erp_bill_confirmation_withdrawn"
@@ -264,7 +264,7 @@ async def withdraw_confirmation(
 ) -> dict:
     """``state`` without the confirmation, with an append-only
     ``invoice.erp_bill_confirmation_withdrawn`` row naming the bill and why,
-    when one stood (decisions §590). Otherwise ``state`` unchanged and nothing
+    when one stood (decisions §588). Otherwise ``state`` unchanged and nothing
     written. The caller assigns the returned state and commits.
 
     A confirmation is a claim every other invoice's confirmation reads

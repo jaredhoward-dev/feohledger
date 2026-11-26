@@ -635,7 +635,7 @@ def test_the_confirmed_bill_on_a_shared_key_is_adopted_as_any_adoption(token, to
 def test_a_bill_at_the_same_total_in_another_currency_is_never_adopted(token, currency, confirmed):
     """The same figure in another currency, or a bill stating none, is not
     known to be this invoice's bill: refused ``currency_mismatch``, coded,
-    nothing created, never adopted — confirmed or not (decisions §590)."""
+    nothing created, never adopted — confirmed or not (decisions §588)."""
     existing = {"InvoiceID": "inv-old", "InvoiceNumber": "SUP-1001", "Type": "ACCPAY"}
     existing["Total"] = 1150.0
     if currency is not None:

@@ -31167,7 +31167,7 @@ only; a confirmation of another bill does not adopt), `test_erp_push_flow.py`,
 `erpOrphanBill.test.ts` (`confirmBillBody`), `codedRefusals.test.ts`; e2e
 `invoices/erp-bill-confirm.spec.ts` (typechecked, not run).
 
-## 590. An unknown payment write keeps its reservation; capped writes and voids are flagged and a person's resolve clears the cap; a bill confirmation is withdrawn once used, refuted or rejected; Xero adoption checks the currency (§584 / §585 / §587 review, round 50)
+## 588. An unknown payment write keeps its reservation; capped writes and voids are flagged and a person's resolve clears the cap; a bill confirmation is withdrawn once used, refuted or rejected; Xero adoption checks the currency (§584 / §585 / §587 review, round 50)
 
 A money-path review of §584–§587 found six gaps.
 

@@ -1082,7 +1082,7 @@ async def _call_erp(
         # bill of record carries the claim from a success on, a success on
         # another bill refutes it, and a refusal of the confirmed bill at a
         # changed total means the person confirmed a figure this invoice no
-        # longer has (decisions §590).
+        # longer has (decisions §588).
         if result.success or (
             payload.confirmed_bill_id and result.refusal_code == DUPLICATE_DOCUMENT_NUMBER
         ):

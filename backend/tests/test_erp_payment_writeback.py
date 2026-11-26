@@ -217,7 +217,7 @@ async def test_a_refused_write_back_is_coded_flagged_and_keeps_the_invoice_paid(
     await _configure(realdb)
     run_id, inv_id, pay_id = await _seed(realdb)
     # Refused before any write (as every adapter refuses an unmapped account):
-    # nothing can stand, so the flag says the bill is unpaid (decisions §590).
+    # nothing can stand, so the flag says the bill is unpaid (decisions §588).
     refused = erp_preflight_refusal("QuickBooks Online", "payment_account_not_mapped")
     await _sync(realdb, run_id, FakeQbo(refused))
 
@@ -248,7 +248,7 @@ async def test_a_failed_write_back_with_no_refusal_code_is_still_explained(reald
     await _sync(realdb, run_id, FakeQbo(ErpPostResult(success=False, message="x", retryable=True)))
     [flag] = await _rows(realdb, APException, invoice_id=inv_id)
     # An outcome nobody knows: the payment may stand, so the sentence asks for
-    # a look by its marker, never "unpaid" or "retry" (decisions §590).
+    # a look by its marker, never "unpaid" or "retry" (decisions §588).
     assert flag.description_code == "exception.erp_payment_writeback_unconfirmed"
     assert flag.description_params == {
         "erp": "QuickBooks Online",
@@ -2078,7 +2078,7 @@ def test_the_open_balance_sentence_is_chosen_by_what_credit_may_stand(standing, 
 # An unknown write outcome keeps its reservation and re-arms a racing void; a
 # capped write or void flag says so and a person's resolve clears the cap; a
 # pending write never retries against a bill the invoice no longer points at
-# (§590)
+# (§588)
 # ---------------------------------------------------------------------------
 
 
@@ -2116,7 +2116,7 @@ async def _reopen(realdb, flag_id) -> None:
 
 async def test_an_unknown_outcome_with_a_racing_void_keeps_it_and_the_next_pass_voids(realdb):
     """The send created BP-9, then the answer was lost (network drop). The void
-    committed meanwhile and its own ERP void found nothing. Before §590 the
+    committed meanwhile and its own ERP void found nothing. Before §588 the
     failure cleared the reservation and re-armed nothing: BP-9 stood on a
     voided payment's bill. Now the void is re-armed and the next pass voids."""
     run_id, inv_id, pay_id = await _seed(realdb)

@@ -760,7 +760,7 @@ write). Any other failure's outcome is unknown, since the payment may stand:
 the record is kept with its claim released (`unconfirmed: true`) for the
 sweep, a void that raced the send is re-armed (and then owns the record), and
 the flag is `erp_payment_writeback_unconfirmed` with `erp_report.outcome:
-unconfirmed` (decisions §590). If that transaction rolls back or the process dies, the
+unconfirmed` (decisions §588). If that transaction rolls back or the process dies, the
 status-sync sweep's `resume_pending_writes` (run before
 `resume_pending_voids`) finds the record once its claim lapses: a payment no
 longer `completed` has its void re-armed (fresh `erp_payment_void_rearmed`
@@ -786,7 +786,7 @@ At the cap the flag says `failure: retries_exhausted` with `attempts`, on its
 own row. A person's **resolve** of either capped flag (write or void) clears
 the cap in the decision's transaction (`rearm_capped_on_resolve`; the
 `exception.resolved` row carries `erp_retry_rearmed` and the payment id); an
-agent's resolve or a dismiss does not (decisions §590).
+agent's resolve or a dismiss does not (decisions §588).
 
 The code is exercised against `tools/fake-erp` and the adapter doubles only,
 not yet a real company; a read-back that is not what we wrote fails closed
@@ -3759,7 +3759,7 @@ time Xero refuses the payments listing, and the settings panel shows it
   retry gate refuses, the confirmation
   stands and Retry ERP Send honours it later. The sharer's own push keeps
   refusing, and its confirmation answers `erp_bill_claimed`. The confirmation
-  stops standing (decisions §590): a push that adopts it drops it (the bill of
+  stops standing (decisions §588): a push that adopts it drops it (the bill of
   record carries the claim); a push that succeeds on another bill, or is
   refused `duplicate_document_number` with it, and the invoice's transition to
   `rejected`, withdraw it with an `invoice.erp_bill_confirmation_withdrawn`

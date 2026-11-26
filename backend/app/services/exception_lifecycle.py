@@ -906,7 +906,7 @@ async def record_decision(
         details["via"] = via
     if action == "resolve" and person and exception.exception_type == "erp_reconciliation":
         # A person resolving a capped ERP payment write / void flag re-arms
-        # its retries, on this decision's own audit row (decisions §590).
+        # its retries, on this decision's own audit row (decisions §588).
         from app.services.erp_payment_writeback import rearm_capped_on_resolve
 
         rearmed = await rearm_capped_on_resolve(db, exception)

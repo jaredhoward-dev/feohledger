@@ -328,7 +328,7 @@ async def test_a_final_failure_records_its_refusal_code(realdb):
 # ---------------------------------------------------------------------------
 # Two invoices confirming one bill serialize on the per-bill lock; a
 # confirmation stops standing once used, refuted or its invoice is rejected
-# (decisions §590)
+# (decisions §588)
 # ---------------------------------------------------------------------------
 
 

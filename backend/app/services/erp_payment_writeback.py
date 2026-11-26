@@ -492,7 +492,7 @@ async def write_back_payment(
         # the bill: the record is kept, its claim released, for
         # :func:`resume_pending_writes` (whose adapter write finds our own
         # earlier payment before it creates), and a void that raced the send
-        # is re-armed as on success (decisions §590).
+        # is re-armed as on success (decisions §588).
         unconfirmed = not result.not_posted
         if unconfirmed:
             void_rearmed = await _rearm_void_if_voided(db, invoice.id, payment.id)
@@ -706,14 +706,14 @@ MAX_WRITE_ATTEMPTS = 12
 VOID_ATTEMPTS_KEY = "erp_payment_void_attempts"
 MAX_VOID_ATTEMPTS = 12
 #: ``erp_report["failure"]`` of the flag a capped write or void opens; resolving
-#: that flag (a person, not an agent) clears the cap (decisions §590).
+#: that flag (a person, not an agent) clears the cap (decisions §588).
 RETRIES_EXHAUSTED = "retries_exhausted"
 #: ``erp_report["outcome"]`` of a write-back flag whose payment may stand in
 #: the ERP (unknown outcome, the cap, a bill that moved): its own row, never
-#: deduped against a definite refusal's (decisions §590).
+#: deduped against a definite refusal's (decisions §588).
 WRITE_UNCONFIRMED = "unconfirmed"
 #: ``erp_report["failure"]`` when a pending write names another bill than the
-#: one its invoice points at now: kept, never retried there (decisions §590).
+#: one its invoice points at now: kept, never retried there (decisions §588).
 WRITE_BILL_CHANGED = "bill_changed"
 
 
@@ -1073,7 +1073,7 @@ async def _reserve_write(
         or status != "completed"
         or (record is not None and (record.get("exhausted") or _claim_live(record, now)))
         # A record for another bill than the invoice's now: a write here would
-        # search and pay the wrong bill (decisions §590). The sweep flags it.
+        # search and pay the wrong bill (decisions §588). The sweep flags it.
         or (
             record is not None
             and record.get("bill_id") is not None
@@ -1102,7 +1102,7 @@ async def _reserve_write(
             },
         )
         # Each attempt may have posted: the sentence asks a person to look for
-        # our payment, never to retry or to record one (decisions §590). Its
+        # our payment, never to retry or to record one (decisions §588). Its
         # own row, never swallowed by an earlier failure's; resolving it lets
         # the sweep try again (:func:`rearm_capped_on_resolve`).
         await open_erp_reconciliation_exception(
@@ -1147,7 +1147,7 @@ def _write_failed_finding(erp_type: str, payment_id, *, unconfirmed: bool) -> di
     else (an unknown outcome, the attempts cap, a record whose bill moved): our
     payment may stand, so the person checks for it by its marker before
     recording one — "retry" or "unpaid" there could pay the bill twice in the
-    ERP's books (decisions §590)."""
+    ERP's books (decisions §588)."""
     if not unconfirmed:
         return erp_finding("erp_payment_writeback_failed", erp_type)
     return erp_finding(
@@ -1167,7 +1167,7 @@ async def _keep_write(
     pending-write record (only while it still names this attempt's token), its
     claim released so the sweep or a re-run tries again at once — or, with
     ``drop`` (the void was just re-armed and now owns what may stand), drop it
-    as :func:`resume_pending_writes` would (decisions §590). Never commits."""
+    as :func:`resume_pending_writes` would (decisions §588). Never commits."""
     if token is None:
         return
     instance = await _lock_instance(db, invoice_id)
@@ -1292,7 +1292,7 @@ async def _resume_one_write(
         # a retry would write against THAT bill, and the adapter's lookup for
         # our earlier payment would search the wrong one, so a payment that
         # stands on the recorded bill would be paid again on the new one.
-        # Kept, fail closed, and flagged once for a person (decisions §590).
+        # Kept, fail closed, and flagged once for a person (decisions §588).
         invoice = await db.get(Invoice, invoice_id)
         if invoice is not None:
             await open_erp_reconciliation_exception(
@@ -1337,7 +1337,7 @@ async def _resume_one_write(
 
 async def rearm_capped_on_resolve(db: AsyncSession, exception) -> dict | None:
     """A person resolved a capped write-back or void flag: clear the cap so
-    the sweep tries again (decisions §590).
+    the sweep tries again (decisions §588).
 
     Called by ``exception_lifecycle.record_decision`` for a person's
     ``resolve`` (never an agent's, never ``dismiss``: dismissing says the
@@ -2041,7 +2041,7 @@ async def void_written_payment(org_id: uuid.UUID, payment_id: uuid.UUID) -> str:
                         bill_id=bill_id,
                         # At the cap the row says so, and opens on its own
                         # (below): nothing calls the ERP again until a person
-                        # resolves it (decisions §590).
+                        # resolves it (decisions §588).
                         failure=(
                             RETRIES_EXHAUSTED
                             if exhausted

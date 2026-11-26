@@ -589,7 +589,7 @@ class XeroAdapter(OAuthErpAdapter):
                     # adopting it would book this invoice's amount in the
                     # wrong currency. A bill or payload that states none is
                     # not known to match, so it is refused too, coded
-                    # (decisions §590). Not ``not_posted``: the bill found may
+                    # (decisions §588). Not ``not_posted``: the bill found may
                     # be an earlier attempt of ours.
                     bill_currency = iso_currency_or_none(existing.get("CurrencyCode"))
                     if bill_currency is None or bill_currency != iso_currency_or_none(

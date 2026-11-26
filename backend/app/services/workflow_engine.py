@@ -378,7 +378,7 @@ async def transition_invoice(
     invoice.status = target_status
     if target_status is InvoiceStatus.rejected:
         # A rejected invoice's confirmation of a bill in the ERP (§587) must
-        # not keep claiming that bill from its real owner (decisions §590).
+        # not keep claiming that bill from its real owner (decisions §588).
         from app.services.erp_bill_confirm import withdraw_on_reject
 
         await withdraw_on_reject(db, invoice, actor_id=actor_id)

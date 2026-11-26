@@ -908,7 +908,7 @@ _ERP_NAMED_SENTENCES: dict[str, str] = {
     ),
     # A write whose outcome FeohLedger does not know (a network drop after the
     # send, an unreadable answer, the attempts cap, a bill that moved —
-    # decisions §590): our payment may stand, so the sentence never says
+    # decisions §588): our payment may stand, so the sentence never says
     # "unpaid" or "retry"; the person looks for it by its marker.
     "erp_payment_writeback_unconfirmed": (
         "may already show this invoice's payment: FeohLedger sent it but could not confirm "

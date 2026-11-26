@@ -2760,7 +2760,7 @@ failure; any other failure (a network drop after the send, an unreadable
 answer) keeps it for the sweep and re-arms a void that raced the send, and its
 flag reads `erp_payment_writeback_unconfirmed` ("check for a payment referenced
 FeohLedger payment <id> before recording one"), never "unpaid, retry"
-(decisions §590). A record naming another bill than the invoice's now is kept
+(decisions §588). A record naming another bill than the invoice's now is kept
 and flagged, never retried there. A void that
 keeps failing is audited when its cause changes, not every pass, and stops at
 12 attempts with its flag open (`failure: retries_exhausted`); so does a write.
