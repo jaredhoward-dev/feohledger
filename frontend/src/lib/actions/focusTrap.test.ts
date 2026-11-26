@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { ownsEscape, tabBoundaryTarget } from './focusTrap';
+import { focusIsSettled, ownsEscape, tabBoundaryTarget } from './focusTrap';
 
 /**
  * The dialog's Tab cycle with satellites (the toast region hosted inside an
@@ -68,5 +68,44 @@ describe('ownsEscape', () => {
 	it('an unregistered trap always answers its own Escape', () => {
 		expect(ownsEscape(['host'], 'popover')).toBe(true);
 		expect(ownsEscape([], 'popover')).toBe(true);
+	});
+});
+
+/**
+ * Whether a closing dialog leaves focus where it is. The stacked case is the
+ * one `tests-e2e/invoices/erp-bill-confirm.spec.ts` (Escape) pins in a browser:
+ * the host reclaimed focus onto its own node before the inner dialog's restore.
+ */
+describe('focusIsSettled', () => {
+	type N = { id: string; kids: string[]; contains(o: N): boolean };
+	const node = (id: string, kids: string[] = []): N => ({
+		id,
+		kids,
+		contains(o) {
+			return o.id === id || kids.includes(o.id);
+		}
+	});
+	const body = node('body', ['host', 'opener', 'other']);
+	const host = node('host', ['opener']);
+	const opener = node('opener');
+	const other = node('other');
+
+	it('restores when nothing holds focus', () => {
+		expect(focusIsSettled(null, body, [host], opener)).toBe(false);
+		expect(focusIsSettled(body, body, [host], opener)).toBe(false);
+	});
+
+	it('restores past a host dialog that only reclaimed focus around the trigger', () => {
+		expect(focusIsSettled(host, body, [host], opener)).toBe(false);
+	});
+
+	it('leaves focus a control or a newly opened dialog took', () => {
+		expect(focusIsSettled(other, body, [host], opener)).toBe(true);
+		const second = node('second');
+		expect(focusIsSettled(second, body, [host, second], opener)).toBe(true);
+	});
+
+	it('leaves a dialog node that does not contain the trigger', () => {
+		expect(focusIsSettled(host, body, [host], other)).toBe(true);
 	});
 });
