@@ -43,7 +43,10 @@ on:
   # A redeploy (run it from `main`: main's tip) or a rollback (run it from an
   # older release tag: that tag's commit — only tags that already contain this
   # workflow can be run from). A commit that is not on origin/main is refused
-  # on the VM.
+  # on the VM. Every run fetches the current secrets ciphertext first
+  # (deploy/lib.sh feoh_fetch_secrets), so a secrets-only change, an emergency
+  # rotation included, goes live by running this from the LIVE release's tag
+  # (docs/decisions.md §591).
   workflow_dispatch:
 
 permissions:
