@@ -59,8 +59,8 @@ for (const size of [
 	// Just above the two-column breakpoint (the scale's `xl`, 1024px — the
 	// two-column layout starts AT 1024, decisions §590): the panel is at its
 	// narrowest beside the form, the shape #635 caught clipping.
-	{ width: 1025, height: 640 },
-	{ width: 1025, height: 560 },
+	{ width: 1024, height: 640 },
+	{ width: 1024, height: 560 },
 	// Below 1024px signup keeps the panel (`panelOnMobile`), stacked under the
 	// form and at its narrowest — and still clipping. `a11y/reflow.spec.ts`
 	// cannot see this: it measures page-level scroll, which a clip hides.
@@ -91,7 +91,7 @@ for (const size of [
 // with no break opportunity — a German compound, an address, a translation
 // longer than English — is what a clip actually eats, so put one in step 3
 // and require it to wrap inside the panel too.
-for (const width of [1025, 320]) test(`an unbroken word in the panel wraps instead of running under the clip (${width}px)`, async ({ page }) => {
+for (const width of [1024, 320]) test(`an unbroken word in the panel wraps instead of running under the clip (${width}px)`, async ({ page }) => {
 	await page.setViewportSize({ width, height: 720 });
 	await page.emulateMedia({ reducedMotion: 'reduce' });
 	await page.goto('/signup');
