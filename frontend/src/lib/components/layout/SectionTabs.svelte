@@ -3,6 +3,7 @@
 	import { auth } from '#lib/stores/auth.svelte.ts';
 	import { groupForPath, sectionTabActive, visibleChildren, type NavChild } from '#lib/nav.ts';
 	import { m } from '#lib/i18n/store.svelte.ts';
+	import { splitSectionTabs } from '#lib/sectionTabsSplit.ts';
 
 	// The grouped section (Procurement / Billing / Automation / Governance /
 	// Settings / Insights) that owns the current route, if any. Top-level links
@@ -17,7 +18,7 @@
 	/** Must match the `gap` on `.section-tabs-row` / `.section-tabs-measure`. */
 	const GAP = 4;
 
-	let rowEl = $state<HTMLElement | undefined>(undefined);
+	let innerEl = $state<HTMLElement | undefined>(undefined);
 	let measureEl = $state<HTMLElement | undefined>(undefined);
 	let moreEl = $state<HTMLElement | undefined>(undefined);
 	let moreBtn = $state<HTMLButtonElement | undefined>(undefined);
@@ -51,37 +52,29 @@
 		if (!measured) {
 			return { visible: tabs, overflow: [] };
 		}
-		const total = widths.reduce((a, b) => a + b, 0) + GAP * Math.max(0, tabs.length - 1);
-		if (total <= availW) return { visible: tabs, overflow: [] };
-
-		// Room for the More button has to come out of the budget first.
-		const budget = availW - moreW - GAP;
-		let used = 0;
-		let n = 0;
-		for (let i = 0; i < tabs.length; i++) {
-			const w = widths[i] + (n > 0 ? GAP : 0);
-			if (used + w > budget) break;
-			used += w;
-			n++;
-		}
-		if (n < 1) n = 1; // never render an empty row
-
-		let visible = tabs.slice(0, n);
-		// The active tab always stays in the row: a section whose current page is
-		// only reachable by opening a menu reads as "nothing is selected".
-		if (activeIndex >= n) {
-			visible = [...tabs.slice(0, Math.max(0, n - 1)), tabs[activeIndex]];
-		}
-		const shown = new Set(visible);
-		return { visible, overflow: tabs.filter((t) => !shown.has(t)) };
+		const { visible, overflow } = splitSectionTabs({
+			widths,
+			barWidth: availW,
+			moreWidth: moreW,
+			gap: GAP,
+			activeIndex
+		});
+		return { visible: visible.map((i) => tabs[i]), overflow: overflow.map((i) => tabs[i]) };
 	});
 
+	// The budget is the content width of `.section-tabs-inner`, which holds the
+	// row AND the More button — not the row's own width, which has already
+	// shrunk by More's once More renders (`lib/sectionTabsSplit.ts`).
 	$effect(() => {
-		const el = rowEl;
+		const el = innerEl;
 		if (!el) return;
-		const ro = new ResizeObserver(() => (availW = el.clientWidth));
+		const contentWidth = () => {
+			const cs = getComputedStyle(el);
+			return el.clientWidth - parseFloat(cs.paddingLeft) - parseFloat(cs.paddingRight);
+		};
+		const ro = new ResizeObserver(() => (availW = contentWidth()));
 		ro.observe(el);
-		availW = el.clientWidth;
+		availW = contentWidth();
 		return () => ro.disconnect();
 	});
 
@@ -131,8 +124,8 @@
 		aria-label={m('shell.sectionNav', { group: m(group.labelKey) })}
 		data-tabs-ready={measured ? 'true' : 'false'}
 	>
-		<div class="section-tabs-inner">
-			<div class="section-tabs-row" bind:this={rowEl}>
+		<div class="section-tabs-inner" bind:this={innerEl}>
+			<div class="section-tabs-row">
 				{#each split.visible as tab (tab.href)}
 					{@const active = sectionTabActive(tab, tabs, page.url)}
 					<a
