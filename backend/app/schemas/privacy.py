@@ -128,6 +128,10 @@ class ErasureResponse(BaseModel):
     documents_deleted: int = 0
     documents_retained: int = 0
     documents_failed: int = 0
+    # Deleted invoices' folders (decisions §592) this pass could not empty, or
+    # left to another drain. Not known to be the subject's, but may be: > 0
+    # also means re-run.
+    orphaned_objects_failed: int = 0
     # Auth material (the `user` subject type only).
     passkeys_deleted: int = 0
     sessions_revoked: int = 0

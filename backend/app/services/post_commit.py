@@ -96,10 +96,7 @@ def is_post_commit_queued(session, factory: Callable[[], Awaitable[None]]) -> bo
     the factory, and enqueue a new one only when this says the old one is gone
     — run by a commit, or dropped by a rollback or a rolled-back savepoint.
     """
-    try:
-        jobs = session.info.get(_JOBS_KEY) or []
-    except Exception:  # noqa: BLE001 — a caller with no usable session
-        return False
+    jobs = session.info.get(_JOBS_KEY) or []
     return any(queued is factory for _name, queued, _savepoint in jobs)
 
 

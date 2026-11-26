@@ -142,6 +142,9 @@ export interface ErasureResponse {
 	documents_deleted: number;
 	documents_retained: number;
 	documents_failed: number;
+	/** Deleted invoices' folders not emptied in this pass (decisions §592): may
+	 *  hold the subject's document, so `> 0` also means re-run. */
+	orphaned_objects_failed?: number;
 	passkeys_deleted: number;
 	sessions_revoked: number;
 }

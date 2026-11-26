@@ -31718,3 +31718,41 @@ erasure's own transactions are not committed early. Tests: one job and one
 claim for a three-invoice bulk delete with one failing folder (only its row
 stays); a second drain mid-storage-call finds the rows unlocked and claimed and
 takes none; an expired claim is retaken, a fresh one is not.
+
+**One connection, a recorded finish, and an erasure that says what it missed
+(second review of this entry).** The two-phase drain above opened its claim and
+finishing sessions on the caller's engine while the caller's own session held a
+connection idle in its transaction, so on a `pool_size=1, max_overflow=0`
+engine (a dispatcher's) it waited out the pool timeout with its rows claimed.
+`drain_pending` now uses only the session it is given: one step claims the
+rows and reads ownership (so the storage calls need no session), the storage
+calls run with no statement in flight, and one step deletes the finished rows
+and writes the audit row. The post-commit job owns its session and passes
+`own_transactions=True`, committing after the claim and after the finish, so
+no lock or connection is held across a bucket call and the lease is visible to
+other drains. The retention sweep and an erasure pass their own session and
+nothing commits: committing would publish the sweep's archive work or the
+erasure's half-written tombstones early, and a second session is exactly the
+second connection a one-connection engine lacks. Their claimed rows stay
+row-locked until they commit, which nobody waits on (every drain reads `SKIP
+LOCKED`; nothing else updates the rows). Under `dispatch_engine_scope` no job
+is queued at all: a dispatcher runs post-commit jobs inline from `after_commit`,
+before the committing session releases its only connection, and the rows are
+durable for the sweep. The lease is stamped and compared on the drain's own
+clock, never a caller's `now`, which a backdated sweep would have turned into
+a claim born expired. A finishing transaction that fails after the bucket
+deletes leaves the rows claimed; once the lease lapses the next drain retakes
+them, finds the folders empty, and writes the `storage.objects_deleted` row
+with `reclaimed` (a new append-only row, never an UPDATE of one), so a folder
+never leaves storage unaudited, though its object count is lost. A row left to
+another drain (live lease, or row-locked) is counted as `skipped_claimed`, and
+an erasure folds it into `orphaned_objects_failed`, which the erasure response
+and audit row now carry and the admin page treats like `documents_failed`:
+re-run. That reverses this entry's earlier "does not mark itself incomplete":
+a queued folder is a deleted invoice's document folder, which may be the
+subject's. `post_commit.is_post_commit_queued` lost its `except Exception`:
+`Session.info` always exists. Tests: every entry point (the drain in a caller's
+open transaction, the sweep, an erasure, the job) on a `pool_size=1,
+max_overflow=0, pool_timeout=2` engine; no job queued under a dispatcher; a
+backdated `now` stamps the real time; a lost finish recorded by the retake;
+an erasure counting a leased row as not done.

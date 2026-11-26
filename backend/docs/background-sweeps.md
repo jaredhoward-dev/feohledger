@@ -313,12 +313,17 @@ folder's row is deleted (and a row another drain claimed within `CLAIM_LEASE`
 is skipped, so the cap moves past it), while its orphan scan of the bucket pages — one S3
 listing page per tick under `{org}/` and `{org}/chat/`, resuming from an
 in-process continuation token, because a live invoice's folder never leaves the
-listing. A restart only restarts the walk from the top. The outbox drain is
-two-phase too: it claims its rows in a short committed transaction (`FOR UPDATE
-SKIP LOCKED`, marked `claimed` with `last_attempt_at`) and holds no row lock
-while it calls the bucket, then deletes the emptied rows in another; the
-delete's post-commit job runs the same drain once per transaction, however many
-invoices it deleted.
+listing. A restart only restarts the walk from the top. The outbox drain uses
+only the one connection of the session it is given (a dispatcher's engine has
+one): it claims its rows and reads ownership (`FOR UPDATE SKIP LOCKED`, marked
+`claimed` with `last_attempt_at` on the drain's own clock, never the sweep's
+`now`), calls the bucket with no statement in flight, then deletes the emptied
+rows and writes the audit row. Here it runs inside the sweep's transaction and
+commits with it, so the archive work is never committed early; the delete's
+post-commit job runs the same drain once per transaction, however many invoices
+it deleted, committing the claim before the bucket calls. Under a dispatcher no
+job is queued (it would run inline while the committing session still holds the
+only connection), and this sweep drains the rows.
 
 The page boundary is safe for the same reason the two-phase shape is safe at all:
 step 2 re-claims the row under `FOR UPDATE` and re-checks the predicate there, so
