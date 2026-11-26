@@ -6,6 +6,13 @@
 # file is infra-secrets/feohledger/prod.sops.yaml, in the private repo — never
 # in this (public) one.
 prod.sops.yaml
+# deploy.sh's in-flight fetch of it (lib.sh feoh_fetch_secrets), the bucket it
+# is fetched from (the name stays out of this public repo), and the sops
+# lastmodified last applied (the replay guard's floor).
+prod.sops.yaml.fetch.*
+secrets-bucket
+.secrets-applied
+.secrets-applied.tmp
 # Per-VM tenant host list — seeded from tenants.caddy.example.
 tenants.caddy
 # deploy.sh's one-deploy-at-a-time lock (flock).

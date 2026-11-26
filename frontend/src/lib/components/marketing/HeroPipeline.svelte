@@ -389,7 +389,7 @@
 		to { opacity: 1; }
 	}
 
-	@media (max-width: 520px) {
+	@media (max-width: 640px) {
 		/* The stacked cards step right by their translate, which on a phone
 		   pushes their edge past the viewport. Halve the step. */
 		.ghost-1 {

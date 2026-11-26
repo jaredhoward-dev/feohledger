@@ -340,6 +340,28 @@ Deleting a retained document would leave a preserved money row with its
 supporting evidence destroyed, which is precisely what the retention argument
 exists to prevent.
 
+### Documents of deleted invoices
+
+Deleting an invoice removes its documents from storage too (`docs/decisions.md`
+§592, `services/invoice_objects`): its document folder `{org}/{invoice}/`
+(every version, a received PEPPOL payload) and its chat folder
+`{org}/chat/{invoice}/` are queued in the delete's transaction and emptied after
+it commits, with the retention sweep retrying any failure. Nothing in the table
+above applies to them — the invoice row they were evidence for is gone.
+
+No row leads the per-subject walk to such a folder, so **every erasure also
+runs the orphan pass** before it: the queued folders, then one bounded page of
+the tenant's invoice folders that no live invoice owns and nothing has written
+to for 24 hours. What it removed is counted as `orphaned_objects_deleted` in the
+request's `record_counts`, a failure as `orphaned_objects_failed`, which also
+counts a queued folder left to another drain (claimed by it within its lease,
+or row-locked right now). That folder is not known to hold the subject's
+documents, but may, so the response carries `orphaned_objects_failed` beside
+`documents_failed` and the admin page reports the erasure incomplete when
+either is above zero: re-run it. The drain runs inside the erasure's own
+transaction on its one connection, so the tombstones, request row and audit
+row still commit together (decisions §592).
+
 ### Why the Positive Pay file is deleted
 
 It looks like transaction evidence and is not. It is an instruction handed to a

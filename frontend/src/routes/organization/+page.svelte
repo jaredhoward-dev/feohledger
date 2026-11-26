@@ -2134,7 +2134,7 @@
 		gap: 20px;
 	}
 
-	@media (min-width: 60rem) {
+	@media (min-width: 1024px) {
 		.settings-layout {
 			grid-template-columns: 200px minmax(0, 1fr);
 			gap: 28px;

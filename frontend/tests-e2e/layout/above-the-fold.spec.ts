@@ -28,7 +28,7 @@ import { expect, NO_TENANT_BASE, stubPartnerWorkspace, test } from '../fixtures/
  * the same contract `lib/help/content.test.ts` holds `PAGE_HELP` to.
  *
  * At 390px the shell collapses the sidebar to its 60px rail (`+layout.svelte`'s
- * `(max-width: 700px)` query), so every locator is scoped to `#main-content`:
+ * `SHELL_NARROW_QUERY`, 768px — `src/lib/breakpoints.ts`), so every locator is scoped to `#main-content`:
  * the assertion is about the page, never the nav.
  */
 

@@ -11,8 +11,8 @@
 # (README.md § Workload stack).
 #
 # The VM holds no static AWS credentials. Everything it may do in AWS is the
-# instance role below: decrypt the sops secrets, read/write the three data
-# buckets under the app key, and send mail through SES.
+# instance role below: fetch and decrypt the sops secrets, read/write the three
+# data buckets under the app key, and send mail through SES.
 
 # ── Security group ───────────────────────────────────────────────────────────
 
@@ -173,6 +173,24 @@ data "aws_iam_policy_document" "app_permissions" {
     sid       = "Backups"
     actions   = ["s3:GetObject", "s3:PutObject", "s3:AbortMultipartUpload"]
     resources = ["${aws_s3_bucket.backups.arn}/*"]
+  }
+
+  # deploy.sh fetches the current production secrets ciphertext before every
+  # deploy (lib.sh feoh_fetch_secrets, secrets_delivery.tf). The one key, read
+  # only: infra-secrets' CI is its only writer. ListBucket on that bucket only
+  # so a missing object reads as 404, not a misleading 403. No
+  # GetObjectVersion: a rollback is a re-upload of the older file, which the
+  # replay guard then refuses without --allow-secrets-rollback.
+  statement {
+    sid       = "FetchSecretsCiphertext"
+    actions   = ["s3:GetObject"]
+    resources = [local.secrets_object_arn]
+  }
+
+  statement {
+    sid       = "ListSecretsBucket"
+    actions   = ["s3:ListBucket"]
+    resources = [aws_s3_bucket.secrets.arn]
   }
 
   statement {

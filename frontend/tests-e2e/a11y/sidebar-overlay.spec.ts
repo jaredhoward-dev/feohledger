@@ -1,4 +1,4 @@
-import type { Page } from '@playwright/test';
+import type { Locator, Page } from '@playwright/test';
 
 import { expect, test } from '../fixtures/helpers';
 import { expectNoA11yViolations } from './axe-helper';
@@ -6,7 +6,9 @@ import { expectNoA11yViolations } from './axe-helper';
 /**
  * The sidebar on a phone (#635 finding 39; WCAG 1.4.10, 2.1.2, 2.4.3).
  *
- * At 700px and below the sidebar starts as its 60px icon rail. Expanding it
+ * At the shell's narrow breakpoint and below (768px, the breakpoint scale's
+ * `lg` — `src/lib/breakpoints.ts`, decisions §590) the sidebar starts as its
+ * 60px icon rail. Expanding it
  * used to push the page right by the full 220px panel, which at 320px left the
  * content about 100px wide. On a narrow viewport the expanded panel is now an
  * OVERLAY: the page keeps the rail's offset and its full width, a backdrop
@@ -245,7 +247,8 @@ test('resizing while open hands the layout over cleanly', async ({ page }) => {
 	await toggle(page).click();
 	await expectOpen(page, 375);
 
-	// Narrow → wide with the panel open: it becomes the desktop push panel.
+	// Narrow → wide with the panel open: the reader's WIDE choice comes back —
+	// here the default, the expanded push panel (decisions §590).
 	await page.setViewportSize({ width: 1280, height: 720 });
 	await expect(backdrop(page)).toHaveCount(0);
 	await expect(main(page)).not.toHaveAttribute('inert', /.*/);
@@ -256,4 +259,122 @@ test('resizing while open hands the layout over cleanly', async ({ page }) => {
 	await page.setViewportSize({ width: 375, height: 720 });
 	await expectClosed(page);
 	await expect.poll(async () => (await main(page).boundingBox())?.x).toBe(60);
+});
+
+test('the shell turns narrow at the scale\'s lg step (768px), not before', async ({ page }) => {
+	// 768 is the last narrow width (`max-width: 768px`); 769 is wide.
+	await openDashboard(page, 768);
+	await expectClosed(page);
+	await expect.poll(async () => (await main(page).boundingBox())?.x).toBe(60);
+
+	await page.setViewportSize({ width: 769, height: 720 });
+	await expect(toggle(page)).toHaveAccessibleName('Collapse sidebar');
+	await expect.poll(async () => (await main(page).boundingBox())?.x).toBe(220);
+});
+
+test('a reader\'s collapsed choice on desktop survives a trip through the phone layout', async ({
+	page
+}) => {
+	await openDashboard(page, 1280);
+	await toggle(page).click();
+	await expect.poll(async () => (await main(page).boundingBox())?.x).toBe(60);
+
+	// Narrow: the rail, and opening + closing the overlay there is a
+	// narrow-only choice.
+	await page.setViewportSize({ width: 320, height: 720 });
+	await expectClosed(page);
+	await toggle(page).click();
+	await expectOpen(page, 320);
+
+	// Wide again: the reader had collapsed it, so it is still collapsed —
+	// not re-expanded by the overlay they opened on the way.
+	await page.setViewportSize({ width: 1280, height: 720 });
+	await expect(backdrop(page)).toHaveCount(0);
+	await expect(page.locator('aside.sidebar')).toHaveClass(/\bcollapsed\b/);
+	await expect.poll(async () => (await main(page).boundingBox())?.x).toBe(60);
+});
+
+test('at 320px every icon-only rail item is named and at least 24px square', async ({ page }) => {
+	// WCAG 2.2 4.1.2 / 2.5.8: the rail shows icons only, so each link carries
+	// its label as its accessible name, and each target clears the 24px floor.
+	await openDashboard(page, 320);
+	await expectClosed(page);
+	const links = primaryNav(page).getByRole('link');
+	const count = await links.count();
+	expect(count).toBeGreaterThan(3);
+	for (let i = 0; i < count; i++) {
+		const link = links.nth(i);
+		const name = (await link.getAttribute('aria-label')) ?? '';
+		expect(name.trim(), `rail link ${i} has no name`).not.toBe('');
+		await expect(link).toHaveAccessibleName(name);
+		const box = (await link.boundingBox())!;
+		expect(box.width, `${name} target width`).toBeGreaterThanOrEqual(24);
+		expect(box.height, `${name} target height`).toBeGreaterThanOrEqual(24);
+	}
+});
+
+/** The section-tab bar on `path` at 320px, once its split has settled. */
+async function sectionTabsAt320(page: Page, path: string) {
+	await page.setViewportSize({ width: 320, height: 720 });
+	await page.goto(path);
+	const bar = page.locator('nav.section-tabs');
+	await expect(bar).toHaveAttribute('data-tabs-ready', 'true');
+	const row = bar.locator('.section-tabs-row');
+	expect(await row.evaluate((el) => getComputedStyle(el).overflowX)).toBe('auto');
+	const active = row.locator('a.section-tab[aria-current="page"]');
+	await expect(active).toHaveCount(1);
+	return { row, active };
+}
+
+/** Where the active tab's edges sit against the row's visible box. */
+async function edges(active: Locator) {
+	return active.evaluate((tab) => {
+		const r = tab.getBoundingClientRect();
+		const box = tab.parentElement!.getBoundingClientRect();
+		return {
+			leftInside: r.left >= box.left - 1 && r.left <= box.right + 1,
+			rightInside: r.right >= box.left - 1 && r.right <= box.right + 1
+		};
+	});
+}
+
+async function pageSideways(page: Page) {
+	return page.evaluate(
+		() => document.documentElement.scrollWidth - document.documentElement.clientWidth
+	);
+}
+
+test('at 320px a tab wider than the row scrolls inside it instead of clipping or widening the page', async ({
+	page
+}) => {
+	// "Bank Reconciliation" beside the More button is wider than the 320px
+	// row, so it cannot be shown whole at once. What decisions §590 promises
+	// is that the row scrolls: both of its edges can be brought into view,
+	// and the document never scrolls sideways.
+	const { row, active } = await sectionTabsAt320(page, '/bank-reconciliation');
+	expect(await row.evaluate((el) => el.scrollWidth > el.clientWidth)).toBe(true);
+
+	await active.focus();
+	expect((await edges(active)).leftInside, 'focusing the tab brings its start into the row').toBe(
+		true
+	);
+
+	await row.evaluate((el) => {
+		el.scrollLeft = el.scrollWidth;
+	});
+	expect((await edges(active)).rightInside, 'scrolling the row reaches the tab\'s end').toBe(true);
+
+	expect(await pageSideways(page)).toBeLessThanOrEqual(0);
+});
+
+test('at 320px a short active tab sits whole in the row', async ({ page }) => {
+	// "Intake" (Procurement) fits beside the More button, so it is shown whole
+	// without any scrolling.
+	const { active } = await sectionTabsAt320(page, '/intake');
+	await active.focus();
+	expect(await edges(active), 'the focused active tab fits fully in the row').toEqual({
+		leftInside: true,
+		rightInside: true
+	});
+	expect(await pageSideways(page)).toBeLessThanOrEqual(0);
 });

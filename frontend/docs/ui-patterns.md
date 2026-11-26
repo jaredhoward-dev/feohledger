@@ -98,6 +98,73 @@ behind a gate and asserts the table (or tab bar) sits at the same `y` before
 and after — add the page there when you put something above a table that
 loads.
 
+### Viewport floor and breakpoints (decisions §590, #432)
+
+**The supported floor is 320px** — the width WCAG 2.2 SC 1.4.10 (Reflow)
+names. Every app-shell route must lay out at 320px with no document-level
+horizontal scroll, and `tests-e2e/a11y/reflow.spec.ts` asserts exactly that
+over every route it reads off `src/routes`. Below 320 is unsupported: nothing
+is designed for it and nothing tests it. 320 is a floor, not a breakpoint —
+nothing switches there.
+
+**Breakpoint scale.** Every `@media` `min-width` / `max-width` query in
+`src/**/*.svelte` and `src/**/*.css` uses one of these px values and no other:
+
+| name | px | what turns there |
+|------|----|------------------|
+| `2xs` | 360 | under-360 phones only: write it `@media not all and (min-width: 360px)` |
+| `xs` | 400 | small phones: tighten chrome that just fits at 375–400 |
+| `sm` | 480 | phones: single-column forms and dialogs |
+| `md` | 640 | large phones: form grids and button rows stack (`.org-panel .form-grid`) |
+| `lg` | 768 | **the app shell's narrow step**: sidebar icon rail, workspace gutter 28→14px, section-tab gutter, chat rail behind a disclosure |
+| `xl` | 1024 | two-pane layouts start: settings rail, auth panel, help contents rail, legal sheet card |
+| `2xl` | 1200 | the widest layouts: legal contents rail, pricing four-up, workflow editor two-up |
+
+- **Source of truth: `src/lib/breakpoints.ts`.** A JS query (`matchMedia`,
+  `svelte/reactivity`'s `MediaQuery`) is built from it — `maxWidth('lg')`,
+  `minWidth('xl')`, `SHELL_NARROW_QUERY` — never typed as a string. The scale
+  is also printed in a comment at the top of `app.css`.
+- **Why not `--bp-*` tokens:** a `var()` cannot appear in a `@media`
+  condition, and the build has no `@custom-media` step (no PostCSS or
+  Lightning CSS config, and adding one for this is not worth a dependency).
+  So the scale is data plus a guard: `src/lib/breakpoints.test.ts` scans every
+  `.svelte` / `.css` under `src/` and fails on an off-scale value (a rem value
+  too — the scale is px, one unit so two queries compare at a glance).
+- **Picking a value:** the nearest scale step, and when in doubt round *up*
+  for a `max-width` rule (the narrow layout applies to a few more widths, which
+  never costs reflow) and *up* for a `min-width` rule (the wide layout waits
+  until it really fits). A genuinely new step changes `breakpoints.ts`, this
+  table and the decisions log together.
+- **Where two queries meet, exactly one side matches.** A `max-width: N` and
+  a `min-width: N` both match at N, so at that one width a component gets the
+  narrow and the wide rules at once (the legal sheet lost its card *and*
+  gained the wide gutter at 1024). When a wide rule starts at a step, write the
+  narrow side as its negation, `@media not all and (min-width: N)`; N then
+  belongs to the wide side. The auth shell, sign-in's proofs and the legal
+  sheet all turn this way at `xl` — the two-column sign-in starts AT 1024, so
+  iPad landscape keeps it. `breakpoints.test.ts` fails on a `max-width: N` in a
+  file that also has a `min-width: N`. A lone `max-width` with no wide partner
+  (the shell's `lg`) keeps the inclusive "at and below" reading.
+- **`@container` queries are outside the scale** — they measure a component's
+  own box, not the viewport (the help centre uses three).
+
+**At and below the floor:**
+
+- **Sidebar** — at or below `lg` the shell is the icon rail (auto-collapsed),
+  and opening it is an overlay, never a push (§ Accessibility patterns →
+  Sidebar on a phone). The reader's wide-viewport choice is kept separately
+  and comes back when the window widens; it lasts the session (held in
+  memory, not persisted, so a reload starts expanded). The store seeds
+  `narrow` from `matchMedia` when it is created, so a phone's first paint is
+  already the rail.
+- **`SectionTabs`** — tabs that do not fit go into the More menu; what stays
+  in the row (always at least the active tab) scrolls sideways *inside* the row
+  when it still does not fit, rather than being clipped or widening the page.
+- **Dense tables keep every column** and scroll horizontally inside
+  `DataTable`'s `.grid-container` (§ Data tables); columns are never dropped
+  at narrow widths, because which column an AP reader can do without is not a
+  call the layout can make.
+
 ### Navigating a long page
 
 Three primitives, and which one a page gets depends on **why its sections share
@@ -1739,8 +1806,10 @@ inherit it for free. Reuse these; don't re-solve them per page.
   `<Badge tone="danger">Below minimum</Badge>` in the Closing cell, the
   `/payments` queue's overdue rows an "Overdue" badge. The banner above a table
   can give the count; only the row can say which.
-- **Sidebar on a phone** (WCAG 1.4.10, 2.1.2, 2.4.3; #635) — at 700px and
-  below the sidebar starts as its 60px icon rail, and expanding it opens the
+- **Sidebar on a phone** (WCAG 1.4.10, 2.1.2, 2.4.3; #635) — at the shell's
+  narrow step and below (`lg`, 768px — § Viewport floor and breakpoints) the
+  sidebar starts as its 60px icon rail, every rail link named by `aria-label`
+  (its label, which the rail hides), and expanding it opens the
   panel as an **overlay**, never a push: `<main>` keeps the rail's 60px offset
   and its full width, a `--overlay` backdrop covers it, and `<main>` plus the
   skip link carry `inert` while it is open (with the body scroll lock `ui/Modal`
@@ -1756,9 +1825,12 @@ inherit it for free. Reuse these; don't re-solve them per page.
   rail's buttons transition `background-color` only, never `all`: a colour
   transition fades the muted labels through sub-4.5:1 values on every theme
   change. Desktop keeps the push layout. State lives
-  in `stores/sidebar.svelte.ts` (`narrow`, `overlay`). Guard:
-  `tests-e2e/a11y/sidebar-overlay.spec.ts` (375 and 320px, both themes under
-  axe, desktop unchanged).
+  in `stores/sidebar.svelte.ts` (`narrow`, `overlay`), which keeps the reader's
+  wide-viewport expand / collapse choice apart from the narrow overlay, so
+  widening the window restores the wide choice (for the session; it is not
+  persisted) instead of whatever the phone layout forced. Guard: `tests-e2e/a11y/sidebar-overlay.spec.ts` (375 and
+  320px, the 768/769 boundary, the restored choice, rail names and 24px
+  targets, both themes under axe, desktop unchanged) and `stores/sidebar.test.ts`.
 - **Icon-only controls** — every icon-only `<button>` needs an
   `aria-label` (NotificationBell reflects the unread count; the sidebar
   collapse toggle + profile button carry `aria-label` + `aria-expanded`).

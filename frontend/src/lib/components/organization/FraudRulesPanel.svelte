@@ -449,7 +449,7 @@
 		color: var(--accent);
 	}
 
-	@media (max-width: 600px) {
+	@media (max-width: 640px) {
 		.threshold-row {
 			grid-template-columns: 1fr;
 		}

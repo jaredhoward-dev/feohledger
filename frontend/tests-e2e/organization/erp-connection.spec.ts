@@ -134,9 +134,15 @@ test.describe('/organization ERP connection', () => {
 			const select = card.getByTestId('erp-provider-select');
 			await expect(select).toBeVisible();
 
-			// The dropdown leads with the two region groups.
+			// The dropdown leads with the region groups.
 			await expect(select.locator('optgroup[label="Popular in the United States"]')).toHaveCount(1);
 			await expect(select.locator('optgroup[label="Popular in South Africa"]')).toHaveCount(1);
+			// Sage Accounting's catalogue `regions: ["GB"]` puts it in the UK group.
+			await expect(
+				select.locator(
+					'optgroup[label="Popular in the United Kingdom"] option[value="sage_accounting"]'
+				)
+			).toHaveCount(1);
 
 			await select.selectOption('netsuite');
 			// A new NetSuite connection starts on OAuth 2.0 (TBA is closed to new

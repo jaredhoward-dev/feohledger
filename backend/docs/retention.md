@@ -73,6 +73,44 @@ load-bearing:
   stopped — no starvation. Same shape as
   `FEOH_RECURRING_INVOICES_MAX_PER_SWEEP` and the audit shipper's batch size.
 
+### Deleted invoices' documents — finish the delete in storage
+
+Not a retention window: an invoice delete's storage half (`docs/decisions.md`
+§592, `services/invoice_objects`). Deleting an invoice queues its two folders,
+`{org}/{invoice}/` (the document from every channel, every superseded version,
+a received PEPPOL payload) and `{org}/chat/{invoice}/` (chat attachments), in
+`pending_object_deletions` inside the delete's transaction, and one post-commit
+job per transaction (a bulk delete included) empties them. Every tick of this
+sweep then, per tenant:
+
+1. **retries the outbox** — the oldest `FEOH_RETENTION_BATCH_SIZE` rows that
+   job did not finish (`drain_pending`); a row is removed only once its folder
+   is empty, and a failure keeps it with `attempts` / `last_error` (a class
+   name). Rows are claimed (`last_error = 'claimed'`, stamped on the drain's
+   own clock) and their ownership read before any bucket call, all on this
+   sweep's one connection and inside its transaction, so nothing is committed
+   early; a row another drain claimed within `CLAIM_LEASE` (15 minutes), or
+   row-locked right now, is skipped and counted (`skipped_claimed`). A claim
+   that lapsed unfinished (a drain died, or its finishing transaction failed
+   after emptying the folder) is retaken, and this pass's audit row records it
+   (`reclaimed`), so an emptied folder is never left unaudited;
+2. **walks one page of orphans** — one S3 listing page of the folders under
+   `{org}/` and `{org}/chat/` (resuming where the last tick stopped), keeps the
+   ones shaped like an invoice folder, and deletes those whose invoice row does
+   not exist **and** whose newest object is older than 24 hours, so an upload
+   whose row has not committed yet is never touched. This reaches invoices
+   deleted before §592 and any write whose row never committed.
+
+Both refuse a folder a live invoice still owns (by id, or because a live row's
+`file_key` sits inside it) and anything not under this organisation's id. A
+pass that removed or refused something writes one `storage.objects_deleted`
+audit row (`trigger`, `folders_purged`, `objects_deleted`, `failed`, `refused`,
+`skipped_fresh`, `skipped_claimed`, `reclaimed` — counts, never a key); `RetentionResult` carries
+`invoice_object_folders_purged` / `_failed`. On the deployed bucket's
+GOVERNANCE Object Lock a delete leaves a delete marker and the locked version
+lapses through the noncurrent-version lifecycle rule (`infra/s3.tf`), as for
+the Positive Pay file below.
+
 ### Positive Pay files — expire the FILE, keep the row
 
 The generated check-issue / ACH-authorization file legitimately carries every
@@ -205,6 +243,12 @@ change**. A future slice that wants a first-class `Invoice.archived_at` column
 tenant past its window with nothing archivable and nothing unshipped writes NO
 manifest on any tick, while an unshipped overdue row (and real archival work)
 still does.
+
+`backend/tests/test_invoice_objects.py`: an invoice delete (single and bulk)
+empties both folders after commit; a storage failure leaves a durable row the
+sweep retries; a rolled-back delete queues nothing; a folder a live invoice owns,
+or outside the org, is refused; the orphan pass deletes only old, unowned
+invoice folders; an unreadable bucket fails softly; an erasure reaches orphans.
 
 `backend/tests/test_retention.py`: resolver (override → default, malformed →
 default); per-tenant failure isolation; sweep archives only overdue terminal

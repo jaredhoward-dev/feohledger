@@ -120,6 +120,7 @@ from app.services.erp_payment_writeback import (
 )
 from app.services.gl_chart import refuse_gl_codes_outside_chart
 from app.services.gl_recode import RecodeFilter, bulk_recode_gl
+from app.services.invoice_objects import queue_invoice_objects
 from app.services.invoice_warnings import reconcile_line_totals, refresh_warnings
 from app.services.open_ap_due import overdue_invoice_ids
 from app.services.report_export import csv_safe_cell
@@ -2669,6 +2670,9 @@ async def _delete_invoice_cascade(
     # Grandchildren first: supplier chat messages (child of chat threads),
     # and virtual card reveal tokens / rebates (children of virtual_cards).
     thread_ids_q = select(SupplierChatThread.id).where(SupplierChatThread.invoice_id == invoice_id)
+    # Its stored documents go too, once this transaction commits: the folders
+    # are queued in it, so a rolled-back delete keeps them (decisions §592).
+    await queue_invoice_objects(db, invoice_id)
     await db.execute(
         sa_delete(SupplierChatMessage).where(SupplierChatMessage.thread_id.in_(thread_ids_q))
     )

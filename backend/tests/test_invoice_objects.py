@@ -1,0 +1,831 @@
+"""A deleted invoice's documents leave object storage too (decisions §592).
+
+Three paths, one rule — a folder goes only when no live invoice owns it:
+
+* the delete queues ``{org}/{invoice}/`` and ``{org}/chat/{invoice}/`` in its
+  own transaction (``pending_object_deletions``) and a post-commit job empties
+  them, so a rolled-back delete keeps every object and a storage failure keeps
+  a durable row;
+* the retention sweep retries the rows that job could not finish;
+* the retention sweep and every erasure walk one bounded page of the tenant's
+  folders and delete the ones no row owns, past a grace period.
+
+Storage is faked at ``services/storage``'s public seams (``delete_prefix``,
+``list_child_prefixes``, ``newest_object_time``); their own boto3 behaviour is
+pinned at the bottom against a mocked client, and in
+``test_storage_delete_prefix.py`` / ``test_storage_nonblocking.py``.
+"""
+
+from __future__ import annotations
+
+import uuid
+from datetime import UTC, datetime, timedelta
+from decimal import Decimal
+from unittest.mock import MagicMock, patch
+
+import pytest
+from botocore.exceptions import ClientError
+from sqlalchemy import delete as sa_delete
+from sqlalchemy import select
+
+from app.models.invoice import Invoice, InvoiceStatus
+from app.models.pending_object_deletion import PendingObjectDeletion
+from app.models.workflow import AuditLog
+from app.services import invoice_objects, storage
+from app.services.post_commit import drain_post_commit
+
+TENANT = "a"
+
+
+# ---------------------------------------------------------------------------
+# Pure: which folders an invoice owns, and which folders parse as one.
+# ---------------------------------------------------------------------------
+
+
+def test_an_invoice_owns_its_document_folder_and_its_chat_folder():
+    org, inv = uuid.uuid4(), uuid.uuid4()
+    assert invoice_objects.invoice_object_prefixes(org, inv) == (
+        f"{org}/{inv}/",
+        f"{org}/chat/{inv}/",
+    )
+
+
+def test_only_invoice_shaped_folders_under_the_org_parse():
+    org, inv = uuid.uuid4(), uuid.uuid4()
+    parse = invoice_objects._invoice_id_of
+    assert parse(org, f"{org}/{inv}/") == inv
+    assert parse(org, f"{org}/chat/{inv}/") == inv
+    # Another organisation's folder, a named segment, a deeper path, a key, a
+    # non-uuid: none is an invoice folder of this org, so none may be deleted.
+    assert parse(org, f"{uuid.uuid4()}/{inv}/") is None
+    for other in ("contracts", "expenses", "tax-forms", "w9", "positive-pay", "chat"):
+        assert parse(org, f"{org}/{other}/") is None
+    assert parse(org, f"{org}/contracts/{inv}/") is None
+    assert parse(org, f"{org}/chat/{inv}/{uuid.uuid4()}/") is None
+    assert parse(org, f"{org}/{inv}") is None
+    assert parse(org, f"{org}/not-a-uuid/") is None
+
+
+# ---------------------------------------------------------------------------
+# Real database.
+# ---------------------------------------------------------------------------
+
+
+async def _seed_invoice(mk, org_id, *, number: str, file_key: str | None = None) -> uuid.UUID:
+    async with mk() as s:
+        inv = Invoice(
+            organization_id=org_id,
+            invoice_number=number,
+            vendor_name="Object Purge Vendor",
+            amount=Decimal("120.00"),
+            currency="USD",
+            status=InvoiceStatus.new,
+            file_key=file_key,
+        )
+        s.add(inv)
+        await s.commit()
+        return inv.id
+
+
+def _record_deletes(monkeypatch, *, removed: int = 2, fail: bool = False) -> list[str]:
+    calls: list[str] = []
+
+    async def _fake(prefix: str) -> int:
+        calls.append(prefix)
+        if fail:
+            raise ConnectionError("storage down")
+        return removed
+
+    monkeypatch.setattr(storage, "delete_prefix", _fake)
+    return calls
+
+
+async def _purge_audits(mk) -> list[AuditLog]:
+    async with mk() as s:
+        return list(
+            (
+                await s.execute(
+                    select(AuditLog).where(AuditLog.action == invoice_objects.AUDIT_ACTION)
+                )
+            )
+            .scalars()
+            .all()
+        )
+
+
+async def _pending(mk) -> list[PendingObjectDeletion]:
+    async with mk() as s:
+        return list((await s.execute(select(PendingObjectDeletion))).scalars().all())
+
+
+@pytest.mark.asyncio
+async def test_deleting_an_invoice_empties_both_its_folders_after_commit(realdb, monkeypatch):
+    org_id = realdb.info(TENANT).org_id
+    mk = realdb.sessionmaker(TENANT)
+    inv = await _seed_invoice(
+        mk, org_id, number="OBJ-DEL-1", file_key=f"{org_id}/placeholder/peppol-inbound.xml"
+    )
+    calls = _record_deletes(monkeypatch, removed=3)
+
+    async with realdb.client(key=TENANT, role="admin") as c:
+        resp = await c.delete(f"/api/invoices/{inv}")
+    assert resp.status_code == 204, resp.text
+    await drain_post_commit()
+
+    assert sorted(calls) == sorted(invoice_objects.invoice_object_prefixes(org_id, inv))
+    # Emptied, so the outbox holds nothing for it.
+    assert await _pending(mk) == []
+    audits = await _purge_audits(mk)
+    assert len(audits) == 1
+    details = audits[0].details
+    assert details["trigger"] == "invoice_deleted"
+    assert details["folders_purged"] == 2 and details["objects_deleted"] == 6
+    # Counts only: no key, folder or id of the invoice in the row.
+    assert str(inv) not in str(details)
+
+
+@pytest.mark.asyncio
+async def test_bulk_delete_queues_every_deleted_invoice(realdb, monkeypatch):
+    org_id = realdb.info(TENANT).org_id
+    mk = realdb.sessionmaker(TENANT)
+    a = await _seed_invoice(mk, org_id, number="OBJ-BULK-A")
+    b = await _seed_invoice(mk, org_id, number="OBJ-BULK-B")
+    calls = _record_deletes(monkeypatch, removed=0)
+
+    async with realdb.client(key=TENANT, role="admin") as c:
+        resp = await c.post("/api/invoices/bulk/delete", json={"ids": [str(a), str(b)]})
+    assert resp.status_code == 200, resp.text
+    await drain_post_commit()
+
+    expected = invoice_objects.invoice_object_prefixes(
+        org_id, a
+    ) + invoice_objects.invoice_object_prefixes(org_id, b)
+    assert sorted(calls) == sorted(expected)
+    assert await _pending(mk) == []
+    # Nothing was in storage, so no append-only row was written for it.
+    assert await _purge_audits(mk) == []
+
+
+@pytest.mark.asyncio
+async def test_a_storage_failure_leaves_a_durable_row_the_sweep_retries(realdb, monkeypatch):
+    org_id = realdb.info(TENANT).org_id
+    mk = realdb.sessionmaker(TENANT)
+    inv = await _seed_invoice(mk, org_id, number="OBJ-FAIL-1")
+    _record_deletes(monkeypatch, fail=True)
+
+    async with realdb.client(key=TENANT, role="admin") as c:
+        resp = await c.delete(f"/api/invoices/{inv}")
+    # The invoice delete itself never waits on, or fails with, storage.
+    assert resp.status_code == 204, resp.text
+    await drain_post_commit()
+
+    rows = await _pending(mk)
+    assert sorted(r.prefix for r in rows) == sorted(
+        invoice_objects.invoice_object_prefixes(org_id, inv)
+    )
+    assert all(r.attempts == 1 and r.last_error == "storage_error" for r in rows)
+    assert all(r.last_attempt_at is not None for r in rows)
+
+    # Storage is back: the retention sweep's retry empties them and clears the rows.
+    calls = _record_deletes(monkeypatch, removed=1)
+    from app.services.retention_sweep import sweep_tenant
+
+    async with mk() as db:
+        result = await sweep_tenant(db, organization_id=org_id, settings_dict={})
+        await db.commit()
+    assert sorted(calls) == sorted(invoice_objects.invoice_object_prefixes(org_id, inv))
+    assert result.invoice_object_folders_purged == 2
+    assert result.invoice_object_folders_failed == 0
+    assert await _pending(mk) == []
+    audits = await _purge_audits(mk)
+    assert [a.details["trigger"] for a in audits] == ["retry"]
+
+
+@pytest.mark.asyncio
+async def test_a_rolled_back_delete_queues_nothing_and_deletes_nothing(realdb, monkeypatch):
+    org_id = realdb.info(TENANT).org_id
+    mk = realdb.sessionmaker(TENANT)
+    inv = await _seed_invoice(mk, org_id, number="OBJ-RB-1")
+    calls = _record_deletes(monkeypatch)
+
+    async with mk() as db:
+        await invoice_objects.queue_invoice_objects(db, inv)
+        await db.rollback()
+    await drain_post_commit()
+
+    assert calls == []
+    assert await _pending(mk) == []
+
+
+@pytest.mark.asyncio
+async def test_a_queued_folder_a_live_invoice_still_owns_is_refused(realdb, monkeypatch):
+    """Fail closed: a row naming a live invoice's folder is dropped, the objects
+    stay, and the refusal is audited."""
+    org_id = realdb.info(TENANT).org_id
+    mk = realdb.sessionmaker(TENANT)
+    live = await _seed_invoice(mk, org_id, number="OBJ-LIVE-1")
+    async with mk() as s:
+        s.add(
+            PendingObjectDeletion(
+                organization_id=org_id,
+                prefix=f"{org_id}/{live}/",
+                owner_type="invoice",
+                owner_id=live,
+            )
+        )
+        # A folder outside this org, which no queued row may reach either.
+        s.add(
+            PendingObjectDeletion(
+                organization_id=org_id,
+                prefix=f"{uuid.uuid4()}/{uuid.uuid4()}/",
+                owner_type="invoice",
+                owner_id=uuid.uuid4(),
+            )
+        )
+        await s.commit()
+    calls = _record_deletes(monkeypatch)
+
+    async with mk() as db:
+        result = await invoice_objects.drain_pending(db, organization_id=org_id, limit=10)
+        await db.commit()
+
+    assert calls == []
+    assert result.refused == 2 and result.folders_purged == 0
+    assert await _pending(mk) == []
+    assert [a.details["refused"] for a in await _purge_audits(mk)] == [2]
+
+
+@pytest.mark.asyncio
+async def test_a_folder_holding_a_live_invoices_document_is_refused(realdb, monkeypatch):
+    """Belt and braces: no path files one invoice's document under another's
+    id today, but if one did, that live document keeps the folder."""
+    org_id = realdb.info(TENANT).org_id
+    mk = realdb.sessionmaker(TENANT)
+    gone = uuid.uuid4()
+    await _seed_invoice(mk, org_id, number="OBJ-SHARE-1", file_key=f"{org_id}/{gone}/doc.pdf")
+    async with mk() as s:
+        s.add(
+            PendingObjectDeletion(
+                organization_id=org_id,
+                prefix=f"{org_id}/{gone}/",
+                owner_type="invoice",
+                owner_id=gone,
+            )
+        )
+        await s.commit()
+    calls = _record_deletes(monkeypatch)
+
+    async with mk() as db:
+        result = await invoice_objects.drain_pending(db, organization_id=org_id, limit=10)
+        await db.commit()
+    assert calls == [] and result.refused == 1
+
+
+@pytest.mark.asyncio
+async def test_bulk_delete_runs_one_post_commit_job_for_every_folder(realdb, monkeypatch):
+    """N invoices in one transaction: one job, one session, one claim, and a
+    failure on one folder leaves only that folder's row."""
+    from app.services import post_commit
+
+    org_id = realdb.info(TENANT).org_id
+    mk = realdb.sessionmaker(TENANT)
+    ids = [await _seed_invoice(mk, org_id, number=f"OBJ-ONE-{n}") for n in range(3)]
+    broken = f"{org_id}/{ids[1]}/"
+    calls: list[str] = []
+
+    async def _fake(prefix: str) -> int:
+        calls.append(prefix)
+        if prefix == broken:
+            raise ConnectionError("storage down")
+        return 1
+
+    monkeypatch.setattr(storage, "delete_prefix", _fake)
+    queued: list[str] = []
+    real_enqueue = post_commit.enqueue_post_commit
+
+    def _spy(session, factory, *, name):
+        queued.append(name)
+        real_enqueue(session, factory, name=name)
+
+    monkeypatch.setattr(invoice_objects, "enqueue_post_commit", _spy)
+    claims: list[int] = []
+    real_claim = invoice_objects._claim
+
+    async def _claim_spy(*args, **kwargs):
+        got = await real_claim(*args, **kwargs)
+        claims.append(len(got))
+        return got
+
+    monkeypatch.setattr(invoice_objects, "_claim", _claim_spy)
+
+    async with realdb.client(key=TENANT, role="admin") as c:
+        resp = await c.post("/api/invoices/bulk/delete", json={"ids": [str(i) for i in ids]})
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["deleted"] == 3
+    await drain_post_commit()
+
+    assert queued.count("invoice_objects.purge") == 1
+    assert claims == [6]
+    expected = [p for i in ids for p in invoice_objects.invoice_object_prefixes(org_id, i)]
+    assert sorted(calls) == sorted(expected)
+    rows = await _pending(mk)
+    assert [r.prefix for r in rows] == [broken]
+    assert rows[0].attempts == 1 and rows[0].last_error == "storage_error"
+    audits = await _purge_audits(mk)
+    assert len(audits) == 1
+    assert audits[0].details["folders_purged"] == 5 and audits[0].details["failed"] == 1
+
+
+@pytest.mark.asyncio
+async def test_a_new_transaction_on_the_same_session_gets_its_own_job(realdb, monkeypatch):
+    org_id = realdb.info(TENANT).org_id
+    mk = realdb.sessionmaker(TENANT)
+    a = await _seed_invoice(mk, org_id, number="OBJ-TX-A")
+    b = await _seed_invoice(mk, org_id, number="OBJ-TX-B")
+    calls = _record_deletes(monkeypatch, removed=0)
+
+    async with mk() as db:
+        await invoice_objects.queue_invoice_objects(db, a)
+        await db.rollback()
+        # The rolled-back transaction's job is gone; this one must queue anew.
+        await invoice_objects.queue_invoice_objects(db, b)
+        await db.execute(sa_delete(Invoice).where(Invoice.id == b))
+        await db.commit()
+    await drain_post_commit()
+
+    assert sorted(calls) == sorted(invoice_objects.invoice_object_prefixes(org_id, b))
+    assert await _pending(mk) == []
+
+
+async def _queue_rows(mk, org_id, count: int) -> list[str]:
+    prefixes = [f"{org_id}/{uuid.uuid4()}/" for _ in range(count)]
+    async with mk() as s:
+        for prefix in prefixes:
+            s.add(
+                PendingObjectDeletion(
+                    organization_id=org_id,
+                    prefix=prefix,
+                    owner_type="invoice",
+                    owner_id=uuid.UUID(prefix.rstrip("/").split("/")[-1]),
+                )
+            )
+        await s.commit()
+    return prefixes
+
+
+@pytest.mark.asyncio
+async def test_no_row_lock_is_held_while_storage_works_and_a_second_drain_skips_claimed_rows(
+    realdb, monkeypatch
+):
+    import asyncio
+
+    org_id = realdb.info(TENANT).org_id
+    mk = realdb.sessionmaker(TENANT)
+    prefixes = await _queue_rows(mk, org_id, 2)
+    entered, release = asyncio.Event(), asyncio.Event()
+    calls: list[str] = []
+
+    async def _slow(prefix: str) -> int:
+        calls.append(prefix)
+        entered.set()
+        await release.wait()
+        return 1
+
+    monkeypatch.setattr(storage, "delete_prefix", _slow)
+
+    async def _first() -> invoice_objects.PurgeResult:
+        # The post-commit job's mode: the claim commits before any storage call.
+        async with mk() as db:
+            return await invoice_objects.drain_pending(
+                db, organization_id=org_id, limit=10, own_transactions=True
+            )
+
+    first = asyncio.create_task(_first())
+    await asyncio.wait_for(entered.wait(), timeout=10)
+
+    # Mid-storage-call: the claim has committed, so the rows are not locked
+    # (NOWAIT would raise if they were) and they carry the claim.
+    async with mk() as s:
+        rows = (
+            (await s.execute(select(PendingObjectDeletion).with_for_update(nowait=True)))
+            .scalars()
+            .all()
+        )
+        assert sorted(r.prefix for r in rows) == sorted(prefixes)
+        assert all(r.last_error == invoice_objects.CLAIMED and r.attempts == 1 for r in rows)
+        await s.rollback()
+
+    # A concurrent drain (the sweep) takes none of them, and says so.
+    async with mk() as db:
+        second = await invoice_objects.drain_pending(db, organization_id=org_id, limit=10)
+    assert second.folders_purged == 0 and second.failed == 0
+    assert second.skipped_claimed == 2
+
+    release.set()
+    result = await first
+    assert result.folders_purged == 2
+    assert sorted(calls) == sorted(prefixes)
+    assert await _pending(mk) == []
+
+
+@pytest.mark.asyncio
+async def test_a_claim_left_by_a_dead_drain_is_retaken_after_its_lease(realdb, monkeypatch):
+    org_id = realdb.info(TENANT).org_id
+    mk = realdb.sessionmaker(TENANT)
+    now = datetime.now(UTC)
+    fresh, stale = await _queue_rows(mk, org_id, 2)
+    async with mk() as s:
+        for row in (await s.execute(select(PendingObjectDeletion))).scalars().all():
+            row.last_error = invoice_objects.CLAIMED
+            row.attempts = 1
+            row.last_attempt_at = (
+                now - timedelta(minutes=1)
+                if row.prefix == fresh
+                else now - invoice_objects.CLAIM_LEASE - timedelta(minutes=1)
+            )
+        await s.commit()
+    calls = _record_deletes(monkeypatch, removed=1)
+
+    async with mk() as db:
+        result = await invoice_objects.drain_pending(db, organization_id=org_id, limit=10)
+        await db.commit()
+
+    assert calls == [stale]
+    assert result.reclaimed == 1 and result.skipped_claimed == 1
+    assert [r.prefix for r in await _pending(mk)] == [fresh]
+
+
+@pytest.mark.asyncio
+async def test_a_backdated_now_does_not_stamp_an_expired_claim(realdb, monkeypatch):
+    """The lease is on the drain's own clock: a sweep run with a `now` a day in
+    the past must not stamp a claim another drain would see as long expired."""
+    from app.services.retention_sweep import sweep_tenant
+
+    org_id = realdb.info(TENANT).org_id
+    mk = realdb.sessionmaker(TENANT)
+    await _queue_rows(mk, org_id, 1)
+    _record_deletes(monkeypatch, fail=True)
+    before = datetime.now(UTC)
+
+    async with mk() as db:
+        await sweep_tenant(
+            db, organization_id=org_id, settings_dict={}, now=before - timedelta(days=1)
+        )
+        await db.commit()
+
+    (row,) = await _pending(mk)
+    assert row.attempts == 1 and row.last_error == "storage_error"
+    assert row.last_attempt_at >= before - timedelta(seconds=5)
+
+
+@pytest.mark.asyncio
+async def test_a_lost_finish_is_recorded_by_the_drain_that_retakes_the_claim(realdb, monkeypatch):
+    """The job empties the folders, then its finishing transaction fails: the
+    rows stay claimed and its audit row is gone. Once the lease lapses, the
+    sweep retakes them, finds the folders empty, and its row records the
+    deletion (`reclaimed`), so a folder never leaves storage unaudited."""
+    org_id = realdb.info(TENANT).org_id
+    mk = realdb.sessionmaker(TENANT)
+    inv = await _seed_invoice(mk, org_id, number="OBJ-LOST-1")
+    calls = _record_deletes(monkeypatch, removed=3)
+    real_audit = invoice_objects._audit
+
+    async def _broken_audit(*args, **kwargs):
+        raise ConnectionError("database went away")
+
+    monkeypatch.setattr(invoice_objects, "_audit", _broken_audit)
+    async with realdb.client(key=TENANT, role="admin") as c:
+        resp = await c.delete(f"/api/invoices/{inv}")
+    assert resp.status_code == 204, resp.text
+    await drain_post_commit()
+
+    assert len(calls) == 2
+    rows = await _pending(mk)
+    assert len(rows) == 2 and all(r.last_error == invoice_objects.CLAIMED for r in rows)
+    assert await _purge_audits(mk) == []
+
+    monkeypatch.setattr(invoice_objects, "_audit", real_audit)
+    _record_deletes(monkeypatch, removed=0)  # the lost drain already emptied them
+    async with mk() as s:
+        for row in (await s.execute(select(PendingObjectDeletion))).scalars().all():
+            row.last_attempt_at = datetime.now(UTC) - invoice_objects.CLAIM_LEASE * 2
+        await s.commit()
+    async with mk() as db:
+        result = await invoice_objects.drain_pending(db, organization_id=org_id, limit=10)
+        await db.commit()
+
+    assert result.reclaimed == 2 and result.folders_purged == 2
+    assert await _pending(mk) == []
+    (audit,) = await _purge_audits(mk)
+    assert audit.details["reclaimed"] == 2 and audit.details["folders_purged"] == 2
+
+
+@pytest.mark.asyncio
+async def test_an_erasure_counts_a_queued_folder_another_drain_holds_as_not_done(
+    realdb, monkeypatch
+):
+    """A row under another drain's live lease is not reached, and its folder
+    may hold the subject's document: the erasure must not read as complete."""
+    from app.models.data_subject_request import SUBJECT_VENDOR_CONTACT
+    from app.services.privacy_erasure import ErasureResult, _erase_documents
+
+    org_id = realdb.info(TENANT).org_id
+    mk = realdb.sessionmaker(TENANT)
+    await _queue_rows(mk, org_id, 1)
+    async with mk() as s:
+        row = (await s.execute(select(PendingObjectDeletion))).scalar_one()
+        row.last_error = invoice_objects.CLAIMED
+        row.last_attempt_at = datetime.now(UTC)
+        await s.commit()
+    calls = _record_deletes(monkeypatch)
+
+    result = ErasureResult()
+    async with mk() as db:
+        await _erase_documents(
+            subject_type=SUBJECT_VENDOR_CONTACT,
+            subject_id=uuid.uuid4(),
+            organization_id=org_id,
+            tenant_db=db,
+            result=result,
+            now=datetime.now(UTC),
+        )
+        await db.commit()
+
+    assert calls == []
+    assert result.orphaned_objects_failed == 1
+
+
+# ---------------------------------------------------------------------------
+# One connection: a dispatcher's engine is `pool_size=1, max_overflow=0`.
+# ---------------------------------------------------------------------------
+
+
+def _single_connection_engine(realdb):
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    from app.database import _make_tenant_url
+
+    return create_async_engine(
+        _make_tenant_url(realdb.info(TENANT).db_name),
+        pool_size=1,
+        max_overflow=0,
+        pool_timeout=2,
+    )
+
+
+@pytest.mark.asyncio
+async def test_every_drain_entry_point_completes_on_a_single_connection_engine(realdb, monkeypatch):
+    """The sweep and an erasure call `drain_pending` with their own session,
+    which holds the engine's only connection idle in its transaction; the
+    post-commit job owns its session. None may need a second connection at
+    once, or it waits for the pool timeout and leaves its rows claimed."""
+    from sqlalchemy.ext.asyncio import async_sessionmaker
+
+    from app.models.data_subject_request import SUBJECT_VENDOR_CONTACT
+    from app.services.privacy_erasure import ErasureResult, _erase_documents
+    from app.services.retention_sweep import sweep_tenant
+
+    org_id = realdb.info(TENANT).org_id
+    mk = realdb.sessionmaker(TENANT)
+    calls = _record_deletes(monkeypatch, removed=1)
+    engine = _single_connection_engine(realdb)
+    one = async_sessionmaker(engine, expire_on_commit=False)
+    try:
+        # The caller's own transaction is open before the drain starts.
+        await _queue_rows(mk, org_id, 2)
+        async with one() as db:
+            await db.execute(select(Invoice.id).limit(1))
+            result = await invoice_objects.drain_pending(db, organization_id=org_id, limit=10)
+            await db.commit()
+        assert result.folders_purged == 2
+
+        await _queue_rows(mk, org_id, 2)
+        async with one() as db:
+            await sweep_tenant(db, organization_id=org_id, settings_dict={})
+            await db.commit()
+
+        await _queue_rows(mk, org_id, 2)
+        erased = ErasureResult()
+        async with one() as db:
+            await _erase_documents(
+                subject_type=SUBJECT_VENDOR_CONTACT,
+                subject_id=uuid.uuid4(),
+                organization_id=org_id,
+                tenant_db=db,
+                result=erased,
+                now=datetime.now(UTC),
+            )
+            await db.commit()
+        assert erased.orphaned_objects_failed == 0
+
+        # The post-commit job, on the engine the delete committed through.
+        prefixes = await _queue_rows(mk, org_id, 2)
+        async with mk() as s:
+            ids = list((await s.execute(select(PendingObjectDeletion.id))).scalars().all())
+        batch = invoice_objects._Batch(engine=engine, rows={org_id: ids})
+        await invoice_objects._drain_batch_job(batch)()
+        assert set(prefixes) <= set(calls)
+    finally:
+        await engine.dispose()
+
+    assert len(calls) == 8
+    assert await _pending(mk) == []
+
+
+@pytest.mark.asyncio
+async def test_a_delete_under_a_dispatcher_leaves_its_rows_to_the_sweep(realdb, monkeypatch):
+    """A dispatcher runs post-commit jobs inline while the committing session
+    still holds the single connection, so no job is queued there at all."""
+    from sqlalchemy.ext.asyncio import async_sessionmaker
+
+    from app.database import dispatch_engine_scope
+
+    org_id = realdb.info(TENANT).org_id
+    mk = realdb.sessionmaker(TENANT)
+    inv = await _seed_invoice(mk, org_id, number="OBJ-DISPATCH-1")
+    calls = _record_deletes(monkeypatch)
+    queued: list[str] = []
+    monkeypatch.setattr(
+        invoice_objects, "enqueue_post_commit", lambda _s, _f, *, name: queued.append(name)
+    )
+    engine = _single_connection_engine(realdb)
+    try:
+        async with dispatch_engine_scope(
+            control_sessionmaker=async_sessionmaker(engine),
+            tenant_engines={realdb.info(TENANT).db_name: engine},
+        ):
+            async with async_sessionmaker(engine, expire_on_commit=False)() as db:
+                await invoice_objects.queue_invoice_objects(db, inv)
+                await db.execute(sa_delete(Invoice).where(Invoice.id == inv))
+                await db.commit()
+    finally:
+        await engine.dispose()
+
+    assert queued == [] and calls == []
+    assert sorted(r.prefix for r in await _pending(mk)) == sorted(
+        invoice_objects.invoice_object_prefixes(org_id, inv)
+    )
+
+
+def _fake_bucket(monkeypatch, folders: dict[str, dict[str, datetime | None]]):
+    """`folders[base]` maps each child folder to its newest object's time."""
+    ages: dict[str, datetime | None] = {}
+    for children in folders.values():
+        ages.update(children)
+
+    async def _list(prefix, *, cursor=None, limit=1000):
+        return list(folders.get(prefix, {})), None
+
+    async def _newest(prefix, *, limit=1000):
+        return ages[prefix]
+
+    monkeypatch.setattr(storage, "list_child_prefixes", _list)
+    monkeypatch.setattr(storage, "newest_object_time", _newest)
+
+
+@pytest.mark.asyncio
+async def test_the_orphan_scan_deletes_only_old_unowned_invoice_folders(realdb, monkeypatch):
+    org_id = realdb.info(TENANT).org_id
+    mk = realdb.sessionmaker(TENANT)
+    live = await _seed_invoice(mk, org_id, number="OBJ-ORPH-LIVE")
+    old_orphan, fresh_orphan, chat_orphan = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    now = datetime.now(UTC)
+    long_ago = now - timedelta(days=3)
+    _fake_bucket(
+        monkeypatch,
+        {
+            f"{org_id}/": {
+                f"{org_id}/{live}/": long_ago,
+                f"{org_id}/{old_orphan}/": long_ago,
+                # Written an hour ago: may be an upload whose row is in flight.
+                f"{org_id}/{fresh_orphan}/": now - timedelta(hours=1),
+                # Named folders belong to other owners and are never candidates.
+                f"{org_id}/contracts/": long_ago,
+                f"{org_id}/chat/": long_ago,
+            },
+            f"{org_id}/chat/": {
+                f"{org_id}/chat/{chat_orphan}/": long_ago,
+                f"{org_id}/chat/{live}/": long_ago,
+            },
+        },
+    )
+    calls = _record_deletes(monkeypatch, removed=1)
+
+    async with mk() as db:
+        result = await invoice_objects.sweep_orphaned_invoice_objects(
+            db, organization_id=org_id, now=now
+        )
+        await db.commit()
+
+    assert sorted(calls) == sorted([f"{org_id}/{old_orphan}/", f"{org_id}/chat/{chat_orphan}/"])
+    assert result.folders_purged == 2 and result.skipped_fresh == 1
+    audits = await _purge_audits(mk)
+    assert [a.details["trigger"] for a in audits] == ["orphan_scan"]
+    assert str(old_orphan) not in str(audits[0].details)
+
+
+@pytest.mark.asyncio
+async def test_an_unreadable_bucket_fails_the_pass_softly(realdb, monkeypatch):
+    org_id = realdb.info(TENANT).org_id
+    mk = realdb.sessionmaker(TENANT)
+
+    async def _down(prefix, *, cursor=None, limit=1000):
+        raise ConnectionError("storage down")
+
+    monkeypatch.setattr(storage, "list_child_prefixes", _down)
+    calls = _record_deletes(monkeypatch)
+    async with mk() as db:
+        result = await invoice_objects.sweep_orphaned_invoice_objects(db, organization_id=org_id)
+        await db.commit()
+    assert calls == [] and result.failed == 2
+    assert await _purge_audits(mk) == []
+
+
+@pytest.mark.asyncio
+async def test_an_erasure_reaches_orphaned_invoice_folders(realdb, monkeypatch):
+    """No row leads the per-subject walk to a deleted invoice's document, so the
+    erasure runs the same orphan pass and counts what it removed."""
+    from app.models.data_subject_request import SUBJECT_VENDOR_CONTACT
+    from app.services.privacy_erasure import ErasureResult, _erase_documents
+
+    org_id = realdb.info(TENANT).org_id
+    mk = realdb.sessionmaker(TENANT)
+    orphan = uuid.uuid4()
+    _fake_bucket(
+        monkeypatch,
+        {f"{org_id}/": {f"{org_id}/{orphan}/": datetime.now(UTC) - timedelta(days=2)}},
+    )
+    calls = _record_deletes(monkeypatch, removed=4)
+
+    result = ErasureResult()
+    async with mk() as db:
+        await _erase_documents(
+            subject_type=SUBJECT_VENDOR_CONTACT,
+            subject_id=uuid.uuid4(),
+            organization_id=org_id,
+            tenant_db=db,
+            result=result,
+            now=datetime.now(UTC),
+        )
+        await db.commit()
+
+    assert calls == [f"{org_id}/{orphan}/"]
+    assert result.orphaned_objects_deleted == 4
+    assert result.documents_failed == 0
+    assert [a.details["trigger"] for a in await _purge_audits(mk)] == ["erasure"]
+
+
+# ---------------------------------------------------------------------------
+# The storage listing helpers, against a mocked boto3 client.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.live_orphan_listing
+@pytest.mark.asyncio
+async def test_list_child_prefixes_returns_one_page_and_a_continuation():
+    client = MagicMock()
+    client.list_objects_v2 = MagicMock(
+        return_value={
+            "CommonPrefixes": [{"Prefix": "o/a/"}, {"Prefix": "o/b/"}],
+            "IsTruncated": True,
+            "NextContinuationToken": "tok",
+        }
+    )
+    with patch.object(storage, "_get_client", return_value=client):
+        children, cursor = await storage.list_child_prefixes("o/", cursor="prev", limit=2)
+    assert children == ["o/a/", "o/b/"] and cursor == "tok"
+    kwargs = client.list_objects_v2.call_args.kwargs
+    assert kwargs["Delimiter"] == "/" and kwargs["MaxKeys"] == 2
+    assert kwargs["ContinuationToken"] == "prev" and kwargs["Prefix"] == "o/"
+
+
+@pytest.mark.live_orphan_listing
+@pytest.mark.asyncio
+async def test_list_child_prefixes_guards_and_missing_bucket():
+    client = MagicMock()
+    client.list_objects_v2 = MagicMock(
+        side_effect=ClientError({"Error": {"Code": "NoSuchBucket"}}, "ListObjectsV2")
+    )
+    with patch.object(storage, "_get_client", return_value=client):
+        for bad in ("", "  ", "o"):
+            with pytest.raises(ValueError):
+                await storage.list_child_prefixes(bad)
+        assert await storage.list_child_prefixes("o/") == ([], None)
+
+
+@pytest.mark.asyncio
+async def test_newest_object_time_reads_one_page_and_fails_closed_when_truncated():
+    t1, t2 = datetime(2026, 1, 1, tzinfo=UTC), datetime(2026, 2, 1, tzinfo=UTC)
+    client = MagicMock()
+    client.list_objects_v2 = MagicMock(
+        return_value={"Contents": [{"LastModified": t1}, {"LastModified": t2}]}
+    )
+    with patch.object(storage, "_get_client", return_value=client):
+        assert await storage.newest_object_time("o/x/") == t2
+        client.list_objects_v2.return_value = {"Contents": []}
+        assert await storage.newest_object_time("o/x/") is None
+        # Too large to read in one page: reported as fresh, so it is left alone.
+        client.list_objects_v2.return_value = {"Contents": [], "IsTruncated": True}
+        assert await storage.newest_object_time("o/x/") > datetime.now(UTC) - timedelta(minutes=1)
+        with pytest.raises(ValueError):
+            await storage.newest_object_time("")

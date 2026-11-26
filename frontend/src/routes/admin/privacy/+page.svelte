@@ -245,8 +245,11 @@
 			}
 			// A storage object that could not be deleted leaves the erasure
 			// incomplete; say so rather than let the success toast stand alone.
-			if ((res.documents_failed ?? 0) > 0) {
-				toast(m('admin.privacy.toast.erasureIncomplete', { failed: res.documents_failed }), 'error');
+			// A deleted invoice's folder not emptied may hold the subject's
+			// document too (decisions §592).
+			const notDeleted = (res.documents_failed ?? 0) + (res.orphaned_objects_failed ?? 0);
+			if (notDeleted > 0) {
+				toast(m('admin.privacy.toast.erasureIncomplete', { failed: notDeleted }), 'error');
 			}
 			identifier = '';
 			await loadRequests();

@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { LAST_UPDATED, OPERATOR, OPERATOR_FACTS_COMPLETE, PENDING, PENDING_FACT_LABELS } from './operator';
 	import { LEGAL_PAGES } from './pages';
+	import { minWidth } from '#lib/breakpoints.ts';
 
 	/**
 	 * Shared chrome for every page under `routes/legal/`.
@@ -65,11 +66,12 @@
 	 * starts open in the rail), in the `min-width` query at the bottom of this
 	 * file (the grid), and in `routes/legal/+layout.svelte` (which widens the
 	 * sheet by exactly the rail at the same width, because a child cannot widen
-	 * its container). 72rem = 1152px: the widened sheet is 67rem, which leaves
-	 * a 2.5rem page margin each side — the narrowest width at which the rail is
-	 * new space rather than space taken from the 46rem measure.
+	 * its container). The widened sheet is 67rem (1072px), so the rail needs a
+	 * window of at least ~1152px to be new space rather than space taken from
+	 * the 46rem measure; the scale step at or above that is `2xl` (1200px,
+	 * `lib/breakpoints.ts`, decisions §590).
 	 */
-	const RAIL_QUERY = '(min-width: 72rem)';
+	const RAIL_QUERY = minWidth('2xl');
 
 	/**
 	 * How far down the viewport the scroll-spy's reading line sits, in CSS px.
@@ -560,7 +562,7 @@
 	   `routes/legal/+layout.svelte` widens the sheet by
 	   `--legal-contents-rail + --legal-contents-gap` at this SAME width and
 	   declares both tokens, so the 46rem measure is untouched and the rail is
-	   new space — change 72rem here and you must change it there and in
+	   new space — change `2xl` here and you must change it there and in
 	   `RAIL_QUERY` above.
 
 	   A rail rather than anything pinned over the text: the layout's top bar is
@@ -569,7 +571,7 @@
 	   `sticky` works here because that file uses `overflow-x: clip` rather than
 	   `hidden` on `.legal-root`, which keeps it from becoming a scroll
 	   container — it says so. */
-	@media (min-width: 72rem) {
+	@media (min-width: 1200px) {
 		.legal-shell {
 			display: grid;
 			/* The document column takes whatever is left, which the sheet's own

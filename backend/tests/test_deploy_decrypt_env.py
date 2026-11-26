@@ -104,10 +104,10 @@ class Deploy:
     def env(self) -> Path:
         return self.dir / ".env"
 
-    def run(self, dotenv: str, *, sops_exit: int = 0) -> subprocess.CompletedProcess[str]:
+    def run(self, dotenv: str, *args: str, sops_exit: int = 0) -> subprocess.CompletedProcess[str]:
         self.output_file.write_text(dotenv)
         return subprocess.run(
-            [str(self.dir / "decrypt-env.sh")],
+            [str(self.dir / "decrypt-env.sh"), *args],
             env={
                 "PATH": f"{self.bin}:{os.environ.get('PATH', '/usr/bin:/bin')}",
                 "SOPS_STUB_ARGS": str(self.args_file),
@@ -159,6 +159,31 @@ def test_refuses_without_the_secrets_file(deploy: Deploy) -> None:
     assert result.returncode != 0
     assert "prod.sops.yaml missing" in result.stderr
     assert not deploy.args_file.exists(), "sops ran with no secrets file to decrypt"
+
+
+def test_decrypts_the_file_it_is_handed(deploy: Deploy) -> None:
+    """deploy.sh hands over the fetched file STAGED beside prod.sops.yaml, and
+    moves it into place only once this accepts it (lib.sh feoh_commit_secrets)."""
+    (deploy.dir / "prod.sops.yaml.fetch.AbC123").write_text("FEOH_SECRET_KEY: ENC[stub]\n")
+    result = deploy.run(_dotenv(), "prod.sops.yaml.fetch.AbC123")
+    assert result.returncode == 0, result.stderr
+    assert deploy.args_file.read_text().split("\n")[-2] == "prod.sops.yaml.fetch.AbC123"
+
+
+@pytest.mark.parametrize("arg", ["../prod.sops.yaml", "/etc/passwd", "-d", ""])
+def test_refuses_a_path_or_option_instead_of_a_file_name(deploy: Deploy, arg: str) -> None:
+    deploy.env.write_text(PREVIOUS_ENV)
+    result = deploy.run(_dotenv(), arg)
+    _assert_refused_and_kept(deploy, result)
+    assert "a file name in deploy/" in result.stderr
+    assert not deploy.args_file.exists(), "sops ran on a path outside deploy/"
+
+
+def test_refuses_a_handed_file_that_is_missing(deploy: Deploy) -> None:
+    result = deploy.run(_dotenv(), "prod.sops.yaml.fetch.gone")
+    assert result.returncode != 0
+    assert "prod.sops.yaml.fetch.gone missing" in result.stderr
+    assert not deploy.args_file.exists()
 
 
 def test_a_failed_decrypt_keeps_the_previous_env(deploy: Deploy) -> None:
@@ -479,6 +504,8 @@ def test_deploy_sh_decrypts_only_through_decrypt_env() -> None:
         for line in DEPLOY_SH.read_text().splitlines()
         if line.strip() and not line.lstrip().startswith("#")
     ]
-    assert "./decrypt-env.sh" in code, "deploy.sh must run decrypt-env.sh before building"
+    assert any(line.startswith("./decrypt-env.sh ") for line in code), (
+        "deploy.sh must run decrypt-env.sh before building"
+    )
     stray = [line for line in code if "sops -d" in line or ".env.sops" in line]
     assert not stray, f"deploy.sh decrypts secrets itself instead of via decrypt-env.sh: {stray}"

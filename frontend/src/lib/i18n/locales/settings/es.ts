@@ -280,6 +280,7 @@ export const messages = {
 	'org.erp.choose': 'Elija su ERP',
 	'org.erp.group.us': 'Populares en Estados Unidos',
 	'org.erp.group.za': 'Populares en Sudáfrica',
+	'org.erp.group.gb': 'Populares en el Reino Unido',
 	'org.erp.group.other': 'Otros ERP',
 	'org.erp.provider.mergeDev': 'Otro ERP mediante Merge.dev',
 	'org.erp.comingSoon': '{erp} (próximamente)',

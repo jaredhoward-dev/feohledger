@@ -13,7 +13,7 @@ The whole flow is four commands on a fresh VM:
 
 ```
 ./bootstrap-vm.sh                     # once: docker, compose, sops, swap, cron, IMDS fix
-# copy infra-secrets' feohledger/prod.sops.yaml in as deploy/prod.sops.yaml, log out/in (docker group), then:
+# write the secrets bucket's name to deploy/secrets-bucket (§ Secrets delivery), log out/in (docker group), then:
 ./deploy.sh                           # first deploy: build the API, migrate, roll, verify (later ones: publish a release, § Deploys)
 ./add-tenant.sh acme --name "Acme" --admin-email admin@acme.com
 ```
@@ -35,7 +35,7 @@ The whole flow is four commands on a fresh VM:
 | `db-role-cutover.sh` | One-shot, idempotent move of the app off the RDS master onto the `feoh_app` role (IAM auth, `CREATEDB`, owner of every app database — § Database role, `docs/decisions.md` §310). Runs as the master; `--check` reports, `--verify-login` proves the app role signs in with a token. SQL in `sql/`. |
 | `backup.sh` | Nightly pg dumps (globals + control plane + every `feoh_*` DB) streamed to S3. Cron installed by bootstrap. On RDS these are the long-retention, provider-independent copy beside RDS's automated backups + PITR (globals with `--no-role-passwords`); in container mode they are the whole DR story. Optional `BACKUP_PING_URL` heartbeat (healthchecks.io-style) so silent failures get noticed. Fails, without pinging, if the server's database list does not include the control plane `feohledger` — an empty list used to report success. |
 | `restore.sh` | Streams a night's dumps back from S3 — each DB via `pg_restore --create` (skips existing DBs unless `--force`). Container mode replays globals first; on RDS it skips them and restores with `--no-owner --no-acl` so everything belongs to the master user. Stops the api for the duration, rolls the stack back up after. Test it once against a scratch stack. On RDS, a point-in-time restore is the first choice (`docs/minimal-deployment.md` § Point-in-time restore). A logical restore on RDS runs as the master (break-glass, § Database role) and refuses the IAM app role, which cannot recreate pgvector. |
-| `decrypt-env.sh` | Decrypts `prod.sops.yaml` to `.env` and checks it — required keys, JWT key strength, the payee fingerprint key (its own, at least 32 chars), values compose's `env_file` would silently rewrite, and the database mode (RDS: a URL `lib.sh` can parse, `PGSSLMODE` `verify-full`, and either a password or `FEOH_DATABASE_IAM_AUTH` true — never both; container: `POSTGRES_PASSWORD`, no TLS mode it cannot serve) — before it replaces the current `.env`. `deploy.sh` runs it; run it on its own to check a new secrets file without deploying. |
+| `decrypt-env.sh` | Decrypts `prod.sops.yaml` to `.env` and checks it — required keys, JWT key strength, the payee fingerprint key (its own, at least 32 chars), values compose's `env_file` would silently rewrite, and the database mode (RDS: a URL `lib.sh` can parse, `PGSSLMODE` `verify-full`, and either a password or `FEOH_DATABASE_IAM_AUTH` true — never both; container: `POSTGRES_PASSWORD`, no TLS mode it cannot serve) — before it replaces the current `.env`. `deploy.sh` runs it on the fetched file, staged (`decrypt-env.sh <file>`), and moves that over `prod.sops.yaml` only if it passes; run it on its own (no argument: `prod.sops.yaml`) to check a secrets file without deploying. |
 | `prod.sops.yaml.example` | Template for the VM's secrets file: flat YAML keyed by env var name, every value quoted. The encrypted original lives in `infra-secrets` (`docs/decisions.md` §171). |
 
 ## Before the VM (once per project)
@@ -48,9 +48,13 @@ The whole flow is four commands on a fresh VM:
   browsers silently fall back to HTTP/2). Instance profile: `kms:Decrypt` on
   the sops key; `kms:GenerateDataKey` + `kms:Decrypt` on the `infra/` **app**
   key (`app_kms_key_arn` output) — all three buckets encrypt under it, so S3
-  refuses every upload and every backup without it; S3 read/write
-  (`s3:GetObject/PutObject/DeleteObject/AbortMultipartUpload/ListBucket`) on the
-  invoice-files, audit-logs, and backup buckets (plus
+  refuses every upload and every backup without it; on the invoice-files
+  bucket `s3:GetObject/PutObject/DeleteObject/AbortMultipartUpload`, on the
+  audit-logs bucket `s3:PutObject/AbortMultipartUpload` only (append-only), on
+  the backups bucket `s3:GetObject/PutObject/AbortMultipartUpload` — **no
+  delete**: a removed tenant's dumps are erased by the approval-gated
+  backup-erasure workflow (`docs/decisions.md` §490) — and `s3:ListBucket` on
+  all three; `s3:GetObject` on the one key of the secrets bucket (plus
   `s3:GetBucketObjectLockConfiguration` on audit-logs once S3 audit shipping is
   on — full list with reasons: `docs/minimal-deployment.md` § 1); `ses:SendEmail` if using
   SES; ideally `ec2:ModifyInstanceMetadataOptions` so bootstrap can fix the
@@ -69,15 +73,82 @@ The whole flow is four commands on a fresh VM:
   `feohledger/prod.sops.yaml` from `prod.sops.yaml.example` —
   `aws sso login --profile feohledger`, then
   `AWS_PROFILE=feohledger sops feohledger/prod.sops.yaml` (paste, fill, save;
-  sops writes it encrypted) — and commit it there. Copy it onto the VM as
-  `deploy/prod.sops.yaml`; `./decrypt-env.sh` checks it without deploying.
-  Session Manager has no file copy, so carry the (still encrypted) file through
-  the backups bucket, which the instance role can already read: `aws s3 cp` it
-  to `s3://<backups bucket>/transfer/prod.sops.yaml` from your laptop, `aws s3
-  cp` it down on the VM, then delete every version of that key (the bucket is
-  versioned, so a plain delete leaves a copy behind).
+  sops writes it encrypted) — and commit and merge it there. infra-secrets' CI
+  uploads the **ciphertext** to the dedicated secrets bucket
+  (`infra/secrets_delivery.tf`), and every deploy fetches the current version
+  onto the VM as `deploy/prod.sops.yaml` before decrypting it (§ Secrets
+  delivery). Nothing is copied by hand.
   Generate keys in your own terminal. Never commit either file here — this
   repo is public. Pattern: `~/github/project-mgmt/docs/secrets-management.md`.
+
+## Secrets delivery
+
+`docs/decisions.md` §591, issue #735. A merge to infra-secrets' `main` that
+changes `feohledger/prod.sops.yaml` uploads its ciphertext to the secrets
+bucket; the next gated deploy applies it:
+
+- `deploy.sh` fetches the current version under its deploy lock
+  (`lib.sh` `feoh_fetch_secrets`) and **stages** it as a 0600 temp file in
+  `deploy/` once it is sops ciphertext with one readable `lastmodified`. It
+  hands the staged file to `decrypt-env.sh <file>`, and moves it over
+  `prod.sops.yaml` only once that accepts it (`feoh_commit_secrets`). A failed
+  or refused fetch, or a file `decrypt-env.sh` refuses (a MAC that fails, a
+  missing var), stops the deploy with the old `prod.sops.yaml`, `.env` and
+  replay floor untouched, and the staged file deleted.
+- It logs the S3 version id and the sops `lastmodified`, nothing else — the run
+  log is public. A failed `aws` call's own error text (which can name the
+  bucket's URL) never reaches it: only the exit code and a coarse class
+  (`AccessDenied`, `NoSuchKey`, `no credentials`, `network`, …).
+- **Replay guard:** a file whose `lastmodified` is older than the one last
+  applied (`deploy/.secrets-applied`) is refused. A deliberate rollback is
+  `./deploy.sh --no-pull --allow-secrets-rollback` from a Session Manager shell.
+  The guard may trust that field because sops authenticates it: it is the
+  additional data of the MAC's AES-GCM encryption, so an edited one fails the
+  decrypt (`docs/decisions.md` §591 cites the sops source).
+- **A secrets-only change** (an emergency rotation too) goes live by running
+  **Deploy to the VM** by hand from the tag of the live release and approving
+  it: the same code redeploys on the new secrets. infra-secrets' CI can only
+  put ciphertext; it never applies anything.
+
+The bucket's name is not in this public repo. Each VM reads it from the
+gitignored `deploy/secrets-bucket` (one line). **Until that file exists the
+deploy keeps the `prod.sops.yaml` already on the VM** and says so in the log
+(`delivery is not set up on this VM`), so releases keep working before the
+steps below are done. Once it exists, the fetch is mandatory: an empty file, a
+bad name or a failed fetch stops the deploy with the old file and `.env`
+untouched.
+
+### Owner steps (once, in this order)
+
+1. Add `secrets_bucket_name`, `infra_secrets_oidc_sub_prefix` and
+   `infra_secrets_repository` (`<owner>/<name>`) to
+   `infra-secrets/feohledger/prod.tfvars.sops` (`../infra/terraform.tfvars.example`
+   shows them; read the prefix with
+   `gh api repos/<owner>/infra-secrets/actions/oidc/customization/sub --jq .sub_claim_prefix`),
+   then plan and apply `infra/` (`../infra/README.md` § Applying) as the
+   Identity Center `AdministratorAccess` role — the bucket policy leaves
+   deleting versions and changing versioning, the lifecycle or the policy to
+   that role alone (`terraform_admin_principal_arn_patterns` if you apply as
+   another).
+2. In infra-secrets, set the repository **variables**
+   `FEOHLEDGER_SECRETS_BUCKET` (`terraform output -raw secrets_bucket`) and
+   `FEOHLEDGER_SECRETS_UPLOAD_ROLE_ARN` (`terraform output -raw secrets_upload_role_arn`),
+   and merge the `feohledger-upload.yml` workflow there.
+3. First upload: run that workflow by hand on `main` (it has
+   `workflow_dispatch`), or merge any change to the file. Check it went green.
+   The role trusts only that workflow file on `main` (GitHub's
+   `job_workflow_ref` claim); a `Not authorized to perform
+   sts:AssumeRoleWithWebIdentity` here means the claim did not match — check
+   `infra_secrets_repository` and the workflow's file name.
+4. On the VM, from a Session Manager shell:
+   `echo '<the secrets_bucket output>' > ~/feohledger/deploy/secrets-bucket`.
+5. Delete every version of the old `transfer/prod.sops.yaml` from the backups
+   bucket, if any are left (the VM role cannot).
+6. In `infra-secrets/feohledger/bootstrap.tfvars`, `deploy_role_can_use_sops =
+   false` is set by the same change: re-apply the account baseline
+   (`templates` `new-project-account.sh feohledger`) so the deploy role loses
+   its grant on the sops key — this repo's CI never decrypts sops.
+7. Release. The deploy log should show `==> secrets: S3 version …`.
 
 ## Deploys
 
@@ -243,6 +314,23 @@ already has open:
 
 Nothing is deleted on the way in, because an open page lazy-loads chunks from
 the build it started on.
+
+`smoke-frontend.sh` then asks the distribution's own domain, the apex and a
+tenant host (`smoke-check.<apex>`), each through public DNS:
+
+- `_app/version.json` is byte-for-byte this build's, so the edge is not serving
+  the previous release from cache;
+- `/`, a reload of a tenant route with its URL state
+  (`/invoices?status=ready_for_review`) and a deep link with a dotted segment
+  each return this build's `index.html` with a 200 — the SPA fallback;
+- a missing `/_app/immutable/…` file is a 404 and not the SPA shell (not
+  `text/html`, not `index.html`'s bytes), which is what a CloudFront custom
+  error response mapping 404 to `/index.html` would serve. `infra/tests/`
+  refuses such a response at plan time too;
+- HSTS is set.
+
+It is curl, not Playwright: every check is one response's status, content type
+or body (`docs/decisions.md` §589).
 
 The apex and tenant hosts must answer from CloudFront: the smoke step fails if
 the apex lacks CloudFront's `x-amz-cf-id` header, because since

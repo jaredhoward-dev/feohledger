@@ -8,6 +8,7 @@
 # input guards, and the release-deploy grant (deploy.tf): one document, one
 # instance, one sha-shaped parameter; and the SPA stack (frontend.tf): a bucket
 # only this distribution reads, the platform certificate on the apex + wildcard,
+# the router as the only SPA fallback (no custom error responses),
 # a publish grant scoped to that bucket and distribution, a missing-asset alarm
 # on the 404 rate with the monitoring subscription that publishes that metric,
 # and DNS that stays on
@@ -20,7 +21,11 @@
 # paging alarm and its artifacts bucket's baseline; and backup erasure
 # (backup_erasure.tf): each role trusts exactly one subject, runs only its own
 # documents on only the app VM, deletes only per-tenant dump versions, never the
-# control-plane dump, and the VM role still cannot delete a backup.
+# control-plane dump, and the VM role still cannot delete a backup; and secrets
+# delivery (secrets_delivery.tf): infra-secrets' main alone, from its one
+# upload workflow, may put the one ciphertext key, with no KMS; only the VM may
+# read it; and only the Terraform apply principal may delete versions or loosen
+# versioning, the lifecycle or the bucket policy.
 
 mock_provider "aws" {
   # A mocked policy document renders a random string, which the KMS key and
@@ -271,15 +276,44 @@ override_resource {
   }
 }
 
+# Secrets delivery (secrets_delivery.tf): the bucket policy and both grants
+# compare these ARNs exactly.
+override_resource {
+  target          = aws_s3_bucket.secrets
+  override_during = plan
+  values = {
+    arn = "arn:aws:s3:::feohledger-secrets-test"
+  }
+}
+
+override_resource {
+  target          = aws_iam_role.secrets_upload
+  override_during = plan
+  values = {
+    arn = "arn:aws:iam::000000000000:role/feohledger-secrets-upload"
+  }
+}
+
+override_resource {
+  target          = aws_iam_role.app
+  override_during = plan
+  values = {
+    arn = "arn:aws:iam::000000000000:role/feohledger-prod-app-vm"
+  }
+}
+
 variables {
-  invoice_files_bucket_name = "feohledger-invoices-test"
-  audit_logs_bucket_name    = "feohledger-audit-logs-test"
-  access_logs_bucket_name   = "feohledger-access-logs-test"
-  backups_bucket_name       = "feohledger-backups-test"
-  budget_alert_emails       = ["ops@feohledger.test"]
-  alert_emails              = ["ops@feohledger.test"]
-  db_master_password        = "testonlynotarealdbpassword"
-  github_oidc_sub_prefix    = "repo:example-owner@1/feohledger@2"
+  invoice_files_bucket_name     = "feohledger-invoices-test"
+  audit_logs_bucket_name        = "feohledger-audit-logs-test"
+  access_logs_bucket_name       = "feohledger-access-logs-test"
+  backups_bucket_name           = "feohledger-backups-test"
+  budget_alert_emails           = ["ops@feohledger.test"]
+  alert_emails                  = ["ops@feohledger.test"]
+  db_master_password            = "testonlynotarealdbpassword"
+  github_oidc_sub_prefix        = "repo:example-owner@1/feohledger@2"
+  secrets_bucket_name           = "feohledger-secrets-test"
+  infra_secrets_oidc_sub_prefix = "repo:example-owner@1/infra-secrets@3"
+  infra_secrets_repository      = "example-owner/infra-secrets"
 }
 
 run "budget_alerts_every_address_on_actual_and_forecast" {
@@ -1193,6 +1227,11 @@ run "distribution_serves_the_apex_and_every_tenant_on_the_platform_certificate" 
   }
 
   assert {
+    condition     = length(aws_cloudfront_distribution.frontend.custom_error_response) == 0
+    error_message = "No custom error responses: mapping a 403/404 to /index.html would serve the SPA shell for a missing /_app/ asset (deploy/smoke-frontend.sh checks the same at the edge; docs/decisions.md §589). The router function is the SPA fallback."
+  }
+
+  assert {
     condition     = aws_cloudfront_function.spa_router.runtime == "cloudfront-js-2.0" && aws_cloudfront_function.spa_router.publish
     error_message = "The router must be published on the 2.0 runtime; an unpublished function never reaches the LIVE stage."
   }
@@ -1597,4 +1636,193 @@ run "rejects_a_canary_threshold_inside_caddys_renewal_window" {
   }
 
   expect_failures = [var.certificate_canary_min_days]
+}
+
+# ── Secrets delivery (secrets_delivery.tf, docs/decisions.md §591) ──────────
+
+run "secrets_upload_role_trusts_only_infra_secrets_main" {
+  command = plan
+
+  assert {
+    condition = alltrue([
+      for c in one(data.aws_iam_policy_document.secrets_upload_trust.statement).condition :
+      c.test == "StringEquals"
+    ])
+    error_message = "The upload role's trust must use StringEquals only — a StringLike would let a wildcard subject in."
+  }
+
+  assert {
+    condition = toset([
+      for c in one(data.aws_iam_policy_document.secrets_upload_trust.statement).condition :
+      "${c.variable}=${join(",", c.values)}"
+      ]) == toset([
+      "token.actions.githubusercontent.com:aud=sts.amazonaws.com",
+      "token.actions.githubusercontent.com:sub=repo:example-owner@1/infra-secrets@3:ref:refs/heads/main",
+      "token.actions.githubusercontent.com:job_workflow_ref=example-owner/infra-secrets/.github/workflows/feohledger-upload.yml@refs/heads/main",
+    ])
+    error_message = "The upload role must trust exactly the STS audience, infra-secrets' main, and the one upload workflow file there — never this repo, a branch, a pull request or another workflow."
+  }
+}
+
+run "secrets_upload_role_puts_the_one_key_and_holds_no_kms" {
+  command = plan
+
+  assert {
+    condition = (
+      length(data.aws_iam_policy_document.secrets_upload.statement) == 1
+      && toset(one(data.aws_iam_policy_document.secrets_upload.statement).actions) == toset(["s3:PutObject"])
+      && toset(one(data.aws_iam_policy_document.secrets_upload.statement).resources) == toset(["arn:aws:s3:::feohledger-secrets-test/prod.sops.yaml"])
+    )
+    error_message = "The upload role may only s3:PutObject the one key: no read, no delete, no other key."
+  }
+
+  assert {
+    condition = alltrue(flatten([
+      for s in data.aws_iam_policy_document.secrets_upload.statement : [
+        for a in s.actions : !startswith(a, "kms:")
+      ]
+    ]))
+    error_message = "The upload role must hold no KMS permission: without the sops key it cannot forge a file sops accepts."
+  }
+
+  assert {
+    condition     = one(one(aws_s3_bucket_server_side_encryption_configuration.secrets.rule).apply_server_side_encryption_by_default).sse_algorithm == "AES256"
+    error_message = "The secrets bucket must be SSE-S3: SSE-KMS would need the uploader to hold a KMS grant."
+  }
+}
+
+run "secrets_bucket_is_private_versioned_and_bounded" {
+  command = plan
+
+  assert {
+    condition     = one(aws_s3_bucket_versioning.secrets.versioning_configuration).status == "Enabled"
+    error_message = "The secrets bucket must be versioned: the deploy log names the version it applied."
+  }
+
+  assert {
+    condition = (
+      aws_s3_bucket_public_access_block.secrets.block_public_acls
+      && aws_s3_bucket_public_access_block.secrets.block_public_policy
+      && aws_s3_bucket_public_access_block.secrets.ignore_public_acls
+      && aws_s3_bucket_public_access_block.secrets.restrict_public_buckets
+    )
+    error_message = "The secrets bucket must block every form of public access."
+  }
+
+  assert {
+    condition     = one(one(aws_s3_bucket_lifecycle_configuration.secrets.rule).noncurrent_version_expiration).newer_noncurrent_versions == 30
+    error_message = "The secrets bucket keeps about 30 superseded versions, then expires them."
+  }
+}
+
+run "secrets_bucket_denies_every_other_writer_and_reader" {
+  command = plan
+
+  assert {
+    condition = anytrue([
+      for s in data.aws_iam_policy_document.secrets_bucket.statement :
+      s.effect == "Deny" && toset(s.actions) == toset(["s3:PutObject"]) && anytrue([
+        for c in s.condition :
+        c.test == "ArnNotEquals" && c.variable == "aws:PrincipalArn" && toset(c.values) == toset(["arn:aws:iam::000000000000:role/feohledger-secrets-upload"])
+      ])
+    ])
+    error_message = "The bucket policy must deny PutObject to every principal but the upload role."
+  }
+
+  assert {
+    condition = anytrue([
+      for s in data.aws_iam_policy_document.secrets_bucket.statement :
+      s.effect == "Deny" && toset(s.actions) == toset(["s3:GetObject", "s3:GetObjectVersion"]) && anytrue([
+        for c in s.condition :
+        c.test == "ArnNotEquals" && c.variable == "aws:PrincipalArn" && toset(c.values) == toset(["arn:aws:iam::000000000000:role/feohledger-prod-app-vm"])
+      ])
+    ])
+    error_message = "The bucket policy must deny reads to every principal but the app VM role."
+  }
+
+  assert {
+    condition = anytrue([
+      for s in data.aws_iam_policy_document.secrets_bucket.statement :
+      s.sid == "DenyInsecureTransport" && s.effect == "Deny"
+    ])
+    error_message = "The secrets bucket must refuse plain HTTP."
+  }
+
+  # Deleting versions, switching versioning or the lifecycle off, or rewriting
+  # this policy is the Terraform apply principal's alone (by default the
+  # Identity Center AdministratorAccess role). Matched by ArnNotLike on the
+  # principal's ARN, over the bucket AND its objects.
+  assert {
+    condition = anytrue([
+      for s in data.aws_iam_policy_document.secrets_bucket.statement :
+      s.sid == "OnlyTerraformAdministers" && s.effect == "Deny"
+      && toset(s.actions) == toset([
+        "s3:DeleteObject", "s3:DeleteObjectVersion", "s3:PutBucketVersioning",
+        "s3:PutLifecycleConfiguration", "s3:PutBucketPolicy", "s3:DeleteBucketPolicy",
+      ])
+      && toset(s.resources) == toset(["arn:aws:s3:::feohledger-secrets-test", "arn:aws:s3:::feohledger-secrets-test/*"])
+      && toset([for pr in s.principals : "${pr.type}=${join(",", pr.identifiers)}"]) == toset(["AWS=*"])
+      && toset([for c in s.condition : "${c.test}:${c.variable}=${join(",", c.values)}"]) == toset([
+        "ArnNotLike:aws:PrincipalArn=arn:aws:iam::000000000000:role/aws-reserved/sso.amazonaws.com/*AWSReservedSSO_AdministratorAccess_*",
+      ])
+    ])
+    error_message = "The bucket policy must deny deleting objects or versions and changing versioning, the lifecycle or the policy to every principal but the Terraform apply principal."
+  }
+}
+
+run "secrets_bucket_admin_principal_is_overridable" {
+  command = plan
+
+  variables {
+    terraform_admin_principal_arn_patterns = ["arn:aws:iam::000000000000:role/terraform-apply"]
+  }
+
+  assert {
+    condition = anytrue([
+      for s in data.aws_iam_policy_document.secrets_bucket.statement :
+      s.sid == "OnlyTerraformAdministers" && anytrue([
+        for c in s.condition : toset(c.values) == toset(["arn:aws:iam::000000000000:role/terraform-apply"])
+      ])
+    ])
+    error_message = "terraform_admin_principal_arn_patterns must replace the default apply principal in the secrets bucket's admin deny."
+  }
+}
+
+run "secrets_bucket_admin_principal_must_be_an_iam_arn" {
+  command = plan
+
+  variables {
+    terraform_admin_principal_arn_patterns = ["*"]
+  }
+
+  expect_failures = [var.terraform_admin_principal_arn_patterns]
+}
+
+run "infra_secrets_repository_is_required_and_shaped" {
+  command = plan
+
+  variables {
+    infra_secrets_repository = "https://github.com/example-owner/infra-secrets"
+  }
+
+  expect_failures = [var.infra_secrets_repository]
+}
+
+run "app_vm_reads_only_the_secrets_key_and_never_writes_it" {
+  command = plan
+
+  # By sid: other statements carry ARNs (the app key) a mocked plan leaves
+  # unknown, so a filter over resources could not be evaluated.
+  assert {
+    condition = toset(flatten([
+      for s in data.aws_iam_policy_document.app_permissions.statement : [
+        for a in s.actions : "${a}=${join(",", s.resources)}"
+      ]
+      if contains(["FetchSecretsCiphertext", "ListSecretsBucket"], s.sid)
+      ])) == toset([
+      "s3:GetObject=arn:aws:s3:::feohledger-secrets-test/prod.sops.yaml",
+      "s3:ListBucket=arn:aws:s3:::feohledger-secrets-test",
+    ])
+    error_message = "The VM may read the one secrets key (and list its bucket) only: no write, no delete, no version reads."
+  }
 }

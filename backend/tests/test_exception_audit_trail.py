@@ -15,7 +15,8 @@ Covered here:
   * the ``payment_blocking`` flag tracks the real payment-run gate;
   * ``details`` carries no generated description text;
   * a human resolve / escalate / dismiss over the API writes its row, naming the
-    actor, and a bulk action writes one per row;
+    actor, and answers with the verb's correct past tense ("Exception dismissed",
+    never "dismissd"); a bulk action writes one per row;
   * an autonomous agent decision writes the SAME row shape, marked ``via:agent``;
   * the whole lifecycle survives a later mutation of the exception row — that's
     the point of putting it in ``audit_log``;
@@ -227,6 +228,7 @@ async def test_resolving_over_the_api_audits_the_decision_and_names_the_actor(re
             json={"action": "resolve", "resolution": "Confirmed distinct PO; not a duplicate."},
         )
         assert res.status_code == 200, res.text
+        assert res.json()["message"] == "Exception resolved"
 
     rows = await _audit_rows(mk, correlation_id=inv.correlation_id, action="exception.resolved")
     assert len(rows) == 1
@@ -259,12 +261,15 @@ async def test_escalate_then_resolve_keeps_both_deciders_in_the_trail(realdb):
             json={"action": "escalate", "resolution": "Bank details changed last week."},
         )
         assert first.status_code == 200, first.text
+        assert first.json()["message"] == "Exception escalated"
     async with realdb.client(key=TENANT, role="admin") as c:
         second = await c.post(
             f"/api/exceptions/{exc_id}/resolve",
             json={"action": "dismiss", "resolution": "Verified by callback to a known number."},
         )
         assert second.status_code == 200, second.text
+        # Past tense from the verb → status map, not verb + "d" ("dismissd").
+        assert second.json()["message"] == "Exception dismissed"
 
     async with mk() as s:
         from app.models.exception import Exception as APException

@@ -37,6 +37,30 @@ This is a SOC 2 prerequisite (`docs/soc2-readiness.md` § Secrets management).
 - Vendor breach affecting the third party that holds the secret
 - Engineer who handled the secret leaves the team
 
+### How a secrets change goes live
+
+Every value in `feohledger/prod.sops.yaml` reaches the VM the same way
+(`docs/decisions.md` §591):
+
+1. Edit it in your `infra-secrets` clone with
+   `AWS_PROFILE=feohledger sops feohledger/prod.sops.yaml`, commit, and merge to
+   `main`. That repo's CI (`.github/workflows/feohledger-upload.yml` there)
+   checks the file is sops ciphertext under the project key and uploads the
+   **ciphertext** to the dedicated secrets bucket (`infra/secrets_delivery.tf`).
+   No one copies a file by hand any more, and nothing goes through the backups
+   bucket.
+2. Apply it with a gated deploy: publish a release, or — for a secrets-only
+   change, including an emergency rotation — run **Deploy to the VM**
+   (`vm-deploy.yml`) by hand **from the tag of the release that is live**, so
+   the same code redeploys, and approve it as the `production` reviewer.
+   `deploy.sh` fetches the current version, logs its S3 version id and sops
+   `lastmodified`, and decrypts it. An emergency rotation goes live only
+   through that one approved run; nothing applies secrets without it.
+3. A file **older** than the one last applied is refused as a possible replay.
+   A deliberate rollback (reverting the file in `infra-secrets`) needs
+   `./deploy.sh --no-pull --allow-secrets-rollback` from a Session Manager
+   shell on the VM.
+
 ---
 
 ## Procedures
@@ -82,8 +106,7 @@ that teach people to clear fraud flags without looking.
    - set `FEOH_PAYEE_FINGERPRINT_KEY` to the new value.
    The new key must differ from `FEOH_SECRET_KEY`; the app refuses to boot
    otherwise.
-3. Commit in `infra-secrets`, copy the file onto the VM as `deploy/prod.sops.yaml`,
-   and run `./deploy.sh --no-pull --backend-only`. New payments stamp under the
+3. Commit and merge in `infra-secrets`, then [apply it](#how-a-secrets-change-goes-live). New payments stamp under the
    new key; voids of older ones still compare under the key that stamped them.
 4. Record the rotation (date, who) in the evidence locker. Name the secret in
    the `infra-secrets` commit message, never a value.
@@ -232,8 +255,8 @@ This section is the container-mode database (`docs/minimal-deployment.md`
 1. On the VM, from `deploy/`: `./compose.sh exec postgres psql -U postgres`,
    then `\password postgres` and type the new value at the prompt (it never reaches shell history).
 2. In `infra-secrets`: `AWS_PROFILE=feohledger sops feohledger/prod.sops.yaml`, set
-   `POSTGRES_PASSWORD`, save and commit; copy the file onto the VM as `deploy/prod.sops.yaml`.
-3. `./deploy.sh --no-pull --backend-only` — recreates the api (new DSN) and the postgres
+   `POSTGRES_PASSWORD`, save, commit and merge.
+3. [Apply it](#how-a-secrets-change-goes-live) — the deploy recreates the api (new DSN) and the postgres
    container (the data volume and its initialised cluster are kept).
 
 `backup.sh` and `restore.sh` connect over the container's local socket and are
@@ -264,9 +287,9 @@ after any break-glass session that typed it on the VM.
 
 **Before the cutover** (or if the app is ever put back on the master), the
 password is also inside `FEOH_DATABASE_URL` in `prod.sops.yaml`: change it there
-in the same sitting, copy the file onto the VM and run
-`./deploy.sh --no-pull --backend-only`. Every new connection made with the old
-password fails between the apply and that redeploy.
+in the same sitting, merge it in `infra-secrets` and [apply it](#how-a-secrets-change-goes-live). Every new
+connection made with the old password fails between the apply and that
+redeploy.
 
 **There is no app-role password to rotate.** `feoh_app` has none (the cutover
 sets `PASSWORD NULL`, and RDS refuses password sign-in for an `rds_iam` member
@@ -279,8 +302,7 @@ connection in their 15 minutes; connections already open must be terminated
 ### HMAC signing keys (`FEOH_APPROVAL_SIGNING_KEY`, `FEOH_EMAIL_ACTION_SIGNING_KEY`, `FEOH_PARTNER_LINK_SIGNING_KEY`, `FEOH_EMAIL_INTAKE_SIGNING_SECRET`)
 
 Generate the new value with `openssl rand -hex 32` in your own terminal, set it in
-`feohledger/prod.sops.yaml`, copy the file onto the VM, and run
-`./deploy.sh --no-pull --backend-only`. None of these keys supports an overlap
+`feohledger/prod.sops.yaml`, merge it in `infra-secrets`, and [apply it](#how-a-secrets-change-goes-live). None of these keys supports an overlap
 window, so know what each rotation breaks:
 
 - **Approval signing** — verification of every signature made under the old key

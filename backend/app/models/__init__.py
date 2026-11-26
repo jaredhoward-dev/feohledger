@@ -33,6 +33,7 @@ from app.models.legal_acceptance import LegalAcceptance
 from app.models.notification import Notification
 from app.models.organization import Organization
 from app.models.payment import Payment, PaymentRun, PaymentSchedule
+from app.models.pending_object_deletion import PendingObjectDeletion
 from app.models.peppol_transmission import PeppolTransmission
 from app.models.positive_pay import PositivePayFile
 from app.models.procurement import (
@@ -166,6 +167,7 @@ __all__ = [
     "PaymentSchedule",
     "PeppolTransmission",
     "POLineItem",
+    "PendingObjectDeletion",
     "PositivePayFile",
     "PreapprovalStatus",
     "PurchaseOrder",

@@ -29,6 +29,13 @@ double-archives and never re-reads the archive). Each tick archives at most
 backlog drains over several ticks instead of one unbounded one; the manifest
 records only counts, never the archived ids.
 
+Every tick also finishes the object-storage half of an invoice delete
+(decisions §592, ``services/invoice_objects``): it retries the queued folders
+the delete's post-commit job could not empty, then walks one bounded page of the
+tenant's invoice folders and deletes those no live invoice owns and nothing has
+written to within the grace period. That pass writes its own
+``storage.objects_deleted`` row (counts only).
+
 For the ``positive_pay`` class the sweep expires the STORED FILE, not the row.
 The generated check-issue / ACH-authorization file is the one artefact in this
 system that legitimately carries full account and routing numbers — that is its
@@ -84,7 +91,7 @@ from app.models.organization import Organization
 from app.models.peppol_transmission import PeppolTransmission
 from app.models.positive_pay import PositivePayFile
 from app.models.workflow import AuditLog
-from app.services import storage
+from app.services import invoice_objects, storage
 from app.services.audit_dispatch import dispatch_audit
 from app.services.sweep_health import SWEEP_RETENTION, run_sweep_loop
 
@@ -116,6 +123,8 @@ class RetentionResult:
 
     tenants_scanned: int = 0
     invoices_archived: int = 0
+    invoice_object_folders_purged: int = 0
+    invoice_object_folders_failed: int = 0
     audit_rows_overdue: int = 0
     audit_rows_overdue_unshipped: int = 0
     positive_pay_files_expired: int = 0
@@ -301,6 +310,19 @@ async def sweep_tenant(
     result.audit_rows_overdue = int(overdue_total)
     result.audit_rows_overdue_unshipped = int(overdue_unshipped)
 
+    # --- Deleted invoices' documents: retry the outbox, then orphans --------
+    # Bounded by the same cap; each pass audits itself (counts only). Both run
+    # inside this sweep's transaction on its one connection and commit with it
+    # (`drain_pending` § own_transactions): the archive work above must not be
+    # committed early, and a second session would need a second connection.
+    # The outbox lease is on the drain's own clock, never `ref_now`.
+    queued = await invoice_objects.drain_pending(db, organization_id=organization_id, limit=cap)
+    orphans = await invoice_objects.sweep_orphaned_invoice_objects(
+        db, organization_id=organization_id, limit=cap, now=ref_now
+    )
+    result.invoice_object_folders_purged = queued.folders_purged + orphans.folders_purged
+    result.invoice_object_folders_failed = queued.failed + orphans.failed
+
     # --- Audited manifest of this sweep -------------------------------------
     # Only write a row when the sweep actually did / observed something
     # ACTIONABLE, so an idle tenant doesn't append a no-op manifest every tick.
@@ -388,6 +410,8 @@ async def run_retention_once(*, now: datetime | None = None) -> RetentionResult:
                 )
                 await db.commit()
             total.invoices_archived += tenant_result.invoices_archived
+            total.invoice_object_folders_purged += tenant_result.invoice_object_folders_purged
+            total.invoice_object_folders_failed += tenant_result.invoice_object_folders_failed
             total.audit_rows_overdue += tenant_result.audit_rows_overdue
             total.audit_rows_overdue_unshipped += tenant_result.audit_rows_overdue_unshipped
             total.positive_pay_files_expired += tenant_result.positive_pay_files_expired

@@ -176,6 +176,7 @@
 						: 'true'
 					: undefined}
 				title={collapsed ? m(entry.labelKey) : ''}
+				aria-label={collapsed ? m(entry.labelKey) : undefined}
 			>
 				<span class="nav-icon">
 					{#if entry.icon === 'dashboard'}

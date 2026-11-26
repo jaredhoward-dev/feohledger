@@ -343,6 +343,10 @@ CLOSURE_ALLOWED: dict[str, str] = {
         "Supplier conversations; a supplier with a portal login blocks on its own."
     ),
     "supplier_chat_messages": "Supplier conversation messages.",
+    "pending_object_deletions": (
+        "Folders of deleted invoices still to be emptied in storage; closing the "
+        "workspace deletes its whole storage prefix."
+    ),
     "audit_log": (
         "Shipped to the write-once archive and sealed before the drop where shipping "
         "is on; a deployed environment without a real archive refuses the closure."

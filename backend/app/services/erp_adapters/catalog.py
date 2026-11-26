@@ -257,7 +257,7 @@ ERP_PROVIDERS: list[dict[str, Any]] = [
     {
         "key": "xero",
         "label": "Xero",
-        "regions": ["US", "ZA"],
+        "regions": ["US", "ZA", "GB"],
         "auth": "oauth",
         "fields": [
             *_byo_app_fields(),

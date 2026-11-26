@@ -7,8 +7,9 @@ release is checked against the edge afterwards (docs/decisions.md §278).
   that are older than the grace period. A partial build is refused before any
   AWS call.
 - `deploy/smoke-frontend.sh` — each origin serves this build's version.json,
-  the SPA for `/` and for a deep link with a dotted segment, a 404 for a missing
-  asset, and HSTS.
+  the SPA for `/`, a reload of a tenant route with its query string and a deep
+  link with a dotted segment, a 404 that is not the SPA shell for a missing
+  asset, and HSTS (docs/decisions.md §589).
 - `.github/workflows/vm-deploy.yml` — the SPA is built outside the gated
   environment and published inside the one approved job, after the VM.
 
@@ -291,8 +292,9 @@ ctype=text/html
 case "$url" in
 */_app/version.json) cp "$SERVE/version.json" "$body"; code=200; ctype=application/json ;;
 */_app/immutable/*)
-	if [ "${MISSING_AS_HTML:-0}" = 1 ]; then cp "$SERVE/index.html" "$body"; code=200
-	else printf 'not found' > "$body"; code=404; ctype=text/plain; fi ;;
+	if [ -n "${MISSING_AS_HTML:-}" ]; then cp "$SERVE/index.html" "$body"; code=$MISSING_AS_HTML
+	else printf 'not found' > "$body"; code=404; ctype=application/xml; fi ;;
+*\?*) cp "$SERVE/index.html" "$body"; code=${QUERY_ROUTE_STATUS:-200} ;;
 *.*) cp "$SERVE/index.html" "$body"; code=${DOTTED_ROUTE_STATUS:-200} ;;
 *) cp "$SERVE/index.html" "$body"; code=200 ;;
 esac
@@ -348,6 +350,7 @@ def test_smoke_passes_on_a_correctly_served_build(smoke: Smoke) -> None:
     for origin in ("https://d1.cloudfront.net", "https://feohledger.com"):
         assert f"{origin}/_app/version.json" in urls
         assert f"{origin}/" in urls
+        assert f"{origin}/invoices?status=ready_for_review" in urls
         assert f"{origin}/smoke-check/route.with.dots" in urls
         assert f"{origin}/_app/immutable/feoh-smoke-missing.js" in urls
 
@@ -366,9 +369,23 @@ def test_smoke_fails_when_a_dotted_route_is_treated_as_a_file(smoke: Smoke) -> N
 
 
 def test_smoke_fails_when_a_missing_asset_is_answered_with_the_spa(smoke: Smoke) -> None:
-    result = smoke.run(MISSING_AS_HTML="1")
+    result = smoke.run(MISSING_AS_HTML="200")
     assert result.returncode != 0
     assert "missing hashed asset returned HTTP 200" in result.stderr
+
+
+def test_smoke_fails_when_a_missing_asset_is_a_404_carrying_the_spa(smoke: Smoke) -> None:
+    # A custom_error_response mapping 404 → /index.html keeps the status but
+    # serves the shell; the browser parses it as a script and the page breaks.
+    result = smoke.run(MISSING_AS_HTML="404")
+    assert result.returncode != 0
+    assert "returned 404 with the SPA shell" in result.stderr
+
+
+def test_smoke_fails_when_a_tenant_route_reload_loses_the_spa(smoke: Smoke) -> None:
+    result = smoke.run(QUERY_ROUTE_STATUS="404")
+    assert result.returncode != 0
+    assert "/invoices?status=ready_for_review: HTTP 404" in result.stderr
 
 
 def test_smoke_fails_without_hsts(smoke: Smoke) -> None:

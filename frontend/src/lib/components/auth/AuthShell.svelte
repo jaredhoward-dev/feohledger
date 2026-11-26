@@ -218,7 +218,10 @@
 		to { opacity: 1; transform: translate3d(0, 0, 0) rotate(0); }
 	}
 
-	@media (max-width: 960px) {
+	/* Single column below the scale's `xl` step; the two-column layout starts
+	   AT 1024px, so iPad landscape keeps it. Written as the negation of the
+	   wide query so exactly one side matches at 1024 (decisions §590). */
+	@media not all and (min-width: 1024px) {
 		.auth-shell {
 			grid-template-columns: 1fr;
 		}

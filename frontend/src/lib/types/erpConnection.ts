@@ -174,10 +174,15 @@ export function optionLabelKey(option: string): MessageKey | null {
 	return Object.hasOwn(OPTION_LABEL_KEYS, option) ? OPTION_LABEL_KEYS[option] : null;
 }
 
-/** The two region groups the dropdown leads with, in display order. */
+/**
+ * The region groups the dropdown leads with, in display order. Each reads the
+ * catalogue's `regions` (ISO 3166 alpha-2), so a provider joins a group by its
+ * backend entry alone; a region with no provider renders no group.
+ */
 export const ERP_REGION_GROUPS: { region: string; labelKey: MessageKey }[] = [
 	{ region: 'US', labelKey: 'org.erp.group.us' },
-	{ region: 'ZA', labelKey: 'org.erp.group.za' }
+	{ region: 'ZA', labelKey: 'org.erp.group.za' },
+	{ region: 'GB', labelKey: 'org.erp.group.gb' }
 ];
 
 export interface ErpOptionGroup {

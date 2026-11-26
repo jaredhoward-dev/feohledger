@@ -328,6 +328,7 @@ export const messages = {
 	'audit.action.requisition.updated': "Requisición actualizada",
 	'audit.action.retention.archived': "Registros archivados según la política de retención",
 	'audit.action.retention_policy.updated': "Política de retención actualizada",
+	'audit.action.storage.objects_deleted': "Documentos almacenados de facturas eliminadas borrados",
 	'audit.action.role.created': "Rol creado",
 	'audit.action.role.deleted': "Rol eliminado",
 	'audit.action.role.updated': "Rol actualizado",

@@ -3,6 +3,7 @@
 	import { auth } from '#lib/stores/auth.svelte.ts';
 	import { groupForPath, sectionTabActive, visibleChildren, type NavChild } from '#lib/nav.ts';
 	import { m } from '#lib/i18n/store.svelte.ts';
+	import { splitSectionTabs } from '#lib/sectionTabsSplit.ts';
 
 	// The grouped section (Procurement / Billing / Automation / Governance /
 	// Settings / Insights) that owns the current route, if any. Top-level links
@@ -24,7 +25,7 @@
 	/** Must match the `gap` on `.section-tabs-row` / `.section-tabs-measure`. */
 	const GAP = 4;
 
-	let rowEl = $state<HTMLElement | undefined>(undefined);
+	let innerEl = $state<HTMLElement | undefined>(undefined);
 	let measureEl = $state<HTMLElement | undefined>(undefined);
 	let moreEl = $state<HTMLElement | undefined>(undefined);
 	let moreBtn = $state<HTMLButtonElement | undefined>(undefined);
@@ -42,7 +43,8 @@
 	 *
 	 * Before the first measurement (`widths` empty, or stale after the tab list
 	 * changed) everything renders inline; `.section-tabs-row` is `overflow:
-	 * hidden`, so that pre-measure frame clips instead of widening the document.
+	 * hidden` on its cross axis and scrolls on its main one, so that pre-measure
+	 * frame scrolls inside the row instead of widening the document.
 	 */
 	/**
 	 * True once the off-screen row has been measured for THIS tab set, so the
@@ -57,37 +59,29 @@
 		if (!measured) {
 			return { visible: tabs, overflow: [] };
 		}
-		const total = widths.reduce((a, b) => a + b, 0) + GAP * Math.max(0, tabs.length - 1);
-		if (total <= availW) return { visible: tabs, overflow: [] };
-
-		// Room for the More button has to come out of the budget first.
-		const budget = availW - moreW - GAP;
-		let used = 0;
-		let n = 0;
-		for (let i = 0; i < tabs.length; i++) {
-			const w = widths[i] + (n > 0 ? GAP : 0);
-			if (used + w > budget) break;
-			used += w;
-			n++;
-		}
-		if (n < 1) n = 1; // never render an empty row
-
-		let visible = tabs.slice(0, n);
-		// The active tab always stays in the row: a section whose current page is
-		// only reachable by opening a menu reads as "nothing is selected".
-		if (activeIndex >= n) {
-			visible = [...tabs.slice(0, Math.max(0, n - 1)), tabs[activeIndex]];
-		}
-		const shown = new Set(visible);
-		return { visible, overflow: tabs.filter((t) => !shown.has(t)) };
+		const { visible, overflow } = splitSectionTabs({
+			widths,
+			barWidth: availW,
+			moreWidth: moreW,
+			gap: GAP,
+			activeIndex
+		});
+		return { visible: visible.map((i) => tabs[i]), overflow: overflow.map((i) => tabs[i]) };
 	});
 
+	// The budget is the content width of `.section-tabs-inner`, which holds the
+	// row AND the More button — not the row's own width, which has already
+	// shrunk by More's once More renders (`lib/sectionTabsSplit.ts`).
 	$effect(() => {
-		const el = rowEl;
+		const el = innerEl;
 		if (!el) return;
-		const ro = new ResizeObserver(() => (availW = el.clientWidth));
+		const contentWidth = () => {
+			const cs = getComputedStyle(el);
+			return el.clientWidth - parseFloat(cs.paddingLeft) - parseFloat(cs.paddingRight);
+		};
+		const ro = new ResizeObserver(() => (availW = contentWidth()));
 		ro.observe(el);
-		availW = el.clientWidth;
+		availW = contentWidth();
 		return () => ro.disconnect();
 	});
 
@@ -137,8 +131,8 @@
 		aria-label={m('shell.sectionNav', { group: m(group.labelKey) })}
 		data-tabs-ready={measured ? 'true' : 'false'}
 	>
-		<div class="section-tabs-inner">
-			<div class="section-tabs-row" bind:this={rowEl}>
+		<div class="section-tabs-inner" bind:this={innerEl}>
+			<div class="section-tabs-row">
 				{#each split.visible as tab (tab.href)}
 					{@const active = sectionTabActive(tab, tabs, page.url)}
 					<a
@@ -242,20 +236,32 @@
 		align-items: stretch;
 	}
 
-	/* `min-width: 0` lets this flex child shrink below its content width, and
-	   `overflow: hidden` is the hard backstop: whatever the measurement says,
-	   the row can never widen the document into a horizontal scrollbar
-	   (WCAG 1.4.10 — the whole page used to scroll sideways here). */
+	/* `min-width: 0` lets this flex child shrink below its content width, so
+	   the row can never widen the document into a horizontal scrollbar (WCAG
+	   1.4.10 — the whole page used to scroll sideways here). The More menu
+	   takes every tab that does not fit, but it always leaves at least one —
+	   the active one — in the row, and at the 320px floor a single long label
+	   (a German one, or a section name beside the More button) can still be
+	   wider than what is left. The row SCROLLS sideways inside itself then,
+	   rather than clipping the label it cannot fit (decisions §590): every
+	   item in it is a link, so the region is keyboard-reachable and focusing a
+	   tab scrolls it into view. `overflow-y: hidden` keeps the scroll on one
+	   axis; the active indicator sits inside the tab (`bottom: 0`), so nothing
+	   is hung below the row for it to clip. */
 	.section-tabs-row {
 		display: flex;
 		gap: 4px;
 		min-width: 0;
 		flex: 1;
-		overflow: hidden;
+		overflow-x: auto;
+		overflow-y: hidden;
+		scrollbar-width: thin;
+		overscroll-behavior-x: contain;
 	}
 
 	.section-tab {
 		position: relative;
+		flex: none;
 		padding: 13px 14px;
 		color: var(--text-muted);
 		font-size: 0.88rem;
@@ -267,7 +273,7 @@
 	/* The indicator is a pseudo-element that grows from the centre, so the
 	   active tab reads as selected at a glance and the change of tab has a
 	   moment of motion; it never moves layout. It sits at `bottom: 0`, inside the
-	   tab, because `.section-tabs-row` is `overflow: hidden` and would clip
+	   tab, because `.section-tabs-row` clips its cross axis (`overflow-y: hidden`) and would clip
 	   anything hung below it over the strip's border. */
 	.section-tab::after {
 		content: '';
@@ -294,7 +300,7 @@
 		box-shadow: 0 0 10px var(--accent-glow);
 	}
 
-	@media (max-width: 700px) {
+	@media (max-width: 768px) {
 		.section-tabs-inner {
 			padding: 0 14px;
 		}

@@ -31291,3 +31291,468 @@ bill found may be an earlier attempt of ours. A different total is still
   refusal keeps it.
 - `test_erp_xero_adapter.py`: the same total in another currency, or none, is
   refused `currency_mismatch`, confirmed or not.
+
+## 589. The deployed-URL SPA smoke stays curl, and now proves a tenant-route reload and that a missing asset's 404 is not the shell (#582, round 51)
+
+**Context.** #582's last open box asked for "a Playwright smoke run against the
+deployed URL (or a preview distribution), covering deep-link reload on a tenant
+route (SPA fallback) and a missing `/_app/...` asset returning 404, not
+`index.html`". `deploy/smoke-frontend.sh` (§278) already ran after every
+publish, through public DNS, against the distribution's own domain, the apex
+and the synthetic tenant host `smoke-check.<apex>`. Two holes remained:
+
+* its deep links were `/` and `/smoke-check/route.with.dots`; neither is a route
+  a tenant user reloads, and neither carries URL state, so a router rewrite
+  that folded the query string into the path would pass;
+* its missing-asset check asserted only the status. A CloudFront custom error
+  response mapping 404 → `/index.html` with `response_code = 404` keeps the 404
+  and serves the SPA shell; the check passed it, and the browser would then
+  parse HTML as a script.
+
+`infra/frontend.tf` has no custom error response today (the router function is
+the only fallback, §278), so there was no bug at the source; the gap was in
+what would catch one.
+
+**Decision.** Extend `smoke-frontend.sh`, not add Playwright:
+
+* every origin also gets `/invoices?status=ready_for_review` and must return
+  this build's `index.html` with a 200 — the tenant-route reload, run on a
+  tenant subdomain because `vm-deploy.yml` passes `smoke-check.<apex>`;
+* a missing `/_app/immutable/…` file must be a 404 whose body is neither
+  `text/html` nor `index.html`'s bytes;
+* `infra/tests/guardrails.tftest.hcl` refuses any `custom_error_response` on the
+  distribution at plan time, so the shape the smoke catches after a deploy is
+  also refused before one.
+
+**Why curl.** Each property in the box is the status, content type or body of
+one HTTP response. A browser observes the same response less directly (a
+reload renders the page; a 404'd script shows only as a console error), and
+Playwright on the deploy runner would add a browser download and a second
+toolchain to the approved job for no extra signal. What a browser alone would
+prove — that the shell hydrates and the route renders — is the e2e suite's job
+against the same build, not the edge's.
+
+**Tests.** `backend/tests/test_frontend_publish.py` runs the script against a
+stubbed `curl` (a tenant-route reload that 404s fails; a missing asset served
+as the shell under a 404 fails; the passing run asks for the tenant route on
+every origin); the new tftest assertion was checked to fail with a 404 →
+`/index.html` error response added.
+
+## 590. The supported viewport floor is 320px; width queries use one seven-step px scale with a CI guard; at the narrow step the sidebar is the icon rail with the reader's wide choice kept apart, section tabs scroll inside their row, and tables keep every column (#432, round 51)
+
+**Context.** #432 asked three product questions and found 42 width `@media`
+queries across 23 values (`700`, `720`, `760` and `768` were four answers to
+one question), three of them rem, and two more as JS `matchMedia` strings
+nothing could grep. The owner delegated the calls: the floor is **320px**
+(WCAG 2.2 SC 1.4.10, which `tests-e2e/a11y/reflow.spec.ts` already asserts for
+every route); below the narrow breakpoint the sidebar collapses to its icon
+state; dense tables keep horizontal scroll inside their container.
+
+**Floor.** 320px is the supported minimum, recorded in `frontend/CLAUDE.md` and
+`frontend/docs/ui-patterns.md` § Viewport floor and breakpoints. It is a
+floor, not a breakpoint; below it is unsupported and untested.
+
+**Scale, not tokens.** A `var()` cannot appear in a `@media` condition, and the
+build has no `@custom-media` step (no PostCSS / Lightning CSS config; adding
+one for this was not worth a dependency), so `--bp-*` custom properties would
+have been decoration. The scale is data in `src/lib/breakpoints.ts` — `2xs`
+360, `xs` 400, `sm` 480, `md` 640, `lg` 768, `xl` 1024, `2xl` 1200 — echoed in
+a comment at the top of `app.css`. JS queries are built from it
+(`SHELL_NARROW_QUERY`, `minWidth('xl')`, `minWidth('2xl')`), and
+`src/lib/breakpoints.test.ts` scans every `.svelte` / `.css` under `src/` and
+fails on any other `min-width` / `max-width` value, rem included. px only, so
+two queries compare at a glance; the three rem queries were converted (they
+now ignore a non-default browser font size, which none of them depended on
+for reflow — the floor test runs at the default). `@container` queries are
+out of scope: they measure a component, not the viewport. The one
+"below 360" query is written `not all and (min-width: 360px)`.
+
+**Mapping** (rule: round a `max-width` up — the narrow layout reaching a few
+more widths never costs reflow — and a `min-width` up — the wide layout
+waits until it fits; one exception named below):
+
+| was | now | what shifts |
+|-----|-----|-------------|
+| 359 | `not … (min-width: 360px)` | nothing |
+| 400, 480, 640, 768, 1024, 1200 | same | nothing |
+| 420 | 480 | password-strength meter stacks at 421–480 |
+| 520 | 640 | landing hero's stacked cards step halved at 521–640 |
+| 600, 620 | 640 | org/SSO/fraud form grids, landing hero padding and feature grid stack at 601–640 |
+| 700, 720, 760 | 768 | **shell narrow step**: icon rail, half gutter and section-tab gutter at 701–768 (iPad portrait now gets the rail); dashboard charts, help padding, chat rail disclosure, landing nav/stats/diff grid |
+| 800 | 768 | the exception — rounded down: landing "how it works" steps stay three-up at 769–800 |
+| 900, 960 | 1024 | auth shell single column, landing hero/feature/tally grids, help contents rail (min) now from 1024 |
+| 52rem (832) | 1024 | legal sheet is edge-to-edge up to 1024 and a card above it (768 would have drawn the card touching both window edges, the state its comment rules out) |
+| 60rem (960) | 1024 | settings rail on `/organization` and `/profile` beside the panel from 1024 |
+| 1100 | 1200 | pricing two-up and workflow editor one-up at 1101–1200 |
+| 72rem (1152) | 1200 | legal contents rail from 1200 (still new space, not taken from the 46rem measure) |
+
+**Sidebar.** The auto-collapse already existed (`+layout`'s `matchMedia`
+called `collapse()` on entering narrow), but it wrote the narrow state into
+the reader's one `collapsed` flag, so widening the window kept whatever the
+phone layout had forced. The store now holds two choices: the wide
+expand/collapse (`toggle()` on a wide viewport) and whether the panel is open
+on a narrow one (always closed on crossing into narrow). `collapsed` derives
+from whichever applies, so a reader who collapsed the panel on desktop finds
+it collapsed again after the window passes through phone width, and one who
+left it open finds it open. Opening the panel while narrow stays an
+**overlay** (#635 finding 39) — the icon rail is the default state below the
+step, the overlay is the reader's explicit request to see labels, so both of
+the owner's conditions hold. Rejected: dropping the overlay entirely (the
+labels would then be unreachable on a phone except as tooltips, which touch
+input never shows). Rail links now carry `aria-label` when collapsed (they
+had only `title`, a last-resort name source), matching the help and profile
+rows beside them; targets are 38px, above 2.5.8's 24px.
+
+**Section tabs.** The More menu already took tabs that do not fit, but it
+always leaves at least the active tab in the row, and at 320px one long label
+beside the More button could be wider than the row, which was
+`overflow: hidden` — the label was clipped. The row now scrolls on its main
+axis (`overflow-x: auto`, `overflow-y: hidden`): every item is a link, so the
+region is keyboard-reachable and focusing a tab scrolls it into view.
+
+**Tables.** No column dropping: which column an AP reader can do without is not
+a call a layout can make. `DataTable`'s `.grid-container` already scrolls and
+is a named, focusable region (`a11y/tableScrollRegion.test.ts`).
+
+**Tests.** `src/lib/breakpoints.test.ts` (the repo scan and the guard's own
+parsing); `src/lib/stores/sidebar.test.ts` (auto-collapse, overlay only when
+opened narrow, both wide choices restored after a narrow trip, idempotent
+`setNarrow`); `tests-e2e/a11y/sidebar-overlay.spec.ts` (the 768 / 769
+boundary, the restored collapsed choice, rail names and 24px targets at 320,
+section tabs scrolling at 320 on `/bank-reconciliation`);
+`organization/sharedPanelCss.test.ts` follows the 600 → 640 move;
+`signup/panel-layout.spec.ts`'s "just above the auth breakpoint" size moves
+961 → 1025.
+
+
+**Review follow-up (same round).** *Boundaries.* A `max-width: N` beside a
+`min-width: N` matches both at N; at exactly 1024px the legal sheet lost its
+card and took the wide gutter at once. Where a wide and a narrow query meet,
+the narrow side is now `not all and (min-width: N)`, so N belongs to the wide
+side alone; `breakpoints.test.ts` flags a `max-width: N` in a file that also
+has a `min-width: N`. The auth shell and sign-in's proofs take the same form:
+the two-column sign-in starts AT 1024, so iPad landscape keeps it, and
+`signup/panel-layout.spec.ts` regains #635's short case just above the step
+(1025×560). The legal card is gone at 833–1023 (it was a card from 52rem);
+accepted, because no lower step keeps it: at `lg` the sheet is 768px with the
+16px gutter and 792px with the 28px one, so a card from 769 would touch or
+overrun both window edges — the state the rule exists to avoid. *Sidebar.* The
+store seeds `narrow` from `SHELL_NARROW_QUERY` when created in the browser;
+left to the layout's effect, a phone painted the 220px panel for a frame. The
+wide expand/collapse choice lasts the session — it is held in memory, not
+persisted, and a reload starts expanded; persisting it was not taken up.
+*Section tabs.* The More budget was taken from the row, which is More's flex
+sibling and had already shrunk by More's width, then subtracted More again
+(about 80px of tabs pushed into the menu); it now reads
+`.section-tabs-inner`'s content width, and the split is the pure
+`lib/sectionTabsSplit.ts`, unit-tested. The 320px e2e no longer asserts that
+"Bank Reconciliation" fits whole beside More, which it cannot; it asserts the
+row scrolls to both of the tab's edges, with `/intake` as the fits-whole case.
+
+## 591. Production secrets reach the VM as ciphertext from infra-secrets' CI, and only a gated deploy applies them (#735, round 51)
+
+**Problem.** A change to `feohledger/prod.sops.yaml` took five hand steps
+before a deploy could use it: commit in the private `infra-secrets` repo, upload
+the ciphertext to a `transfer/` prefix of the backups bucket, copy it onto the VM
+from a Session Manager shell, delete every version of the transfer object, and
+optionally `./decrypt-env.sh`. Nothing in the release path fetched a new file,
+so a forgotten copy left the VM on stale secrets (v0.3.0's new required key,
+#733) and a forgotten cleanup left ciphertext in `transfer/` for up to 120 days.
+
+**Decision (option A of #735).**
+
+- **Storage.** A dedicated bucket (`infra/secrets_delivery.tf`), not a prefix
+  under the backups bucket's whole-bucket grant: versioned, Block Public Access,
+  SSE-S3, about 30 noncurrent versions kept. Its bucket policy denies
+  `PutObject` to every principal but the upload role and `GetObject` /
+  `GetObjectVersion` to every principal but the app VM role. Its name is a
+  variable kept in the private `prod.tfvars.sops`, as every bucket name is, and
+  reaches the VM as one line in the gitignored `deploy/secrets-bucket`.
+- **Writer.** `feohledger-secrets-upload`, minted in this module like the
+  backup-erasure roles (§490) because it serves this project's bucket alone.
+  It trusts `<infra_secrets_oidc_sub_prefix>:ref:refs/heads/main` with
+  `StringEquals`; infra-secrets presents immutable subject claims (read from
+  `gh api …/actions/oidc/customization/sub`, as for this repo, #449), so the
+  prefix is a variable, never built from the slug. It may `PutObject` the one key
+  and holds **no KMS permission**: it cannot read the file or forge one sops
+  accepts (the MAC needs the data key). SSE-S3 rather than the app key for the
+  same reason: an SSE-KMS put needs the writer to hold the key.
+- **Upload.** infra-secrets' own workflow, on a push to `main` touching the
+  file: refuses anything that is not sops ciphertext under the project key, puts
+  it with a SHA-256 checksum S3 verifies, and compares the checksum S3 returns —
+  no read grant needed. It prints neither key names nor values.
+- **Apply.** `deploy.sh` fetches the current version under its deploy lock,
+  before `decrypt-env.sh` (`lib.sh` `feoh_fetch_secrets`): a 0600 temp file in
+  `deploy/`, checked for a `sops:` block and a readable `lastmodified`, then
+  `mv`'d over `prod.sops.yaml`. A failed or refused fetch stops the deploy with
+  the old file and `.env` untouched. The log names the S3 version id and the sops
+  `lastmodified`, nothing more (the run log is public).
+- **Replay guard.** The upload role cannot forge, but it can re-upload an
+  older genuine file. A file whose `lastmodified` is older than the last one
+  `decrypt-env.sh` accepted (`deploy/.secrets-applied`) is refused unless
+  `--allow-secrets-rollback` is passed, which only a Session Manager shell can
+  do (the SSM document takes nothing but a sha). The VM therefore gets no
+  `GetObjectVersion`: a rollback is a revert in infra-secrets plus that flag.
+- **A secrets-only change** goes live through the existing `vm-deploy.yml`
+  `workflow_dispatch`, run from the live release's tag and approved under
+  `production`: the same SSM document, the same sha-only parameter, the same
+  code, new secrets. No new workflow or document was needed. An emergency
+  rotation goes live only through that one approved run (owner decision).
+- **Least privilege.** `deploy_role_can_use_sops = false` in feohledger's
+  `bootstrap.tfvars`: this repo's CI never decrypts sops, so the deploy role
+  loses the baseline's default grant on the sops key.
+- **Retired.** The `transfer/` steps are gone from `deploy/README.md`,
+  `docs/secrets-rotation.md` and the infra-secrets README.
+
+**Rejected.** CI decrypting into Parameter Store / Secrets Manager, or `sops
+publish` (plaintext on an ungateable runner); the VM pulling infra-secrets with a
+deploy key (a standing credential to every project's ciphertext, as §275
+rejected); infra-secrets' CI sending the SSM command, or S3 → EventBridge → Run
+Command (secrets applied with no reviewer). `sops exec-env` in place of a
+plaintext `deploy/.env` was out of scope (owner decision): compose embeds the
+values in the container config either way.
+
+**Not verified here.** Everything that needs AWS: the apply, the OIDC handshake
+from a private repo on the Free plan, the first upload, and the live sops key
+policy after the baseline re-apply. sops' `lastmodified` format is RFC 3339 UTC
+(`…Z`), confirmed from the sops source in the review fixes below; anything else
+is refused, fail-closed.
+
+**Tests.** `infra/tests/guardrails.tftest.hcl` (the upload role's one subject,
+its one-key put and no KMS, the bucket's versioning, public-access block,
+lifecycle and deny statements, the VM's read-only grant);
+`backend/tests/test_deploy_release.py` (fetch before decrypt and under the
+lock, metadata-only log, a failed fetch keeps the old file and `.env`, an older
+file refused, `--allow-secrets-rollback`, non-ciphertext and unversioned
+refusals, an empty `deploy/secrets-bucket`, and a VM with no such file yet
+deploying on its own copy).
+
+**Rollout: a VM without `deploy/secrets-bucket` keeps its own copy.** Making the
+file mandatory from the first deploy would have failed every release at
+preflight until the owner had applied the bucket and written the file, so
+merging this would have blocked releases on infrastructure nobody had applied.
+The file's absence is therefore read as "delivery not set up yet": the deploy
+uses the `prod.sops.yaml` already on the VM and logs that plainly. Its presence
+switches the fetch on for good; an empty file, a bad name or a failed fetch
+still aborts. This is not a silent fallback: the log line names the state, and
+removing the file is a deliberate act on the VM.
+
+**Review fixes (round 51).** Seven findings from reviewing #735, each fixed with
+a test that failed before:
+
+- *The aws CLI's error text could reach the public log.* `get-object`'s stderr
+  can carry the bucket's URL and vm-deploy prints the log's tail. It now goes to
+  an owner-only temp file in `deploy/`, is reduced to the exit code and a fixed
+  class (`feoh_aws_error_class`: a known S3 error code such as `AccessDenied` or
+  `NoSuchKey`, else `no credentials` / `network` / `unclassified`), and is
+  deleted. Nothing of the CLI's own words is printed.
+- *Is `lastmodified` safe to order by? Yes — sops authenticates it.* Checked in
+  the source, getsops/sops at `5032a7184f1a1cac0f8cf3bc6b680b339a500395`:
+  `cmd/sops/common/common.go` `EncryptTree` sets `LastModified =
+  time.Now().UTC()` and encrypts the MAC with
+  `Cipher.Encrypt(mac, dataKey, LastModified.Format(time.RFC3339))` — the
+  timestamp is the AES-GCM additional data — and `DecryptTree` decrypts the MAC
+  with the same AAD and, unless `--ignore-mac` (decrypt-env.sh never passes it),
+  fails with "Cannot decrypt MAC" (`codes.MacMismatch`); `stores/stores.go`
+  parses the field with `time.Parse(time.RFC3339, …)`. So an uploader without the
+  key cannot move a genuine file's `lastmodified` forward: the decrypt fails and
+  the file is discarded (next bullet). No serial inside the payload was added;
+  it would buy nothing the MAC does not already give. Two gaps the
+  parse-then-format leaves are closed on our side, because the AAD covers the
+  *parsed instant*, not the bytes the awk reads: `feoh_sops_lastmodified`
+  accepts only `YYYY-MM-DDTHH:MM:SSZ` (what sops writes; a fraction is dropped by
+  `Format(RFC3339)` and an offset would let the same instant read as a
+  different string), and only when it is the one `lastmodified` in the file, a
+  direct child of the one `sops:` block, in a single YAML document — so the awk
+  and sops' YAML parser cannot be shown different lines. Pinned in
+  `test_deploy_release.py`, which also checks `lib.sh` still names the source
+  it relies on.
+- *A fetched file replaced `prod.sops.yaml` before it was proven to decrypt.*
+  `feoh_fetch_secrets` now only stages it (`FEOH_SECRETS_STAGED`);
+  `decrypt-env.sh` takes an optional file name in `deploy/` (default
+  `prod.sops.yaml`, so it still runs standalone; a path or option is refused);
+  `deploy.sh` hands it the staged file and `feoh_commit_secrets` moves it into
+  place and raises the replay floor only after it is accepted. A refused file
+  is removed by an EXIT trap, leaving the last working file, `.env` and the
+  floor as they were.
+- *Any principal with a broad `s3:*` could erase history or loosen the
+  bucket.* A `OnlyTerraformAdministers` Deny on `s3:DeleteObject`,
+  `s3:DeleteObjectVersion`, `s3:PutBucketVersioning`,
+  `s3:PutLifecycleConfiguration`, `s3:PutBucketPolicy` and
+  `s3:DeleteBucketPolicy` for every principal whose ARN is not like the apply
+  principal's. The repo had no existing pattern naming that principal (the
+  backups bucket relies on Object Lock, not a principal deny); `infra/README.md`
+  documents applying as the Identity Center `AdministratorAccess` role, so that
+  is the default, matched by its `aws-reserved/sso.amazonaws.com/` path with a
+  wildcard for the hash Identity Center appends, and
+  `terraform_admin_principal_arn_patterns` overrides it. The break-glass is
+  the account root: S3 lets the bucket owner's root principal Get/Put/Delete a
+  bucket policy that explicitly denies it (S3 API Reference, PutBucketPolicy
+  § Permissions, read 2026-11-25). Noncurrent-version expiry is S3's own
+  lifecycle action, not a principal's call, so the 30-version bound still runs.
+- *Plaintext could ride in a comment.* sops encrypts YAML comments by default
+  (`sops.go` `shouldBeEncrypted`, comments emitted as
+  `#ENC[AES256_GCM,…,type:comment]`); a plaintext one appears only through
+  `unencrypted_comment_regex` or a hand edit. infra-secrets'
+  `check-sops-ciphertext.py` now refuses any comment that is not an encrypted
+  one, any comment in the sops block (sops writes none there), and any entry
+  directly under `sops:` that is not sops metadata — with a synthetic-fixture
+  self-test the upload workflow runs first.
+- *Any workflow on infra-secrets' main could assume the upload role.* The trust
+  now also requires `token.actions.githubusercontent.com:job_workflow_ref` =
+  `<infra_secrets_repository>/.github/workflows/feohledger-upload.yml@refs/heads/main`.
+  AWS accepts `job_workflow_ref` as a GitHub trust key (IAM User Guide,
+  "Available keys for AWS OIDC federation", read 2026-11-25), so no sub-claim
+  customisation — a setting on infra-secrets shared by every role trusting it —
+  was needed. GitHub documents the claim for reusable workflows; for a
+  top-level job it is the job's own workflow path and ref, which is what is
+  pinned. That is not verified against a live token here: if the claim were
+  absent or different, `StringEquals` fails closed and the first upload is
+  refused (deploy/README.md owner step 3 says what that error means), and the
+  fallback is the sub pin alone. `infra_secrets_repository` is a new variable,
+  set in `prod.tfvars.sops`.
+- *The absent-file fallback should not outlive the rollout.* Tracked in
+  `docs/followups.md` (c): make the fetch mandatory once the first release log
+  shows `==> secrets: S3 version`.
+
+## 592. A deleted invoice's documents leave object storage through an outbox, and an orphan scan reaches what no row names (follow-up from §586, round 51)
+
+**The gap.** `_delete_invoice_cascade` removed an invoice's rows but none of its
+objects: the uploaded document and every superseded version §363 kept, a
+received PEPPOL payload at `{org}/{invoice}/peppol-inbound.xml`, and its
+supplier-chat attachments. Nothing deleted them later. The retention sweep
+reached only Positive Pay files, and the erasure walk (§183) starts from rows,
+so a deleted invoice's document, which can carry supplier bank details and
+personal data, outlived every retention window and every DSAR erasure.
+
+**Folders, not keys.** Every object an invoice owns sits in `{org}/{invoice}/`
+or `{org}/chat/{invoice}/`, by construction of every key-writing site; nothing
+else is keyed by an invoice id. Collecting keys was rejected: a superseded
+version is named only by an `audit_log` row, which in `lambda` audit mode is not
+in the tenant database, so a key list would be incomplete exactly where it
+mattered. A folder needs no row, and `storage.delete_prefix` already refuses an
+empty or slash-less prefix.
+
+**A transactional outbox, then best-effort.** The cascade writes one
+`pending_object_deletions` row per folder (migration 0153, tenant, idempotent
+DDL) in the delete's own transaction and queues a `post_commit` job that empties
+them. A rolled-back delete drops both. A row leaves the table only when its
+folder is empty; a storage failure keeps it with `attempts` and `last_error` (a
+class name), and the retention sweep retries the oldest rows each tick. Deleting
+directly from the request was rejected: the bytes would go before the commit
+that might roll back, and a crash between the two would leave nothing to retry.
+No existing outbox fitted: the webhook delivery table is per subscription and
+`post_commit` alone is in memory.
+
+**An orphan scan for what no row names.** The retention sweep, and every
+erasure before its per-subject walk, list one S3 page of folders under `{org}/`
+and `{org}/chat/` (resuming from an in-process continuation token, so a tenant's
+cost per tick is bounded and a restart only restarts the walk), keep the ones
+shaped like an invoice folder, and delete those whose invoice row does not exist
+and whose newest object is older than 24 hours, so an upload whose row has not
+committed yet is never touched. That reaches every invoice deleted before this
+decision, which is why nothing is backfilled, and any write whose row never
+committed. An erasure counts what the pass removed (`orphaned_objects_deleted`)
+but does not mark itself incomplete on a pass failure: those folders are not the
+subject's documents, and the next pass retries them.
+
+**Fail closed.** Both paths refuse a folder a live invoice owns, by id or
+because a live row's `file_key` sits inside it (no path writes one invoice's
+document under another's id today; this keeps a future one from losing it), and
+anything not under this organisation's id or not shaped `{org}/{uuid}/` /
+`{org}/chat/{uuid}/`. A refused outbox row is dropped and its objects kept.
+Contract, expense, tax-form, vendor-statement and Positive Pay folders are never
+candidates: each has its own owning row and its own deletion rule.
+
+**The received PEPPOL payload goes with the invoice.** §586 keeps the record
+that a supplier delivered an e-invoice (the detached `peppol_transmissions`
+row); the payload itself was the deleted invoice's document, and a deleted
+invoice was one the customer judged not to be a payable (spam, a duplicate).
+Keeping the XML for the `peppol_transmissions` window instead was considered;
+it would make a retention class hold a document no row points at, which nothing
+could later find to expire. If counsel's view on received e-invoices (§586's
+open question) requires the payload, the transmission row should gain a key and
+the payload should move under it, not stay under the invoice's folder.
+
+**Object Lock.** On the deployed bucket's GOVERNANCE default retention a delete
+writes a delete marker; the app can no longer read the object and the locked
+version is reaped by the noncurrent-version lifecycle rule once its lock lapses
+(`infra/s3.tf`), the same outcome as the Positive Pay expiry (§184) and erasure
+(§183). Bypassing governance retention was not considered: it needs a privileged
+role the app does not and should not hold.
+
+**Audit and logs.** A pass that removed or refused something writes one
+`storage.objects_deleted` row (`trigger`, `folders_purged`, `objects_deleted`,
+`failed`, `refused`, `skipped_fresh`): counts only, never a key, because a key's
+last segment is a user's filename. Who deleted the invoice is on its
+`invoice.deleted` row. Logs carry exception class names only.
+
+**Tests.** `test_invoice_objects.py` (single and bulk delete empty both folders
+after commit; a storage failure leaves a row the sweep retries; a rolled-back
+delete queues nothing; refusals for a live owner, a shared `file_key` and a
+foreign prefix; the orphan pass's age and shape rules; a soft failure on an
+unreadable bucket; an erasure reaching orphans; the listing helpers against a
+mocked client) and `test_migration_0153_pending_object_deletions.py`. The suite
+otherwise sees an empty folder listing (`conftest._isolate_orphan_scan`): the
+harness orgs keep their ids across runs while their rows are truncated, so the
+shared MinIO bucket holds real orphans an unrelated test's scan would delete.
+
+**One job per transaction, and no lock across a bucket call (review of this
+entry).** As first written, every `_delete_invoice_cascade` call queued its own
+post-commit job, so a bulk delete of N invoices opened N sessions after the
+commit, and `drain_pending` held `SELECT … FOR UPDATE` on the outbox rows
+through every S3 round trip. Now `queue_invoice_objects` keeps one batch per
+transaction on `Session.info` and queues one job for it
+(`post_commit.is_post_commit_queued` says whether the batch's job is still
+waiting; a commit or rollback starts a new batch), and that job drains every
+row the transaction wrote. `drain_pending` claims rows in its own short
+committed transaction (`FOR UPDATE SKIP LOCKED`, `attempts + 1`,
+`last_error = 'claimed'`, `last_attempt_at`), empties the folders holding no
+lock, then deletes the emptied rows and records failures in a second short
+transaction that also writes the audit row. A row claimed within the last
+`CLAIM_LEASE` (15 minutes) is left to its drain, so the sweep and a post-commit
+drain never work the same row; a drain that dies leaves its claim to lapse, and
+a slower-than-the-lease drain costs a repeat idempotent delete, never a lost
+row. The caller's session is only read (ownership), so the sweep's and an
+erasure's own transactions are not committed early. Tests: one job and one
+claim for a three-invoice bulk delete with one failing folder (only its row
+stays); a second drain mid-storage-call finds the rows unlocked and claimed and
+takes none; an expired claim is retaken, a fresh one is not.
+
+**One connection, a recorded finish, and an erasure that says what it missed
+(second review of this entry).** The two-phase drain above opened its claim and
+finishing sessions on the caller's engine while the caller's own session held a
+connection idle in its transaction, so on a `pool_size=1, max_overflow=0`
+engine (a dispatcher's) it waited out the pool timeout with its rows claimed.
+`drain_pending` now uses only the session it is given: one step claims the
+rows and reads ownership (so the storage calls need no session), the storage
+calls run with no statement in flight, and one step deletes the finished rows
+and writes the audit row. The post-commit job owns its session and passes
+`own_transactions=True`, committing after the claim and after the finish, so
+no lock or connection is held across a bucket call and the lease is visible to
+other drains. The retention sweep and an erasure pass their own session and
+nothing commits: committing would publish the sweep's archive work or the
+erasure's half-written tombstones early, and a second session is exactly the
+second connection a one-connection engine lacks. Their claimed rows stay
+row-locked until they commit, which nobody waits on (every drain reads `SKIP
+LOCKED`; nothing else updates the rows). Under `dispatch_engine_scope` no job
+is queued at all: a dispatcher runs post-commit jobs inline from `after_commit`,
+before the committing session releases its only connection, and the rows are
+durable for the sweep. The lease is stamped and compared on the drain's own
+clock, never a caller's `now`, which a backdated sweep would have turned into
+a claim born expired. A finishing transaction that fails after the bucket
+deletes leaves the rows claimed; once the lease lapses the next drain retakes
+them, finds the folders empty, and writes the `storage.objects_deleted` row
+with `reclaimed` (a new append-only row, never an UPDATE of one), so a folder
+never leaves storage unaudited, though its object count is lost. A row left to
+another drain (live lease, or row-locked) is counted as `skipped_claimed`, and
+an erasure folds it into `orphaned_objects_failed`, which the erasure response
+and audit row now carry and the admin page treats like `documents_failed`:
+re-run. That reverses this entry's earlier "does not mark itself incomplete":
+a queued folder is a deleted invoice's document folder, which may be the
+subject's. `post_commit.is_post_commit_queued` lost its `except Exception`:
+`Session.info` always exists. Tests: every entry point (the drain in a caller's
+open transaction, the sweep, an erasure, the job) on a `pool_size=1,
+max_overflow=0, pool_timeout=2` engine; no job queued under a dispatcher; a
+backdated `now` stamps the real time; a lost finish recorded by the retake;
+an erasure counting a leased row as not done.

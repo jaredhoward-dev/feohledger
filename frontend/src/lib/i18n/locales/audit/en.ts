@@ -331,6 +331,7 @@ export const enAudit = {
 	'audit.action.requisition.updated': "Requisition updated",
 	'audit.action.retention.archived': "Records archived under retention policy",
 	'audit.action.retention_policy.updated': "Retention policy updated",
+	'audit.action.storage.objects_deleted': "Stored documents of deleted invoices removed",
 	'audit.action.role.created': "Role created",
 	'audit.action.role.deleted': "Role deleted",
 	'audit.action.role.updated': "Role updated",
