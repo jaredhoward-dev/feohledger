@@ -100,7 +100,8 @@ function notifyModals() {
  *    browser puts it when the focused dialog node is removed. If something else
  *    already holds focus (a second dialog opened in the same flush, or a caller
  *    that moved focus deliberately), restoring would steal it back.
- * 2. To the trigger, if it is still in the document and accepts focus — a
+ * 2. To the trigger, if it is still in the document, is not `<body>` (nothing
+ *    was focused, as when a deep link opened the dialog) and accepts focus — a
  *    disabled button (a row whose action is now in flight) silently refuses
  *    `focus()`, which is why the check reads `activeElement` afterwards rather
  *    than trusting the call.
@@ -124,7 +125,10 @@ export function ownsEscape<T>(stack: readonly T[], node: T): boolean {
 function restoreFocus(prev: HTMLElement | null): void {
 	const active = document.activeElement;
 	if (active && active !== document.body && active.isConnected) return;
-	if (prev?.isConnected) {
+	// `<body>` is no trigger: a dialog opened from a deep link (`?id=`) had
+	// nothing focused, and "restoring" body is the top-of-document drop rule 3
+	// exists to prevent.
+	if (prev?.isConnected && prev !== document.body) {
 		prev.focus?.();
 		if (document.activeElement === prev) return;
 	}

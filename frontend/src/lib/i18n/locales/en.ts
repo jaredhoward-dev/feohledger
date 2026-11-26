@@ -5062,6 +5062,8 @@ export const en = {
 	'invoices.modal.erpBillConfirm.confirming': "Confirming…",
 	'invoices.modal.erpBillConfirm.done': "Bill {number} confirmed; the push is being retried",
 	'invoices.modal.erpBillConfirm.confirmFailed': "The bill was not confirmed.",
+	'invoices.modal.erpBillConfirm.idLabel': "ERP id",
+	'invoices.modal.erpBillConfirm.statusLabel': "Status in the ERP",
 	'invoices.modal.erp.retrying': 'Retrying...',
 	'invoices.modal.erp.title': 'ERP Status',
 	'invoices.modal.extract': 'Extract',

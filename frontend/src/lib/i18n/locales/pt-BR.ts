@@ -4869,6 +4869,8 @@ export const messages = {
 	'invoices.modal.erpBillConfirm.confirming': "Confirmando…",
 	'invoices.modal.erpBillConfirm.done': "Conta {number} confirmada; o envio está sendo repetido",
 	'invoices.modal.erpBillConfirm.confirmFailed': "A conta não foi confirmada.",
+	'invoices.modal.erpBillConfirm.idLabel': "ID no ERP",
+	'invoices.modal.erpBillConfirm.statusLabel': "Status no ERP",
 	'invoices.modal.erp.retrying': 'Tentando novamente...',
 	'invoices.modal.erp.title': 'Status do ERP',
 	'invoices.modal.extract': 'Extrair',

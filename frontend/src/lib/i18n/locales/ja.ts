@@ -4805,6 +4805,8 @@ export const messages = {
 	'invoices.modal.erpBillConfirm.confirming': "確定中…",
 	'invoices.modal.erpBillConfirm.done': "請求書{number}を確定しました。送信を再試行しています",
 	'invoices.modal.erpBillConfirm.confirmFailed': "請求書は確定されませんでした。",
+	'invoices.modal.erpBillConfirm.idLabel': "ERP ID",
+	'invoices.modal.erpBillConfirm.statusLabel': "ERPでのステータス",
 	'invoices.modal.erp.retrying': '再試行中...',
 	'invoices.modal.erp.title': 'ERP ステータス',
 	'invoices.modal.extract': '抽出',

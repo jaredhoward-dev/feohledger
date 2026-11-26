@@ -1574,7 +1574,8 @@ inherit it for free. Reuse these; don't re-solve them per page.
   dialog's own action can remove its trigger (approving a request from its
   dialog filters the row out of the Pending list), and a trigger focused
   synchronously is then lost to `<body>` when it unmounts. If the trigger is
-  gone or now disabled, focus lands on `<main id="main-content">` instead; if
+  gone or now disabled, or there was none (a dialog a deep link opened, with
+  `<body>` focused), focus lands on `<main id="main-content">` instead; if
   something else already took focus (a second dialog), it is left alone.
   The page outside the topmost dialog is `inert` while it is open (§ Modals,
   decisions §384), and that is taken off before the restore runs, so the
