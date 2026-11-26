@@ -426,7 +426,8 @@ class XeroAdapter(OAuthErpAdapter):
         tenant shares it (``payload.bill_key_shared`` false, set by
         ``services/erp`` from ``erp_bill_void.shared_lookup_keys``, the rule
         the orphan-bill lookup applies); otherwise it refuses
-        ``erp_bill_key_shared`` (decisions §572)."""
+        ``erp_bill_key_shared`` (decisions §572), unless the bill found is
+        the one a person confirmed (``payload.confirmed_bill_id``, §587)."""
         resp, bills = await self._matching_bills(client, headers, payload)
         return resp, (bills[0] if bills else None)
 
@@ -573,10 +574,15 @@ class XeroAdapter(OAuthErpAdapter):
                 # Fail closed: without the lookup we cannot rule out a duplicate.
                 return _failure(lookup)
             if existing is not None:
-                if payload.bill_key_shared:
+                if payload.bill_key_shared and not (
+                    payload.confirmed_bill_id
+                    and existing.get("InvoiceID") == payload.confirmed_bill_id
+                ):
                     # Another invoice carries this supplier + number, so the
                     # bill may be its own: never adopted as this invoice's,
-                    # and no second bill is created beside it (§572).
+                    # and no second bill is created beside it (§572) — unless
+                    # a person confirmed this very bill as this invoice's
+                    # (§587), when it is adopted as below, total included.
                     return erp_refusal(PROVIDER, ERP_BILL_KEY_SHARED)
                 if _decimal(existing.get("Total")) == payload.amount:
                     return ErpPostResult(

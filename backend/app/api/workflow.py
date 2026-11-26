@@ -618,7 +618,10 @@ async def review_actions(
     field) and `PUT /line-items` would answer (decisions §370), and
     ``review.recall_refusal`` `/recall-approval`'s (decisions §374), and — on a
     failed push that may have left a bill only — ``erp_orphan_lookup_refusal``,
-    what ``GET /erp-orphan-bill`` answers before it calls the ERP (§560). The modal offers
+    what ``GET /erp-orphan-bill`` answers before it calls the ERP (§560), and —
+    on a push last refused ``erp_bill_key_shared`` only —
+    ``erp_bill_confirm_refusal``, what ``GET /erp-bill-confirmation`` and ``POST
+    /confirm-erp-bill`` answer before they call the ERP (§587). The modal offers
     an action exactly when its verdict is ``null`` and states the refusal
     otherwise, so it never restates a rule.
 
@@ -646,12 +649,17 @@ async def review_actions(
     shared = await ebv.shared_lookup_keys(
         db, org.settings, [invoice] if ebv.orphan_candidate(invoice, orphan_instance) else []
     )
+    from app.services import erp_bill_confirm as ebc
+
     return {
         **review,
         **workflow,
         **ebv.orphan_lookup_verdicts(
             invoice, orphan_instance, user, org.settings, key_shared=invoice.id in shared
         ),
+        # The shared-key bill confirmation (decisions §587): present only on a
+        # push last refused `erp_bill_key_shared`.
+        **ebc.confirm_verdicts(invoice, orphan_instance, user, org.settings),
         "resubmit": resubmit_refusal(user, invoice),
         "manage_file": manage_file_refusal(user, invoice),
         "edit_financials": edit_financials_refusal(user, invoice),
@@ -1059,6 +1067,145 @@ async def void_erp_orphan_bill(
         "erp_document_id": outcome.document_id,
         "invoice_status": outcome.status,
         "replayed": outcome.replayed,
+    }
+
+
+# ---------- A bill on a shared Xero key, confirmed as this invoice's (§587) ----------
+
+
+def _raise_confirm_verdict(refused: dict | None) -> None:
+    if refused is not None:
+        code = 403 if refused["code"] == "role_not_permitted" else 409
+        raise HTTPException(status_code=code, detail=refused)
+
+
+@router.get("/{invoice_id}/erp-bill-confirmation")
+async def lookup_erp_bill_to_confirm(
+    invoice_id: uuid.UUID,
+    db: AsyncSession = Depends(get_tenant_db),
+    org: Organization = Depends(get_tenant),
+    user: User = Depends(require_permission(PERM_PAYMENT_VOID)),
+    entity_id: uuid.UUID | None = Depends(get_entity_id),
+):
+    """Name the bill on the supplier + number another invoice shares, for a
+    push refused ``erp_bill_key_shared``, by the adapter's read-only lookup
+    (the match its own push runs). Same answer shape as ``GET
+    /erp-orphan-bill``; an append-only lookup row records who looked."""
+    from app.services import erp_bill_confirm as ebc
+    from app.services import erp_bill_void as ebv
+
+    await ensure_in_entity_scope(db, Invoice, invoice_id, entity_id, detail="Invoice not found")
+    invoice = (await db.execute(select(Invoice).where(Invoice.id == invoice_id))).scalar_one()
+    instance = await _workflow_instance_locked(db, invoice_id, lock=False)
+    _raise_confirm_verdict(ebc.confirm_lookup_refusal(invoice, instance, user, org.settings))
+    payload = await ebc.payload_for(db, org, invoice)
+    await db.commit()
+    try:
+        found = await ebv.find_orphan(org, payload)
+    except ebv.VoidRefused as refused_:
+        raise HTTPException(status_code=refused_.status_code, detail=refused_.detail()) from None
+    await ebv.record_lookup(db, invoice, user=user, found=found)
+    await db.commit()
+    return {
+        "invoice_id": str(invoice.id),
+        "found": found is not None,
+        "bill": _found_bill_dict(found),
+    }
+
+
+class ConfirmErpBillRequest(BaseModel):
+    """The bill the lookup named, and why it is this invoice's."""
+
+    erp_document_id: str = Field(..., min_length=1, max_length=255)
+    reason: str = Field(..., min_length=1, max_length=500)
+
+
+@router.post("/{invoice_id}/confirm-erp-bill", status_code=status.HTTP_202_ACCEPTED)
+async def confirm_erp_bill(
+    invoice_id: uuid.UUID,
+    body: ConfirmErpBillRequest,
+    db: AsyncSession = Depends(get_tenant_db),
+    org: Organization = Depends(get_tenant),
+    user: User = Depends(require_permission(PERM_PAYMENT_VOID)),
+    entity_id: uuid.UUID | None = Depends(get_entity_id),
+    control_db: AsyncSession = Depends(get_control_db),
+):
+    """Confirm that the bill on a shared supplier + number is this invoice's,
+    then retry the push, which adopts that bill and no other
+    (``services/erp_bill_confirm``). The lookup runs again with no lock held;
+    then, under the invoice and instance locks, the verdict, the bill being
+    the one the lookup still names, and no other invoice holding it are
+    re-checked before the confirmation and its audit row are committed. The
+    retry is ``POST /retry-erp``'s own start; when one of its gates refuses,
+    the confirmation stands and the invoice stays ``failed``."""
+    from app.services import erp_bill_confirm as ebc
+    from app.services import erp_bill_void as ebv
+
+    await ensure_in_entity_scope(db, Invoice, invoice_id, entity_id, detail="Invoice not found")
+    document_id = body.erp_document_id.strip()
+    reason = body.reason.strip()
+    if not reason or not document_id:
+        raise HTTPException(status_code=422, detail="A reason and the bill are required")
+
+    def _refuse(code: str) -> HTTPException:
+        return HTTPException(status_code=409, detail=coded_refusal(code, ebc.MESSAGES[code]))
+
+    # Before any ERP call: the verdict, and a bill another invoice holds.
+    unlocked = (await db.execute(select(Invoice).where(Invoice.id == invoice_id))).scalar_one()
+    instance = await _workflow_instance_locked(db, invoice_id, lock=False)
+    _raise_confirm_verdict(ebc.confirm_lookup_refusal(unlocked, instance, user, org.settings))
+    if await ebc.claimed_elsewhere(db, invoice_id, document_id):
+        raise _refuse(ebc.ERP_BILL_CLAIMED)
+    payload = await ebc.payload_for(db, org, unlocked)
+    await db.commit()
+    try:
+        found = await ebv.find_orphan(org, payload)
+    except ebv.VoidRefused as refused_:
+        raise HTTPException(status_code=refused_.status_code, detail=refused_.detail()) from None
+
+    invoice = await get_invoice_for_update(db, invoice_id)
+    instance = await _workflow_instance_locked(db, invoice_id, lock=True)
+    try:
+        _raise_confirm_verdict(ebc.confirm_lookup_refusal(invoice, instance, user, org.settings))
+        if ebv.live_pending(invoice) is not None:
+            raise HTTPException(
+                status_code=409,
+                detail=coded_refusal(
+                    ebv.ERP_VOID_IN_PROGRESS, ebv.refusal_message(ebv.ERP_VOID_IN_PROGRESS)
+                ),
+            )
+        if found is None or found.document_id != document_id:
+            raise _refuse(ebc.ERP_BILL_CONFIRM_NOT_FOUND)
+        await ebc.lock_bill(db, document_id)
+        if await ebc.claimed_elsewhere(db, invoice_id, document_id):
+            raise _refuse(ebc.ERP_BILL_CLAIMED)
+        await ebc.record_confirmation(
+            db,
+            invoice=invoice,
+            instance=instance,
+            user=user,
+            document_id=document_id,
+            reason=reason,
+            found=found,
+        )
+    except HTTPException:
+        await db.rollback()
+        raise
+    await db.commit()
+
+    retried = await start_erp_send(
+        db,
+        org_id=org.id,
+        org_settings=org.settings,
+        invoice_id=invoice_id,
+        actor_id=user.id,
+        control_db=control_db,
+        retry=True,
+    )
+    return {
+        "id": str(invoice_id),
+        "erp_document_id": document_id,
+        "status": retried.status.value if retried is not None else InvoiceStatus.failed.value,
     }
 
 

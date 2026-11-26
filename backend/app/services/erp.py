@@ -19,6 +19,7 @@ from app.services.erp_adapters import (
 )
 from app.services.erp_adapters.base import ACCOUNT_NOT_LINKED, NOT_CONNECTED
 from app.services.erp_adapters.deep_links import erp_document_url
+from app.services.erp_bill_confirm import LAST_REFUSAL_CODE_KEY, confirmed_bill_id
 from app.services.erp_export_gate import erp_export_refusal
 from app.services.erp_link_realm import bill_realm, connection_realm, legacy_links_trusted
 from app.services.erp_status_sync import status_sync_active
@@ -434,7 +435,11 @@ async def reset_erp_push_budget(db: AsyncSession, invoice_id: uuid.UUID) -> None
     """
     instance = await get_workflow_instance(db, invoice_id)
     if instance:
-        instance.state_data = {**(instance.state_data or {}), "erp_retries": 0}
+        # The last failure's refusal code describes that push only: a new one
+        # drops it, so a failure that records none cannot inherit it (§587).
+        state = {**(instance.state_data or {}), "erp_retries": 0}
+        state.pop(LAST_REFUSAL_CODE_KEY, None)
+        instance.state_data = state
         instance.state = "active"
 
 
@@ -716,6 +721,10 @@ async def send_to_erp_internal(
                         **(instance.state_data or {}),
                         "erp_retries": attempt + 1,
                         "last_error": str(exc),
+                        # What the bill confirmation's verdict reads (§587).
+                        LAST_REFUSAL_CODE_KEY: (_refusal_details(exc).get("refusal") or {}).get(
+                            "code"
+                        ),
                     }
                 await db.commit()
                 return
@@ -774,6 +783,7 @@ async def _fail_push(
     )
     if instance is not None:
         instance.state = "failed"
+        instance.state_data = {**(instance.state_data or {}), LAST_REFUSAL_CODE_KEY: refusal_code}
 
 
 async def fail_interrupted_erp_send(db: AsyncSession, invoice_id: uuid.UUID) -> bool:
@@ -970,6 +980,9 @@ async def _call_erp(
     from app.services.erp_bill_void import shared_lookup_keys
 
     payload.bill_key_shared = invoice.id in await shared_lookup_keys(db, {"erp": config}, [invoice])
+    # A person's confirmation that the bill on that shared key is this
+    # invoice's (§587): the adapter adopts that bill, and only that one.
+    payload.confirmed_bill_id = confirmed_bill_id(state)
     payload.pending_job_id = state.get(PENDING_JOB_KEY)
     payload.outcome_unknown_since = prior_unknown_at
     # Strictly `is True`: a row written before the key existed records no
