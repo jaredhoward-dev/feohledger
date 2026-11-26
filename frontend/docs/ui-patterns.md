@@ -135,6 +135,16 @@ nothing switches there.
   never costs reflow) and *up* for a `min-width` rule (the wide layout waits
   until it really fits). A genuinely new step changes `breakpoints.ts`, this
   table and the decisions log together.
+- **Where two queries meet, exactly one side matches.** A `max-width: N` and
+  a `min-width: N` both match at N, so at that one width a component gets the
+  narrow and the wide rules at once (the legal sheet lost its card *and*
+  gained the wide gutter at 1024). When a wide rule starts at a step, write the
+  narrow side as its negation, `@media not all and (min-width: N)`; N then
+  belongs to the wide side. The auth shell, sign-in's proofs and the legal
+  sheet all turn this way at `xl` — the two-column sign-in starts AT 1024, so
+  iPad landscape keeps it. `breakpoints.test.ts` fails on a `max-width: N` in a
+  file that also has a `min-width: N`. A lone `max-width` with no wide partner
+  (the shell's `lg`) keeps the inclusive "at and below" reading.
 - **`@container` queries are outside the scale** — they measure a component's
   own box, not the viewport (the help centre uses three).
 

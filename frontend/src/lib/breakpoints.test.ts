@@ -86,6 +86,33 @@ describe('every @media width query is on the scale', () => {
 	);
 });
 
+/**
+ * The boundary rule (decisions §590): where a wide and a narrow query meet at
+ * the same scale value, the narrow side is written `not all and (min-width: N)`
+ * so exactly one side matches at N. `(max-width: N)` beside `(min-width: N)`
+ * matches both at N — the legal sheet was stripped of its card AND given the
+ * wide gutter at exactly 1024px. Checked per file, which is where a pair meets.
+ */
+function boundaryClashes(queries: WidthQuery[]): WidthQuery[] {
+	const mins = new Set(queries.filter((q) => q.feature === 'min-width').map((q) => q.value));
+	return queries.filter((q) => q.feature === 'max-width' && mins.has(q.value));
+}
+
+describe('a max-width never meets a min-width at the same value', () => {
+	it.each(files.filter((f) => mediaWidths(f.source).length > 0).map((f) => [f.path, f.source]))(
+		'%s',
+		(path, source) => {
+			const clashes = boundaryClashes(mediaWidths(source)).map(
+				(q) => `${path}:${q.line} (max-width: ${q.value})`
+			);
+			expect(
+				clashes,
+				'both sides match at this width — write the narrow side `not all and (min-width: N)`'
+			).toEqual([]);
+		}
+	);
+});
+
 describe('the guard itself', () => {
 	it('reads min and max widths out of a prelude, including compound ones', () => {
 		expect(
@@ -114,6 +141,18 @@ a { max-width: 333px; }`;
 		expect(onScale('700px')).toBe(false);
 		expect(onScale('48rem')).toBe(false);
 		expect(onScale('767px')).toBe(false);
+	});
+
+	it('flags a max-width that meets a min-width, and accepts the negated form', () => {
+		const clash = `@media (max-width: 1024px) { a {} }
+@media (min-width: 1024px) { b {} }`;
+		expect(boundaryClashes(mediaWidths(clash))).toEqual([
+			{ feature: 'max-width', value: '1024px', line: 1 }
+		]);
+		const ok = `@media not all and (min-width: 1024px) { a {} }
+@media (min-width: 1024px) { b {} }
+@media (max-width: 768px) { c {} }`;
+		expect(boundaryClashes(mediaWidths(ok))).toEqual([]);
 	});
 
 	it('reports the line of the offending query', () => {
