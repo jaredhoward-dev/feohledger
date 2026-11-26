@@ -48,7 +48,7 @@ test.describe('/profile — passkey list failure', () => {
 
 		// Retry succeeds → the honest empty state finally appears.
 		fail = false;
-		await card.getByRole('button', { name: 'Try again' }).click();
+		await card.getByRole('button', { name: 'Retry', exact: true }).click();
 		await expect(card.getByText('No passkeys yet')).toBeVisible();
 		await expect(card.getByText(/Couldn't load your passkeys/)).toHaveCount(0);
 	});
