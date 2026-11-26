@@ -18,8 +18,16 @@ from app.services.erp_adapters import (
     get_erp_adapter,
 )
 from app.services.erp_adapters.base import ACCOUNT_NOT_LINKED, NOT_CONNECTED
+from app.services.erp_adapters.bill_allocation import DUPLICATE_DOCUMENT_NUMBER
 from app.services.erp_adapters.deep_links import erp_document_url
-from app.services.erp_bill_confirm import LAST_REFUSAL_CODE_KEY, confirmed_bill_id
+from app.services.erp_bill_confirm import (
+    CONFIRMED_BILL_KEY,
+    LAST_REFUSAL_CODE_KEY,
+    WITHDRAWN_OTHER_BILL,
+    WITHDRAWN_TOTAL_CHANGED,
+    confirmed_bill_id,
+    withdraw_confirmation,
+)
 from app.services.erp_export_gate import erp_export_refusal
 from app.services.erp_link_realm import bill_realm, connection_realm, legacy_links_trusted
 from app.services.erp_status_sync import status_sync_active
@@ -1070,6 +1078,24 @@ async def _call_erp(
             new_state["erp_realm"] = bill_realm(config)
         if result.pending_job_id != payload.pending_job_id:
             new_state[PENDING_JOB_KEY] = result.pending_job_id
+        # A confirmation (§587) stands only until it is used or refuted: the
+        # bill of record carries the claim from a success on, a success on
+        # another bill refutes it, and a refusal of the confirmed bill at a
+        # changed total means the person confirmed a figure this invoice no
+        # longer has (decisions §590).
+        if result.success or (
+            payload.confirmed_bill_id and result.refusal_code == DUPLICATE_DOCUMENT_NUMBER
+        ):
+            used = result.success and result.erp_document_id == payload.confirmed_bill_id
+            if used:
+                new_state.pop(CONFIRMED_BILL_KEY, None)
+            else:
+                new_state = await withdraw_confirmation(
+                    db,
+                    invoice,
+                    new_state,
+                    reason=WITHDRAWN_OTHER_BILL if result.success else WITHDRAWN_TOTAL_CHANGED,
+                )
         if result.success:
             for key in (
                 *_ORPHAN_KEYS,

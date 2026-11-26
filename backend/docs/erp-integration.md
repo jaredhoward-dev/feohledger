@@ -754,8 +754,13 @@ id, nor another payment's stall on the same invoice.
 void** (decisions §584). Before `post_payment`, the write-back commits
 `state_data.erp_payment_writes_pending[<payment id>]` (`token`, `bill_id`,
 `attempts`, `claimed_until`) under the same locks, and the transaction that
-records the outcome — success or failure — clears it when it still names that
-attempt's token. If that transaction rolls back or the process dies, the
+records the outcome clears it when it still names that attempt's token — on
+success, or on a failure the adapter marks `not_posted` (refused before any
+write). Any other failure's outcome is unknown, since the payment may stand:
+the record is kept with its claim released (`unconfirmed: true`) for the
+sweep, a void that raced the send is re-armed (and then owns the record), and
+the flag is `erp_payment_writeback_unconfirmed` with `erp_report.outcome:
+unconfirmed` (decisions §590). If that transaction rolls back or the process dies, the
 status-sync sweep's `resume_pending_writes` (run before
 `resume_pending_voids`) finds the record once its claim lapses: a payment no
 longer `completed` has its void re-armed (fresh `erp_payment_void_rearmed`
@@ -765,8 +770,10 @@ own find-by-payment-id (QuickBooks `PrivateNote`, Xero `Reference`, NetSuite
 `externalId`) answers with our earlier BillPayment instead of creating one. A
 live claim or `MAX_WRITE_ATTEMPTS` (12, then `payment.erp_post_failed` with
 `retries_exhausted` and a `payment_writeback_failed` flag with `failure:
-retries_exhausted`, once) means nothing is sent. The invoice delete door counts
-the key as pending.
+retries_exhausted`, the unconfirmed sentence, its own row) means nothing is
+sent. A record whose `bill_id` is not the bill the invoice points at now is
+kept and flagged (`failure: bill_changed`, `current_bill_id`), never retried
+against either bill. The invoice delete door counts the key as pending.
 A payment void whose credit reverse is refused `discount_credit_not_ours`
 calls `void_payment` anyway: `payment.erp_voided` carries
 `discount_credit_held: <id>`, the credit's entries stay, and the
@@ -775,6 +782,11 @@ A void that keeps failing records `erp_payment_void_attempts[<payment id>]`
 (`outcome`, `attempts`); `payment.erp_void_failed` is audited only when the
 outcome changes or `MAX_VOID_ATTEMPTS` (12) is reached, after which no pass
 calls the ERP for it until a write-back re-arms it (which resets the count).
+At the cap the flag says `failure: retries_exhausted` with `attempts`, on its
+own row. A person's **resolve** of either capped flag (write or void) clears
+the cap in the decision's transaction (`rearm_capped_on_resolve`; the
+`exception.resolved` row carries `erp_retry_rearmed` and the payment id); an
+agent's resolve or a dismiss does not (decisions §590).
 
 The code is exercised against `tools/fake-erp` and the adapter doubles only,
 not yet a real company; a read-back that is not what we wrote fails closed
@@ -3741,10 +3753,17 @@ time Xero refuses the payments listing, and the settings panel shows it
   `invoice.erp_bill_confirmed` audit row (actor, reason), and starts the
   ordinary retry (`invoice.erp_retried`). The push passes the id as
   `payload.confirmed_bill_id`; Xero adopts a found bill on a shared key only
-  when it is that id, at the approved total (a different total is still
-  `duplicate_document_number`). If a retry gate refuses, the confirmation
+  when it is that id, at the approved total and in the payload's currency (a
+  different total is still `duplicate_document_number`; a bill in another
+  currency, or stating none, is `currency_mismatch` for any adoption). If a
+  retry gate refuses, the confirmation
   stands and Retry ERP Send honours it later. The sharer's own push keeps
-  refusing, and its confirmation answers `erp_bill_claimed`.
+  refusing, and its confirmation answers `erp_bill_claimed`. The confirmation
+  stops standing (decisions §590): a push that adopts it drops it (the bill of
+  record carries the claim); a push that succeeds on another bill, or is
+  refused `duplicate_document_number` with it, and the invoice's transition to
+  `rejected`, withdraw it with an `invoice.erp_bill_confirmation_withdrawn`
+  row (`reason`: `other_bill` / `total_changed` / `invoice_rejected`).
 - **The posted total is checked, on the bill read back.** After the create the
   adapter `GET`s `Invoices/{id}`. Xero computes `Total` from the lines and
   their tax types; a `Total` other than `amount` voids (AUTHORISED) or deletes

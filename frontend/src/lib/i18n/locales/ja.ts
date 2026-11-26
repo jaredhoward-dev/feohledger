@@ -747,6 +747,8 @@ export const messages = {
 	'exceptions.description.erpReportedPaymentVoided': "ERP が報告した支払いが FeohLedger で無効化されましたが、ERP ではまだ請求書が支払済みと表示されている可能性があります。ERP の支払いが取り消されたことを誰かが確認するまで、FeohLedger はこれを再び支払いません。",
 	'exceptions.description.erpPaymentWritebackFailed': "{erp} はこの請求書の支払いを記録しなかったため、資金は支払済みにもかかわらず、ERP では請求書が未払いのまま表示されています。原因を解消してから、「支払い」でこの支払いの支払実行にある「ERP連携を再実行」を使用してください。",
 	'exceptions.description.erpPaymentWritebackFailedUnnamed': "ご利用の ERP はこの請求書の支払いを記録しなかったため、資金は支払済みにもかかわらず、ERP では請求書が未払いのまま表示されています。原因を解消してから、「支払い」でこの支払いの支払実行にある「ERP連携を再実行」を使用してください。",
+	'exceptions.description.erpPaymentWritebackUnconfirmed': "{erp} にはこの請求書の支払いがすでに表示されている可能性があります。FeohLedger は支払いを送信しましたが、記録されたことを確認できませんでした。支払いを記録する前に、請求書に参照「{marker}」の支払いがないか確認してください。",
+	'exceptions.description.erpPaymentWritebackUnconfirmedUnnamed': "ご利用の ERP にはこの請求書の支払いがすでに表示されている可能性があります。FeohLedger は支払いを送信しましたが、記録されたことを確認できませんでした。支払いを記録する前に、請求書に参照「{marker}」の支払いがないか確認してください。",
 	'exceptions.description.erpPaymentWritebackBalanceOpen': "{erp} はこの請求書の支払いを記録しましたが、請求書にはまだ {amount} の未決済残高が表示されています（FeohLedger で適用した割引またはクレジット）。ERP で差額を解消してください。",
 	'exceptions.description.erpPaymentWritebackBalanceOpenUnnamed': "ご利用の ERP はこの請求書の支払いを記録しましたが、請求書にはまだ {amount} の未決済残高が表示されています（FeohLedger で適用した割引またはクレジット）。ERP で差額を解消してください。",
 	'exceptions.description.erpDiscountCreditPending': "{erp} はこの請求書の支払いを記録しましたが、請求書にはまだ {amount} の未決済残高が表示されています。FeohLedger は早期支払割引のクレジット {credit} を計上済みで、これから適用します。別のクレジットは計上しないでください。",

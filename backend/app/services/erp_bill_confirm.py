@@ -72,6 +72,14 @@ CONFIRM_VERDICT_KEY = "erp_bill_confirm_refusal"
 
 #: Audit action for the confirmation (the lookup reuses the orphan lookup's).
 ACTION_INVOICE_ERP_BILL_CONFIRMED = "invoice.erp_bill_confirmed"
+#: Audit action when a confirmation stops standing (decisions §590): its
+#: invoice adopted or created another bill, the push refused the confirmed
+#: bill for a changed total, or the invoice was rejected.
+ACTION_INVOICE_ERP_BILL_CONFIRMATION_WITHDRAWN = "invoice.erp_bill_confirmation_withdrawn"
+#: ``details["reason"]`` of that row.
+WITHDRAWN_OTHER_BILL = "other_bill"
+WITHDRAWN_TOTAL_CHANGED = "total_changed"
+WITHDRAWN_REJECTED = "invoice_rejected"
 
 #: The invoice is not a failed push refused ``erp_bill_key_shared`` by an ERP
 #: whose bill key may be shared.
@@ -248,4 +256,60 @@ async def record_confirmation(
             "reason": reason,
             "confirmed_at": now,
         },
+    )
+
+
+async def withdraw_confirmation(
+    db: AsyncSession, invoice: Invoice, state: dict, *, reason: str, actor_id=None
+) -> dict:
+    """``state`` without the confirmation, with an append-only
+    ``invoice.erp_bill_confirmation_withdrawn`` row naming the bill and why,
+    when one stood (decisions §590). Otherwise ``state`` unchanged and nothing
+    written. The caller assigns the returned state and commits.
+
+    A confirmation is a claim every other invoice's confirmation reads
+    (:func:`claimed_elsewhere`): one that outlived its purpose would refuse
+    the bill's real owner ``erp_bill_claimed`` forever. So it goes when its
+    invoice adopts or creates another bill, when the push refuses the
+    confirmed bill for a changed total (``duplicate_document_number``: the
+    person confirmed a bill at a figure the invoice no longer has), and when
+    the invoice is rejected."""
+    document_id = confirmed_bill_id(state)
+    if document_id is None and CONFIRMED_BILL_KEY not in (state or {}):
+        return state
+    new_state = {k: v for k, v in (state or {}).items() if k != CONFIRMED_BILL_KEY}
+    if document_id is not None:
+        from app.services.erp_bill_void import _audit_invoice
+
+        await _audit_invoice(
+            db,
+            invoice,
+            action=ACTION_INVOICE_ERP_BILL_CONFIRMATION_WITHDRAWN,
+            actor_id=actor_id,
+            details={
+                "invoice_id": str(invoice.id),
+                "erp_document_id": document_id,
+                "reason": reason,
+            },
+        )
+    return new_state
+
+
+async def withdraw_on_reject(db: AsyncSession, invoice: Invoice, *, actor_id=None) -> None:
+    """At the transition to ``rejected`` (``workflow_engine.transition_invoice``):
+    drop the invoice's confirmation, audited, under the instance's row lock.
+    Never commits."""
+    from app.models.workflow import WorkflowInstance
+
+    instance = (
+        await db.execute(
+            select(WorkflowInstance)
+            .where(WorkflowInstance.invoice_id == invoice.id)
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
+    if instance is None or CONFIRMED_BILL_KEY not in (instance.state_data or {}):
+        return
+    instance.state_data = await withdraw_confirmation(
+        db, invoice, dict(instance.state_data), reason=WITHDRAWN_REJECTED, actor_id=actor_id
     )

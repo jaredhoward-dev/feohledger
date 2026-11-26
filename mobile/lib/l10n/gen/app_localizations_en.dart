@@ -3929,6 +3929,21 @@ class AppLocalizationsEn extends AppLocalizations {
       'Your ERP did not record this invoice\'s payment, so the bill still shows as unpaid there although the money was paid. Resolve what stopped it, then use Retry ERP sync on the payment\'s run in Payments.';
 
   @override
+  String exceptionDescriptionErpPaymentWritebackUnconfirmed(
+    String erp,
+    String marker,
+  ) {
+    return '$erp may already show this invoice\'s payment: FeohLedger sent it but could not confirm it was recorded. Check the bill for a payment referenced “$marker” before recording one.';
+  }
+
+  @override
+  String exceptionDescriptionErpPaymentWritebackUnconfirmedUnnamed(
+    String marker,
+  ) {
+    return 'Your ERP may already show this invoice\'s payment: FeohLedger sent it but could not confirm it was recorded. Check the bill for a payment referenced “$marker” before recording one.';
+  }
+
+  @override
   String exceptionDescriptionErpPaymentWritebackBalanceOpen(
     String erp,
     String amount,

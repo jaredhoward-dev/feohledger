@@ -376,6 +376,12 @@ async def transition_invoice(
     _refuse_outside_the_recall(invoice, target_status, action_name)
     old_status = invoice.status.value
     invoice.status = target_status
+    if target_status is InvoiceStatus.rejected:
+        # A rejected invoice's confirmation of a bill in the ERP (§587) must
+        # not keep claiming that bill from its real owner (decisions §590).
+        from app.services.erp_bill_confirm import withdraw_on_reject
+
+        await withdraw_on_reject(db, invoice, actor_id=actor_id)
 
     # One id per transition OCCURRENCE. An invoice legitimately reaches
     # `approved` (and `paid`) more than once — `POST /api/payments/{id}/void`

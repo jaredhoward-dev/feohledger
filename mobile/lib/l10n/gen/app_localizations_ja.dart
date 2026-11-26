@@ -3762,6 +3762,21 @@ class AppLocalizationsJa extends AppLocalizations {
       'ご利用の ERP はこの請求書の支払いを記録しなかったため、資金は支払済みにもかかわらず、ERP では請求書が未払いのまま表示されています。原因を解消してから、「支払い」でこの支払いの支払実行にある「ERP連携を再実行」を使用してください。';
 
   @override
+  String exceptionDescriptionErpPaymentWritebackUnconfirmed(
+    String erp,
+    String marker,
+  ) {
+    return '$erp にはこの請求書の支払いがすでに表示されている可能性があります。FeohLedger は支払いを送信しましたが、記録されたことを確認できませんでした。支払いを記録する前に、請求書に参照「$marker」の支払いがないか確認してください。';
+  }
+
+  @override
+  String exceptionDescriptionErpPaymentWritebackUnconfirmedUnnamed(
+    String marker,
+  ) {
+    return 'ご利用の ERP にはこの請求書の支払いがすでに表示されている可能性があります。FeohLedger は支払いを送信しましたが、記録されたことを確認できませんでした。支払いを記録する前に、請求書に参照「$marker」の支払いがないか確認してください。';
+  }
+
+  @override
   String exceptionDescriptionErpPaymentWritebackBalanceOpen(
     String erp,
     String amount,

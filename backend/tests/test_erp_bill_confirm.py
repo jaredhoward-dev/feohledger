@@ -323,3 +323,190 @@ async def test_a_final_failure_records_its_refusal_code(realdb):
         assert (await s.get(Invoice, inv_id)).status == InvoiceStatus.failed
         state = (await _instance(s, inv_id)).state_data
         assert state[ebc.LAST_REFUSAL_CODE_KEY] == "erp_bill_key_shared"
+
+
+# ---------------------------------------------------------------------------
+# Two invoices confirming one bill serialize on the per-bill lock; a
+# confirmation stops standing once used, refuted or its invoice is rejected
+# (decisions §590)
+# ---------------------------------------------------------------------------
+
+
+async def _advisory_waiters(mk) -> int:
+    from sqlalchemy import text
+
+    async with mk() as s:
+        return (
+            await s.execute(
+                text(
+                    "SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() "
+                    "AND wait_event_type = 'Lock' AND wait_event = 'advisory'"
+                )
+            )
+        ).scalar_one()
+
+
+async def test_a_confirmation_waits_for_another_holding_the_bill_then_is_refused(realdb):
+    """A holds the per-bill lock with its confirmation uncommitted. C's
+    confirmation passes the unlocked pre-check (A's write is invisible),
+    blocks on the lock, and once A commits answers ``erp_bill_claimed`` with
+    nothing recorded."""
+    import asyncio
+
+    info = realdb.info(TENANT)
+    mk = realdb.sessionmaker(TENANT)
+    mine, other = await _pair(mk, info.org_id)
+    async with mk() as s:
+        (await s.get(Invoice, other)).status = InvoiceStatus.failed
+        await s.commit()
+    await _set_code(mk, other)
+    with _adapter(_Adapter()), _shared_key(), _no_dispatch() as dispatched:
+        async with mk() as a:
+            await ebc.lock_bill(a, "ORPHAN-1")
+            inst = await _instance(a, other)
+            inst.state_data = {
+                **(inst.state_data or {}),
+                ebc.CONFIRMED_BILL_KEY: {"document_id": "ORPHAN-1"},
+            }
+            await a.flush()
+            async with realdb.client(key=TENANT, role="admin") as c:
+                task = asyncio.create_task(
+                    c.post(f"/api/invoices/{mine}/confirm-erp-bill", json=_BODY)
+                )
+                loop = asyncio.get_running_loop()
+                deadline = loop.time() + 10
+                while await _advisory_waiters(mk) == 0 and loop.time() < deadline:
+                    assert not task.done(), (await task).text
+                    await asyncio.sleep(0.02)
+                assert await _advisory_waiters(mk) == 1  # C is blocked on A's lock
+                assert not task.done()
+                await a.commit()
+                res = await task
+    assert res.status_code == 409, res.text
+    assert res.json()["detail"]["code"] == ebc.ERP_BILL_CLAIMED
+    dispatched.assert_not_awaited()
+    async with mk() as s:
+        assert ebc.confirmed_bill_id((await _instance(s, mine)).state_data) is None
+    assert await _audit(mk, mine, ebc.ACTION_INVOICE_ERP_BILL_CONFIRMED) == []
+
+
+async def _confirmed(mk, inv_id, doc="ORPHAN-1"):
+    async with mk() as s:
+        inst = await _instance(s, inv_id)
+        inst.state_data = {
+            **(inst.state_data or {}),
+            ebc.CONFIRMED_BILL_KEY: {"document_id": doc},
+        }
+        await s.commit()
+
+
+async def _push(mk, inv_id, result):
+    from app.services.erp import ErpPostRefusedError, _call_erp
+
+    class _Fixed:
+        async def post_invoice(self, payload):
+            return result
+
+    xero = {"type": "xero", "integration_method": "direct", "oauth": {"external_tenant_id": "o"}}
+    async with mk() as s:
+        inv = await s.get(Invoice, inv_id)
+        inst = await _instance(s, inv_id)
+        with patch("app.services.erp.get_erp_adapter", return_value=_Fixed()):
+            try:
+                await _call_erp(s, inv, xero, instance=inst)
+            except ErpPostRefusedError:
+                pass
+        await s.commit()
+
+
+async def test_a_confirmation_is_withdrawn_when_its_invoice_adopts_another_bill(realdb):
+    from app.services.erp_adapters.base import ErpPostResult
+
+    info = realdb.info(TENANT)
+    mk = realdb.sessionmaker(TENANT)
+    mine, other = await _pair(mk, info.org_id)
+    await _confirmed(mk, mine)
+    await _push(mk, mine, ErpPostResult(success=True, erp_document_id="BILL-NEW"))
+    async with mk() as s:
+        assert ebc.CONFIRMED_BILL_KEY not in (await _instance(s, mine)).state_data
+    [row] = await _audit(mk, mine, ebc.ACTION_INVOICE_ERP_BILL_CONFIRMATION_WITHDRAWN)
+    assert row.details["erp_document_id"] == "ORPHAN-1"
+    assert row.details["reason"] == ebc.WITHDRAWN_OTHER_BILL
+    # ORPHAN-1 is free for its real owner again.
+    async with mk() as s:
+        assert not await ebc.claimed_elsewhere(s, other, "ORPHAN-1")
+
+
+async def test_a_confirmation_used_by_the_push_is_dropped_silently(realdb):
+    from app.services.erp_adapters.base import ErpPostResult
+
+    info = realdb.info(TENANT)
+    mk = realdb.sessionmaker(TENANT)
+    mine, other = await _pair(mk, info.org_id)
+    await _confirmed(mk, mine)
+    await _push(mk, mine, ErpPostResult(success=True, erp_document_id="ORPHAN-1"))
+    async with mk() as s:
+        assert ebc.CONFIRMED_BILL_KEY not in (await _instance(s, mine)).state_data
+        assert (await s.get(Invoice, mine)).erp_document_id == "ORPHAN-1"
+        # The bill of record carries the claim now.
+        assert await ebc.claimed_elsewhere(s, other, "ORPHAN-1")
+    assert await _audit(mk, mine, ebc.ACTION_INVOICE_ERP_BILL_CONFIRMATION_WITHDRAWN) == []
+
+
+async def test_a_confirmation_refused_for_a_changed_total_is_withdrawn(realdb):
+    from app.services.erp_adapters.base import erp_refusal
+
+    info = realdb.info(TENANT)
+    mk = realdb.sessionmaker(TENANT)
+    mine, other = await _pair(mk, info.org_id)
+    await _confirmed(mk, mine)
+    await _push(mk, mine, erp_refusal("Xero", "duplicate_document_number"))
+    async with mk() as s:
+        assert ebc.CONFIRMED_BILL_KEY not in (await _instance(s, mine)).state_data
+        assert not await ebc.claimed_elsewhere(s, other, "ORPHAN-1")
+    [row] = await _audit(mk, mine, ebc.ACTION_INVOICE_ERP_BILL_CONFIRMATION_WITHDRAWN)
+    assert row.details["reason"] == ebc.WITHDRAWN_TOTAL_CHANGED
+
+
+async def test_another_refusal_keeps_the_confirmation(realdb):
+    from app.services.erp_adapters.base import erp_refusal
+
+    info = realdb.info(TENANT)
+    mk = realdb.sessionmaker(TENANT)
+    mine, _ = await _pair(mk, info.org_id)
+    await _confirmed(mk, mine)
+    await _push(mk, mine, erp_refusal("Xero", "erp_bill_key_shared"))
+    async with mk() as s:
+        assert ebc.confirmed_bill_id((await _instance(s, mine)).state_data) == "ORPHAN-1"
+
+
+async def test_a_rejected_invoice_no_longer_claims_its_confirmed_bill(realdb):
+    from app.services.workflow_engine import transition_invoice
+
+    info = realdb.info(TENANT)
+    mk = realdb.sessionmaker(TENANT)
+    mine, other = await _pair(mk, info.org_id)
+    async with mk() as s:
+        (await s.get(Invoice, other)).status = InvoiceStatus.failed
+        await s.commit()
+    await _set_code(mk, other)
+    await _confirmed(mk, mine)
+    actor = uuid.uuid4()
+    async with mk() as s:
+        inv = await s.get(Invoice, mine)
+        inv.status = InvoiceStatus.ready_for_review
+        await s.flush()
+        await transition_invoice(
+            s, inv, InvoiceStatus.rejected, actor_id=actor, action_name="invoice.rejected"
+        )
+        await s.commit()
+    async with mk() as s:
+        assert ebc.CONFIRMED_BILL_KEY not in (await _instance(s, mine)).state_data
+    [row] = await _audit(mk, mine, ebc.ACTION_INVOICE_ERP_BILL_CONFIRMATION_WITHDRAWN)
+    assert row.details["reason"] == ebc.WITHDRAWN_REJECTED
+    assert row.actor_id == actor
+    # The real owner confirms it now.
+    with _adapter(_Adapter()), _shared_key(), _no_dispatch():
+        async with realdb.client(key=TENANT, role="admin") as c:
+            res = await c.post(f"/api/invoices/{other}/confirm-erp-bill", json=_BODY)
+    assert res.status_code == 202, res.text

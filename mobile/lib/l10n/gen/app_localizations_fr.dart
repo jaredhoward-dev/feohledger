@@ -3963,6 +3963,21 @@ class AppLocalizationsFr extends AppLocalizations {
       'Votre ERP n\'a pas enregistré le paiement de cette facture : elle y apparaît donc toujours comme impayée alors que l\'argent a été versé. Corrigez ce qui l\'a empêché, puis utilisez « Relancer la synchro ERP » sur le lot de paiement concerné, dans Paiements.';
 
   @override
+  String exceptionDescriptionErpPaymentWritebackUnconfirmed(
+    String erp,
+    String marker,
+  ) {
+    return '$erp affiche peut-être déjà le paiement de cette facture : FeohLedger l\'a envoyé mais n\'a pas pu confirmer son enregistrement. Cherchez sur la facture un paiement portant la référence « $marker » avant d\'en enregistrer un.';
+  }
+
+  @override
+  String exceptionDescriptionErpPaymentWritebackUnconfirmedUnnamed(
+    String marker,
+  ) {
+    return 'Votre ERP affiche peut-être déjà le paiement de cette facture : FeohLedger l\'a envoyé mais n\'a pas pu confirmer son enregistrement. Cherchez sur la facture un paiement portant la référence « $marker » avant d\'en enregistrer un.';
+  }
+
+  @override
   String exceptionDescriptionErpPaymentWritebackBalanceOpen(
     String erp,
     String amount,

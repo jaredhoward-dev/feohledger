@@ -208,6 +208,7 @@ export const messages = {
 	'audit.action.invoice.erp_bill_voided': "ERPで請求書を無効化し、承認済みに戻しました",
 	'audit.action.invoice.erp_orphan_bill_looked_up': "失敗した送信の請求書をERPで検索",
 	'audit.action.invoice.erp_bill_confirmed': "ERPの請求書をこの請求書のものとして確認",
+	'audit.action.invoice.erp_bill_confirmation_withdrawn': "ERPの請求書をこの請求書のものとした確認を取り消し",
 	'audit.action.invoice.erp_orphan_bill_voided': "失敗した送信の請求書をERPで無効化",
 	'audit.action.invoice.erp_orphan_bill_void_orphaned': "ERPへ無効化を送信したが、ここでは記録されていない",
 	'audit.action.organization.branding_updated': "ブランディングを更新",

@@ -208,6 +208,7 @@ export const messages = {
 	'audit.action.invoice.erp_bill_voided': "Rechnung im ERP storniert, zurück auf genehmigt",
 	'audit.action.invoice.erp_orphan_bill_looked_up': "Beleg einer fehlgeschlagenen Übertragung im ERP gesucht",
 	'audit.action.invoice.erp_bill_confirmed': "Beleg im ERP als den dieser Rechnung bestätigt",
+	'audit.action.invoice.erp_bill_confirmation_withdrawn': "Bestätigung des Belegs im ERP als den dieser Rechnung zurückgenommen",
 	'audit.action.invoice.erp_orphan_bill_voided': "Beleg einer fehlgeschlagenen Übertragung im ERP storniert",
 	'audit.action.invoice.erp_orphan_bill_void_orphaned': "Stornierung an das ERP gesendet, hier aber nicht erfasst",
 	'audit.action.organization.branding_updated': "Branding aktualisiert",

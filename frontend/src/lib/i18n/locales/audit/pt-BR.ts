@@ -208,6 +208,7 @@ export const messages = {
 	'audit.action.invoice.erp_bill_voided': "Conta anulada no ERP, de volta a aprovada",
 	'audit.action.invoice.erp_orphan_bill_looked_up': "Conta de um envio com falha procurada no ERP",
 	'audit.action.invoice.erp_bill_confirmed': "Conta do ERP confirmada como a desta fatura",
+	'audit.action.invoice.erp_bill_confirmation_withdrawn': "Confirmação da conta do ERP como a desta fatura retirada",
 	'audit.action.invoice.erp_orphan_bill_voided': "Conta de um envio com falha anulada no ERP",
 	'audit.action.invoice.erp_orphan_bill_void_orphaned': "Anulação enviada ao ERP, mas não registrada aqui",
 	'audit.action.organization.branding_updated': "Identidade visual atualizada",
