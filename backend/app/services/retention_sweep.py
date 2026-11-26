@@ -51,6 +51,14 @@ default retention (``infra/s3.tf``), which defers any expiration until the lock
 elapses, so a rule measured in weeks would silently not fire. See
 ``docs/decisions.md`` § 184.
 
+For the ``peppol_transmissions`` class the sweep reaches only an inbound
+transmission that outlived its deleted invoice (``invoice_id`` NULL, decisions
+§586). Deleting the invoice detached and stamped it rather than erasing the
+record of a received e-invoice; once its window, measured from receipt
+(``created_at``), has passed, nothing is left that needs it, so the row is
+deleted, counted in the manifest. A row still attached to an invoice is never
+touched — it lives as long as its invoice.
+
 Mirrors ``contract_renewal`` / ``qms_sync``: a long-lived asyncio loop started
 in ``main.lifespan``, fresh per-tenant engine, one tenant's failure logged but
 never halting the sweep. Disabled by default (``FEOH_RETENTION_ENABLED``).
@@ -63,7 +71,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm.attributes import flag_modified
 
@@ -73,6 +81,7 @@ from app.db_engine import create_async_engine
 from app.models.invoice import Invoice
 from app.models.invoice_status import SETTLED_STATUSES
 from app.models.organization import Organization
+from app.models.peppol_transmission import PeppolTransmission
 from app.models.positive_pay import PositivePayFile
 from app.models.workflow import AuditLog
 from app.services import storage
@@ -111,6 +120,7 @@ class RetentionResult:
     audit_rows_overdue_unshipped: int = 0
     positive_pay_files_expired: int = 0
     positive_pay_files_failed: int = 0
+    peppol_transmissions_expired: int = 0
     failures: int = 0
 
 
@@ -241,6 +251,34 @@ async def sweep_tenant(
     result.positive_pay_files_expired = pp_expired
     result.positive_pay_files_failed = pp_failed
 
+    # --- PEPPOL: expire an inbound record that outlived its invoice --------
+    # Only detached rows (§586); the window runs from receipt, and the same cap
+    # bounds the tick. The deleted row was the only thing left to expire, so a
+    # re-run finds nothing: deletion is its own idempotency marker.
+    peppol_months = resolve_retention_months(settings_dict, "peppol_transmissions")
+    peppol_cutoff = ref_now - timedelta(days=peppol_months * _DAYS_PER_MONTH)
+    expired_ids = (
+        select(PeppolTransmission.id)
+        .where(
+            PeppolTransmission.organization_id == organization_id,
+            PeppolTransmission.invoice_id.is_(None),
+            PeppolTransmission.direction == "inbound",
+            PeppolTransmission.created_at < peppol_cutoff,
+        )
+        .order_by(PeppolTransmission.created_at.asc(), PeppolTransmission.id.asc())
+        .limit(cap)
+    )
+    peppol_expired = len(
+        (
+            await db.execute(
+                delete(PeppolTransmission)
+                .where(PeppolTransmission.id.in_(expired_ids.scalar_subquery()))
+                .returning(PeppolTransmission.id)
+            )
+        ).all()
+    )
+    result.peppol_transmissions_expired = peppol_expired
+
     # --- Audit class: verify WORM-shipment, never delete --------------------
     audit_months = resolve_retention_months(settings_dict, "audit_log")
     audit_cutoff = ref_now - timedelta(days=audit_months * _DAYS_PER_MONTH)
@@ -287,7 +325,7 @@ async def sweep_tenant(
     #
     # The details are a PII-free retention manifest — counts + window months
     # ONLY, never the archived ids (see the note on the details dict below).
-    if archived or overdue_unshipped or pp_expired or pp_failed:
+    if archived or overdue_unshipped or pp_expired or pp_failed or peppol_expired:
         await dispatch_audit(
             db,
             correlation_id=uuid.uuid4(),
@@ -312,6 +350,8 @@ async def sweep_tenant(
                 "positive_pay_months": pp_months,
                 "positive_pay_files_expired": pp_expired,
                 "positive_pay_files_failed": pp_failed,
+                "peppol_transmissions_months": peppol_months,
+                "peppol_transmissions_expired": peppol_expired,
                 "audit_log_note": (
                     "audit_log rows are WORM/immutable and never deleted; "
                     "retention verifies shipment only"
@@ -352,6 +392,7 @@ async def run_retention_once(*, now: datetime | None = None) -> RetentionResult:
             total.audit_rows_overdue_unshipped += tenant_result.audit_rows_overdue_unshipped
             total.positive_pay_files_expired += tenant_result.positive_pay_files_expired
             total.positive_pay_files_failed += tenant_result.positive_pay_files_failed
+            total.peppol_transmissions_expired += tenant_result.peppol_transmissions_expired
         except Exception as exc:  # noqa: BLE001 — one tenant must not halt the sweep
             logger.warning("[retention] failed sweeping %s: %s", db_name, exc.__class__.__name__)
             total.failures += 1
@@ -363,16 +404,18 @@ async def run_retention_once(*, now: datetime | None = None) -> RetentionResult:
         total.invoices_archived
         or total.audit_rows_overdue
         or total.positive_pay_files_expired
+        or total.peppol_transmissions_expired
         or total.failures
     ):
         logger.info(
             "[retention] swept %d tenant(s); archived=%d audit_overdue=%d "
-            "audit_overdue_unshipped=%d positive_pay_expired=%d failed=%d",
+            "audit_overdue_unshipped=%d positive_pay_expired=%d peppol_expired=%d failed=%d",
             total.tenants_scanned,
             total.invoices_archived,
             total.audit_rows_overdue,
             total.audit_rows_overdue_unshipped,
             total.positive_pay_files_expired,
+            total.peppol_transmissions_expired,
             total.failures,
         )
     return total

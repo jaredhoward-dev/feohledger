@@ -33,7 +33,12 @@ router = APIRouter(prefix="/retention-policy", tags=["retention"])
 # and routing numbers — while keeping its PII-free row. It defaults to a much
 # shorter window than the rest (``retention_sweep.RECORD_CLASS_DEFAULT_MONTHS``)
 # because the bank consumes the file within days.
-RECORD_CLASSES = ["invoices", "audit_log", "positive_pay"]
+#
+# ``peppol_transmissions`` keeps an inbound PEPPOL transmission that outlived
+# its deleted invoice (decisions §586) for the window, measured from receipt,
+# then deletes it. A row still attached to an invoice is never touched: it
+# lives as long as its invoice does.
+RECORD_CLASSES = ["invoices", "audit_log", "positive_pay", "peppol_transmissions"]
 
 
 class RetentionPolicyResponse(BaseModel):
