@@ -17,6 +17,7 @@ plain functions — ``await`` them.
 import asyncio
 import re
 import uuid
+from datetime import UTC, datetime
 
 import boto3
 from botocore.exceptions import ClientError
@@ -182,6 +183,79 @@ async def delete_prefix(prefix: str) -> int:
         return removed
 
     return await asyncio.to_thread(_delete_all)
+
+
+def _require_folder_prefix(prefix: str, caller: str) -> None:
+    """The same two guards `delete_prefix` applies, for the listing helpers."""
+    if not prefix or not prefix.strip() or not prefix.endswith("/"):
+        raise ValueError(f"{caller}() needs a non-empty prefix ending in '/', got {prefix!r}")
+
+
+async def list_child_prefixes(
+    prefix: str, *, cursor: str | None = None, limit: int = 1000
+) -> tuple[list[str], str | None]:
+    """One bounded page of the "folders" directly under ``prefix``.
+
+    Returns ``(child_prefixes, cursor)``: each child ends in ``/``, and
+    ``cursor`` is S3's opaque continuation token when more may follow (pass it
+    back as ``cursor``) or ``None`` once the listing is exhausted. One S3 round
+    trip, never a full traversal: the orphan sweep in ``invoice_objects`` calls
+    it once per tick so a tenant with a million invoices costs the same per tick
+    as one with ten. A missing bucket is an empty listing, as in
+    :func:`delete_prefix`.
+    """
+    _require_folder_prefix(prefix, "list_child_prefixes")
+    limit = max(1, min(int(limit), 1000))
+
+    def _list() -> tuple[list[str], str | None]:
+        client = _get_client()
+        kwargs: dict = {
+            "Bucket": settings.s3_bucket,
+            "Prefix": prefix,
+            "Delimiter": "/",
+            "MaxKeys": limit,
+        }
+        if cursor:
+            kwargs["ContinuationToken"] = cursor
+        try:
+            page = client.list_objects_v2(**kwargs)
+        except ClientError as exc:
+            if exc.response.get("Error", {}).get("Code") in {"NoSuchBucket", "404"}:
+                return [], None
+            raise
+        children = [p["Prefix"] for p in page.get("CommonPrefixes", []) if p.get("Prefix")]
+        token = page.get("NextContinuationToken") if page.get("IsTruncated") else None
+        return children, token
+
+    return await asyncio.to_thread(_list)
+
+
+async def newest_object_time(prefix: str, *, limit: int = 1000):
+    """The latest ``LastModified`` among the objects under ``prefix``.
+
+    ``None`` when nothing is there. Reads at most ``limit`` keys (one page):
+    an invoice's folder holds a handful of documents, and a folder too large to
+    read in one page is reported as "now" so the caller treats it as fresh and
+    leaves it alone — fail closed, never delete what was not seen.
+    """
+    _require_folder_prefix(prefix, "newest_object_time")
+
+    def _newest():
+        client = _get_client()
+        try:
+            page = client.list_objects_v2(
+                Bucket=settings.s3_bucket, Prefix=prefix, MaxKeys=max(1, min(int(limit), 1000))
+            )
+        except ClientError as exc:
+            if exc.response.get("Error", {}).get("Code") in {"NoSuchBucket", "404"}:
+                return None
+            raise
+        if page.get("IsTruncated"):
+            return datetime.now(UTC)
+        stamps = [o["LastModified"] for o in page.get("Contents", []) if o.get("LastModified")]
+        return max(stamps) if stamps else None
+
+    return await asyncio.to_thread(_newest)
 
 
 def invoice_file_url(file_key: str) -> str:

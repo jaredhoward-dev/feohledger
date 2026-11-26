@@ -85,6 +85,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 
+from app.config import settings
 from app.models.data_subject_request import (
     SUBJECT_USER,
     SUBJECT_VENDOR_CONTACT,
@@ -96,6 +97,7 @@ from app.models.user import User
 from app.models.vendor import Vendor
 from app.models.vendor_user import VendorUser
 from app.models.webauthn_credential import WebAuthnCredential
+from app.services import invoice_objects
 from app.services.privacy_documents import (
     DELETE,
     KIND_CHAT_ATTACHMENT,
@@ -134,6 +136,10 @@ class ErasureResult:
         self.documents_deleted: int = 0
         self.documents_retained: int = 0
         self.documents_failed: int = 0
+        # Deleted invoices' folders no live row owns (decisions §592): a
+        # subject's document can sit in one, and no row leads the walk to it.
+        self.orphaned_objects_deleted: int = 0
+        self.orphaned_objects_failed: int = 0
         # Auth material (the `user` leg only).
         self.passkeys_deleted: int = 0
         self.sessions_revoked: int = 0
@@ -159,6 +165,20 @@ async def _erase_documents(
     this leg existed still has their documents reachable, and asking again now
     removes them rather than returning ``noop`` over the gap.
     """
+    # First the folders of deleted invoices: no row leads the per-subject walk
+    # to them, and one may hold this subject's document. The queued ones, then
+    # one bounded page of orphans; both refuse a folder a live invoice owns.
+    queued = await invoice_objects.drain_pending(
+        tenant_db, organization_id=organization_id, limit=settings.retention_batch_size, now=now
+    )
+    orphans = await invoice_objects.sweep_orphaned_invoice_objects(
+        tenant_db, organization_id=organization_id, now=now, trigger="erasure"
+    )
+    result.orphaned_objects_deleted += queued.objects_deleted + orphans.objects_deleted
+    # Counted apart from `documents_failed`: a folder of some deleted invoice is
+    # not one of this subject's documents, and the next pass retries it.
+    result.orphaned_objects_failed += queued.failed + orphans.failed
+
     docs = await collect_subject_documents(
         subject_type=subject_type,
         subject_id=subject_id,
@@ -355,6 +375,10 @@ def _with_document_counts(counts: dict[str, int], result: ErasureResult) -> dict
         counts["documents_retained"] = result.documents_retained
     if result.documents_failed:
         counts["documents_failed"] = result.documents_failed
+    if result.orphaned_objects_deleted:
+        counts["orphaned_objects_deleted"] = result.orphaned_objects_deleted
+    if result.orphaned_objects_failed:
+        counts["orphaned_objects_failed"] = result.orphaned_objects_failed
     return counts
 
 

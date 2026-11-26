@@ -307,6 +307,12 @@ lowest-id rows forever and never reach the rest; it keyset-paginates
 and `contract_renewal` are in the same position and page the same way (below).
 `retention_sweep` and `recurring_invoices` *can* cap, because an archived invoice
 / a generated period leaves the candidate set and the next tick resumes past it.
+The retention sweep's object-storage pass (`services/invoice_objects`, decisions
+§592) does both: its `pending_object_deletions` outbox caps, because an emptied
+folder's row is deleted, while its orphan scan of the bucket pages — one S3
+listing page per tick under `{org}/` and `{org}/chat/`, resuming from an
+in-process continuation token, because a live invoice's folder never leaves the
+listing. A restart only restarts the walk from the top.
 
 The page boundary is safe for the same reason the two-phase shape is safe at all:
 step 2 re-claims the row under `FOR UPDATE` and re-checks the predicate there, so

@@ -29563,3 +29563,85 @@ section tabs scrolling at 320 on `/bank-reconciliation`);
 `organization/sharedPanelCss.test.ts` follows the 600 → 640 move;
 `signup/panel-layout.spec.ts`'s "just above the auth breakpoint" size moves
 961 → 1025.
+
+## 592. A deleted invoice's documents leave object storage through an outbox, and an orphan scan reaches what no row names (follow-up from §586, round 51)
+
+**The gap.** `_delete_invoice_cascade` removed an invoice's rows but none of its
+objects: the uploaded document and every superseded version §363 kept, a
+received PEPPOL payload at `{org}/{invoice}/peppol-inbound.xml`, and its
+supplier-chat attachments. Nothing deleted them later. The retention sweep
+reached only Positive Pay files, and the erasure walk (§183) starts from rows,
+so a deleted invoice's document, which can carry supplier bank details and
+personal data, outlived every retention window and every DSAR erasure.
+
+**Folders, not keys.** Every object an invoice owns sits in `{org}/{invoice}/`
+or `{org}/chat/{invoice}/`, by construction of every key-writing site; nothing
+else is keyed by an invoice id. Collecting keys was rejected: a superseded
+version is named only by an `audit_log` row, which in `lambda` audit mode is not
+in the tenant database, so a key list would be incomplete exactly where it
+mattered. A folder needs no row, and `storage.delete_prefix` already refuses an
+empty or slash-less prefix.
+
+**A transactional outbox, then best-effort.** The cascade writes one
+`pending_object_deletions` row per folder (migration 0153, tenant, idempotent
+DDL) in the delete's own transaction and queues a `post_commit` job that empties
+them. A rolled-back delete drops both. A row leaves the table only when its
+folder is empty; a storage failure keeps it with `attempts` and `last_error` (a
+class name), and the retention sweep retries the oldest rows each tick. Deleting
+directly from the request was rejected: the bytes would go before the commit
+that might roll back, and a crash between the two would leave nothing to retry.
+No existing outbox fitted: the webhook delivery table is per subscription and
+`post_commit` alone is in memory.
+
+**An orphan scan for what no row names.** The retention sweep, and every
+erasure before its per-subject walk, list one S3 page of folders under `{org}/`
+and `{org}/chat/` (resuming from an in-process continuation token, so a tenant's
+cost per tick is bounded and a restart only restarts the walk), keep the ones
+shaped like an invoice folder, and delete those whose invoice row does not exist
+and whose newest object is older than 24 hours, so an upload whose row has not
+committed yet is never touched. That reaches every invoice deleted before this
+decision, which is why nothing is backfilled, and any write whose row never
+committed. An erasure counts what the pass removed (`orphaned_objects_deleted`)
+but does not mark itself incomplete on a pass failure: those folders are not the
+subject's documents, and the next pass retries them.
+
+**Fail closed.** Both paths refuse a folder a live invoice owns, by id or
+because a live row's `file_key` sits inside it (no path writes one invoice's
+document under another's id today; this keeps a future one from losing it), and
+anything not under this organisation's id or not shaped `{org}/{uuid}/` /
+`{org}/chat/{uuid}/`. A refused outbox row is dropped and its objects kept.
+Contract, expense, tax-form, vendor-statement and Positive Pay folders are never
+candidates: each has its own owning row and its own deletion rule.
+
+**The received PEPPOL payload goes with the invoice.** §586 keeps the record
+that a supplier delivered an e-invoice (the detached `peppol_transmissions`
+row); the payload itself was the deleted invoice's document, and a deleted
+invoice was one the customer judged not to be a payable (spam, a duplicate).
+Keeping the XML for the `peppol_transmissions` window instead was considered;
+it would make a retention class hold a document no row points at, which nothing
+could later find to expire. If counsel's view on received e-invoices (§586's
+open question) requires the payload, the transmission row should gain a key and
+the payload should move under it, not stay under the invoice's folder.
+
+**Object Lock.** On the deployed bucket's GOVERNANCE default retention a delete
+writes a delete marker; the app can no longer read the object and the locked
+version is reaped by the noncurrent-version lifecycle rule once its lock lapses
+(`infra/s3.tf`), the same outcome as the Positive Pay expiry (§184) and erasure
+(§183). Bypassing governance retention was not considered: it needs a privileged
+role the app does not and should not hold.
+
+**Audit and logs.** A pass that removed or refused something writes one
+`storage.objects_deleted` row (`trigger`, `folders_purged`, `objects_deleted`,
+`failed`, `refused`, `skipped_fresh`): counts only, never a key, because a key's
+last segment is a user's filename. Who deleted the invoice is on its
+`invoice.deleted` row. Logs carry exception class names only.
+
+**Tests.** `test_invoice_objects.py` (single and bulk delete empty both folders
+after commit; a storage failure leaves a row the sweep retries; a rolled-back
+delete queues nothing; refusals for a live owner, a shared `file_key` and a
+foreign prefix; the orphan pass's age and shape rules; a soft failure on an
+unreadable bucket; an erasure reaching orphans; the listing helpers against a
+mocked client) and `test_migration_0153_pending_object_deletions.py`. The suite
+otherwise sees an empty folder listing (`conftest._isolate_orphan_scan`): the
+harness orgs keep their ids across runs while their rows are truncated, so the
+shared MinIO bucket holds real orphans an unrelated test's scan would delete.

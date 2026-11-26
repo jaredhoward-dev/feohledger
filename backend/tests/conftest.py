@@ -1516,6 +1516,11 @@ def pytest_configure(config) -> None:
         "Without it, _test_users_accept_the_legal_versions records the versions in force "
         "for every one, as scripts/seed.py does for fixture accounts.",
     )
+    config.addinivalue_line(
+        "markers",
+        "live_orphan_listing: storage.list_child_prefixes is the real function, not the "
+        "empty listing _isolate_orphan_scan gives every other test (decisions §592).",
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -1776,6 +1781,32 @@ def _refuse_real_engine_in_mock_tests(request, monkeypatch):
             "test. See _refuse_real_engine_in_mock_tests in tests/conftest.py.",
             pytrace=False,
         )
+
+
+@pytest.fixture(autouse=True)
+def _isolate_orphan_scan(request, monkeypatch):
+    """Keep the invoice-folder orphan scan (decisions §592) off the shared bucket.
+
+    The retention sweep and every erasure list the tenant's folders in object
+    storage. The harness orgs keep their ids across runs while their tables are
+    truncated per test, so the local / CI MinIO bucket holds folders from earlier
+    tests that no row owns — real orphans, which a scan in an unrelated test
+    would delete and audit. Every test therefore sees an empty listing unless
+    it fakes one itself (``tests/test_invoice_objects.py``) or is marked
+    ``live_orphan_listing``. The in-process resume cursor is per org, and the
+    org ids are stable, so it is cleared too.
+    """
+    from app.services import invoice_objects, storage
+
+    invoice_objects._orphan_cursors.clear()
+    if request.node.get_closest_marker("live_orphan_listing") is None:
+
+        async def _empty(prefix, *, cursor=None, limit=1000):
+            return [], None
+
+        monkeypatch.setattr(storage, "list_child_prefixes", _empty)
+    yield
+    invoice_objects._orphan_cursors.clear()
 
 
 @pytest.fixture(autouse=True)
