@@ -794,7 +794,7 @@ def sops_fixture(lastmodified: str) -> str:
         "    kms:\n"
         "        - arn: arn:aws:kms:us-east-1:000000000000:alias/example-sops\n"
         "          enc: ZmFrZQ==\n"
-        f"    lastmodified: \"{lastmodified}\"\n"
+        f'    lastmodified: "{lastmodified}"\n'
         "    mac: ENC[AES256_GCM,data:GGGG,iv:HHHH,tag:IIII,type:str]\n"
         "    version: 3.9.0\n"
     )
@@ -825,9 +825,10 @@ class Stack:
         # on a MAC that fails or a missing var — before writing any .env.
         decrypt = self.deploy / "decrypt-env.sh"
         decrypt.write_text(
-            "#!/bin/sh\nprintf '%s\\n' \"$*\" > \"$STUB_DIR/decrypt_args\"\n"
-            "cp \"$1\" \"$STUB_DIR/decrypt_input\"\n"
-            "[ -z \"${DECRYPT_FAIL:-}\" ] || { echo 'decrypt-env.sh: Cannot decrypt MAC' >&2; exit 1; }\n"
+            '#!/bin/sh\nprintf \'%s\\n\' "$*" > "$STUB_DIR/decrypt_args"\n'
+            'cp "$1" "$STUB_DIR/decrypt_input"\n'
+            '[ -z "${DECRYPT_FAIL:-}" ] || '
+            "{ echo 'decrypt-env.sh: Cannot decrypt MAC' >&2; exit 1; }\n"
             "printf 'APP_DOMAIN=app.example.com\\nAPI_DOMAIN=api.example.com\\n"
             "POSTGRES_PASSWORD=x\\nFEOH_SIGNUP_ENABLED=false\\n"
             "FEOH_HCAPTCHA_SECRET=x\\nFEOH_HCAPTCHA_SITEKEY=site-key-1\\n' > .env\n"
@@ -1116,7 +1117,10 @@ def test_the_same_or_a_newer_secrets_file_is_accepted(stack: Stack) -> None:
     "body, why",
     [
         ("FEOH_FAKE_ONE: plaintext\n", "not sops ciphertext"),
-        ("FEOH_FAKE_ONE: ENC[x]\nsops:\n    version: 3.9.0\n", "no single readable sops lastmodified"),
+        (
+            "FEOH_FAKE_ONE: ENC[x]\nsops:\n    version: 3.9.0\n",
+            "no single readable sops lastmodified",
+        ),
     ],
 )
 def test_a_file_that_is_not_sops_ciphertext_is_refused(stack: Stack, body: str, why: str) -> None:
@@ -1192,7 +1196,9 @@ def _lastmodified(tmp_path: Path, body: str) -> str:
 
 def test_the_lastmodified_sops_writes_is_read(tmp_path: Path) -> None:
     assert _lastmodified(tmp_path, sops_fixture("2026-11-20T10:00:00Z")) == "2026-11-20T10:00:00Z"
-    single = sops_fixture("2026-11-20T10:00:00Z").replace('"2026-11-20T10:00:00Z"', "'2026-11-20T10:00:00Z'")
+    single = sops_fixture("2026-11-20T10:00:00Z").replace(
+        '"2026-11-20T10:00:00Z"', "'2026-11-20T10:00:00Z'"
+    )
     assert _lastmodified(tmp_path, single) == "2026-11-20T10:00:00Z"
 
 
@@ -1220,11 +1226,13 @@ def test_a_lastmodified_the_mac_does_not_cover_byte_for_byte_is_unreadable(
             '          enc: ZmFrZQ==\n          lastmodified: "2099-01-01T00:00:00Z"\n',
         ),
         # two sops blocks
-        lambda b: b + "sops:\n    lastmodified: \"2099-01-01T00:00:00Z\"\n",
+        lambda b: b + 'sops:\n    lastmodified: "2099-01-01T00:00:00Z"\n',
         # a second YAML document
-        lambda b: b + "---\nsops:\n    lastmodified: \"2099-01-01T00:00:00Z\"\n",
+        lambda b: b + '---\nsops:\n    lastmodified: "2099-01-01T00:00:00Z"\n',
         # trailing content after the value
-        lambda b: b.replace('lastmodified: "2026-11-20T10:00:00Z"', 'lastmodified: "2026-11-20T10:00:00Z" x'),
+        lambda b: b.replace(
+            'lastmodified: "2026-11-20T10:00:00Z"', 'lastmodified: "2026-11-20T10:00:00Z" x'
+        ),
     ],
 )
 def test_an_ambiguous_lastmodified_is_unreadable(tmp_path: Path, mutate) -> None:

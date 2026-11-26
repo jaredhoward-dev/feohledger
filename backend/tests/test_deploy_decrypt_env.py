@@ -104,9 +104,7 @@ class Deploy:
     def env(self) -> Path:
         return self.dir / ".env"
 
-    def run(
-        self, dotenv: str, *args: str, sops_exit: int = 0
-    ) -> subprocess.CompletedProcess[str]:
+    def run(self, dotenv: str, *args: str, sops_exit: int = 0) -> subprocess.CompletedProcess[str]:
         self.output_file.write_text(dotenv)
         return subprocess.run(
             [str(self.dir / "decrypt-env.sh"), *args],
