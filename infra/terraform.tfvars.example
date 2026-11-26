@@ -90,6 +90,13 @@ github_oidc_sub_prefix = "repo:REPLACE@0000000/feohledger@0000000"
 # ciphertext. Read it the same way (it is on immutable subject claims too):
 #   gh api repos/<owner>/infra-secrets/actions/oidc/customization/sub --jq .sub_claim_prefix
 infra_secrets_oidc_sub_prefix = "repo:REPLACE@0000000/infra-secrets@0000000"
+# The same repo as <owner>/<name>: the upload role also pins GitHub's
+# job_workflow_ref claim to <this>/.github/workflows/feohledger-upload.yml@refs/heads/main.
+infra_secrets_repository = "REPLACE/infra-secrets"
+# Who may administer the secrets bucket (delete versions, change versioning,
+# the lifecycle or its policy). Default: the Identity Center AdministratorAccess
+# role this stack is applied with. Set only if you apply as another principal.
+# terraform_admin_principal_arn_patterns = ["arn:aws:iam::<account>:role/<apply-role>"]
 
 # --- Secrets ------------------------------------------------------------------
 # Never in a tfvars. The one secret, the RDS master password, is an ephemeral

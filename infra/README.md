@@ -649,15 +649,21 @@ The one secret this module handles is the RDS master password (break-glass only 
 versioned, SSE-S3 bucket (`var.secrets_bucket_name`, set in `prod.tfvars.sops`
 like every bucket name) holds one object: the sops **ciphertext** of
 `infra-secrets/feohledger/prod.sops.yaml`. Its bucket policy denies `PutObject`
-to everyone but `feohledger-secrets-upload` and reads to everyone but the app
-VM role; about 30 superseded versions are kept.
+to everyone but `feohledger-secrets-upload`, reads to everyone but the app VM
+role, and deleting objects or versions or changing versioning, the lifecycle or
+the policy itself to everyone but the Terraform apply principal (the Identity
+Center `AdministratorAccess` role by default; `terraform_admin_principal_arn_patterns`
+overrides it). The account root user can still replace a policy that locks
+everyone out — the break-glass. About 30 superseded versions are kept.
 
 `feohledger-secrets-upload` is minted here, like the backup-erasure roles, not
 by the estate baseline: it serves this project's bucket only. It trusts exactly
 `<infra_secrets_oidc_sub_prefix>:ref:refs/heads/main` — the private repo is on
 immutable subject claims too, so read its prefix with
 `gh api repos/<owner>/infra-secrets/actions/oidc/customization/sub --jq .sub_claim_prefix`,
-never build it. It may `PutObject` that one key and nothing else, and holds no
+never build it — and only from `<infra_secrets_repository>/.github/workflows/feohledger-upload.yml@refs/heads/main`
+(GitHub's `job_workflow_ref` claim), so another workflow on that `main` cannot
+take the role. It may `PutObject` that one key and nothing else, and holds no
 KMS permission: it can move ciphertext, never read or forge it. The gate stays
 in this repo — the next `production`-approved deploy applies the file
 (`../deploy/README.md` § Secrets delivery, which lists the owner steps).

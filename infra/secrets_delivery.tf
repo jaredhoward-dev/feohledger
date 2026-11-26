@@ -36,6 +36,25 @@ locals {
   secrets_upload_sub = "${var.infra_secrets_oidc_sub_prefix}:ref:refs/heads/main"
 
   secrets_object_arn = "${aws_s3_bucket.secrets.arn}/${local.secrets_object_key}"
+
+  # The one workflow file allowed to assume the upload role, on infra-secrets'
+  # main: GitHub's job_workflow_ref claim, which AWS accepts as a trust
+  # condition key (IAM User Guide, "Available keys for AWS OIDC federation",
+  # GitHub tab). See the trust policy below for why it pins this beside `sub`.
+  secrets_upload_workflow_ref = "${var.infra_secrets_repository}/.github/workflows/feohledger-upload.yml@refs/heads/main"
+
+  # Who may administer the secrets bucket: delete an object or a version, turn
+  # versioning or the lifecycle off, or replace / remove this policy. Terraform
+  # is applied by the operator's IAM Identity Center AdministratorAccess role
+  # (README.md § Workload stack), so by default that role, matched by its
+  # aws-reserved path — the hash suffix Identity Center adds is not stable
+  # across a permission-set re-provision. The account root is not listed: S3
+  # lets the bucket-owning account's root user Get/Put/DeleteBucketPolicy even
+  # when the policy denies it (S3 API Reference, PutBucketPolicy § Permissions),
+  # which is the break-glass (docs/decisions.md §591).
+  secrets_bucket_admin_patterns = length(var.terraform_admin_principal_arn_patterns) > 0 ? var.terraform_admin_principal_arn_patterns : [
+    "arn:aws:iam::${data.aws_caller_identity.current.account_id}:role/aws-reserved/sso.amazonaws.com/*AWSReservedSSO_AdministratorAccess_*",
+  ]
 }
 
 # ── Bucket ───────────────────────────────────────────────────────────────────
@@ -119,7 +138,8 @@ resource "aws_s3_bucket_lifecycle_configuration" "secrets" {
 # Resource-side half of the two grants. The identity policies below and in
 # compute.tf ALLOW; these DENY everyone else, so a future broad grant elsewhere
 # in the account (an admin role's s3:*) cannot quietly become a second writer
-# or reader. Bucket-level administration (this policy itself) is untouched.
+# or reader — nor delete versions, or loosen versioning, the lifecycle or this
+# policy itself: those are the Terraform apply principal's alone.
 data "aws_iam_policy_document" "secrets_bucket" {
   statement {
     sid     = "DenyInsecureTransport"
@@ -153,6 +173,38 @@ data "aws_iam_policy_document" "secrets_bucket" {
       test     = "ArnNotEquals"
       variable = "aws:PrincipalArn"
       values   = [aws_iam_role.secrets_upload.arn]
+    }
+  }
+
+  # Without this, any principal with a broad s3:* grant could erase the version
+  # history the deploy log names, or switch versioning / the lifecycle off so
+  # the next upload overwrites the only copy, or rewrite this policy to admit a
+  # second writer. Only the Terraform apply principal administers the bucket;
+  # superseded versions still expire through the lifecycle rule, which S3 runs
+  # as itself and no bucket policy gates.
+  statement {
+    sid    = "OnlyTerraformAdministers"
+    effect = "Deny"
+    actions = [
+      "s3:DeleteObject",
+      "s3:DeleteObjectVersion",
+      "s3:PutBucketVersioning",
+      "s3:PutLifecycleConfiguration",
+      "s3:PutBucketPolicy",
+      "s3:DeleteBucketPolicy",
+    ]
+    resources = [
+      aws_s3_bucket.secrets.arn,
+      "${aws_s3_bucket.secrets.arn}/*",
+    ]
+    principals {
+      type        = "AWS"
+      identifiers = ["*"]
+    }
+    condition {
+      test     = "ArnNotLike"
+      variable = "aws:PrincipalArn"
+      values   = local.secrets_bucket_admin_patterns
     }
   }
 
@@ -202,6 +254,20 @@ data "aws_iam_policy_document" "secrets_upload_trust" {
       test     = "StringEquals"
       variable = "token.actions.githubusercontent.com:sub"
       values   = [local.secrets_upload_sub]
+    }
+    # And only from the one workflow file. `sub` names the repo and branch but
+    # not the workflow, so without this any other workflow a commit adds to
+    # infra-secrets' main could take the role. AWS accepts job_workflow_ref as
+    # a trust key without customising the sub template (which is a setting on
+    # infra-secrets, and shared by every role trusting that repo). GitHub
+    # documents the claim for reusable workflows; for a top-level job it
+    # carries the job's own workflow path and ref. If it were ever absent the
+    # StringEquals fails CLOSED — the upload is refused and says so in that
+    # repo's run, nothing is put (deploy/README.md § Secrets delivery).
+    condition {
+      test     = "StringEquals"
+      variable = "token.actions.githubusercontent.com:job_workflow_ref"
+      values   = [local.secrets_upload_workflow_ref]
     }
   }
 }
