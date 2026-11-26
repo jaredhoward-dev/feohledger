@@ -1,4 +1,4 @@
-import type { Page } from '@playwright/test';
+import type { Locator, Page } from '@playwright/test';
 
 import { expect, test } from '../fixtures/helpers';
 import { expectNoA11yViolations } from './axe-helper';
@@ -313,32 +313,68 @@ test('at 320px every icon-only rail item is named and at least 24px square', asy
 	}
 });
 
-test('at 320px the section tabs scroll inside their row instead of clipping or widening the page', async ({
-	page
-}) => {
-	// A grouped section whose active tab has one of the longer labels. The
-	// More menu takes what does not fit; whatever is left in the row must be
-	// reachable whole (the row scrolls), never cut off, and the document must
-	// not scroll sideways (decisions §590).
+/** The section-tab bar on `path` at 320px, once its split has settled. */
+async function sectionTabsAt320(page: Page, path: string) {
 	await page.setViewportSize({ width: 320, height: 720 });
-	await page.goto('/bank-reconciliation');
+	await page.goto(path);
 	const bar = page.locator('nav.section-tabs');
 	await expect(bar).toHaveAttribute('data-tabs-ready', 'true');
 	const row = bar.locator('.section-tabs-row');
 	expect(await row.evaluate((el) => getComputedStyle(el).overflowX)).toBe('auto');
-
 	const active = row.locator('a.section-tab[aria-current="page"]');
 	await expect(active).toHaveCount(1);
-	await active.focus();
-	const fits = await active.evaluate((tab) => {
+	return { row, active };
+}
+
+/** Where the active tab's edges sit against the row's visible box. */
+async function edges(active: Locator) {
+	return active.evaluate((tab) => {
 		const r = tab.getBoundingClientRect();
 		const box = tab.parentElement!.getBoundingClientRect();
-		return r.left >= box.left - 1 && r.right <= box.right + 1;
+		return {
+			leftInside: r.left >= box.left - 1 && r.left <= box.right + 1,
+			rightInside: r.right >= box.left - 1 && r.right <= box.right + 1
+		};
 	});
-	expect(fits, 'the focused active tab is scrolled fully into the row').toBe(true);
+}
 
-	const sideways = await page.evaluate(
+async function pageSideways(page: Page) {
+	return page.evaluate(
 		() => document.documentElement.scrollWidth - document.documentElement.clientWidth
 	);
-	expect(sideways).toBeLessThanOrEqual(0);
+}
+
+test('at 320px a tab wider than the row scrolls inside it instead of clipping or widening the page', async ({
+	page
+}) => {
+	// "Bank Reconciliation" beside the More button is wider than the 320px
+	// row, so it cannot be shown whole at once. What decisions §590 promises
+	// is that the row scrolls: both of its edges can be brought into view,
+	// and the document never scrolls sideways.
+	const { row, active } = await sectionTabsAt320(page, '/bank-reconciliation');
+	expect(await row.evaluate((el) => el.scrollWidth > el.clientWidth)).toBe(true);
+
+	await active.focus();
+	expect((await edges(active)).leftInside, 'focusing the tab brings its start into the row').toBe(
+		true
+	);
+
+	await row.evaluate((el) => {
+		el.scrollLeft = el.scrollWidth;
+	});
+	expect((await edges(active)).rightInside, 'scrolling the row reaches the tab\'s end').toBe(true);
+
+	expect(await pageSideways(page)).toBeLessThanOrEqual(0);
+});
+
+test('at 320px a short active tab sits whole in the row', async ({ page }) => {
+	// "Intake" (Procurement) fits beside the More button, so it is shown whole
+	// without any scrolling.
+	const { active } = await sectionTabsAt320(page, '/intake');
+	await active.focus();
+	expect(await edges(active), 'the focused active tab fits fully in the row').toEqual({
+		leftInside: true,
+		rightInside: true
+	});
+	expect(await pageSideways(page)).toBeLessThanOrEqual(0);
 });
