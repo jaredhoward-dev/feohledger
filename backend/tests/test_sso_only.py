@@ -170,7 +170,7 @@ async def test_login_rejected_when_sso_only():
 
     pw = "Correct-Horse-9"
     user = _user_with_password(pw)
-    org = SimpleNamespace(id=user.organization_id, settings={"sso": _SAML_READY})
+    org = SimpleNamespace(id=user.organization_id, settings={"sso": _SAML_READY}, is_partner=False)
 
     audits: list[dict] = []
 
@@ -269,7 +269,7 @@ async def test_a_password_is_no_step_up_proof_in_an_sso_only_tenant(offered):
     from app.services import mfa as mfa_service
 
     user = _account_with_totp("Correct-Horse-9")
-    org = SimpleNamespace(id=user.organization_id, settings=SSO_ONLY_SETTINGS)
+    org = SimpleNamespace(id=user.organization_id, settings=SSO_ONLY_SETTINGS, is_partner=False)
     verify = AsyncMock(return_value=True)
     audit = AsyncMock()
 
@@ -307,7 +307,7 @@ async def test_disabling_totp_with_a_password_is_refused_in_an_sso_only_tenant()
 
     pw = "Correct-Horse-9"
     user = _account_with_totp(pw)
-    org = SimpleNamespace(id=user.organization_id, settings=SSO_ONLY_SETTINGS)
+    org = SimpleNamespace(id=user.organization_id, settings=SSO_ONLY_SETTINGS, is_partner=False)
 
     with patch("app.api.auth.dispatch_auth_audit", AsyncMock()):
         with pytest.raises(HTTPException) as exc:
@@ -330,7 +330,7 @@ async def test_an_authenticator_code_still_proves_a_step_up_in_an_sso_only_tenan
     from app.schemas.auth import MFAStepUpRequest
 
     user = _account_with_totp("Correct-Horse-9")
-    org = SimpleNamespace(id=user.organization_id, settings=SSO_ONLY_SETTINGS)
+    org = SimpleNamespace(id=user.organization_id, settings=SSO_ONLY_SETTINGS, is_partner=False)
 
     with patch("app.api.auth.settings.mfa_enabled", True):
         resp = await enroll_mfa_start(
@@ -363,7 +363,7 @@ async def test_the_password_still_proves_a_step_up_when_sso_is_not_really_enforc
 
     pw = "Correct-Horse-9"
     user = _account_with_totp(pw)
-    org = SimpleNamespace(id=user.organization_id, settings={"sso": sso_block})
+    org = SimpleNamespace(id=user.organization_id, settings={"sso": sso_block}, is_partner=False)
 
     with patch("app.api.auth.settings.mfa_enabled", True):
         resp = await enroll_mfa_start(
@@ -465,7 +465,7 @@ async def test_every_reader_reports_exactly_the_predicate_login_enforces(org_set
 
     pw = "Correct-Horse-9"
     user = _account_with_totp(pw)
-    org = SimpleNamespace(id=user.organization_id, settings=org_settings)
+    org = SimpleNamespace(id=user.organization_id, settings=org_settings, is_partner=False)
 
     me = await get_me(user=user, db=_control_db(org))
     assert me.password_sign_in_closed is closed
@@ -516,7 +516,7 @@ async def test_has_password_reflects_the_account_row_not_the_org_setting():
     to change. docs/followups.md (c)."""
     from app.api.auth import get_me
 
-    org = SimpleNamespace(id=uuid.uuid4(), settings={})  # not SSO-only
+    org = SimpleNamespace(id=uuid.uuid4(), settings={}, is_partner=False)  # not SSO-only
 
     account = _account_with_totp("Correct-Horse-9")
     account.organization_id = org.id
@@ -557,7 +557,7 @@ async def test_a_refused_code_names_only_the_proofs_the_tenant_accepts(
     from app.schemas.auth import MFADisableRequest, MFAStepUpRequest
 
     user = _account_with_totp("Correct-Horse-9")
-    org = SimpleNamespace(id=user.organization_id, settings=org_settings)
+    org = SimpleNamespace(id=user.organization_id, settings=org_settings, is_partner=False)
 
     with (
         patch("app.api.auth.settings.mfa_enabled", True),
@@ -616,7 +616,7 @@ async def test_a_password_let_through_by_the_escape_hatch_is_logged(sso_block, w
     pw = "Correct-Horse-9"
     user = _user_with_password(pw)
     block = {**sso_block, "client_secret": "must-never-be-logged"}
-    org = SimpleNamespace(id=user.organization_id, settings={"sso": block})
+    org = SimpleNamespace(id=user.organization_id, settings={"sso": block}, is_partner=False)
 
     with (
         caplog.at_level(logging.WARNING, logger="app.api.auth"),

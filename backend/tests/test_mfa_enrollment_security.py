@@ -77,7 +77,7 @@ def _passkey_db(existing=None, org=None):
     result = MagicMock()
     result.scalars.return_value.all.return_value = existing or []
     result.scalar_one_or_none.return_value = (
-        org if org is not None else SimpleNamespace(settings={})
+        org if org is not None else SimpleNamespace(settings={}, is_partner=False)
     )
     db = AsyncMock()
     db.execute = AsyncMock(return_value=result)
@@ -309,6 +309,7 @@ async def test_enroll_mfa_verify_with_correct_code_flips_on():
         name="Acme",
         plan="pro",
         settings={},
+        is_partner=False,
     )
     from app.services import mfa as mfa_service
 
@@ -357,7 +358,7 @@ async def test_disable_mfa_requires_password_re_entry():
     user = _fake_user(mfa_secret="JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP", mfa_enabled=True)
     # An org that has not closed password sign-in, so the password IS a proof
     # here and it is the wrong one that is refused.
-    db = _db_returning_org(SimpleNamespace(id=user.organization_id, settings={}))
+    db = _db_returning_org(SimpleNamespace(id=user.organization_id, settings={}, is_partner=False))
 
     with patch("app.utils.passwords.pwd_context.verify", return_value=False):
         with pytest.raises(HTTPException) as exc:
@@ -380,6 +381,7 @@ async def test_disable_mfa_refused_when_org_requires_mfa():
         id=uuid.uuid4(),
         slug="acme",
         settings={"mfa": {"required": True}},
+        is_partner=False,
     )
     user = _fake_user(mfa_secret="JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP", mfa_enabled=True)
     user.organization_id = org.id
@@ -413,6 +415,7 @@ async def test_disable_mfa_clears_secret_and_enrolled_at_on_success():
         name="Acme",
         plan="pro",
         settings={},
+        is_partner=False,
     )
     user = _fake_user(mfa_secret="JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP", mfa_enabled=True)
     user.organization_id = org.id

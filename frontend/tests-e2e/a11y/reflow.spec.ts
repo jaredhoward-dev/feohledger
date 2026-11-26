@@ -8,7 +8,7 @@ import {
 	API_BASE,
 	authedTenantHeaders,
 	expect,
-	stubPartnerCapability,
+	stubPartnerWorkspace,
 	test
 } from '../fixtures/helpers';
 import { formatViolations } from './axe-helper';
@@ -328,21 +328,7 @@ test.describe("reflow at 320px — /organization's panels (WCAG 1.4.10)", () => 
  */
 test.describe('reflow at 320px — /admin/partner when the partner has no children', () => {
 	test('the empty-row sentence fits the screen', async ({ page }) => {
-		await stubPartnerCapability(page);
-		await page.route(
-			(url) => url.pathname === '/api/partner',
-			(route) =>
-				route.request().method() === 'GET'
-					? route.fulfill({
-							json: {
-								organization_id: '00000000-0000-4000-8000-000000000440',
-								name: 'Reflow Fixture Workspace',
-								is_partner: true,
-								children: []
-							}
-						})
-					: route.fallback()
-		);
+		await stubPartnerWorkspace(page, 'Reflow Fixture Workspace');
 		await page.setViewportSize({ width: 320, height: 720 });
 		await page.goto('/admin/partner');
 
