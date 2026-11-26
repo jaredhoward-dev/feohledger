@@ -512,9 +512,18 @@ feoh_sops_lastmodified() {
 # refused unless allow-rollback is 1 (deploy.sh --allow-secrets-rollback).
 feoh_fetch_secrets() {
 	local allow_rollback=${1:-0} bucket tmp version new old=""
+	# A VM where delivery is not set up yet (no bucket file at all — the owner
+	# steps in deploy/README.md § Secrets delivery are not done) keeps the copy
+	# it already has, said plainly in the log, so merging this never stops a
+	# release on infrastructure nobody has applied. Once the file exists the
+	# fetch is mandatory: an empty file, a bad name or a failed fetch aborts.
+	if [ ! -e "$FEOH_SECRETS_BUCKET_FILE" ]; then
+		echo "==> secrets: delivery is not set up on this VM (no deploy/${FEOH_SECRETS_BUCKET_FILE}); using the ${FEOH_SECRETS_KEY} already here (deploy/README.md § Secrets delivery)."
+		return 0
+	fi
 	bucket=$(head -n 1 "$FEOH_SECRETS_BUCKET_FILE" 2>/dev/null | tr -d '[:space:]' || true)
 	if [ -z "$bucket" ]; then
-		echo "secrets: deploy/${FEOH_SECRETS_BUCKET_FILE} is missing or empty — write the secrets bucket's name into it once (terraform output -raw secrets_bucket; deploy/README.md § Secrets)." >&2
+		echo "secrets: deploy/${FEOH_SECRETS_BUCKET_FILE} is empty — write the secrets bucket's name into it (terraform output -raw secrets_bucket; deploy/README.md § Secrets delivery)." >&2
 		return 1
 	fi
 	[[ "$bucket" =~ ^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$ ]] || {

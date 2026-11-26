@@ -29638,7 +29638,18 @@ lifecycle and deny statements, the VM's read-only grant);
 `backend/tests/test_deploy_release.py` (fetch before decrypt and under the
 lock, metadata-only log, a failed fetch keeps the old file and `.env`, an older
 file refused, `--allow-secrets-rollback`, non-ciphertext and unversioned
-refusals, a missing `deploy/secrets-bucket`).
+refusals, an empty `deploy/secrets-bucket`, and a VM with no such file yet
+deploying on its own copy).
+
+**Rollout: a VM without `deploy/secrets-bucket` keeps its own copy.** Making the
+file mandatory from the first deploy would have failed every release at
+preflight until the owner had applied the bucket and written the file, so
+merging this would have blocked releases on infrastructure nobody had applied.
+The file's absence is therefore read as "delivery not set up yet": the deploy
+uses the `prod.sops.yaml` already on the VM and logs that plainly. Its presence
+switches the fetch on for good; an empty file, a bad name or a failed fetch
+still aborts. This is not a silent fallback: the log line names the state, and
+removing the file is a deliberate act on the VM.
 
 ## 592. A deleted invoice's documents leave object storage through an outbox, and an orphan scan reaches what no row names (follow-up from §586, round 51)
 

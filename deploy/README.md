@@ -103,9 +103,14 @@ bucket; the next gated deploy applies it:
   put ciphertext; it never applies anything.
 
 The bucket's name is not in this public repo. Each VM reads it from the
-gitignored `deploy/secrets-bucket` (one line).
+gitignored `deploy/secrets-bucket` (one line). **Until that file exists the
+deploy keeps the `prod.sops.yaml` already on the VM** and says so in the log
+(`delivery is not set up on this VM`), so releases keep working before the
+steps below are done. Once it exists, the fetch is mandatory: an empty file, a
+bad name or a failed fetch stops the deploy with the old file and `.env`
+untouched.
 
-### Owner steps (once, in this order, before the next release)
+### Owner steps (once, in this order)
 
 1. Add `secrets_bucket_name` and `infra_secrets_oidc_sub_prefix` to
    `infra-secrets/feohledger/prod.tfvars.sops` (`../infra/terraform.tfvars.example`

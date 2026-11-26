@@ -1062,11 +1062,21 @@ def test_no_version_id_means_an_unversioned_bucket_and_is_refused(stack: Stack) 
     assert "no version id" in result.stderr
 
 
-def test_a_vm_without_the_bucket_file_is_told_how_to_set_it(stack: Stack) -> None:
+def test_a_vm_without_delivery_set_up_keeps_its_own_copy_and_says_so(stack: Stack) -> None:
+    """Before the owner applies the bucket and writes deploy/secrets-bucket, a
+    release still deploys on the file already on the VM (decisions §591)."""
     (stack.deploy / "secrets-bucket").unlink()
     result = stack.run()
+    assert result.returncode == 0, result.stderr
+    assert "delivery is not set up on this VM" in result.stdout
+    assert not any("get-object" in c for c in stack.calls())
+
+
+def test_an_empty_bucket_file_is_refused(stack: Stack) -> None:
+    (stack.deploy / "secrets-bucket").write_text("\n")
+    result = stack.run()
     assert result.returncode != 0
-    assert "deploy/secrets-bucket is missing" in result.stderr
+    assert "deploy/secrets-bucket is empty" in result.stderr
     assert not any("get-object" in c for c in stack.calls())
 
 
