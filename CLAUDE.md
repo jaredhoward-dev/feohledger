@@ -183,7 +183,7 @@ before changing any router; the summaries below are only an index.
 | `/organization` | Org settings, connection tests, SSO config (`/organization/sso`, the one audited writer of `settings.sso`), provider credentials (`/organization/credentials` — ERP / payment / card / commerce / extraction secrets and the OIDC client secret, KMS-sealed, write-only), SCIM token, branding, custom domains, data residency, closing an unused workspace (`/organization/close`, fail-closed guards + second-factor step-up, decisions §306), the link code consenting to be adopted by a partner (`/organization/partner-link-code`, any admin) |
 | `/entities` | Multi-entity admin (legal entities / subsidiaries — the `entity_id` scope target) |
 | `/partner` | Partner / reseller multi-tenant admin — child tenants, attach (redeem), provision; requires the operator-granted `is_partner` |
-| `/invoices` | Invoice CRUD, upload, extraction, approve/reject, line items, e-invoice, email approval, ERP orphan-bill lookup + void |
+| `/invoices` | Invoice CRUD, upload, extraction, approve/reject, line items, e-invoice, email approval, ERP orphan-bill lookup + void, Xero shared-key bill confirmation (`erp-bill-confirmation` / `confirm-erp-bill`: `payment.void` + admin/ap_manager/cfo, decisions §587) |
 | `/vendors` | Vendor CRUD, sanctions screening, risk, bulk ops; bank changes are dual-control |
 | `/vendor-statements` | Vendor statement reconciliation (CSV/PDF) against our AP ledger |
 | `/bank-reconciliation` | Bank statement import + auto-match against our `Payment` rows |
