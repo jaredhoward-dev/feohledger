@@ -692,5 +692,24 @@ async def test_policy_endpoint_exposes_and_accepts_peppol_transmissions(realdb):
         assert "peppol_transmissions" in got.json()["policy"]
 
         put = await c.put("/api/retention-policy", json={"policy": {"peppol_transmissions": 120}})
-    assert put.status_code == 200
-    assert put.json()["policy"]["peppol_transmissions"] == 120
+        assert put.status_code == 200
+        assert put.json()["policy"]["peppol_transmissions"] == 120
+
+        # Bounded like every other class: a non-positive window is refused
+        # before any write, so the stored 120 survives.
+        for bad in (0, -1):
+            resp = await c.put(
+                "/api/retention-policy", json={"policy": {"peppol_transmissions": bad}}
+            )
+            assert resp.status_code == 422, resp.text
+
+    # Persisted under the class's own key on org settings, which is what the
+    # sweep resolves (`resolve_retention_months(..., "peppol_transmissions")`).
+    from app.models.organization import Organization
+
+    async with realdb.control_sessionmaker()() as s:
+        org = (
+            await s.execute(select(Organization).where(Organization.id == realdb.info("a").org_id))
+        ).scalar_one()
+    assert org.settings["retention"]["peppol_transmissions_months"] == 120
+    assert resolve_retention_months(org.settings, "peppol_transmissions") == 120
