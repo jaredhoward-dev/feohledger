@@ -449,6 +449,10 @@ const BUILDERS: Record<string, Builder> = {
 	erp_lookup_not_failed: fixed('refusal.erpLookupNotFailed'),
 	erp_lookup_unsupported: fixed('refusal.erpLookupUnsupported'),
 	erp_lookup_failed: fixed('refusal.erpLookupFailed'),
+	// A bill on a shared Xero key, confirmed as this invoice's (decisions §587).
+	erp_bill_confirm_not_offered: fixed('refusal.erpBillConfirmNotOffered'),
+	erp_bill_confirm_not_found: fixed('refusal.erpBillConfirmNotFound'),
+	erp_bill_claimed: fixed('refusal.erpBillClaimed'),
 	invoice_recall_claimed: (params, t) => {
 		const claim = str(params, 'claim');
 		if (claim === 'payment') return t('refusal.paymentBlocksRecall');

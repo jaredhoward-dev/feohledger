@@ -969,7 +969,10 @@ describe('voiding a flagged bill in the ERP (decisions §539, §542, §545)', ()
 			['erp_void_not_found', 'refusal.erpVoidNotFound'],
 			['erp_lookup_not_failed', 'refusal.erpLookupNotFailed'],
 			['erp_lookup_unsupported', 'refusal.erpLookupUnsupported'],
-			['erp_lookup_failed', 'refusal.erpLookupFailed']
+			['erp_lookup_failed', 'refusal.erpLookupFailed'],
+			['erp_bill_confirm_not_offered', 'refusal.erpBillConfirmNotOffered'],
+			['erp_bill_confirm_not_found', 'refusal.erpBillConfirmNotFound'],
+			['erp_bill_claimed', 'refusal.erpBillClaimed']
 		];
 		for (const [loc, catalogue] of Object.entries(locales)) {
 			const t = translator(catalogue as typeof en, loc);

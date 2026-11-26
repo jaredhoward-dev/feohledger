@@ -207,6 +207,7 @@ export const messages = {
 	'audit.action.invoice.voided_return_to_approved': "Paiement annulé, retour à approuvée",
 	'audit.action.invoice.erp_bill_voided': "Facture annulée dans l'ERP, retour à approuvée",
 	'audit.action.invoice.erp_orphan_bill_looked_up': "Facture d'un envoi échoué recherchée dans l'ERP",
+	'audit.action.invoice.erp_bill_confirmed': "Facture de l'ERP confirmée comme celle de cette facture",
 	'audit.action.invoice.erp_orphan_bill_voided': "Facture d'un envoi échoué annulée dans l'ERP",
 	'audit.action.invoice.erp_orphan_bill_void_orphaned': "Annulation envoyée à l'ERP mais non enregistrée ici",
 	'audit.action.organization.branding_updated': "Image de marque mise à jour",
