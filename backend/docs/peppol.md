@@ -392,6 +392,27 @@ index.
 carries `direction` (CHECK allows `inbound`), the partial-unique `message_id`,
 and `status` (CHECK allows `delivered`) — inbound writes zero DDL.
 
+### Deleting an invoice we received
+
+Deleting an invoice that arrived over PEPPOL (a spam or duplicate document) is
+allowed, but its inbound transmission row is **kept**: `_delete_invoice_cascade`
+detaches it (`invoice_id` → NULL) and stamps `invoice_deleted_at`,
+`invoice_deleted_by_id` (the actor the `invoice.deleted` audit row names) and
+`deleted_invoice_id` (decisions §586, migration 0152). The row is the local
+record of an e-invoice a supplier delivered, which some jurisdictions require
+be retained. `ck_peppol_detached_inbound` holds the rule at the data layer: a
+row with no invoice must be inbound and stamped. Because the row survives, its
+`message_id` still dedupes: a redelivery of the deleted document does not
+recreate the invoice.
+
+A detached row is then governed by the `peppol_transmissions` retention class
+(`backend/docs/retention.md`): once its window, measured from receipt, has
+passed, the retention sweep deletes it. Every reader that lists transmissions
+filters by an invoice id, so a detached row never appears on another invoice;
+`GET /peppol-transmissions` of the deleted invoice is a 404 like any other read
+of it. A detached row still counts as an e-invoice record for the workspace
+closure guard (`einvoice_transmissions`).
+
 `parse_inbound` is implemented on both adapters: the `mock` adapter parses a
 dev-shaped JSON envelope (`message_id` / `sender_*` / `doc_type_id` /
 `process_id` / `payload_base64`) **or** raw-UBL-body + `X-Peppol-*` metadata
@@ -448,8 +469,15 @@ real inbound signing secret (sops) to receive/transmit for real.
   reservation (row `sending`, `invoice.peppol_send_started` only) and
   `settle_stale_sending` (too recent, AP `sent`, AP `not_found` then a resend,
   never `failed` on an inconclusive or unsupported lookup, provider changed).
-- `tests/test_invoice_delete_cascade.py` — delete refused (bulk skipped) with a
-  transmission not `failed`; a `failed` one is cleared with the invoice.
+- `tests/test_invoice_delete_cascade.py` — delete refused (bulk skipped) with an
+  outbound transmission not `failed`; a `failed` one is cleared with the
+  invoice; an inbound one survives detached and stamped (single and bulk), and
+  the check refuses detaching an outbound or unstamped row (§586).
+- `tests/test_migration_0152_peppol_inbound_detach.py` — the detach columns
+  and check: model parity, down / up / up, refuses a downgrade over a
+  detached row, control-plane no-op.
+- `tests/test_retention.py` — the `peppol_transmissions` class expires only a
+  detached inbound row past its window.
 - `tests/test_peppol_route.py` — 200 / already_sent / 404 / 400 / 422 / 403,
   the structured 422 body, and `GET /peppol-transmissions` (empty / populated
   / PII-free / clerk-readable / 404 / tenant- + entity-scoped).

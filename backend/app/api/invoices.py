@@ -2601,7 +2601,7 @@ async def delete_invoice(
     # instances, extraction results, chat threads and virtual cards was the one
     # destructive tenant operation leaving no record of who did it.
     await _audit_invoice_deleted(db, invoice, actor_id=user.id, bulk=False)
-    await _delete_invoice_cascade(db, invoice_id)
+    await _delete_invoice_cascade(db, invoice_id, actor_id=user.id)
     await db.commit()
 
 
@@ -2634,7 +2634,9 @@ async def _audit_invoice_deleted(
 # ---------- Helpers ----------
 
 
-async def _delete_invoice_cascade(db: AsyncSession, invoice_id: uuid.UUID) -> None:
+async def _delete_invoice_cascade(
+    db: AsyncSession, invoice_id: uuid.UUID, *, actor_id: uuid.UUID
+) -> None:
     """Delete an invoice and all related records across tables.
 
     Every FK referencing `invoices.id` (or transitively, `virtual_cards.id` /
@@ -2648,6 +2650,13 @@ async def _delete_invoice_cascade(db: AsyncSession, invoice_id: uuid.UUID) -> No
     statement import, a vendor-statement reconciliation line, the other side
     of an inter-company mirror pair — are unlinked (FK set NULL) instead,
     so deleting the invoice doesn't destroy that external history.
+
+    An INBOUND PEPPOL transmission is the second kind: the record of an
+    e-invoice a supplier delivered to us. It is detached and stamped with
+    ``actor_id`` and the time, never deleted, and kept under the
+    ``peppol_transmissions`` retention class (decisions §586). Outbound rows
+    reaching here are only ``failed`` ones — `_delete_refusals` refuses any
+    other (§580) — and are deleted: they never left.
     """
     # Grandchildren first: supplier chat messages (child of chat threads),
     # and virtual card reveal tokens / rebates (children of virtual_cards).
@@ -2671,6 +2680,21 @@ async def _delete_invoice_cascade(db: AsyncSession, invoice_id: uuid.UUID) -> No
     # Workflow steps (child of workflow_instances).
     wf_ids_q = select(WorkflowInstance.id).where(WorkflowInstance.invoice_id == invoice_id)
     await db.execute(sa_delete(WorkflowStep).where(WorkflowStep.instance_id.in_(wf_ids_q)))
+
+    # Received e-invoices outlive the invoice (§586): detach, never delete.
+    await db.execute(
+        sa_update(PeppolTransmission)
+        .where(
+            PeppolTransmission.invoice_id == invoice_id,
+            PeppolTransmission.direction == "inbound",
+        )
+        .values(
+            invoice_id=None,
+            deleted_invoice_id=invoice_id,
+            invoice_deleted_by_id=actor_id,
+            invoice_deleted_at=func.now(),
+        )
+    )
 
     # Direct children of invoices, owned outright.
     for model in (
@@ -2810,7 +2834,7 @@ async def bulk_delete(
             skipped.append(str(inv.id))
         else:
             await _audit_invoice_deleted(db, inv, actor_id=user.id, bulk=True)
-            await _delete_invoice_cascade(db, inv.id)
+            await _delete_invoice_cascade(db, inv.id, actor_id=user.id)
             deleted += 1
 
     await db.commit()

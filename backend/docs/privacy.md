@@ -388,6 +388,20 @@ replaced with `erased+<subject_id>@redacted.invalid` — which stays unique, is
 obviously non-deliverable, and lets an operator correlate a row to its erasure
 without revealing the original value. Free-text names become `[redacted]`.
 
+### Received PEPPOL e-invoice records
+
+An inbound `peppol_transmissions` row is part of the transactional record, not
+the subject's own data: it holds the supplier **company's** PEPPOL participant
+id (a business identifier such as a VAT or organisation number), the amount and
+the AS4 message id. Like the invoice it delivered, it is preserved by erasure,
+and since decisions §586 it is preserved even when that invoice is deleted
+(detached and stamped). It is not reached by `vendor_contact` erasure, which
+redacts the vendor row's own tax id; nothing on a detached row links back to a
+vendor. Its end of life is the `peppol_transmissions` retention class
+(`backend/docs/retention.md`), which deletes the detached row once its window
+from receipt has passed. If a supplier is a sole trader whose participant id is
+personal data, that window is what bounds it.
+
 ### Money trail is never touched
 
 No amount, status, currency, or date is mutated by erasure — only PII text
