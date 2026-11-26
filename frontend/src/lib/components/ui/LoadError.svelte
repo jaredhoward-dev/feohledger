@@ -12,7 +12,9 @@
 	 * `GET /api/organization` (#635).
 	 *
 	 * Every string arrives already localized, so each caller keeps its own key
-	 * namespace; the button defaults to `common.retry`.
+	 * namespace. The button always reads `common.retry`: one label for one
+ * situation, everywhere (a panel that said "Try again" sent a spec looking
+ * for a button that did not exist).
 	 *
 	 * Two shapes:
 	 *
@@ -45,7 +47,6 @@
 		onretry,
 		heading,
 		headingLevel = 2,
-		retryLabel,
 		retrying = false,
 		actions,
 		testId
@@ -55,8 +56,6 @@
 		/** A title for the failure. Omit inside a page; pass when this replaces the screen. */
 		heading?: string;
 		headingLevel?: 1 | 2 | 3;
-		/** Defaults to `common.retry`. */
-		retryLabel?: string;
 		/** A retry is in flight and this block stays mounted through it. */
 		retrying?: boolean;
 		/** Further buttons after Retry. */
@@ -84,7 +83,7 @@
 	<p class="message">{message}</p>
 	<div class="actions">
 		<button type="button" class="btn-primary" onclick={retry} aria-disabled={retrying || undefined}>
-			{retrying ? m('common.retrying') : (retryLabel ?? m('common.retry'))}
+			{retrying ? m('common.retrying') : m('common.retry')}
 		</button>
 		{@render actions?.()}
 	</div>
