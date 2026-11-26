@@ -84,9 +84,14 @@ sweep then, per tenant:
 1. **retries the outbox** — the oldest `FEOH_RETENTION_BATCH_SIZE` rows that
    job did not finish (`drain_pending`); a row is removed only once its folder
    is empty, and a failure keeps it with `attempts` / `last_error` (a class
-   name). Rows are claimed in a short committed transaction before any bucket
-   call (`last_error = 'claimed'`), so no row lock is held across storage and a
-   row another drain claimed within `CLAIM_LEASE` (15 minutes) is skipped;
+   name). Rows are claimed (`last_error = 'claimed'`, stamped on the drain's
+   own clock) and their ownership read before any bucket call, all on this
+   sweep's one connection and inside its transaction, so nothing is committed
+   early; a row another drain claimed within `CLAIM_LEASE` (15 minutes), or
+   row-locked right now, is skipped and counted (`skipped_claimed`). A claim
+   that lapsed unfinished (a drain died, or its finishing transaction failed
+   after emptying the folder) is retaken, and this pass's audit row records it
+   (`reclaimed`), so an emptied folder is never left unaudited;
 2. **walks one page of orphans** — one S3 listing page of the folders under
    `{org}/` and `{org}/chat/` (resuming where the last tick stopped), keeps the
    ones shaped like an invoice folder, and deletes those whose invoice row does
@@ -98,7 +103,7 @@ Both refuse a folder a live invoice still owns (by id, or because a live row's
 `file_key` sits inside it) and anything not under this organisation's id. A
 pass that removed or refused something writes one `storage.objects_deleted`
 audit row (`trigger`, `folders_purged`, `objects_deleted`, `failed`, `refused`,
-`skipped_fresh` — counts, never a key); `RetentionResult` carries
+`skipped_fresh`, `skipped_claimed`, `reclaimed` — counts, never a key); `RetentionResult` carries
 `invoice_object_folders_purged` / `_failed`. On the deployed bucket's
 GOVERNANCE Object Lock a delete leaves a delete marker and the locked version
 lapses through the noncurrent-version lifecycle rule (`infra/s3.tf`), as for

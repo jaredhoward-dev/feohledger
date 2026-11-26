@@ -353,9 +353,14 @@ No row leads the per-subject walk to such a folder, so **every erasure also
 runs the orphan pass** before it: the queued folders, then one bounded page of
 the tenant's invoice folders that no live invoice owns and nothing has written
 to for 24 hours. What it removed is counted as `orphaned_objects_deleted` in the
-request's `record_counts`, a failure as `orphaned_objects_failed` (a folder of
-some deleted invoice is not one of the subject's documents, so it does not mark
-the erasure incomplete; the next pass retries it).
+request's `record_counts`, a failure as `orphaned_objects_failed`, which also
+counts a queued folder left to another drain (claimed by it within its lease,
+or row-locked right now). That folder is not known to hold the subject's
+documents, but may, so the response carries `orphaned_objects_failed` beside
+`documents_failed` and the admin page reports the erasure incomplete when
+either is above zero: re-run it. The drain runs inside the erasure's own
+transaction on its one connection, so the tombstones, request row and audit
+row still commit together (decisions §592).
 
 ### Why the Positive Pay file is deleted
 
