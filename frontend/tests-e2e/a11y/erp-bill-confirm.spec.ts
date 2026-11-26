@@ -44,7 +44,10 @@ async function sharedKeyInvoice(page: Page, number: string): Promise<string> {
 	const id = ((await res.json()) as { id: string }).id;
 	tenantPsql(
 		`UPDATE invoices SET status='failed', approved_by='Approver', approval_date=CURRENT_DATE WHERE id='${id}';` +
-			` UPDATE workflow_instances SET state_data = COALESCE(state_data, '{}'::jsonb) || '{"erp_last_refusal_code": "erp_bill_key_shared"}'::jsonb WHERE invoice_id='${id}'`
+			` UPDATE workflow_instances SET state_data = COALESCE(state_data, '{}'::jsonb) || '{"erp_last_refusal_code": "erp_bill_key_shared"}'::jsonb WHERE invoice_id='${id}';` +
+			// The row a refused push writes: the invoice's ERP section shows a
+			// failed push from it, so the panel inside it renders.
+			` INSERT INTO audit_log (id, correlation_id, organization_id, action, entity_type, entity_id, details, created_at) SELECT gen_random_uuid(), correlation_id, organization_id, 'invoice.erp_failed', 'invoice', id, '{"error": "xero: another invoice shares this supplier and number", "refusal": {"code": "erp_bill_key_shared", "params": {"provider": "xero"}}}'::jsonb, now() FROM invoices WHERE id='${id}'`
 	);
 	await page.route(`**/api/invoices/${id}/review-actions`, async (route) => {
 		const real = await route.fetch();
