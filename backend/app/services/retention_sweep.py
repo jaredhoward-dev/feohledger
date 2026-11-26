@@ -273,10 +273,12 @@ async def sweep_tenant(
     result.audit_rows_overdue_unshipped = int(overdue_unshipped)
 
     # --- Deleted invoices' documents: retry the outbox, then orphans --------
-    # Bounded by the same cap; each pass audits itself (counts only).
-    queued = await invoice_objects.drain_pending(
-        db, organization_id=organization_id, limit=cap, now=ref_now
-    )
+    # Bounded by the same cap; each pass audits itself (counts only). Both run
+    # inside this sweep's transaction on its one connection and commit with it
+    # (`drain_pending` § own_transactions): the archive work above must not be
+    # committed early, and a second session would need a second connection.
+    # The outbox lease is on the drain's own clock, never `ref_now`.
+    queued = await invoice_objects.drain_pending(db, organization_id=organization_id, limit=cap)
     orphans = await invoice_objects.sweep_orphaned_invoice_objects(
         db, organization_id=organization_id, limit=cap, now=ref_now
     )

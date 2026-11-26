@@ -537,6 +537,7 @@ async def erasure(
             "documents_deleted": result.documents_deleted,
             "documents_retained": result.documents_retained,
             "documents_failed": result.documents_failed,
+            "orphaned_objects_failed": result.orphaned_objects_failed,
             "passkeys_deleted": result.passkeys_deleted,
             "sessions_revoked": result.sessions_revoked,
         },
@@ -566,6 +567,7 @@ async def erasure(
         documents_deleted=result.documents_deleted,
         documents_retained=result.documents_retained,
         documents_failed=result.documents_failed,
+        orphaned_objects_failed=result.orphaned_objects_failed,
         passkeys_deleted=result.passkeys_deleted,
         sessions_revoked=result.sessions_revoked,
     )

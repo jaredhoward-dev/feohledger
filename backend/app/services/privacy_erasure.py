@@ -168,16 +168,22 @@ async def _erase_documents(
     # First the folders of deleted invoices: no row leads the per-subject walk
     # to them, and one may hold this subject's document. The queued ones, then
     # one bounded page of orphans; both refuse a folder a live invoice owns.
+    # Both inside the erasure's own transaction on its one connection: the
+    # erasure commits its tombstones, request row and audit row together, so
+    # nothing here may commit them early (`drain_pending` § own_transactions).
     queued = await invoice_objects.drain_pending(
-        tenant_db, organization_id=organization_id, limit=settings.retention_batch_size, now=now
+        tenant_db, organization_id=organization_id, limit=settings.retention_batch_size
     )
     orphans = await invoice_objects.sweep_orphaned_invoice_objects(
         tenant_db, organization_id=organization_id, now=now, trigger="erasure"
     )
     result.orphaned_objects_deleted += queued.objects_deleted + orphans.objects_deleted
     # Counted apart from `documents_failed`: a folder of some deleted invoice is
-    # not one of this subject's documents, and the next pass retries it.
-    result.orphaned_objects_failed += queued.failed + orphans.failed
+    # not known to be one of this subject's documents. It may be, though, so
+    # the response surfaces it (`orphaned_objects_failed > 0`: re-run). A
+    # queued row another drain holds (`skipped_claimed`) was not reached by this
+    # pass either, and counts the same as a failure (decisions §592).
+    result.orphaned_objects_failed += queued.failed + queued.skipped_claimed + orphans.failed
 
     docs = await collect_subject_documents(
         subject_type=subject_type,
