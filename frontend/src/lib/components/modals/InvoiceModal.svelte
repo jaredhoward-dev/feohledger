@@ -2547,11 +2547,16 @@
 								</p>
 							{/if}
 						{/if}
-						{#if isOffered(verdicts?.erp_orphan_lookup_refusal)}
+						{#if isOffered(verdicts?.erp_orphan_lookup_refusal) && !isOffered(verdicts?.erp_bill_confirm_refusal)}
 							<!-- The bill this failed push may have left in the ERP
 							     (decisions §556): find it, then void or keep it. Shown
 							     from the server's verdict alone (§560); keyed on the
-							     invoice so one invoice's bill never shows on another. -->
+							     invoice so one invoice's bill never shows on another.
+							     Not beside the shared-key confirmation below: that push
+							     was refused before it created a bill, so this panel could
+							     only state its own refusal next to a second, disabled
+							     "Find it in the ERP". The confirmation finds the one bill
+							     in question and is the action that resolves the failure. -->
 							{#key invoice.id}
 								<ErpOrphanBill
 									invoiceId={invoice.id}
