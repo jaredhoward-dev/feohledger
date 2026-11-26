@@ -3953,6 +3953,21 @@ class AppLocalizationsPt extends AppLocalizations {
       'Seu ERP não registrou o pagamento desta fatura, então ela ainda aparece lá como não paga, embora o dinheiro já tenha sido pago. Resolva o que impediu e depois use “Repetir sincronização com o ERP” no lote de pagamento correspondente, em Pagamentos.';
 
   @override
+  String exceptionDescriptionErpPaymentWritebackUnconfirmed(
+    String erp,
+    String marker,
+  ) {
+    return '$erp talvez já mostre o pagamento desta fatura: o FeohLedger o enviou, mas não conseguiu confirmar que foi registrado. Procure na fatura um pagamento com a referência “$marker” antes de registrar um.';
+  }
+
+  @override
+  String exceptionDescriptionErpPaymentWritebackUnconfirmedUnnamed(
+    String marker,
+  ) {
+    return 'Seu ERP talvez já mostre o pagamento desta fatura: o FeohLedger o enviou, mas não conseguiu confirmar que foi registrado. Procure na fatura um pagamento com a referência “$marker” antes de registrar um.';
+  }
+
+  @override
   String exceptionDescriptionErpPaymentWritebackBalanceOpen(
     String erp,
     String amount,
@@ -9162,6 +9177,21 @@ class AppLocalizationsPtBr extends AppLocalizationsPt {
   @override
   String get exceptionDescriptionErpPaymentWritebackFailedUnnamed =>
       'Seu ERP não registrou o pagamento desta fatura, então ela ainda aparece lá como não paga, embora o dinheiro já tenha sido pago. Resolva o que impediu e depois use “Repetir sincronização com o ERP” no lote de pagamento correspondente, em Pagamentos.';
+
+  @override
+  String exceptionDescriptionErpPaymentWritebackUnconfirmed(
+    String erp,
+    String marker,
+  ) {
+    return '$erp talvez já mostre o pagamento desta fatura: o FeohLedger o enviou, mas não conseguiu confirmar que foi registrado. Procure na fatura um pagamento com a referência “$marker” antes de registrar um.';
+  }
+
+  @override
+  String exceptionDescriptionErpPaymentWritebackUnconfirmedUnnamed(
+    String marker,
+  ) {
+    return 'Seu ERP talvez já mostre o pagamento desta fatura: o FeohLedger o enviou, mas não conseguiu confirmar que foi registrado. Procure na fatura um pagamento com a referência “$marker” antes de registrar um.';
+  }
 
   @override
   String exceptionDescriptionErpPaymentWritebackBalanceOpen(

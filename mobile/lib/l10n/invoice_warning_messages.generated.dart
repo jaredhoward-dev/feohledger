@@ -285,6 +285,11 @@ const Map<String, Map<String, String>> invoiceWarningParamKinds = {
   'exception.erp_voided_after_post_unnamed': {},
   'exception.erp_payment_writeback_failed': {'erp': 'text'},
   'exception.erp_payment_writeback_failed_unnamed': {},
+  'exception.erp_payment_writeback_unconfirmed': {
+    'erp': 'text',
+    'marker': 'text',
+  },
+  'exception.erp_payment_writeback_unconfirmed_unnamed': {'marker': 'text'},
   'exception.erp_payment_writeback_balance_open': {
     'erp': 'text',
     'amount': 'money',
@@ -1178,6 +1183,20 @@ String? _localizeWarningCode(
     // Your ERP did not record this invoice's payment, so the bill still shows as unpaid there although the money was paid. Resolve what stopped it, then use Retry ERP sync on the payment's run in Payments.
     case 'exception.erp_payment_writeback_failed_unnamed':
       return l.exceptionDescriptionErpPaymentWritebackFailedUnnamed;
+    // {erp} may already show this invoice's payment: FeohLedger sent it but could not confirm it was recorded. Check the bill for a payment referenced “{marker}” before recording one.
+    case 'exception.erp_payment_writeback_unconfirmed':
+      final erp = _text(p['erp'], currency);
+      if (erp == null) return null;
+      final marker = _text(p['marker'], currency);
+      if (marker == null) return null;
+      return l.exceptionDescriptionErpPaymentWritebackUnconfirmed(erp, marker);
+    // Your ERP may already show this invoice's payment: FeohLedger sent it but could not confirm it was recorded. Check the bill for a payment referenced “{marker}” before recording one.
+    case 'exception.erp_payment_writeback_unconfirmed_unnamed':
+      final marker = _text(p['marker'], currency);
+      if (marker == null) return null;
+      return l.exceptionDescriptionErpPaymentWritebackUnconfirmedUnnamed(
+        marker,
+      );
     // {erp} recorded this invoice's payment, but the bill still shows {amount} {currency} open there (a discount or credit taken in FeohLedger). Close the difference in the ERP.
     case 'exception.erp_payment_writeback_balance_open':
       final erp = _text(p['erp'], currency);

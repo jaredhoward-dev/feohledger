@@ -3954,6 +3954,21 @@ class AppLocalizationsEs extends AppLocalizations {
       'Su ERP no registró el pago de esta factura, así que allí la factura sigue figurando como impagada aunque el dinero ya se pagó. Resuelva lo que lo impidió y luego use «Reintentar sincronización ERP» en la ejecución de pago correspondiente, en Pagos.';
 
   @override
+  String exceptionDescriptionErpPaymentWritebackUnconfirmed(
+    String erp,
+    String marker,
+  ) {
+    return 'Es posible que $erp ya muestre el pago de esta factura: FeohLedger lo envió, pero no pudo confirmar que se registrara. Busque en la factura un pago con la referencia «$marker» antes de registrar uno.';
+  }
+
+  @override
+  String exceptionDescriptionErpPaymentWritebackUnconfirmedUnnamed(
+    String marker,
+  ) {
+    return 'Es posible que su ERP ya muestre el pago de esta factura: FeohLedger lo envió, pero no pudo confirmar que se registrara. Busque en la factura un pago con la referencia «$marker» antes de registrar uno.';
+  }
+
+  @override
   String exceptionDescriptionErpPaymentWritebackBalanceOpen(
     String erp,
     String amount,

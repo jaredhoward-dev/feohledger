@@ -3948,6 +3948,21 @@ class AppLocalizationsDe extends AppLocalizations {
       'Ihr ERP hat die Zahlung dieser Rechnung nicht erfasst, daher wird die Rechnung dort weiterhin als unbezahlt angezeigt, obwohl das Geld gezahlt wurde. Beheben Sie die Ursache und verwenden Sie dann „ERP-Abgleich wiederholen“ beim Zahlungslauf dieser Zahlung unter Zahlungen.';
 
   @override
+  String exceptionDescriptionErpPaymentWritebackUnconfirmed(
+    String erp,
+    String marker,
+  ) {
+    return '$erp zeigt die Zahlung dieser Rechnung möglicherweise bereits an: FeohLedger hat sie gesendet, konnte aber nicht bestätigen, dass sie erfasst wurde. Suchen Sie bei der Rechnung nach einer Zahlung mit der Referenz „$marker“, bevor Sie eine erfassen.';
+  }
+
+  @override
+  String exceptionDescriptionErpPaymentWritebackUnconfirmedUnnamed(
+    String marker,
+  ) {
+    return 'Ihr ERP zeigt die Zahlung dieser Rechnung möglicherweise bereits an: FeohLedger hat sie gesendet, konnte aber nicht bestätigen, dass sie erfasst wurde. Suchen Sie bei der Rechnung nach einer Zahlung mit der Referenz „$marker“, bevor Sie eine erfassen.';
+  }
+
+  @override
   String exceptionDescriptionErpPaymentWritebackBalanceOpen(
     String erp,
     String amount,

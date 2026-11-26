@@ -247,6 +247,10 @@ export const INVOICE_WARNING_MESSAGE_KEYS = {
 	'exception.erp_payment_writeback_failed': 'exceptions.description.erpPaymentWritebackFailed',
 	// Your ERP did not record this invoice's payment, so the bill still shows as unpaid there although the money was paid. Resolve what stopped it, then use Retry ERP sync on the payment's run in Payments.
 	'exception.erp_payment_writeback_failed_unnamed': 'exceptions.description.erpPaymentWritebackFailedUnnamed',
+	// {erp} may already show this invoice's payment: FeohLedger sent it but could not confirm it was recorded. Check the bill for a payment referenced “{marker}” before recording one.
+	'exception.erp_payment_writeback_unconfirmed': 'exceptions.description.erpPaymentWritebackUnconfirmed',
+	// Your ERP may already show this invoice's payment: FeohLedger sent it but could not confirm it was recorded. Check the bill for a payment referenced “{marker}” before recording one.
+	'exception.erp_payment_writeback_unconfirmed_unnamed': 'exceptions.description.erpPaymentWritebackUnconfirmedUnnamed',
 	// {erp} recorded this invoice's payment, but the bill still shows {amount} {currency} open there (a discount or credit taken in FeohLedger). Close the difference in the ERP.
 	'exception.erp_payment_writeback_balance_open': 'exceptions.description.erpPaymentWritebackBalanceOpen',
 	// Your ERP recorded this invoice's payment, but the bill still shows {amount} {currency} open there (a discount or credit taken in FeohLedger). Close the difference in the ERP.
@@ -475,6 +479,8 @@ export const INVOICE_WARNING_PARAM_KINDS = {
 	'exception.erp_voided_after_post_unnamed': {},
 	'exception.erp_payment_writeback_failed': { erp: 'text' },
 	'exception.erp_payment_writeback_failed_unnamed': {},
+	'exception.erp_payment_writeback_unconfirmed': { erp: 'text', marker: 'text' },
+	'exception.erp_payment_writeback_unconfirmed_unnamed': { marker: 'text' },
 	'exception.erp_payment_writeback_balance_open': { erp: 'text', amount: 'money', currency: 'currency' },
 	'exception.erp_payment_writeback_balance_open_unnamed': { amount: 'money', currency: 'currency' },
 	'exception.erp_discount_credit_pending': { erp: 'text', amount: 'money', currency: 'currency', credit: 'text' },
