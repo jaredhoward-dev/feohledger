@@ -11,7 +11,7 @@ Retention windows live on `Organization.settings.retention`, keyed
 `<record_class>_months`:
 
 ```json
-{ "retention": { "invoices_months": 84, "audit_log_months": 84, "positive_pay_months": 1 } }
+{ "retention": { "invoices_months": 84, "audit_log_months": 84, "positive_pay_months": 1, "peppol_transmissions_months": 84 } }
 ```
 
 `resolve_retention_months(settings, record_class)` (in
@@ -39,7 +39,9 @@ An org whose bank has a long dispute window can raise it like any other.
   themselves live on the control plane). PII-free — only class names + month
   windows.
 
-Record classes the engine understands: `invoices`, `audit_log`, `positive_pay` (`RECORD_CLASSES`).
+Record classes the engine understands: `invoices`, `audit_log`, `positive_pay`,
+`peppol_transmissions` (`RECORD_CLASSES`). The web settings page edits only the
+first two; the other two are set through the API.
 
 ## Enforcement sweep — `services/retention_sweep.py`
 
@@ -142,6 +144,21 @@ and the bucket carries a GOVERNANCE-mode Object Lock default retention
 measured in weeks would sit in the Terraform looking like a control and never
 fire. `docs/decisions.md` §184.
 
+### Received PEPPOL e-invoices — keep the record past the invoice, then expire
+
+Deleting an invoice we received over PEPPOL detaches its inbound
+`peppol_transmissions` row rather than deleting it (`invoice_id` NULL, stamped
+with who deleted the invoice and when — `backend/docs/peppol.md`, decisions
+§586). The `peppol_transmissions` class (platform default window) governs that
+detached row: once `created_at` (receipt) is past the window, the sweep deletes
+it, oldest first, under the same `FEOH_RETENTION_BATCH_SIZE` cap, and counts it
+in the manifest (`peppol_transmissions_months` /
+`peppol_transmissions_expired`). The deletion is its own idempotency marker.
+**A row still attached to an invoice is never touched**: it lives as long as
+its invoice does, and the invoice class only soft-archives. Outbound rows are
+never detached (§580 refuses deleting their invoice while live; a `failed` one
+is cleared with it).
+
 ### Audit records (WORM) — verify, never delete
 
 **CRITICAL: the sweep never deletes `audit_log` rows.** Migration 0022 installs
@@ -165,12 +182,13 @@ archived invoices, the batch size and whether the batch was capped
 (`invoices_archive_batch_size` / `invoices_archive_batch_capped` — a capped tick
 means more remain), the Positive Pay counts (`positive_pay_months` /
 `positive_pay_files_expired` / `positive_pay_files_failed` — never a file key,
-which embeds org and record ids), and the audit overdue/unshipped counts, plus a
+which embeds org and record ids), the PEPPOL counts, and the audit overdue/unshipped counts, plus a
 note that audit rows are immutable and never deleted. An idle tenant writes no
 manifest (no no-op spam).
 
 **The gate is `archived or audit_rows_overdue_unshipped or positive_pay_files_expired
-or positive_pay_files_failed` — deliberately not `audit_rows_overdue`.** The two
+or positive_pay_files_failed or peppol_transmissions_expired` — deliberately not
+`audit_rows_overdue`.** The two
 Positive Pay counters are safe to gate on for the same reason `archived` is: both
 describe work actually done (or attempted) this tick and both return to zero once
 the backlog drains, so neither can inflate itself. That counter is monotonic and self-inflating: it counts
@@ -233,4 +251,6 @@ invoices; idempotent (no double-archive); already-archived rows excluded in SQL
 (a batch of 1 still reaches the *second* invoice on the next tick); the batch
 cap; the manifest carries counts and **no** id list; **never deletes audit
 rows** (composes with the immutability trigger); policy GET/PUT + audit row;
-`422` on unknown class / non-positive window; RBAC (admin-only, 401/403).
+`422` on unknown class / non-positive window; RBAC (admin-only, 401/403); the
+`peppol_transmissions` class expires only a detached inbound row past its
+window (attached and young rows kept, idempotent, counted in the manifest).

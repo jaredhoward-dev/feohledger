@@ -285,6 +285,11 @@ const Map<String, Map<String, String>> invoiceWarningParamKinds = {
   'exception.erp_voided_after_post_unnamed': {},
   'exception.erp_payment_writeback_failed': {'erp': 'text'},
   'exception.erp_payment_writeback_failed_unnamed': {},
+  'exception.erp_payment_writeback_unconfirmed': {
+    'erp': 'text',
+    'marker': 'text',
+  },
+  'exception.erp_payment_writeback_unconfirmed_unnamed': {'marker': 'text'},
   'exception.erp_payment_writeback_balance_open': {
     'erp': 'text',
     'amount': 'money',
@@ -294,8 +299,32 @@ const Map<String, Map<String, String>> invoiceWarningParamKinds = {
     'amount': 'money',
     'currency': 'currency',
   },
+  'exception.erp_discount_credit_pending': {
+    'erp': 'text',
+    'amount': 'money',
+    'currency': 'currency',
+    'credit': 'text',
+  },
+  'exception.erp_discount_credit_pending_unnamed': {
+    'amount': 'money',
+    'currency': 'currency',
+    'credit': 'text',
+  },
+  'exception.erp_discount_credit_pending_unidentified': {
+    'erp': 'text',
+    'amount': 'money',
+    'currency': 'currency',
+    'marker': 'text',
+  },
+  'exception.erp_discount_credit_pending_unidentified_unnamed': {
+    'amount': 'money',
+    'currency': 'currency',
+    'marker': 'text',
+  },
   'exception.erp_payment_void_writeback_failed': {'erp': 'text'},
   'exception.erp_payment_void_writeback_failed_unnamed': {},
+  'exception.erp_discount_credit_stalled': {'erp': 'text'},
+  'exception.erp_discount_credit_stalled_unnamed': {},
   'exception.erp_credit_settlement': {},
   'exception.erp_settled_no_payment': {},
   'exception.erp_paid_while_scheduled': {},
@@ -1154,6 +1183,20 @@ String? _localizeWarningCode(
     // Your ERP did not record this invoice's payment, so the bill still shows as unpaid there although the money was paid. Resolve what stopped it, then use Retry ERP sync on the payment's run in Payments.
     case 'exception.erp_payment_writeback_failed_unnamed':
       return l.exceptionDescriptionErpPaymentWritebackFailedUnnamed;
+    // {erp} may already show this invoice's payment: FeohLedger sent it but could not confirm it was recorded. Check the bill for a payment referenced “{marker}” before recording one.
+    case 'exception.erp_payment_writeback_unconfirmed':
+      final erp = _text(p['erp'], currency);
+      if (erp == null) return null;
+      final marker = _text(p['marker'], currency);
+      if (marker == null) return null;
+      return l.exceptionDescriptionErpPaymentWritebackUnconfirmed(erp, marker);
+    // Your ERP may already show this invoice's payment: FeohLedger sent it but could not confirm it was recorded. Check the bill for a payment referenced “{marker}” before recording one.
+    case 'exception.erp_payment_writeback_unconfirmed_unnamed':
+      final marker = _text(p['marker'], currency);
+      if (marker == null) return null;
+      return l.exceptionDescriptionErpPaymentWritebackUnconfirmedUnnamed(
+        marker,
+      );
     // {erp} recorded this invoice's payment, but the bill still shows {amount} {currency} open there (a discount or credit taken in FeohLedger). Close the difference in the ERP.
     case 'exception.erp_payment_writeback_balance_open':
       final erp = _text(p['erp'], currency);
@@ -1168,6 +1211,52 @@ String? _localizeWarningCode(
       return l.exceptionDescriptionErpPaymentWritebackBalanceOpenUnnamed(
         amount,
       );
+    // {erp} recorded this invoice's payment, but the bill still shows {amount} {currency} open there. FeohLedger booked credit {credit} for the early-payment discount and will apply it, so don't book another.
+    case 'exception.erp_discount_credit_pending':
+      final erp = _text(p['erp'], currency);
+      if (erp == null) return null;
+      final amount = _money(p['amount'], currency);
+      if (amount == null) return null;
+      final credit = _text(p['credit'], currency);
+      if (credit == null) return null;
+      return l.exceptionDescriptionErpDiscountCreditPending(
+        erp,
+        amount,
+        credit,
+      );
+    // Your ERP recorded this invoice's payment, but the bill still shows {amount} {currency} open there. FeohLedger booked credit {credit} for the early-payment discount and will apply it, so don't book another.
+    case 'exception.erp_discount_credit_pending_unnamed':
+      final amount = _money(p['amount'], currency);
+      if (amount == null) return null;
+      final credit = _text(p['credit'], currency);
+      if (credit == null) return null;
+      return l.exceptionDescriptionErpDiscountCreditPendingUnnamed(
+        amount,
+        credit,
+      );
+    // {erp} recorded this invoice's payment, but the bill still shows {amount} {currency} open there. FeohLedger may have booked a credit for this discount, so check for “{marker}” before booking one.
+    case 'exception.erp_discount_credit_pending_unidentified':
+      final erp = _text(p['erp'], currency);
+      if (erp == null) return null;
+      final amount = _money(p['amount'], currency);
+      if (amount == null) return null;
+      final marker = _text(p['marker'], currency);
+      if (marker == null) return null;
+      return l.exceptionDescriptionErpDiscountCreditPendingUnidentified(
+        erp,
+        amount,
+        marker,
+      );
+    // Your ERP recorded this invoice's payment, but the bill still shows {amount} {currency} open there. FeohLedger may have booked a credit for this discount, so check for “{marker}” before booking one.
+    case 'exception.erp_discount_credit_pending_unidentified_unnamed':
+      final amount = _money(p['amount'], currency);
+      if (amount == null) return null;
+      final marker = _text(p['marker'], currency);
+      if (marker == null) return null;
+      return l.exceptionDescriptionErpDiscountCreditPendingUnidentifiedUnnamed(
+        amount,
+        marker,
+      );
     // {erp} still shows this bill paid by a payment that was voided in FeohLedger, because voiding it in the ERP failed. Void that payment in the ERP so the books agree.
     case 'exception.erp_payment_void_writeback_failed':
       final erp = _text(p['erp'], currency);
@@ -1176,6 +1265,14 @@ String? _localizeWarningCode(
     // Your ERP still shows this bill paid by a payment that was voided in FeohLedger, because voiding it in the ERP failed. Void that payment in the ERP so the books agree.
     case 'exception.erp_payment_void_writeback_failed_unnamed':
       return l.exceptionDescriptionErpPaymentVoidWritebackFailedUnnamed;
+    // {erp} may hold an early-payment discount credit FeohLedger created for this invoice's payment that it could not apply or reverse automatically. Find the credit marked “FeohLedger discount” with this payment's id there, and apply or delete it so the discount is counted once.
+    case 'exception.erp_discount_credit_stalled':
+      final erp = _text(p['erp'], currency);
+      if (erp == null) return null;
+      return l.exceptionDescriptionErpDiscountCreditStalled(erp);
+    // Your ERP may hold an early-payment discount credit FeohLedger created for this invoice's payment that it could not apply or reverse automatically. Find the credit marked “FeohLedger discount” with this payment's id there, and apply or delete it so the discount is counted once.
+    case 'exception.erp_discount_credit_stalled_unnamed':
+      return l.exceptionDescriptionErpDiscountCreditStalledUnnamed;
     // The ERP shows this bill settled, at least in part by a vendor credit applied there. FeohLedger will not pay it until someone confirms what is still owed.
     case 'exception.erp_credit_settlement':
       return l.exceptionDescriptionErpCreditSettlement;

@@ -26,6 +26,15 @@ from sqlalchemy import select, update
 
 from app.models.organization import Organization
 from app.models.workflow import AuditLog
+from tests.partner_capability_helpers import granted_partner
+
+
+@pytest.fixture(autouse=True)
+async def _a_is_partner(realdb):
+    """Tenant "a" is the partner in this module: the operator granted it the
+    capability every `/api/partner` route requires (decisions §574)."""
+    async with granted_partner(realdb, "a"):
+        yield
 
 
 async def _set_parent(realdb, *, child_key: str, parent_key: str | None) -> None:
@@ -73,15 +82,62 @@ async def test_overview_lists_only_own_children(realdb):
 
 
 @pytest.mark.asyncio
-async def test_overview_standalone_org_is_not_partner(realdb):
-    """An org with no children gets an empty list + is_partner:false (no error)."""
+async def test_overview_partner_with_no_children_is_empty(realdb):
+    """A granted partner with no children yet gets an empty list (no error)."""
     await _set_parent(realdb, child_key="b", parent_key=None)  # ensure detached
     async with realdb.client(key="a", role="admin") as c:
         resp = await c.get("/api/partner")
     assert resp.status_code == 200
     body = resp.json()
-    assert body["is_partner"] is False
+    assert body["is_partner"] is True
     assert body["children"] == []
+
+
+@pytest.mark.asyncio
+async def test_every_partner_route_refuses_an_admin_of_a_non_partner(realdb):
+    """Decisions §574: the capability gates the whole surface. B's admin holds
+    the admin role but B was never granted the capability, so every route is the
+    coded 403 — and nothing is read or written. Driven off the route table, so a
+    route added later without the gate fails here."""
+    from app.api.partner import PARTNER_CAPABILITY_REQUIRED, router
+
+    some_id = realdb.info("a").org_id
+    async with realdb.client(key="b", role="admin") as c:
+        for route in router.routes:
+            path = route.path.replace("{child_id}", str(some_id))
+            for method in route.methods:
+                resp = await c.request(method, f"/api{path}", json={})
+                assert resp.status_code == 403, (method, path, resp.text)
+                assert resp.json()["detail"]["code"] == PARTNER_CAPABILITY_REQUIRED
+
+
+@pytest.mark.asyncio
+async def test_non_admin_of_a_non_partner_still_gets_the_role_refusal(realdb):
+    """RBAC is unchanged: the role gate runs first, so a non-admin gets its
+    plain 403, not the capability's coded one."""
+    async with realdb.client(key="b", role="ap_manager") as c:
+        resp = await c.get("/api/partner")
+    assert resp.status_code == 403
+    assert not isinstance(resp.json()["detail"], dict)
+
+
+@pytest.mark.asyncio
+async def test_existing_partner_keeps_access_and_revoked_partner_loses_it(realdb):
+    """The capability, not the hierarchy, decides: A with a child reaches the
+    overview while granted, and the same A is refused once it is taken away."""
+    from tests.partner_capability_helpers import set_is_partner
+
+    await _set_parent(realdb, child_key="b", parent_key="a")
+    try:
+        async with realdb.client(key="a", role="admin") as c:
+            assert (await c.get("/api/partner")).status_code == 200
+        await set_is_partner(realdb, "a", False)
+        async with realdb.client(key="a", role="admin") as c:
+            denied = await c.get("/api/partner")
+        assert denied.status_code == 403
+        assert denied.json()["detail"]["code"] == "partner_capability_required"
+    finally:
+        await _set_parent(realdb, child_key="b", parent_key=None)
 
 
 @pytest.mark.asyncio

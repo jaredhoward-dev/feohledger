@@ -20,13 +20,12 @@ from ``create_all``, so the DDL mirrors
 throughout.
 
 Revision ID: 0153_pending_object_deletions
-Revises: 0148_card_transaction_events
+Revises: 0152_peppol_inbound_detach
 Create Date: 2026-11-25
 
 29 characters (``alembic_version.version_num`` is ``VARCHAR(32)``); the filename
-matches the id. Round 51 was cut from ``main`` before rounds 48–50's 0149–0152
-landed; when the two meet, ``down_revision`` becomes
-``0152_peppol_inbound_detach`` so the chain keeps one head.
+matches the id. Chained after rounds 48–50's 0152 (round 51 was cut before
+they landed and was re-chained when the two met), so the chain keeps one head.
 """
 
 from sqlalchemy import text
@@ -34,7 +33,7 @@ from sqlalchemy import text
 from alembic import op
 
 revision = "0153_pending_object_deletions"
-down_revision = "0148_card_transaction_events"
+down_revision = "0152_peppol_inbound_detach"
 branch_labels = None
 depends_on = None
 

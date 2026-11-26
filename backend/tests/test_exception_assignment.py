@@ -33,6 +33,12 @@ def _invoice():
         organization_id=uuid.uuid4(),
         entity_id=uuid.uuid4(),  # multi-entity P2: exception inherits invoice entity
         vendor_id=None,
+        # A real Invoice always has both: raising a `duplicate` / `fraud_flag`
+        # asks `erp_bill_void.bill_holder` whether its bill is already in the
+        # ERP (decisions §542), and a fake missing them only failed inside that
+        # notice's best-effort `except`, never on the path production takes.
+        status="new",
+        erp_document_id=None,
     )
 
 
@@ -51,6 +57,10 @@ def _capture_db():
         )
     )
     db.add = MagicMock()
+    # `AsyncSession.begin_nested()` is synchronous and returns an async context
+    # manager (the flag-on-posted-bill notice runs in one); an `AsyncMock`
+    # attribute would hand back a never-awaited coroutine instead.
+    db.begin_nested = MagicMock()
     return db
 
 
@@ -415,6 +425,10 @@ def test_get_exception_returns_full_dict_for_found_row():
         currency="USD",
         uploaded_by_id=None,
         segregation_actor_ids=None,
+        # The detail carries the orphan-bill lookup verdict (decisions §560,
+        # §566), which reads the row's status and ERP bill id like a list row.
+        status="ready_for_review",
+        erp_document_id=None,
     )
 
     db = AsyncMock()

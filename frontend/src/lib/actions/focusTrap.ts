@@ -100,7 +100,8 @@ function notifyModals() {
  *    browser puts it when the focused dialog node is removed. If something else
  *    already holds focus (a second dialog opened in the same flush, or a caller
  *    that moved focus deliberately), restoring would steal it back.
- * 2. To the trigger, if it is still in the document and accepts focus — a
+ * 2. To the trigger, if it is still in the document, is not `<body>` (nothing
+ *    was focused, as when a deep link opened the dialog) and accepts focus — a
  *    disabled button (a row whose action is now in flight) silently refuses
  *    `focus()`, which is why the check reads `activeElement` afterwards rather
  *    than trusting the call.
@@ -121,10 +122,35 @@ export function ownsEscape<T>(stack: readonly T[], node: T): boolean {
 	return !stack.includes(node) || stack.at(-1) === node;
 }
 
+/**
+ * Does focus already sit where the user meant it, so a closing dialog must not
+ * restore? Not when nothing holds it (`<body>`), and not when an open dialog's
+ * own node holds it while containing the trigger: closing a dialog stacked
+ * inside another drops focus to `<body>` for a moment, and the host's
+ * focus-loss handler (`onFocusOut`) can reclaim it onto the host node before
+ * this restore runs. That node is a fallback, not a choice; the trigger inside
+ * it is where focus belongs (WCAG 2.4.3). Pure, so it is unit-tested.
+ */
+export function focusIsSettled<T extends { contains(other: T): boolean }>(
+	active: T | null,
+	body: T,
+	openDialogs: readonly T[],
+	trigger: T | null
+): boolean {
+	if (!active || active === body) return false;
+	if (trigger && openDialogs.includes(active) && active !== trigger && active.contains(trigger)) {
+		return false;
+	}
+	return true;
+}
+
 function restoreFocus(prev: HTMLElement | null): void {
-	const active = document.activeElement;
-	if (active && active !== document.body && active.isConnected) return;
-	if (prev?.isConnected) {
+	const active = document.activeElement as HTMLElement | null;
+	if (active?.isConnected && focusIsSettled(active, document.body, openModals, prev)) return;
+	// `<body>` is no trigger: a dialog opened from a deep link (`?id=`) had
+	// nothing focused, and "restoring" body is the top-of-document drop rule 3
+	// exists to prevent.
+	if (prev?.isConnected && prev !== document.body) {
 		prev.focus?.();
 		if (document.activeElement === prev) return;
 	}

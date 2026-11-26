@@ -946,3 +946,147 @@ def test_resolve_business_failure_is_not_connected():
 
 def test_sage_token_endpoint_takes_credentials_in_the_body():
     assert SageAccountingAdapter.oauth_provider.token_auth == "body"
+
+
+# ---------------------------------------------------------------------------
+# find_posted_bill — the orphan-bill lookup (decisions §556, §576)
+# ---------------------------------------------------------------------------
+
+
+def _ours(**fields) -> dict:
+    return {
+        "id": "pi-old",
+        "vendor_reference": "BILL-77",
+        "notes": "FeohLedger corr-sage-1",
+        "status": {"id": "UNPAID"},
+        "total_amount": 1150.00,
+        "currency": {"id": "GBP", "displayed_as": "Pound Sterling (GBP)"},
+        **fields,
+    }
+
+
+def _lookup_client(cm, pages: list[httpx.Response], detail: httpx.Response | None = None):
+    """GETs only: the listing answers ``pages`` in turn, the detail ``detail``.
+    Any write fails the test."""
+    client = _client(cm)
+    listing = iter(pages)
+
+    async def get(url, params=None, headers=None):
+        if url.endswith("/purchase_invoices"):
+            return next(listing)
+        if "/purchase_invoices/" in url:
+            assert detail is not None, f"unexpected detail read {url}"
+            return detail
+        raise AssertionError(f"unexpected GET {url}")
+
+    client.get = AsyncMock(side_effect=get)
+    for write in ("post", "put", "patch", "delete"):
+        setattr(client, write, AsyncMock(side_effect=AssertionError(f"lookup must not {write}")))
+    return client
+
+
+def _find(payload: InvoicePayload | None = None):
+    return _run(_adapter().find_posted_bill(payload or _payload()))
+
+
+def test_the_lookup_is_offered_and_its_key_is_not_shared():
+    assert SageAccountingAdapter.supports_bill_lookup is True
+    assert SageAccountingAdapter.bill_lookup_key_shared is False
+
+
+def test_the_lookup_finds_our_push_by_its_marker_and_reads_only(token):
+    detail = _resp(
+        200, {"status": {"id": "UNPAID"}, "total_amount": 1150.0, "outstanding_amount": 1150.0}
+    )
+    other = _ours(id="pi-other", vendor_reference="BILL-1", notes="FeohLedger corr-sage-2")
+    with patch("httpx.AsyncClient") as cm:
+        client = _lookup_client(cm, [_resp(200, _page([other, _ours()]))], detail)
+        found = _find()
+    assert found is not None
+    assert found.document_id == "pi-old" and found.document_number == "BILL-77"
+    assert found.amount == Decimal("1150.00") and found.currency == "GBP"
+    assert found.status is ErpInvoiceStatus.open
+    listing = client.get.await_args_list[0].kwargs["params"]
+    # The push's own window, plus the currency link.
+    assert listing["contact_id"] == VENDOR
+    assert listing["from_date"] == listing["to_date"] == "2026-09-01"
+    assert listing["attributes"].split(",")[-1] == "currency"
+    assert client.get.await_args_list[1].args[0].endswith("/purchase_invoices/pi-old")
+
+
+def test_the_lookup_reads_the_whole_window(token):
+    first = _page([_ours(id=f"pi-{i}", vendor_reference=f"X{i}", notes=None) for i in range(3)])
+    first["$next"] = "https://next"
+    detail = _resp(200, {"status": {"id": "DRAFT"}})
+    with patch("httpx.AsyncClient") as cm:
+        _lookup_client(cm, [_resp(200, first), _resp(200, _page([_ours()]))], detail)
+        found = _find()
+    assert found is not None and found.document_id == "pi-old"
+    assert found.status is ErpInvoiceStatus.draft
+
+
+def test_a_status_read_that_fails_leaves_a_found_bill_unknown(token):
+    with patch("httpx.AsyncClient") as cm:
+        _lookup_client(cm, [_resp(200, _page([_ours()]))], _resp(503))
+        found = _find()
+    assert found is not None and found.status is ErpInvoiceStatus.unknown
+
+
+def test_the_lookup_answers_none_when_nothing_of_ours_is_live(token):
+    voided = _ours(status={"id": "VOID"})
+    deleted = _ours(id="pi-del", deleted_at="2026-09-02T00:00:00Z")
+    unrelated = _ours(id="pi-x", vendor_reference="BILL-1", notes=None)
+    with patch("httpx.AsyncClient") as cm:
+        _lookup_client(cm, [_resp(200, _page([voided, deleted, unrelated]))])
+        assert _find() is None
+
+
+def test_the_lookup_never_names_another_invoices_bill(token):
+    """Our marker is a whole token: ``corr-sage-1`` never matches the notes of
+    ``corr-sage-10``. A live bill with our supplier reference but not our
+    marker is not "none" either: ours with its notes edited is not knowable
+    from someone else's."""
+    namesake = _ours(id="pi-10", notes="FeohLedger corr-sage-10")
+    with patch("httpx.AsyncClient") as cm:
+        _lookup_client(cm, [_resp(200, _page([namesake]))])
+        with pytest.raises(RuntimeError):
+            _find()
+    elsewhere = _ours(id="pi-10", vendor_reference="BILL-9", notes="FeohLedger corr-sage-10")
+    with patch("httpx.AsyncClient") as cm:
+        _lookup_client(cm, [_resp(200, _page([elsewhere]))])
+        assert _find() is None
+
+
+def test_two_bills_carrying_our_marker_raise(token):
+    with patch("httpx.AsyncClient") as cm:
+        _lookup_client(cm, [_resp(200, _page([_ours(), _ours(id="pi-2")]))])
+        with pytest.raises(RuntimeError):
+            _find()
+
+
+@pytest.mark.parametrize(
+    "pages",
+    [
+        [_resp(429, {}, {"Retry-After": "60"})],
+        [_resp(503)],
+        [_resp(200, _page([], next_url="https://next"))] * 10,
+        [_resp(200, _page([_ours(id="")]))],
+    ],
+    ids=["rate_limited", "unavailable", "past_the_page_cap", "no_id"],
+)
+def test_a_lookup_that_cannot_finish_raises_never_none(token, pages):
+    with patch("httpx.AsyncClient") as cm:
+        _lookup_client(cm, pages)
+        with pytest.raises(RuntimeError):
+            _find()
+
+
+@pytest.mark.parametrize(
+    "overrides", [{"vendor_erp_id": None}, {"invoice_date": None}, {"correlation_id": " "}]
+)
+def test_a_lookup_the_push_would_refuse_raises_before_any_call(token, overrides):
+    with patch("httpx.AsyncClient") as cm:
+        client = _lookup_client(cm, [])
+        with pytest.raises(ValueError):
+            _find(_payload(**overrides))
+    client.get.assert_not_awaited()

@@ -177,4 +177,36 @@ test.describe('dashboard KPI row — labelled by the payload, not the org store'
 		const unknown = rows.filter({ hasText: 'INV-9002' }).locator('.upcoming-amount');
 		await expect(unknown).toHaveText('250.00');
 	});
+
+	test('a rescheduled upcoming payment shows its effective date, the date it moved from, and the server flag', async ({
+		page
+	}) => {
+		// `due_date` is the EFFECTIVE date (the current payment schedule's) that
+		// `is_overdue` and the overdue count read; `own_due_date` is the
+		// invoice's own (decisions §565). The flag is the server's, never the
+		// browser's own comparison.
+		await stubDashboard(page, {
+			reportingCurrency: 'USD',
+			upcomingPayments: [
+				{
+					...upcomingPaymentRow('INV-9101', 100, 'USD'),
+					due_date: '2026-09-20',
+					own_due_date: '2026-10-15',
+					is_overdue: true
+				},
+				{ ...upcomingPaymentRow('INV-9102', 100, 'USD'), own_due_date: '2026-09-30' }
+			]
+		});
+		await page.goto('/');
+		await awaitKpis(page);
+
+		const rows = page.locator('.upcoming-row');
+		const moved = rows.filter({ hasText: 'INV-9101' });
+		await expect(moved.getByTestId('due-rescheduled-from')).toContainText('rescheduled from');
+		await expect(moved.locator('.overdue-badge')).toBeVisible();
+		const unmoved = rows.filter({ hasText: 'INV-9102' });
+		await expect(unmoved.getByTestId('due-date')).toBeVisible();
+		await expect(unmoved.getByTestId('due-rescheduled-from')).toHaveCount(0);
+		await expect(unmoved.locator('.overdue-badge')).toHaveCount(0);
+	});
 });

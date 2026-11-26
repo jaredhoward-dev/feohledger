@@ -16,7 +16,7 @@
 	import { auth } from '#lib/stores/auth.svelte.ts';
 	import { brand } from '#lib/stores/brand.svelte.ts';
 	import { m, currentLocale } from '#lib/i18n/store.svelte.ts';
-	import { canSee } from '#lib/nav.ts';
+	import { canSee, type OrgCapability } from '#lib/nav.ts';
 	import { NAV_PAGES, PAGE_HELP, guideFor } from '#lib/help/content.ts';
 	import RichText from '#lib/components/help/RichText.svelte';
 	import HelpCrumbs from '#lib/components/help/HelpCrumbs.svelte';
@@ -26,6 +26,7 @@
 	const englishLang = $derived(currentLocale() === 'en' ? undefined : 'en');
 	const has = (...roles: string[]) => auth.hasAnyRole(...roles);
 	const can = (perm: string) => auth.can(perm);
+	const hasCapability = (c: OrgCapability) => auth.hasCapability(c);
 
 	type Row = { href: string; labelKey?: MessageKey; label?: string; open: boolean };
 	type Group = { key: MessageKey; rows: Row[] };
@@ -38,7 +39,11 @@
 	const groups = $derived.by((): Group[] => {
 		const out: Group[] = [{ key: 'help.pages.main', rows: [] }];
 		for (const p of NAV_PAGES) {
-			const row = { href: p.href, labelKey: p.labelKey, open: canSee(p.roles, has, p.permissions, can) };
+			const row = {
+				href: p.href,
+				labelKey: p.labelKey,
+				open: canSee(p.roles, has, p.permissions, can, p.capability, hasCapability)
+			};
 			if (!p.groupKey) out[0].rows.push(row);
 			else {
 				const g = out.find((x) => x.key === p.groupKey);

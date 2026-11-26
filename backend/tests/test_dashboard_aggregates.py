@@ -1274,3 +1274,196 @@ async def test_overdue_list_filter_is_scoped_to_the_selected_entity(realdb):
 
     assert consolidated["total"] == 3
     assert scoped["total"] == scoped_dash["overdue_count"] == 2
+
+
+# ---------------------------------------------------------------------------
+# 7. One effective due date across the count, the upcoming list, the payment
+#    queue row and the aging bands (decisions §565)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_a_rescheduled_invoice_reads_the_same_overdue_state_everywhere(realdb):
+    """Two approved invoices whose payment schedule moved their due date, one
+    each way, and one whose payment completed before its `paid` sync-back.
+
+    * `pushed`: own date 20 days past, rescheduled 3 days out. Not overdue in
+      the count, not flagged in the upcoming list or the queue row, `current`
+      in both aging builders.
+    * `pulled`: own date 30 days out, rescheduled 10 days past. Overdue in the
+      count, flagged in the list and the queue row, in the 1-30 band.
+    * `paid_out`: overdue by any date, but a completed payment means the money
+      has left: neither counted nor listed (`open_ap_due.paid_out`).
+
+    Each list row shows the effective date and carries the invoice's own.
+    """
+    from app.services.ap_commitments import aging_snapshot_buckets
+
+    org_id = realdb.info(TENANT).org_id
+    mk = realdb.sessionmaker(TENANT)
+    today = utc_today()
+    async with mk() as s:
+        ent = await _default_entity_id(s)
+        pushed = _inv(
+            org_id,
+            ent,
+            status=InvoiceStatus.approved,
+            due_date=today - timedelta(days=20),
+            amount=Decimal("100.00"),
+        )
+        pulled = _inv(
+            org_id,
+            ent,
+            status=InvoiceStatus.approved,
+            due_date=today + timedelta(days=30),
+            amount=Decimal("200.00"),
+        )
+        paid_out = _inv(
+            org_id,
+            ent,
+            status=InvoiceStatus.payment_scheduled,
+            due_date=today - timedelta(days=5),
+            amount=Decimal("400.00"),
+        )
+        s.add_all([pushed, pulled, paid_out])
+        await s.flush()
+        s.add_all(
+            [
+                PaymentSchedule(invoice_id=pushed.id, due_date=today + timedelta(days=3)),
+                PaymentSchedule(invoice_id=pulled.id, due_date=today - timedelta(days=10)),
+                Payment(
+                    entity_id=ent,
+                    invoice_id=paid_out.id,
+                    amount=Decimal("400.00"),
+                    method="ach",
+                    provider="mock",
+                    status="completed",
+                    completed_at=today,
+                ),
+            ]
+        )
+        await s.commit()
+
+    async with realdb.client(key=TENANT, role="admin") as c:
+        dash = (await c.get("/api/dashboard")).json()
+        overdue_list = (await c.get("/api/invoices", params={"overdue": "true"})).json()
+        queue_r = await c.get("/api/payments/queue", params={"page_size": 100})
+    assert queue_r.status_code == 200, queue_r.text
+    queue = {row["id"]: row for row in queue_r.json()["items"]}
+
+    # The count and the list it opens.
+    assert dash["overdue_count"] == 1
+    assert {row["id"] for row in overdue_list["items"]} == {str(pulled.id)}
+    assert dash["due_soon_count"] == 1
+
+    # The upcoming list: same flags, effective date shown, own date carried.
+    upcoming = {row["id"]: row for row in dash["upcoming_payments"]}
+    assert set(upcoming) == {str(pushed.id), str(pulled.id)}
+    assert upcoming[str(pushed.id)]["is_overdue"] is False
+    assert upcoming[str(pushed.id)]["due_date"] == (today + timedelta(days=3)).isoformat()
+    assert upcoming[str(pushed.id)]["own_due_date"] == (today - timedelta(days=20)).isoformat()
+    assert upcoming[str(pulled.id)]["is_overdue"] is True
+    assert upcoming[str(pulled.id)]["due_date"] == (today - timedelta(days=10)).isoformat()
+    # Overdue first: the list is ordered on the effective date.
+    assert [row["id"] for row in dash["upcoming_payments"]] == [str(pulled.id), str(pushed.id)]
+
+    # The payment queue row (the paid-out invoice has a live payment, so it is
+    # not a queue row at all).
+    assert str(paid_out.id) not in queue
+    assert queue[str(pushed.id)]["is_overdue"] is False
+    assert queue[str(pushed.id)]["due_date"] == (today + timedelta(days=3)).isoformat()
+    assert queue[str(pushed.id)]["own_due_date"] == (today - timedelta(days=20)).isoformat()
+    assert queue[str(pulled.id)]["is_overdue"] is True
+    assert queue[str(pulled.id)]["due_date"] == (today - timedelta(days=10)).isoformat()
+    queue_order = [i for i in queue if i in {str(pushed.id), str(pulled.id)}]
+    assert queue_order == [str(pulled.id), str(pushed.id)]
+
+    # The aging bands, dashboard and snapshot alike. Aging keeps the AP
+    # balance's population (F-4), so the paid-out invoice still bands, on its
+    # own date (no schedule): 1-30.
+    assert dash["aging"]["current"] == 100.0
+    assert dash["aging"]["days_30"] == 600.0
+    async with mk() as s:
+        snap = await aging_snapshot_buckets(s, today=today, reporting_currency="USD")
+    assert snap["current"] == Decimal("100.00")
+    assert snap["days_30"] == Decimal("600.00")
+
+
+@pytest.mark.asyncio
+async def test_a_completed_payment_that_does_not_discharge_leaves_the_invoice_owed(realdb):
+    """`paid_out` is `payment_coverage`'s `covered`, not `status == completed`
+    (decisions §569). Four invoices due five days ago, each with a `completed`
+    payment:
+
+    * `minted`: a run's card leg, card minted but never charged: in flight,
+      still owed, so overdue in the count, the list and the forecast.
+    * `settled_card`: card leg whose card SETTLED in full: discharged, gone.
+    * `short`: a rail settled 9,500 of 10,000: held short, still owed.
+    * `full`: a rail settled in full: discharged, gone.
+    """
+    from app.models.virtual_card import VirtualCard
+
+    org_id = realdb.info(TENANT).org_id
+    mk = realdb.sessionmaker(TENANT)
+    today = utc_today()
+    past = today - timedelta(days=5)
+    face = Decimal("10000.00")
+    async with mk() as s:
+        ent = await _default_entity_id(s)
+        minted, settled_card, short, full = (
+            _inv(org_id, ent, status=InvoiceStatus.payment_scheduled, due_date=past, amount=face)
+            for _ in range(4)
+        )
+        s.add_all([minted, settled_card, short, full])
+        await s.flush()
+
+        def _pay(inv, **kw):
+            return Payment(
+                entity_id=ent,
+                invoice_id=inv.id,
+                amount=face,
+                provider="mock",
+                status="completed",
+                completed_at=today,
+                **{"method": "ach", **kw},
+            )
+
+        minted_pay = _pay(minted, method="virtual_card")
+        card_pay = _pay(settled_card, method="virtual_card")
+        s.add_all(
+            [
+                minted_pay,
+                card_pay,
+                _pay(short, settled_amount=Decimal("9500.00"), settled_currency="USD"),
+                _pay(full, settled_amount=face, settled_currency="USD"),
+            ]
+        )
+        await s.flush()
+        for inv, pay, status, charged in (
+            (minted, minted_pay, "active", None),
+            (settled_card, card_pay, "completed", face),
+        ):
+            s.add(
+                VirtualCard(
+                    organization_id=org_id,
+                    entity_id=ent,
+                    invoice_id=inv.id,
+                    payment_id=pay.id,
+                    card_provider="mock",
+                    provider_card_id=f"pc-{uuid.uuid4().hex[:12]}",
+                    amount_limit=face,
+                    amount_charged=charged,
+                    status=status,
+                )
+            )
+        await s.commit()
+
+    async with realdb.client(key=TENANT, role="admin") as c:
+        dash = (await c.get("/api/dashboard")).json()
+        overdue_list = (await c.get("/api/invoices", params={"overdue": "true"})).json()
+        forecast = (await c.get("/api/analytics/cashflow_forecast")).json()
+
+    owed = {str(minted.id), str(short.id)}
+    assert {row["id"] for row in overdue_list["items"]} == owed
+    assert dash["overdue_count"] == 2
+    assert forecast["totals"]["overdue_count"] == 2

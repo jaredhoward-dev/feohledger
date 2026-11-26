@@ -21,7 +21,6 @@
 		EXPENSE_FILTER_STATUSES,
 		EXPENSE_STATUS_LABEL_KEYS,
 		expenseStatusLabelKey,
-		EXPENSE_STATUS_TONES,
 		expenseReportStatusLabelKey,
 		EXPENSE_REPORT_STATUS_TONES,
 		EXPENSE_PREAPPROVAL_STATUSES,
@@ -30,7 +29,8 @@
 		RECONCILIATION_STATUSES,
 		reconciliationStatusLabelKey,
 		canAuthorLooseLine,
-		RECONCILIATION_STATUS_TONES
+		RECONCILIATION_STATUS_TONES,
+		preapprovalBalance
 	} from '#lib/types/expense.ts';
 	import { expenseStore } from '#lib/stores/expenses.svelte.ts';
 	import { auth } from '#lib/stores/auth.svelte.ts';
@@ -89,6 +89,7 @@
 	import LinkedMessage from '#lib/components/ui/LinkedMessage.svelte';
 	import Money from '#lib/components/ui/Money.svelte';
 	import ExpensePicker from '#lib/components/ui/ExpensePicker.svelte';
+	import ExpenseStatusCell from '#lib/components/ui/ExpenseStatusCell.svelte';
 	import { composableReports, splitAttachable, type ExpensePickerOption } from '#lib/utils/expensePicker.ts';
 	import type { SearchPickerLoad } from '#lib/utils/searchPicker.ts';
 	import { DEFAULT_CURRENCY, formatMoney } from '#lib/utils/money.ts';
@@ -957,11 +958,6 @@
 		exportExpensesCsv({ report_id: activeReport.id });
 	}
 
-	// --- Violation badge helpers (shared by expenses + report-detail rows) ---
-	function violationTitle(list: PolicyViolation[]): string {
-		return list.map((v) => policyViolationText(v, m)).join('; ');
-	}
-
 	// …and so does `?tab=policies` for a reader without the Policies tab.
 	$effect(() => {
 		if (tab === 'policies' && !canManagePolicies) untrack(() => switchTab('expenses'));
@@ -1578,20 +1574,7 @@
 						<td class="muted">{glLabel(exp.gl_account_id)}</td>
 						<td class="right mono"><Money amount={exp.amount} currency={exp.currency} /></td>
 						<td>
-							<!-- The 6px that used to be the violation pill's own
-							     `margin-left` lives on this wrapper: `<Badge>` owns colour
-							     and metrics, the caller owns placement. `cursor: help` is
-							     inherited down onto the pill from `.violation-chip`, which
-							     is also the caller's to own — the tooltip is the point of
-							     that chip. -->
-							<span class="status-cell">
-								<Badge tone={EXPENSE_STATUS_TONES[exp.status as ExpenseStatus]} variant={exp.status}>{statusLabel(exp.status)}</Badge>
-								{#if exp.policy_violations && exp.policy_violations.length}
-									<span class="violation-chip">
-										<Badge tone="danger" variant="violation" title={violationTitle(exp.policy_violations)}>⚠ {exp.policy_violations.length}</Badge>
-									</span>
-								{/if}
-							</span>
+							<ExpenseStatusCell expense={exp} />
 						</td>
 						<td class="actions">
 							<!-- A colleague's line on no report is theirs to delete
@@ -1773,14 +1756,7 @@
 								<td>{exp.category ?? '—'}</td>
 								<td class="right mono"><Money amount={exp.amount} currency={exp.currency} /></td>
 								<td>
-									<span class="status-cell">
-										<Badge tone={EXPENSE_STATUS_TONES[exp.status as ExpenseStatus]} variant={exp.status}>{statusLabel(exp.status)}</Badge>
-										{#if exp.policy_violations && exp.policy_violations.length}
-											<span class="violation-chip">
-												<Badge tone="danger" variant="violation" title={violationTitle(exp.policy_violations)}>⚠ {exp.policy_violations.length}</Badge>
-											</span>
-										{/if}
-									</span>
+									<ExpenseStatusCell expense={exp} />
 								</td>
 								<td class="actions">
 									{#if isAllowed(activeReport?.actions?.compose)}
@@ -1928,6 +1904,7 @@
 				{ label: m('expenses.preapprovals.col.title') },
 				{ label: m('expenses.preapprovals.col.category') },
 				{ label: m('expenses.preapprovals.col.estimated'), class: 'right' },
+				{ label: m('expenses.preapprovals.col.remaining'), class: 'right' },
 				{ label: m('expenses.preapprovals.col.status') },
 				{ label: '', class: 'actions-col' }
 			]}
@@ -1937,10 +1914,26 @@
 		>
 			{#snippet body()}
 				{#each preapprovals as pa (pa.id)}
+					{@const balance = preapprovalBalance(pa)}
 					<tr>
 						<td>{pa.title}</td>
 						<td>{pa.category ?? '—'}</td>
 						<td class="right mono"><Money amount={pa.estimated_amount} currency={pa.currency} /></td>
+						<!-- The draw-down (decisions §563): what is left of an approved
+						     estimate after the submitted lines it covers. A pending or
+						     rejected request covers nothing, so it shows no balance. -->
+						<td class="right mono" data-testid="preapproval-remaining">
+							{#if balance}
+								<Money amount={balance.remaining} currency={pa.currency} />
+								<span class="cell-sub">
+									{balance.exhausted
+										? m('expenses.preapprovals.exhausted')
+										: m('expenses.preapprovals.drawn', { amount: formatMoney(balance.drawn, { currency: pa.currency }) })}
+								</span>
+							{:else}
+								<span class="muted">—</span>
+							{/if}
+						</td>
 						<td><Badge tone={EXPENSE_PREAPPROVAL_STATUS_TONES[pa.status as ExpensePreapprovalStatus]} variant={pa.status}>{preapprovalStatusLabel(pa.status)}</Badge></td>
 						<td class="actions">
 							{#if canDecidePreapproval(pa)}
@@ -2339,23 +2332,13 @@
 	   here, .15 in the modal). What stays here is placement and the tooltip
 	   affordance. */
 
-	/* Status pill + the optional policy-violation pill beside it. The 6px was
-	   the violation pill's own `margin-left`; `flex-wrap` keeps the pair able to
-	   break at a narrow viewport, which two inline runs did for free and a flex
-	   row must be told to do (SC 1.4.10). */
-	.status-cell {
-		display: inline-flex;
-		align-items: center;
-		gap: 6px;
-		flex-wrap: wrap;
-	}
-
-	/* `cursor` is inherited, so the caller can own the affordance without
-	   `Badge` growing a prop for it. The pill's whole job is its `title`
-	   tooltip, which is what the help cursor advertises. */
-	.violation-chip {
-		display: inline-flex;
-		cursor: help;
+	/* A pre-approval's draw-down under its remaining balance (decisions §563):
+	   a second, quieter line in the same cell, so the figure stays the one the
+	   column is sorted and scanned by. */
+	.cell-sub {
+		display: block;
+		font-size: 0.75rem;
+		color: var(--text-muted);
 	}
 
 	.bulk-gl-select {

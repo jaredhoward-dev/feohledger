@@ -35,6 +35,7 @@ from app.services.peppol_adapters.base import (
     ParticipantCapability,
     ParticipantId,
     PeppolAdapter,
+    TransmissionLookup,
     TransmissionRequest,
     TransmissionResult,
 )
@@ -207,6 +208,61 @@ class AS4GatewayAdapter(PeppolAdapter):
             success=status != "failed",
             message_id=message_id,
             status=status,
+            failure_reason=data.get("failure_code") if status == "failed" else None,
+            raw_response=data,
+        )
+
+    async def lookup_transmission(self, business_message_id: str) -> TransmissionLookup:
+        """``GET {gateway}/as4/outbound/{business_message_id}`` — the same
+        resource ``send`` posts to, read back by our idempotency key. Only a 404
+        whose body says ``{"status": "not_found"}`` is ``not_found`` (the
+        gateway never accepted the document); a bare 404, a transport
+        error, a non-404 error status or an unrecognised status is ``unknown``,
+        never ``failed`` (decisions §580). The path is this adapter's generic
+        gateway shape, like ``/as4/outbound``; a real gateway's status endpoint
+        is mapped here when one is contracted."""
+        if not self.api_key or not self.gateway_url:
+            return TransmissionLookup(outcome="unknown", failure_reason="peppol_not_configured")
+        try:
+            async with await self._client() as client:
+                response = await client.get(
+                    f"{self.gateway_url}/as4/outbound/{business_message_id}",
+                    headers=self._headers(),
+                )
+        except UnsafeUrlError:
+            self._refused()
+            return TransmissionLookup(outcome="unknown", failure_reason=GATEWAY_URL_NOT_PUBLIC)
+        except httpx.RequestError as exc:
+            return TransmissionLookup(
+                outcome="unknown",
+                failure_reason=f"gateway_transport_error:{exc.__class__.__name__}",
+            )
+        if response.status_code == 404:
+            # Only an affirmative answer that the KEY is unknown is
+            # `not_found`: a gateway without this route answers a bare 404 for
+            # every key, and reading that as "never accepted" would mark a
+            # delivered e-invoice failed and send it again (decisions §581).
+            try:
+                body = response.json() or {}
+            except ValueError:
+                body = {}
+            if isinstance(body, dict) and body.get("status") == "not_found":
+                return TransmissionLookup(outcome="not_found")
+            return TransmissionLookup(outcome="unknown", failure_reason="gateway_error:404")
+        if response.status_code >= 400:
+            return TransmissionLookup(
+                outcome="unknown", failure_reason=f"gateway_error:{response.status_code}"
+            )
+        try:
+            data = response.json() or {}
+        except ValueError:
+            data = {}
+        status = data.get("status")
+        if status not in ("sent", "delivered", "failed"):
+            return TransmissionLookup(outcome="unknown", failure_reason="gateway_status_unknown")
+        return TransmissionLookup(
+            outcome=status,
+            message_id=data.get("message_id") if status != "failed" else None,
             failure_reason=data.get("failure_code") if status == "failed" else None,
             raw_response=data,
         )

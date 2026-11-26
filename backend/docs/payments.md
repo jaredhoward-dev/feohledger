@@ -120,7 +120,14 @@ Virtual cards are **not** on a separate page. Card payments appear in the Histor
 
 Shows invoices in payable statuses (`approved`, `sent_to_erp`, `posted_in_erp`, `payment_scheduled`) that don't have a completed payment yet.
 
-- Sorted by due date (soonest first)
+- Sorted by EFFECTIVE due date, soonest first: the invoice's current payment
+  schedule's due date, else its own (`open_ap_due.effective_due_of`, the date
+  the dashboard's overdue count reads; the page reads the current schedule
+  through the correlated `payment_schedules.current_schedule_of_row`, and
+  `/queue/ids` returns ids in the same order, decisions §569). Each row's `due_date` is that
+  date, `is_overdue` is judged on it in the same SELECT, and `own_due_date`
+  carries the invoice's own, shown as "rescheduled from …" when it differs
+  (decisions §565)
 - Overdue invoices highlighted in red with badge
 - Shows payment terms per invoice
 - Count shown in the tab badge
@@ -462,6 +469,14 @@ and the 1099 totals, which sum `Payment.amount` — what was actually paid. The 
 payment sync posts no amount today (`payment_erp_sync` logs and transitions); a
 real `post_payment` must send `discount_amount` beside `amount` so the ERP
 records the bill as settled with a discount taken rather than short-paid.
+
+With the org's opt-in (`settings.erp.book_discount_as_credit`, decisions §575)
+the payment write-back books `discount_amount` as a vendor credit applied to
+the bill. A credit that may stand unapplied is recorded on the workflow
+instance and finished by its recorded id, never booked twice; one whose id is
+unknown is held and flagged for a person, and a void that runs while a credit
+attempt is in flight gets that credit reversed (decisions §577, §579;
+[erp-integration.md](erp-integration.md)).
 
 **Cards.** A card is spendable up to its limit and nothing on the card webhook
 compares a charge with `Payment.amount`, so the `virtual_card` leg will not
@@ -2726,11 +2741,32 @@ payment id, from the org's mapped pay-from account. A refusal never undoes the
 transition; it is audited (`payment.erp_post_failed`, coded) and flagged
 (`erp_reconciliation`), and `POST /api/payments/runs/{id}/sync-erp` retries it.
 A discount or credit taken here leaves the bill partly open in QuickBooks, which
-is flagged for the bookkeeper. An accepted short settlement
+is flagged for the bookkeeper — unless the org opted in to booking early-payment
+discounts as a vendor credit applied to the bill
+(`settings.erp.book_discount_as_credit`, decisions §575; `erp-integration.md`
+§ Early-payment discount booked as a vendor credit). A credit that cannot be
+booked leaves the same flag, with its refusal code. An accepted short settlement
 (`/settlement/accept`) writes back what was settled. Voiding a settled payment
 voids its BillPayment; the intent is recorded in the void's own transaction
 (`erp_payment_voids_pending`) so the status-sync sweep finishes it if the
-process dies first. Voiding a payment the ERP REPORTED opens the blocking
+process dies first. The write itself is reserve → call → record (decisions
+§584): `erp_payment_writes_pending` is committed before `post_payment` and
+cleared with the recorded outcome, so a lost outcome is finished by the sweep
+(`resume_pending_writes`) — the void re-armed if the payment was voided
+meanwhile, else the payment written back again, which the adapter's
+find-by-payment-id makes a lookup, never a second ERP payment. Only a refusal
+the adapter knows left nothing in the ERP (`not_posted`) clears the record on
+failure; any other failure (a network drop after the send, an unreadable
+answer) keeps it for the sweep and re-arms a void that raced the send, and its
+flag reads `erp_payment_writeback_unconfirmed` ("check for a payment referenced
+FeohLedger payment <id> before recording one"), never "unpaid, retry"
+(decisions §588). A record naming another bill than the invoice's now is kept
+and flagged, never retried there. A void that
+keeps failing is audited when its cause changes, not every pass, and stops at
+12 attempts with its flag open (`failure: retries_exhausted`); so does a write.
+A person resolving that capped flag in the exception queue re-arms the retries
+(the resolve's audit row carries `erp_retry_rearmed`); dismissing it leaves the
+cap. Voiding a payment the ERP REPORTED opens the blocking
 `payment_reconciliation` in the same transaction: the invoice is `approved`
 again while QuickBooks may still show the bill paid, and nothing about that
 bill would ever be reported again. A bill settled in QuickBooks by a vendor
@@ -2752,7 +2788,8 @@ And a payment written back is a Xero Payment from the mapped account at the
 exact amount that reached the supplier. Xero payments carry no discount, so an
 early-payment discount taken here leaves the bill open by the discount, flagged
 for the bookkeeper with the discount in the flag's `erp_report`; no credit note
-is created on their behalf.
+is created on their behalf unless the org opted in (decisions §575), in which
+case an ACCPAYCREDIT credit note to the chosen account is allocated to the bill.
 
 The new `card` rail (`schemas/payment.PaymentMethod.card`) is a company card used
 OUTSIDE FeohLedger's card programme: recordable as paid outside, reported by

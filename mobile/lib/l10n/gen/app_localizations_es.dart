@@ -846,6 +846,30 @@ class AppLocalizationsEs extends AppLocalizations {
       'Se ha emitido una tarjeta virtual para pagar esta factura. Cancele la tarjeta antes de retirar la aprobación.';
 
   @override
+  String get codedRefusalRecallPeppolTransmitted =>
+      'Esta factura ya se envió por PEPPOL y el receptor tiene el documento aprobado. Emita una nota de crédito y envíe una factura corregida; su aprobación no se puede retirar.';
+
+  @override
+  String get codedRefusalRecallMirrorUnsigned =>
+      'Esta factura se enrutó entre empresas del grupo y su factura espejo en la otra entidad copió los importes aprobados. Elimine la factura espejo (aún no está aprobada), retire después esta aprobación y vuelva a enrutar la factura cuando se apruebe de nuevo.';
+
+  @override
+  String get codedRefusalRecallMirrorProgressed =>
+      'Esta factura se enrutó entre empresas del grupo y su factura espejo en la otra entidad ya está aprobada o se está pagando allí. Corrija ambos lados con una nota de crédito en cada uno; esta aprobación no se puede retirar.';
+
+  @override
+  String get codedRefusalRecallIsMirror =>
+      'Esta factura es una factura espejo entre empresas del grupo: sus importes se copiaron de la factura de origen de la otra entidad. Elimine esta factura espejo y corrija la factura original; después vuelva a enrutarla.';
+
+  @override
+  String get codedRefusalPartnerCapabilityRequired =>
+      'Este espacio de trabajo no está configurado como socio. FeohLedger habilita la Administración de socios bajo solicitud — contacta con soporte si revendes o gestionas otros espacios de trabajo.';
+
+  @override
+  String get codedRefusalPartnerLinkingDisabled =>
+      'La vinculación con socios aún no está habilitada en esta plataforma, así que no se puede generar un código de vinculación. Contacta con soporte.';
+
+  @override
   String invoicesBulkRejectTitle(int count) {
     String _temp0 = intl.Intl.pluralLogic(
       count,
@@ -2532,6 +2556,11 @@ class AppLocalizationsEs extends AppLocalizations {
   }
 
   @override
+  String erpRefusalBillKeyShared(String provider) {
+    return '$provider ya tiene una factura de este proveedor con este número, y otra factura en FeohLedger tiene el mismo proveedor y número, así que esa factura no se vinculó a esta y no se creó una segunda. Compruebe en $provider a qué factura corresponde. Si el número de esta factura es incorrecto, corríjalo y vuelva a intentarlo; si no, pregunte a un administrador cómo proceder.';
+  }
+
+  @override
   String erpRefusalExceptionBlocksExport(String type) {
     return 'Esta factura tiene una excepción abierta ($type). Resuélvala o descártela en Excepciones y, después, envíela al ERP.';
   }
@@ -3925,6 +3954,21 @@ class AppLocalizationsEs extends AppLocalizations {
       'Su ERP no registró el pago de esta factura, así que allí la factura sigue figurando como impagada aunque el dinero ya se pagó. Resuelva lo que lo impidió y luego use «Reintentar sincronización ERP» en la ejecución de pago correspondiente, en Pagos.';
 
   @override
+  String exceptionDescriptionErpPaymentWritebackUnconfirmed(
+    String erp,
+    String marker,
+  ) {
+    return 'Es posible que $erp ya muestre el pago de esta factura: FeohLedger lo envió, pero no pudo confirmar que se registrara. Busque en la factura un pago con la referencia «$marker» antes de registrar uno.';
+  }
+
+  @override
+  String exceptionDescriptionErpPaymentWritebackUnconfirmedUnnamed(
+    String marker,
+  ) {
+    return 'Es posible que su ERP ya muestre el pago de esta factura: FeohLedger lo envió, pero no pudo confirmar que se registrara. Busque en la factura un pago con la referencia «$marker» antes de registrar uno.';
+  }
+
+  @override
   String exceptionDescriptionErpPaymentWritebackBalanceOpen(
     String erp,
     String amount,
@@ -3940,6 +3984,40 @@ class AppLocalizationsEs extends AppLocalizations {
   }
 
   @override
+  String exceptionDescriptionErpDiscountCreditPending(
+    String erp,
+    String amount,
+    String credit,
+  ) {
+    return '$erp registró el pago de esta factura, pero allí la factura sigue mostrando $amount pendientes. FeohLedger registró el abono $credit por el descuento por pronto pago y lo aplicará, así que no registre otro.';
+  }
+
+  @override
+  String exceptionDescriptionErpDiscountCreditPendingUnnamed(
+    String amount,
+    String credit,
+  ) {
+    return 'Su ERP registró el pago de esta factura, pero allí la factura sigue mostrando $amount pendientes. FeohLedger registró el abono $credit por el descuento por pronto pago y lo aplicará, así que no registre otro.';
+  }
+
+  @override
+  String exceptionDescriptionErpDiscountCreditPendingUnidentified(
+    String erp,
+    String amount,
+    String marker,
+  ) {
+    return '$erp registró el pago de esta factura, pero allí la factura sigue mostrando $amount pendientes. FeohLedger puede haber registrado un abono por este descuento, así que busque «$marker» antes de registrar uno.';
+  }
+
+  @override
+  String exceptionDescriptionErpDiscountCreditPendingUnidentifiedUnnamed(
+    String amount,
+    String marker,
+  ) {
+    return 'Su ERP registró el pago de esta factura, pero allí la factura sigue mostrando $amount pendientes. FeohLedger puede haber registrado un abono por este descuento, así que busque «$marker» antes de registrar uno.';
+  }
+
+  @override
   String exceptionDescriptionErpPaymentVoidWritebackFailed(String erp) {
     return '$erp sigue mostrando esta factura como pagada mediante un pago que se anuló en FeohLedger, porque no se pudo anular en el ERP. Anule ese pago en el ERP para que los libros cuadren.';
   }
@@ -3947,6 +4025,15 @@ class AppLocalizationsEs extends AppLocalizations {
   @override
   String get exceptionDescriptionErpPaymentVoidWritebackFailedUnnamed =>
       'Su ERP sigue mostrando esta factura como pagada mediante un pago que se anuló en FeohLedger, porque no se pudo anular en el ERP. Anule ese pago en el ERP para que los libros cuadren.';
+
+  @override
+  String exceptionDescriptionErpDiscountCreditStalled(String erp) {
+    return '$erp puede tener un abono por descuento por pronto pago que FeohLedger creó para el pago de esta factura y que no pudo aplicar ni revertir automáticamente. Busque allí el abono marcado como «FeohLedger discount» con el id de este pago, y aplíquelo o elimínelo para que el descuento se cuente una sola vez.';
+  }
+
+  @override
+  String get exceptionDescriptionErpDiscountCreditStalledUnnamed =>
+      'Su ERP puede tener un abono por descuento por pronto pago que FeohLedger creó para el pago de esta factura y que no pudo aplicar ni revertir automáticamente. Busque allí el abono marcado como «FeohLedger discount» con el id de este pago, y aplíquelo o elimínelo para que el descuento se cuente una sola vez.';
 
   @override
   String get exceptionDescriptionErpSyncBackFailed =>
@@ -5128,4 +5215,18 @@ class AppLocalizationsEs extends AppLocalizations {
   @override
   String get legalAcceptAppOutdated =>
       'Esta versión de la app muestra unos Términos o una Política de privacidad anteriores a los vigentes, por lo que no puede registrar su aceptación. Actualice la app desde su tienda de aplicaciones o acepte en la aplicación web y vuelva a iniciar sesión.';
+
+  @override
+  String invoiceDetailAssignedElsewhere(String name) {
+    return 'Asignada a $name: aun así puede actuar como aprobador.';
+  }
+
+  @override
+  String get invoiceDetailAssignedElsewhereUnnamed =>
+      'Asignada a un compañero: aun así puede actuar como aprobador.';
+
+  @override
+  String payQueueRescheduledFrom(String date) {
+    return 'reprogramada desde el $date';
+  }
 }

@@ -52,6 +52,9 @@ def _invoice(**overrides):
         # invoice's own currency rather than a hardcoded `$` (decisions.md §157).
         currency="USD",
         status=InvoiceStatus.new,
+        # Read when a `duplicate` / `fraud_flag` is raised, to ask whether the
+        # invoice's bill is already in the ERP (decisions §542).
+        erp_document_id=None,
         po_number=None,
         po_match=None,
         contract_id=None,
@@ -86,6 +89,10 @@ def _mk_db(dup_count: int = 0, exception_count: int = 0):
     db.execute = AsyncMock(side_effect=results)
     db.add = MagicMock()
     db.flush = AsyncMock()
+    # `AsyncSession.begin_nested()` is synchronous and returns an async context
+    # manager (the flag-on-posted-bill notice runs in one); an `AsyncMock`
+    # attribute would hand back a never-awaited coroutine instead.
+    db.begin_nested = MagicMock()
     return db
 
 

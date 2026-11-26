@@ -9,6 +9,7 @@ import {
 	visibleChildren,
 	type NavLink,
 	type NavGroup,
+	type OrgCapability
 } from './nav';
 import {
 	PERM_PAYMENT_EXECUTE,
@@ -18,6 +19,7 @@ import {
 	PERM_VENDOR_BLOCK,
 	PERM_VENDOR_MANAGE
 } from './types/admin';
+import { NAV_PAGES, navPageFor } from './help/navPages';
 
 const links = NAV.filter((e): e is NavLink => e.kind === 'link');
 const link = (href: string): NavLink => links.find((l) => l.href === href)!;
@@ -60,7 +62,10 @@ const url = (p: string) => new URL(`http://acme.localhost:7777${p}`);
 const ALL_FOUR = ['admin', 'ap_manager', 'ap_clerk', 'cfo'];
 const NOT_CLERK = ['admin', 'ap_manager', 'cfo'];
 
-const NAV_GATES: Record<string, { roles: string[] | null; permissions?: string[] }> = {
+const NAV_GATES: Record<
+	string,
+	{ roles: string[] | null; permissions?: string[]; capability?: OrgCapability }
+> = {
 	// top-level links
 	'/': { roles: null },
 	'/invoices': { roles: null },
@@ -110,7 +115,8 @@ const NAV_GATES: Record<string, { roles: string[] | null; permissions?: string[]
 	'/admin?tab=users': { roles: ['admin'], permissions: [PERM_USER_MANAGE] },
 	'/admin?tab=roles': { roles: ['admin'] },
 	'/admin/entities': { roles: ['admin'] },
-	'/admin/partner': { roles: ['admin'] },
+	// Also needs the operator-granted partner capability (decisions §574).
+	'/admin/partner': { roles: ['admin'], capability: 'partner' },
 	'/admin/api-keys': { roles: ['admin'] },
 	'/admin/webhooks': { roles: ['admin'] },
 	'/admin/health': { roles: ['admin'] }
@@ -121,7 +127,11 @@ test('every nav row carries exactly the gate the role matrix pins', () => {
 	const actual = Object.fromEntries(
 		rows.map((r) => [
 			r.href,
-			{ roles: r.roles ?? null, ...(r.permissions ? { permissions: r.permissions } : {}) }
+			{
+				roles: r.roles ?? null,
+				...(r.permissions ? { permissions: r.permissions } : {}),
+				...(r.capability ? { capability: r.capability } : {})
+			}
 		])
 	);
 	// Compared as whole objects: a row missing from the table, a table entry
@@ -343,6 +353,62 @@ test('canSee: permissions is an OR alternative to roles, not an AND', () => {
 	// permissions declared but no can function supplied (e.g. a caller that
 	// never passes one) must not throw and must not grant access on its own.
 	expect(canSee(undefined, noHas, [PERM_USER_MANAGE])).toBe(false);
+});
+
+// ---------------------------------------------------------------------------
+// The operator-granted capability gate (decisions §574). Partner Admin needs
+// the admin role AND a workspace the operator made a partner — the same two
+// checks every /api/partner route makes — so the row and the page agree.
+// ---------------------------------------------------------------------------
+
+test('canSee: a capability is ANDed on top of the role gate, and fails closed', () => {
+	const hasAdmin = (...r: string[]) => r.includes('admin');
+	const partner = (c: OrgCapability) => c === 'partner';
+	const notPartner = () => false;
+	expect(canSee(['admin'], hasAdmin, undefined, undefined, 'partner', partner)).toBe(true);
+	expect(canSee(['admin'], hasAdmin, undefined, undefined, 'partner', notPartner)).toBe(false);
+	// No check passed at all: hidden, never shown by default.
+	expect(canSee(['admin'], hasAdmin, undefined, undefined, 'partner')).toBe(false);
+	// The capability does not stand in for the role.
+	expect(canSee(['admin'], () => false, undefined, undefined, 'partner', partner)).toBe(false);
+	// A row with no capability ignores the check.
+	expect(canSee(['admin'], hasAdmin, undefined, undefined, undefined, notPartner)).toBe(true);
+});
+
+test('help pages carry the capability gate, so help never links Partner Admin to a non-partner', () => {
+	const page = navPageFor('/admin/partner')!;
+	expect(page.capability).toBe('partner');
+	const hasAdmin = (...r: string[]) => r.includes('admin');
+	const partner = (c: OrgCapability) => c === 'partner';
+	const notPartner = () => false;
+	// The call shape both help routes use.
+	expect(canSee(page.roles, hasAdmin, page.permissions, undefined, page.capability, notPartner)).toBe(false);
+	expect(canSee(page.roles, hasAdmin, page.permissions, undefined, page.capability, partner)).toBe(true);
+	// Every sidebar row's capability survives the flattening, not just this one.
+	const navCaps = NAV.flatMap((e) =>
+		e.kind === 'link' ? [[e.href, e.capability]] : e.children.map((c) => [c.href, c.capability])
+	);
+	for (const [href, cap] of navCaps) {
+		expect(NAV_PAGES.find((p) => p.href === href)?.capability, href as string).toBe(cap);
+	}
+});
+
+test('Partner Admin shows only to an admin of a partner workspace', () => {
+	const hasAdmin = (...r: string[]) => r.includes('admin');
+	const hasClerk = (...r: string[]) => r.includes('ap_clerk');
+	const partner = (c: OrgCapability) => c === 'partner';
+	const notPartner = () => false;
+	const tabs = (has: typeof hasAdmin, cap?: (c: OrgCapability) => boolean) =>
+		visibleChildren(settings, has, () => false, cap).map((c) => c.href);
+
+	expect(tabs(hasAdmin, partner)).toContain('/admin/partner');
+	expect(tabs(hasAdmin, notPartner)).not.toContain('/admin/partner');
+	expect(tabs(hasAdmin)).not.toContain('/admin/partner');
+	expect(tabs(hasClerk, partner)).not.toContain('/admin/partner');
+	// Everything else in Settings is untouched by the capability.
+	expect(tabs(hasAdmin, partner).filter((h) => h !== '/admin/partner')).toEqual(
+		tabs(hasAdmin, notPartner)
+	);
 });
 
 test('a user.manage-only custom role sees the Users tab but not Roles', () => {

@@ -90,7 +90,11 @@ class UpcomingPayment(BaseModel):
     # USD-reporting tenant (docs/decisions.md §200).
     amount: MoneyAmount
     currency: str | None
+    # The EFFECTIVE due date (the current payment schedule's, else the
+    # invoice's own) — the date `is_overdue` reads, as the overdue count does.
     due_date: str | None
+    # The invoice's own due date; differs from `due_date` when rescheduled.
+    own_due_date: str | None = None
     is_overdue: bool
 
 

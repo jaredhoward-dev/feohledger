@@ -45,7 +45,7 @@ test.describe('account load failure', () => {
 		// panel is not a fixed number.)
 		const beforeRetry = meCalls;
 		failing = false;
-		await page.getByRole('button', { name: 'Try again' }).click();
+		await page.getByRole('button', { name: 'Retry', exact: true }).click();
 
 		// The app shell renders on the same page once /me answers.
 		await expect(page.locator('#main-content')).toBeVisible();
@@ -68,7 +68,7 @@ test.describe('account load failure', () => {
 		await expect(heading).toBeFocused();
 
 		hold = new Promise<void>((resolve) => (release = resolve));
-		const retry = page.getByRole('button', { name: 'Try again' });
+		const retry = page.getByRole('button', { name: 'Retry', exact: true });
 		await retry.focus();
 		await page.keyboard.press('Enter');
 		// In flight: the panel stays, the button says so and keeps focus
@@ -79,7 +79,7 @@ test.describe('account load failure', () => {
 		await expect(page.getByRole('status')).toHaveText('Retrying…');
 
 		release();
-		await expect(page.getByRole('button', { name: 'Try again' })).toBeVisible();
+		await expect(page.getByRole('button', { name: 'Retry', exact: true })).toBeVisible();
 		await expect(heading).toBeFocused();
 	});
 

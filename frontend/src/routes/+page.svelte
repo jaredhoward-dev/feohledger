@@ -4,7 +4,7 @@
 	import type { InvoiceStatus } from '#lib/types/invoice.ts';
 	import PageHeader from '#lib/components/ui/PageHeader.svelte';
 	import KpiCard from '#lib/components/ui/KpiCard.svelte';
-	import Badge from '#lib/components/ui/Badge.svelte';
+	import DueDate from '#lib/components/ui/DueDate.svelte';
 	import EmptyState from '#lib/components/ui/EmptyState.svelte';
 	import LoadError from '#lib/components/ui/LoadError.svelte';
 	import SetupChecklist from '#lib/components/ui/SetupChecklist.svelte';
@@ -148,11 +148,9 @@
 		return formatMoney(amount, { currency, whole: true });
 	}
 
-	// Due-date cell: locale-aware short date, no year (the shared helper drives
-	// its locale off the active i18n picker).
-	function fmtDue(iso: string | null): string {
-		return formatDate(iso, '—', { month: 'short', day: 'numeric' });
-	}
+	// The upcoming list's compact date: locale-aware (the shared helper follows
+	// the active i18n picker), no year.
+	const DUE_OPTS: Intl.DateTimeFormatOptions = { month: 'short', day: 'numeric' };
 
 	// Pipeline order
 	const PIPELINE_ORDER: InvoiceStatus[] = [
@@ -580,10 +578,14 @@
 									>{formatMoney(inv.amount, { currency: inv.currency })}</span
 								>
 								<span class="upcoming-date" class:overdue-text={inv.is_overdue}>
-									{fmtDue(inv.due_date)}
-									{#if inv.is_overdue}
-										<Badge tone="danger" variant="overdue-badge">{m('dashboard.overdue')}</Badge>
-									{/if}
+									<DueDate
+										due={inv.due_date}
+										own={inv.own_due_date}
+										overdue={inv.is_overdue}
+										overdueLabel={m('dashboard.overdue')}
+										opts={DUE_OPTS}
+										align="end"
+									/>
 								</span>
 							</div>
 						{/each}
@@ -1171,15 +1173,6 @@
 
 	.overdue-text {
 		color: var(--danger);
-	}
-
-	/* Colour + metrics come from `ui/Badge.svelte`; this keeps only the spacing
-	   that is the CALLER's business — the gap between the due date and the flag.
-	   `/payments` already renders this same flag through the primitive, so the
-	   dashboard's own copy (0.62rem, alpha .12, a literal #f06464 where the
-	   palette says --danger-on-tint) was the same badge at a second size. */
-	:global(.overdue-badge) {
-		margin-left: 4px;
 	}
 
 	/* Trend */

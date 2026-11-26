@@ -15,6 +15,7 @@
 	import { invoiceStore } from '#lib/stores/invoices.svelte.ts';
 	import { auth } from '#lib/stores/auth.svelte.ts';
 	import ErpOrphanBill from '#lib/components/erp/ErpOrphanBill.svelte';
+	import ErpBillConfirm from '#lib/components/erp/ErpBillConfirm.svelte';
 	import { adminStore } from '#lib/stores/admin.svelte.ts';
 	import { api, ApiError } from '#lib/api.ts';
 	import {
@@ -59,6 +60,8 @@
 		type InvoiceActionVerdicts
 	} from '#lib/api/invoices.ts';
 	import { isAllowed, isOffered, refusalText } from '#lib/api/actionVerdicts.ts';
+	import RefusalNote from '#lib/components/ui/RefusalNote.svelte';
+	import { assignedElsewhere } from '#lib/utils/reviewAssignment.ts';
 	import RecallApprovalModal from '#lib/components/modals/RecallApprovalModal.svelte';
 	import LoadError from '#lib/components/ui/LoadError.svelte';
 	import { listInvoiceChart } from '#lib/api/glAccounts.ts';
@@ -699,21 +702,34 @@
 			verdictsFailed = false;
 		}
 	});
-	// The assignee clause is presentation, not a server rule: the endpoint
-	// accepts any approver, and docs/followups.md tracks deciding whether
-	// assignment should be enforced there or dropped here.
-	let isAssignedElsewhere = $derived(
-		!!invoice.assigned_to_id && invoice.assigned_to_id !== auth.user?.id
-	);
+	// Assignment is routing, not authority (decisions §564): the verdict alone
+	// decides whether Approve / Reject are offered. When the invoice is someone
+	// else's, the footer says so beside the buttons instead of hiding them.
+	let assignedTo = $derived(assignedElsewhere(invoice, auth.user?.id));
 	let canReview = $derived(
-		isReadyForReview &&
-			!isAssignedElsewhere &&
-			(isOffered(verdicts?.approve) || isOffered(verdicts?.reject))
+		isReadyForReview && (isOffered(verdicts?.approve) || isOffered(verdicts?.reject))
 	);
 	// The reason to show beside a DISABLED Approve — never for
 	// `role_not_permitted`, where the button is not rendered at all.
 	let approveRefusal = $derived(
 		isOffered(verdicts?.approve) ? (verdicts?.approve ?? null) : null
+	);
+	// What each decision button's `aria-describedby` names: the assignee note
+	// (so a screen-reader user hears whose invoice it is before acting), and
+	// for Approve its refusal when disabled.
+	let approveDescribedBy = $derived(
+		[approveRefusal ? 'approve-refusal' : null, assignedTo ? 'review-assigned-elsewhere' : null]
+			.filter(Boolean)
+			.join(' ') || undefined
+	);
+	let rejectDescribedBy = $derived(assignedTo ? 'review-assigned-elsewhere' : undefined);
+	// The verdict for an invoice in review is still on its way: the footer's
+	// review region shows that, rather than the "Assigned to X for review."
+	// line it would swap for the buttons a moment later. Fail closed: nothing
+	// is offered until the answer lands, and a failed read falls back to the
+	// line (the form's LoadError says why).
+	let verdictsLoading = $derived(
+		isReadyForReview && !!invoice.id && verdicts === undefined && !verdictsFailed
 	);
 	// `POST /{id}/complete` (Submit / Send to ERP / Mark Complete). Hidden for
 	// a status it does not advance — not something the reader can act on, like
@@ -2531,17 +2547,37 @@
 								</p>
 							{/if}
 						{/if}
-						{#if isOffered(verdicts?.erp_orphan_lookup_refusal)}
+						{#if isOffered(verdicts?.erp_orphan_lookup_refusal) && !isOffered(verdicts?.erp_bill_confirm_refusal)}
 							<!-- The bill this failed push may have left in the ERP
 							     (decisions §556): find it, then void or keep it. Shown
 							     from the server's verdict alone (§560); keyed on the
-							     invoice so one invoice's bill never shows on another. -->
+							     invoice so one invoice's bill never shows on another.
+							     Not beside the shared-key confirmation below: that push
+							     was refused before it created a bill, so this panel could
+							     only state its own refusal next to a second, disabled
+							     "Find it in the ERP". The confirmation finds the one bill
+							     in question and is the action that resolves the failure. -->
 							{#key invoice.id}
 								<ErpOrphanBill
 									invoiceId={invoice.id}
 									verdict={verdicts?.erp_orphan_lookup_refusal ?? null}
 									idPrefix="invoice-erp-orphan"
 									onvoided={() => loadVerdicts()}
+								/>
+							{/key}
+						{/if}
+						{#if isOffered(verdicts?.erp_bill_confirm_refusal)}
+							<!-- A push refused because another invoice shares this
+							     supplier + number (§572): confirm the bill found there
+							     is this invoice's, which retries the push (§587). From
+							     the server's verdict alone; like Retry ERP Send, a
+							     confirmation closes the modal and the host refetches. -->
+							{#key invoice.id}
+								<ErpBillConfirm
+									invoiceId={invoice.id}
+									verdict={verdicts?.erp_bill_confirm_refusal ?? null}
+									idPrefix="invoice-erp-bill-confirm"
+									onconfirmed={() => onclose()}
 								/>
 							{/key}
 						{/if}
@@ -2949,6 +2985,21 @@
 							<div class="review-title">{m('invoices.modal.review.title')}</div>
 							<HelpTip term="segregation-of-duties" />
 						</div>
+						{#if assignedTo}
+							<!-- Non-blocking: any approver the server accepts may act; this
+							     only keeps them from taking a colleague's invoice unawares. -->
+							<p
+								class="review-assigned-hint review-assigned-note"
+								id="review-assigned-elsewhere"
+								data-testid="review-assigned-elsewhere"
+							>
+								{#if assignedTo.name}
+									{m('invoices.modal.review.assignedElsewherePre')}<strong>{assignedTo.name}</strong>{m('invoices.modal.review.assignedElsewherePost')}
+								{:else}
+									{m('invoices.modal.review.assignedElsewhereUnnamed')}
+								{/if}
+							</p>
+						{/if}
 						{#if showRejectForm}
 							<div class="reject-form">
 								<textarea
@@ -2972,7 +3023,7 @@
 										type="button"
 										class="btn-primary review-choice"
 										disabled={reviewing || !isAllowed(verdicts?.approve)}
-										aria-describedby={approveRefusal ? 'approve-refusal' : undefined}
+										aria-describedby={approveDescribedBy}
 										onclick={handleApprove}
 									>
 										<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" aria-hidden="true"><polyline points="20 6 9 17 4 12"/></svg>
@@ -2984,6 +3035,7 @@
 										type="button"
 										class="btn-danger review-choice"
 										disabled={reviewing || !isAllowed(verdicts?.reject)}
+										aria-describedby={rejectDescribedBy}
 										onclick={() => (showRejectForm = true)}
 									>
 										<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
@@ -3001,6 +3053,10 @@
 							{/if}
 						{/if}
 					</div>
+				{:else if verdictsLoading}
+					<div class="review-section">
+						<LoadingState label={m('invoices.modal.review.checking')} testId="review-verdicts-loading" />
+					</div>
 				{:else if isReadyForReview && invoice.assigned_to}
 					<div class="review-section">
 						<p class="review-assigned-hint">{m('invoices.modal.review.assignedHintPre')}<strong>{invoice.assigned_to}</strong>{m('invoices.modal.review.assignedHintPost')}</p>
@@ -3008,6 +3064,36 @@
 				{/if}
 
 					<div class="footer-right">
+						{#if (canSubmit && (submitRefusal || awaitingApprover)) || (resubmitOffered && resubmitRefusal) || (recallOffered && recallRefusal)}
+							<!-- Why a footer action is refused, on its own line ABOVE the
+							     buttons (ui/RefusalNote, ui-patterns § Showing the reason);
+							     each refused button names its note in aria-describedby. -->
+							<div class="footer-refusals">
+								{#if canSubmit && submitRefusal}
+									<!-- The server's reason Submit would be refused (an ERP export
+									     gate, a clerk past the entry window), localized from its
+									     code, instead of a 409 after the click. -->
+									<RefusalNote id="submit-refusal" reason={refusalText(submitRefusal, m)} testid="submit-refusal" />
+								{:else if canSubmit && awaitingApprover}
+									<!-- The one reason Submit is disabled that the reader can fix
+									     here: say so rather than leaving it greyed. -->
+									<RefusalNote
+										id="approver-required-hint"
+										reason={m('invoices.modal.approverRequiredHint')}
+										testid="approver-required-hint"
+									/>
+								{/if}
+								{#if resubmitOffered && resubmitRefusal}
+									<RefusalNote id="resubmit-refusal" reason={refusalText(resubmitRefusal, m)} testid="resubmit-refusal" />
+								{/if}
+								{#if recallOffered && recallRefusal}
+									<!-- Why the approval can't be taken back, from the server's
+									     verdict: a bill the ERP may hold, a rail paying it, a
+									     PEPPOL transmission or an inter-company pair. -->
+									<RefusalNote id="recall-refusal" reason={refusalText(recallRefusal, m)} testid="recall-refusal" />
+								{/if}
+							</div>
+						{/if}
 						<button type="button" class="btn-cancel" onclick={onclose}>{m('common.cancel')}</button>
 						{#if canExtract || extracting}
 							<button type="button" class="btn-secondary" disabled={extracting} onclick={handleExtract}>
@@ -3063,20 +3149,6 @@
 							>
 								{submitting ? m('invoices.modal.submitting') : submitLabel}
 							</button>
-							{#if submitRefusal}
-								<!-- The server's reason Submit would be refused (an ERP export
-								     gate, a clerk past the entry window), localized from its
-								     code, instead of a 409 after the click. -->
-								<p class="approver-hint" id="submit-refusal" data-testid="submit-refusal">
-									{refusalText(submitRefusal, m)}
-								</p>
-							{:else if awaitingApprover}
-								<!-- The one reason Submit is disabled that the reader can fix
-								     here: say so beside the button rather than leaving it greyed. -->
-								<p class="approver-hint" id="approver-required-hint" data-testid="approver-required-hint">
-									{m('invoices.modal.approverRequiredHint')}
-								</p>
-							{/if}
 						{/if}
 						{#if resubmitOffered}
 							<button
@@ -3089,11 +3161,6 @@
 							>
 								{resubmitting ? m('invoices.modal.submitting') : m('invoices.modal.submit.resubmit')}
 							</button>
-							{#if resubmitRefusal}
-								<p class="approver-hint" id="resubmit-refusal" data-testid="resubmit-refusal">
-									{refusalText(resubmitRefusal, m)}
-								</p>
-							{/if}
 						{/if}
 						{#if recallOffered}
 							<button
@@ -3106,13 +3173,6 @@
 							>
 								{m('invoices.modal.recall.open')}
 							</button>
-							{#if recallRefusal}
-								<!-- Why the approval can't be taken back, from the server's
-								     verdict: a bill the ERP may hold, or a rail paying it. -->
-								<p class="approver-hint" id="recall-refusal" data-testid="recall-refusal">
-									{refusalText(recallRefusal, m)}
-								</p>
-							{/if}
 						{/if}
 					</div>
 				</footer>
@@ -3744,19 +3804,13 @@
 	/* Shown in place of the picker when there is no reviewer to offer —
 	   explains what Submit will do rather than leaving a bare disabled button. */
 	.approver-note,
-	.approver-hint {
-		margin: 0;
-		max-width: 320px;
-		font-size: 0.78rem;
-		line-height: 1.35;
-		color: var(--text-muted);
-	}
-
-	/* Its own line under the buttons, right-aligned beside Submit. */
-	.approver-hint {
+	/* The refused footer actions' reasons: one full-width line above the
+	   buttons, right-aligned over them. */
+	.footer-refusals {
 		flex-basis: 100%;
-		max-width: none;
-		text-align: right;
+		display: flex;
+		flex-direction: column;
+		align-items: flex-end;
 	}
 
 	/* E-invoice section + its format dropdown */
@@ -4521,6 +4575,10 @@
 		font-size: 0.78rem;
 		color: var(--text-muted);
 		margin: 0;
+	}
+
+	.review-assigned-note {
+		margin-bottom: 0.5rem;
 	}
 
 	.review-refusal {

@@ -841,6 +841,30 @@ class AppLocalizationsEn extends AppLocalizations {
       'A virtual card has been issued to pay this invoice. Cancel the card before recalling the approval.';
 
   @override
+  String get codedRefusalRecallPeppolTransmitted =>
+      'This invoice has already been sent over PEPPOL, and the receiver holds the approved document. Issue a credit note and send a corrected invoice; its approval can\'t be recalled.';
+
+  @override
+  String get codedRefusalRecallMirrorUnsigned =>
+      'This invoice has been routed inter-company, and its mirror under the other entity copied the approved figures. Delete the mirror (it hasn\'t been approved yet), then recall this approval, and route the invoice again once it is re-approved.';
+
+  @override
+  String get codedRefusalRecallMirrorProgressed =>
+      'This invoice has been routed inter-company, and its mirror under the other entity has already been approved or is being paid there. Correct the pair with a credit memo on each side; this approval can\'t be recalled.';
+
+  @override
+  String get codedRefusalRecallIsMirror =>
+      'This invoice is an inter-company mirror: its figures are copied from the originating invoice under the other entity. Delete this mirror and correct the original invoice, then route it again.';
+
+  @override
+  String get codedRefusalPartnerCapabilityRequired =>
+      'This workspace is not set up as a partner. Partner Admin is enabled by FeohLedger on request — contact support if you resell or manage other workspaces.';
+
+  @override
+  String get codedRefusalPartnerLinkingDisabled =>
+      'Partner linking is not enabled on this platform yet, so no link code can be generated. Contact support.';
+
+  @override
   String invoicesBulkRejectTitle(int count) {
     String _temp0 = intl.Intl.pluralLogic(
       count,
@@ -2508,6 +2532,11 @@ class AppLocalizationsEn extends AppLocalizations {
   }
 
   @override
+  String erpRefusalBillKeyShared(String provider) {
+    return '$provider already has a bill with this supplier and invoice number, and another invoice in FeohLedger has the same supplier and number, so that bill wasn\'t linked to this invoice and no second bill was created. Check in $provider which invoice the bill is for. If this invoice\'s number is wrong, correct it and retry; otherwise ask an administrator how to proceed.';
+  }
+
+  @override
   String erpRefusalExceptionBlocksExport(String type) {
     return 'This invoice has an open $type exception. Resolve or dismiss it in Exceptions, then send it to the ERP.';
   }
@@ -3900,6 +3929,21 @@ class AppLocalizationsEn extends AppLocalizations {
       'Your ERP did not record this invoice\'s payment, so the bill still shows as unpaid there although the money was paid. Resolve what stopped it, then use Retry ERP sync on the payment\'s run in Payments.';
 
   @override
+  String exceptionDescriptionErpPaymentWritebackUnconfirmed(
+    String erp,
+    String marker,
+  ) {
+    return '$erp may already show this invoice\'s payment: FeohLedger sent it but could not confirm it was recorded. Check the bill for a payment referenced “$marker” before recording one.';
+  }
+
+  @override
+  String exceptionDescriptionErpPaymentWritebackUnconfirmedUnnamed(
+    String marker,
+  ) {
+    return 'Your ERP may already show this invoice\'s payment: FeohLedger sent it but could not confirm it was recorded. Check the bill for a payment referenced “$marker” before recording one.';
+  }
+
+  @override
   String exceptionDescriptionErpPaymentWritebackBalanceOpen(
     String erp,
     String amount,
@@ -3915,6 +3959,40 @@ class AppLocalizationsEn extends AppLocalizations {
   }
 
   @override
+  String exceptionDescriptionErpDiscountCreditPending(
+    String erp,
+    String amount,
+    String credit,
+  ) {
+    return '$erp recorded this invoice\'s payment, but the bill still shows $amount open there. FeohLedger booked credit $credit for the early-payment discount and will apply it, so don\'t book another.';
+  }
+
+  @override
+  String exceptionDescriptionErpDiscountCreditPendingUnnamed(
+    String amount,
+    String credit,
+  ) {
+    return 'Your ERP recorded this invoice\'s payment, but the bill still shows $amount open there. FeohLedger booked credit $credit for the early-payment discount and will apply it, so don\'t book another.';
+  }
+
+  @override
+  String exceptionDescriptionErpDiscountCreditPendingUnidentified(
+    String erp,
+    String amount,
+    String marker,
+  ) {
+    return '$erp recorded this invoice\'s payment, but the bill still shows $amount open there. FeohLedger may have booked a credit for this discount, so check for “$marker” before booking one.';
+  }
+
+  @override
+  String exceptionDescriptionErpDiscountCreditPendingUnidentifiedUnnamed(
+    String amount,
+    String marker,
+  ) {
+    return 'Your ERP recorded this invoice\'s payment, but the bill still shows $amount open there. FeohLedger may have booked a credit for this discount, so check for “$marker” before booking one.';
+  }
+
+  @override
   String exceptionDescriptionErpPaymentVoidWritebackFailed(String erp) {
     return '$erp still shows this bill paid by a payment that was voided in FeohLedger, because voiding it in the ERP failed. Void that payment in the ERP so the books agree.';
   }
@@ -3922,6 +4000,15 @@ class AppLocalizationsEn extends AppLocalizations {
   @override
   String get exceptionDescriptionErpPaymentVoidWritebackFailedUnnamed =>
       'Your ERP still shows this bill paid by a payment that was voided in FeohLedger, because voiding it in the ERP failed. Void that payment in the ERP so the books agree.';
+
+  @override
+  String exceptionDescriptionErpDiscountCreditStalled(String erp) {
+    return '$erp may hold an early-payment discount credit FeohLedger created for this invoice\'s payment that it could not apply or reverse automatically. Find the credit marked “FeohLedger discount” with this payment\'s id there, and apply or delete it so the discount is counted once.';
+  }
+
+  @override
+  String get exceptionDescriptionErpDiscountCreditStalledUnnamed =>
+      'Your ERP may hold an early-payment discount credit FeohLedger created for this invoice\'s payment that it could not apply or reverse automatically. Find the credit marked “FeohLedger discount” with this payment\'s id there, and apply or delete it so the discount is counted once.';
 
   @override
   String get exceptionDescriptionErpSyncBackFailed =>
@@ -5097,4 +5184,18 @@ class AppLocalizationsEn extends AppLocalizations {
   @override
   String get legalAcceptAppOutdated =>
       'This version of the app shows older Terms or an older Privacy Policy than the ones now in force, so it cannot record your acceptance. Update the app from your app store, or accept in the web app, then sign in again.';
+
+  @override
+  String invoiceDetailAssignedElsewhere(String name) {
+    return 'Assigned to $name — you can still act as an approver.';
+  }
+
+  @override
+  String get invoiceDetailAssignedElsewhereUnnamed =>
+      'Assigned to a colleague — you can still act as an approver.';
+
+  @override
+  String payQueueRescheduledFrom(String date) {
+    return 'rescheduled from $date';
+  }
 }

@@ -188,6 +188,7 @@ def _caller_verdicts(
     org_settings: dict | None,
     instance: WorkflowInstance | None = None,
     orphan_instance: WorkflowInstance | None = None,
+    orphan_key_shared: bool = False,
 ) -> dict:
     """The caller's verdicts on this row's actions, for the list and the detail:
     Resolve / Dismiss / Escalate (`decision_refusals`) and — only on a row that
@@ -213,7 +214,11 @@ def _caller_verdicts(
         )
         # The bill a failed push may have left (decisions §556, §560): absent
         # unless the flag's invoice is such a push, so nothing is offered then.
-        out.update(orphan_lookup_verdicts(inv, orphan_instance, user, org_settings))
+        out.update(
+            orphan_lookup_verdicts(
+                inv, orphan_instance, user, org_settings, key_shared=orphan_key_shared
+            )
+        )
     if is_erp_paid_report(exc):
         out["record_erp_payment_refusal"] = record_erp_payment_refusal(
             exc, inv, user, org_settings, instance
@@ -230,6 +235,21 @@ async def _orphan_instances(db: AsyncSession, rows) -> dict:
     return await workflow_instances_for(
         db, [inv for exc, inv in rows if is_void_candidate(exc) and may_be_orphan(inv)]
     )
+
+
+async def _orphan_keys_shared(db: AsyncSession, org_settings, rows, orphan_instances) -> set:
+    """The rows' invoice ids whose lookup key another invoice shares
+    (``erp_bill_void.shared_lookup_keys``, decisions §566): queried only for
+    a failed push that may have posted, and only under an adapter whose key
+    is shared."""
+    from app.services.erp_bill_void import orphan_candidate, shared_lookup_keys
+
+    candidates = {
+        inv.id: inv
+        for _exc, inv in rows
+        if inv is not None and orphan_candidate(inv, orphan_instances.get(inv.id))
+    }
+    return await shared_lookup_keys(db, org_settings, list(candidates.values()))
 
 
 def _exception_dict(exc: APException, inv: Invoice | None) -> dict:
@@ -451,6 +471,7 @@ async def list_exceptions(
         db, [inv for exc, inv in rows if needs_approval_chain(exc, inv)]
     )
     orphan_instances = await _orphan_instances(db, rows)
+    orphan_shared = await _orphan_keys_shared(db, org.settings, rows, orphan_instances)
 
     items = [
         {
@@ -464,6 +485,7 @@ async def list_exceptions(
                 org.settings,
                 instances.get(inv.id) if inv else None,
                 orphan_instances.get(inv.id) if inv else None,
+                bool(inv and inv.id in orphan_shared),
             ),
         }
         for exc, inv in rows
@@ -602,10 +624,20 @@ async def get_exception(
     # With the caller's verdicts, like a list row: the queue opens this row's
     # dialog from a deep link (`/exceptions?id=`) and offers its buttons from them.
     instance = await workflow_instance_for(db, exc, inv)
-    orphan_instance = (await _orphan_instances(db, [(exc, inv)])).get(inv.id) if inv else None
+    orphan_instances = await _orphan_instances(db, [(exc, inv)])
+    orphan_instance = orphan_instances.get(inv.id) if inv else None
+    orphan_shared = await _orphan_keys_shared(db, org.settings, [(exc, inv)], orphan_instances)
     return {
         **_exception_dict(exc, inv),
-        **_caller_verdicts(exc, inv, user, org.settings, instance, orphan_instance),
+        **_caller_verdicts(
+            exc,
+            inv,
+            user,
+            org.settings,
+            instance,
+            orphan_instance,
+            bool(inv and inv.id in orphan_shared),
+        ),
     }
 
 

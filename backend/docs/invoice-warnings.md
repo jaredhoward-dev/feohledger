@@ -309,9 +309,23 @@ unnamed (no `{erp}` twin; the adapter is in `erp_report`), with
 `settled_no_payment` and `source: poll` when the sweep read it (decisions
 §533). The payment write-back
 (`services/erp_payment_writeback`) and `services/payment_erp_sync`'s failed leg
-use the same family: `erp_payment_writeback_failed`,
-`erp_payment_writeback_balance_open` (`amount` money + `currency`),
-`erp_payment_void_writeback_failed`, and `erp_sync_back_failed` (no ERP name —
+use the same family: `erp_payment_writeback_failed` (a refusal before any
+write: the bill still shows unpaid), `erp_payment_writeback_unconfirmed` (an
+unknown outcome, the attempts cap, or a record whose bill moved: `marker`
+(text) is the "FeohLedger payment <payment id>" to look for before recording
+one; decisions §588),
+`erp_payment_writeback_balance_open` (`amount` money + `currency`; only when
+no discount credit of ours can stand), `erp_discount_credit_pending` (the same
+open balance while our recorded credit `credit` (text) will be applied, so
+nobody books another) and `erp_discount_credit_pending_unidentified` (the credit
+may stand but FeohLedger cannot finish it: `marker` (text) is the
+"FeohLedger discount <payment id>" to check for) — all three on
+`erp_report.kind` `payment_writeback_balance_open`, chosen by
+`erp_payment_writeback._balance_open_finding` (decisions §585),
+`erp_payment_void_writeback_failed`, `erp_discount_credit_stalled` (a discount
+credit FeohLedger cannot finish alone, decisions §579; `erp_report.kind`
+`discount_credit_stalled` with `reason` and `discount_credit_marker`), and
+`erp_sync_back_failed` (no ERP name —
 the leg that failed need not be the ERP's, and the tenant may have none). Their
 `erp_report.kind` is `payment_writeback_failed` /
 `payment_writeback_balance_open` / `payment_void_writeback_failed` /

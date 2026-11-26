@@ -21,7 +21,6 @@
 		getPartnerOverview,
 		getChildBranding,
 		updateChildBranding,
-		mintLinkCode,
 		attachChild,
 		provisionChild,
 		detachChild
@@ -33,11 +32,14 @@
 		ProvisionedChild
 	} from '#lib/types/partner.ts';
 
-	// RBAC: the backend gates every /api/partner endpoint to admin only and 403s
-	// the rest. Wait for `auth.user` to resolve before redirecting so we don't
-	// bounce before /me lands (the api-keys / billing pages do the same).
+	// The backend gates every /api/partner endpoint on the admin role AND the
+	// operator-granted partner capability (`require_partner_capability`,
+	// decisions §574), and so do this page and its nav row (`#lib/nav.ts`).
+	// Wait for `auth.user` to resolve before redirecting so we don't bounce
+	// before /me lands (the api-keys / billing pages do the same). Consenting
+	// to BE adopted is in Organization settings, open to any admin.
 	const userLoaded = $derived(auth.user !== null);
-	const allowed = $derived(auth.isAdmin);
+	const allowed = $derived(auth.isAdmin && auth.hasCapability('partner'));
 
 	$effect(() => {
 		if (userLoaded && !allowed) goto('/');
@@ -166,34 +168,6 @@
 			toast(e instanceof Error ? e.message : m('admin.partner.toast.brandingSaveFailed'), 'error');
 		} finally {
 			saving = false;
-		}
-	}
-
-	// ── Link-code mint (this workspace consents to being a child) ──────────────
-	let mintedCode = $state<string | null>(null);
-	let mintExpiry = $state<number | null>(null);
-	let minting = $state(false);
-
-	async function mintCode() {
-		minting = true;
-		try {
-			const res = await mintLinkCode();
-			mintedCode = res.link_code;
-			mintExpiry = res.expires_in_minutes;
-		} catch (e) {
-			toast(e instanceof Error ? e.message : m('admin.partner.toast.mintFailed'), 'error');
-		} finally {
-			minting = false;
-		}
-	}
-
-	async function copyCode() {
-		if (!mintedCode) return;
-		try {
-			await navigator.clipboard.writeText(mintedCode);
-			toast(m('admin.partner.toast.codeCopied'), 'success');
-		} catch {
-			toast(m('admin.partner.toast.copyFailed'), 'error');
 		}
 	}
 
@@ -338,35 +312,12 @@
 		<HelpTip term="organization" />
 	</p>
 
-	<!-- Link-code panel: this workspace consents to being attached AS a child. A
-	     partner then redeems the code to link us under their account. -->
-	<section class="link-code-panel" data-testid="link-code-panel">
-		<h2>{m('admin.partner.join.heading')}</h2>
-		<p class="panel-hint">
-			{m('admin.partner.join.hint')}
-		</p>
-		<div class="link-code-actions">
-			<button type="button" class="btn-cancel" onclick={mintCode} disabled={minting}>
-				{minting ? m('admin.partner.join.generating') : m('admin.partner.join.generate')}
-			</button>
-		</div>
-		{#if mintedCode}
-			<div class="minted" data-testid="minted-link-code">
-				<code class="code-value">{mintedCode}</code>
-				<button type="button" class="btn-cancel copy-btn" onclick={copyCode}>{m('admin.partner.join.copy')}</button>
-				{#if mintExpiry !== null}
-					<span class="expiry">{m('admin.partner.join.expiresIn', { minutes: mintExpiry })}</span>
-				{/if}
-			</div>
-		{/if}
-	</section>
-
 	<!-- The table is mounted from first paint with DataTable's own "Loading…"
 	     row: a loading block swapped for the table (or for a separate
 	     "not a partner" note) moved the page when the overview landed. A
-	     workspace that is not a partner administers no children by definition
-	     (`is_partner` is derived from having one), so that state is the
-	     table's empty row, worded for it — decisions §501. `fixed` plus the
+	     partner with no children yet sees the table's empty row (a workspace
+	     that is not a partner never reaches this page — decisions §501, §574).
+	     `fixed` plus the
 	     header widths below keep the columns from re-sizing against the real
 	     rows (frontend/docs/ui-patterns.md § Data tables;
 	     tests-e2e/reactivity/layout-stability.spec.ts). -->
@@ -374,8 +325,7 @@
 		<LoadError message={error} onretry={load} testId="partner-error" />
 	{:else}
 		<!-- `wide` (the 1000px floor below) only while rows are on the way or
-		     present: the settled empty row is a sentence — for a workspace that
-		     is not a partner, the page's whole explanation — and a sentence
+		     present: the settled empty row is a sentence, and a sentence
 		     centred in a 1000px table runs off a phone screen (WCAG 1.4.10;
 		     tests-e2e/a11y/reflow.spec.ts). Loading keeps the floor so the
 		     header does not move when rows land. -->
@@ -385,9 +335,7 @@
 			fixed
 			{loading}
 			isEmpty={children.length === 0}
-			empty={overview && !overview.is_partner
-				? m('admin.partner.notPartner')
-				: m('admin.partner.empty')}
+			empty={m('admin.partner.empty')}
 		>
 			{#snippet body()}
 				{#each children as child (child.id)}
@@ -523,7 +471,7 @@
 		}}
 	>
 		<p class="modal-hint">
-			{m('admin.partner.attach.hint')}
+			{m('admin.partner.attach.hint', { panel: m('org.partnerLink.heading') })}
 		</p>
 		<label>
 			<span>{m('admin.partner.attach.linkCode')} <em class="required">*</em></span>
@@ -673,53 +621,12 @@
 		gap: 0.75rem;
 	}
 
-	.link-code-panel {
-		border: 1px solid var(--border);
-		border-radius: 8px;
-		padding: 1rem 1.25rem;
-		background: var(--surface);
-	}
 
-	.link-code-panel h2 {
-		margin: 0 0 0.25rem;
-		font-size: 1rem;
-	}
 
-	.panel-hint {
-		margin: 0 0 0.75rem;
-		color: var(--text-muted);
-		font-size: 0.82rem;
-		max-width: 640px;
-	}
 
-	.link-code-actions {
-		display: flex;
-		gap: 0.5rem;
-	}
 
-	.minted {
-		display: flex;
-		align-items: center;
-		gap: 0.75rem;
-		margin-top: 0.75rem;
-		flex-wrap: wrap;
-	}
 
-	.code-value {
-		font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-		font-size: 0.78rem;
-		background: var(--bg);
-		border: 1px solid var(--border);
-		border-radius: 6px;
-		padding: 0.4rem 0.6rem;
-		max-width: 100%;
-		overflow-wrap: anywhere;
-	}
 
-	.expiry {
-		color: var(--text-muted);
-		font-size: 0.78rem;
-	}
 
 	.modal-hint {
 		margin: 0 0 0.75rem;
@@ -745,7 +652,4 @@
 		font-size: 0.85rem;
 	}
 
-	.copy-btn {
-		flex: none;
-	}
 </style>

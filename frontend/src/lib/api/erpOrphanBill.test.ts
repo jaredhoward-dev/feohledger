@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { orphanStateFrom } from "./erpOrphanBill.ts";
+import { confirmBillBody, orphanStateFrom } from "./erpOrphanBill.ts";
 
 describe("orphanStateFrom", () => {
   const bill = {
@@ -42,5 +42,26 @@ describe("orphanStateFrom", () => {
       kind: "error",
       message: "boom",
     });
+  });
+});
+
+describe("confirmBillBody", () => {
+  const bill = {
+    erp_document_id: "xero-77",
+    erp_document_number: "SUP-1",
+    amount: "10.00",
+    currency: "ZAR",
+    erp_status: "open",
+  };
+  it("sends the found bill's id and the trimmed reason", () => {
+    expect(confirmBillBody({ kind: "found", bill }, "  checked in Xero ")).toEqual({
+      erp_document_id: "xero-77",
+      reason: "checked in Xero",
+    });
+  });
+  it("is null without a found bill or a reason", () => {
+    expect(confirmBillBody({ kind: "found", bill }, "   ")).toBeNull();
+    expect(confirmBillBody({ kind: "none" }, "reason")).toBeNull();
+    expect(confirmBillBody({ kind: "idle" }, "reason")).toBeNull();
   });
 });

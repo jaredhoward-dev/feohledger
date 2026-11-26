@@ -6,7 +6,7 @@ source's unseal budget is spent for a tenant whose data key is cold (decisions
 §408, §525, §527). Such a delivery is answered with the same silent 204 as a
 forged one and Merge never redelivers it, so a void in the ERP was never
 flagged. This sweep is the backstop: it asks each Merge tenant's change feed
-(``MergeDevAdapter.changed_bills``) for the bills changed since a stored
+(``MergeDevAdapter.bill_change_feed``) for the bills changed since a stored
 cursor, keeps those an invoice here was pushed as (``bills_we_posted``, the
 webhook's own pre-read filter), reads each back (``bill_report``) and applies
 it with ``erp_status_sync.apply_bill_report`` — the reconciler the webhook and
@@ -14,10 +14,13 @@ the QuickBooks / Xero status sync use. One reconciler, three channels: a bill
 means the same here whichever carried it.
 
 **The cursor** is the tenant's ``Organization.settings["erp_merge_readback"]``:
-``through`` (the moment the last listing started; the next one asks Merge for
-changes after ``through`` less ``FEOH_MERGE_READBACK_SWEEP_OVERLAP_MINUTES``,
-so a bill stamped just before our mark by a skewed clock or a lagging sync is
-still listed — decisions §543) and ``pending`` (bills of that listing not yet applied). The
+``through`` (the end of the last completed listing: the moment it started,
+when it reached the present; the next one asks Merge for changes after
+``through`` less ``FEOH_MERGE_READBACK_SWEEP_OVERLAP_MINUTES``, so a bill
+stamped just before our mark by a skewed clock or a lagging sync is still
+listed — decisions §543), ``pending`` (bills of that listing not yet applied),
+and only while they say something, ``deleted``, ``listed_at`` (when a window
+ended before the listing started) and ``window_minutes`` (below). The
 QuickBooks / Xero sync keeps its mark in ``settings.erp.oauth``, but a Merge
 connection has no OAuth block, and a key inside ``settings.erp`` would ride
 into the adapter config and the connection's realm. A first pass (no cursor)
@@ -36,9 +39,28 @@ Applying a bill twice changes nothing (``apply_bill_report`` re-checks under
 the invoice row lock and its flags dedupe while live), so two replicas applying
 the same listing apply it once.
 
-A bill Merge answers 404 for is not read as gone: only Merge's
-``Invoice.removed`` says that, and this feed carries no event (§399). It is
-dropped from ``pending`` and counted.
+**Deletions come from the listing** (decisions §567). Merge documents
+``remote_was_deleted`` on the listing (asked with ``include_deleted_data``) and
+says nothing of what ``GET /invoices/{id}`` answers for a deleted record. So
+the listing's deleted bills are kept in the cursor (``deleted``) beside
+``pending``, and each is read back like any other: a 200 is applied as read (a
+deleted bill reads ``deleted``; a restored one reads as it is now), and a 404
+for a bill the listing called deleted applies ``deleted`` — Merge's own word,
+as the webhook takes it for an ``Invoice.removed`` delivery (§399). A 404 for
+any other bill is not read as gone: it is dropped from ``pending`` and counted.
+
+**A long feed is read in windows** (decisions §567). A listing longer than
+``SYNC_LISTING_MAX_ROWS`` raises ``ErpListingIncomplete`` (truncated), and
+Merge documents no ordering for its pages, so no part of one can be kept.
+Instead the cursor keeps a ``window_minutes``: the next listing asks only
+``(since, since + window)`` (``modified_before``), half the span the truncated
+one asked, and a completed window moves ``through`` to its end, by the same
+compare-and-swap. Each completed window doubles the next; the one that
+reaches now drops the bound and the key. A window in the past is asked from
+its end less a second (Merge's stamps are whole seconds), not less the
+overlap, which covers only a mark set at our own clock's now; so a window
+always advances. At one minute the window narrows no further and the tenant
+fails each tick, logged, until a person looks.
 
 A tenant whose ERP credentials cannot be opened is logged (no exception text)
 and skipped; the others carry on. Never moves money: ``apply_bill_report``
@@ -58,7 +80,14 @@ from sqlalchemy.orm.attributes import flag_modified
 from app.config import settings
 from app.database import control_session_factory, get_tenant_engine
 from app.models.organization import Organization
-from app.services.erp_adapters.base import ErpAdapter, ErpCallBudgetExhausted
+from app.services.erp_adapters.base import (
+    ErpAdapter,
+    ErpBillReport,
+    ErpBillState,
+    ErpCallBudgetExhausted,
+    ErpListingIncomplete,
+    ListingGap,
+)
 from app.services.sweep_health import SWEEP_MERGE_READBACK, run_sweep_loop
 
 logger = logging.getLogger(__name__)
@@ -66,6 +95,11 @@ logger = logging.getLogger(__name__)
 #: ``Organization.settings`` key holding the per-tenant cursor.
 CURSOR_KEY = "erp_merge_readback"
 MERGE_PROVIDER = "merge_dev"
+#: The narrowest window a too-long feed is read in (decisions §567).
+MIN_WINDOW_MINUTES = 1
+#: A past window's end is re-read from this much before it: Merge's
+#: ``modified_after`` / ``modified_before`` are whole seconds.
+_SEAM = timedelta(seconds=1)
 
 
 @dataclass
@@ -79,6 +113,12 @@ class MergeReadbackResult:
     bills_applied: int = 0
     #: Merge answered 404 for a listed bill (not read as gone).
     bills_not_found: int = 0
+    #: Bills applied as deleted on the listing's ``remote_was_deleted`` after
+    #: the single read answered 404 (decisions §567).
+    bills_deleted_by_listing: int = 0
+    #: Tenants whose listing was too long: the window was narrowed, nothing
+    #: else moved.
+    windows_narrowed: int = 0
     #: Tenants whose pass ended because the ERP call budget was used.
     tenants_deferred: int = 0
     #: Tenants skipped or whose pass raised (credentials unopenable, a listing
@@ -165,27 +205,41 @@ async def _sweep_tenant(org: Organization, *, now: datetime, result: MergeReadba
 
     expected = _cursor(org)
     pending = [b for b in expected.get("pending") or [] if isinstance(b, str) and b]
+    deleted = {b for b in expected.get("deleted") or [] if isinstance(b, str) and b}
     through = expected.get("through")
+    listed_at = expected.get("listed_at")
+    window = expected.get("window_minutes")
+    window = window if isinstance(window, int) and window >= MIN_WINDOW_MINUTES else None
     if not pending:
         if await _budget_paused(adapter):
             result.tenants_deferred += 1
             return
-        lookback = timedelta(hours=settings.merge_readback_sweep_lookback_hours)
-        # Ask from a margin before the stored mark: it is our clock at the
-        # last listing's start, and a bill Merge stamped just before it (skew,
-        # or Merge's own lag behind the ERP) would otherwise never be listed.
-        # The overlap is re-read, which the reconciler makes harmless (§543).
-        last = _parse(through)
-        overlap = timedelta(minutes=settings.merge_readback_sweep_overlap_minutes)
-        since = (last - overlap) if last is not None else (now - lookback)
+        since = _listing_start(through, listed_at, now)
+        until = min(since + timedelta(minutes=window), now) if window else now
+        bounded = until < now
         try:
-            changed = await adapter.changed_bills(since)
+            feed = await adapter.bill_change_feed(since, until if bounded else None)
         except ErpCallBudgetExhausted:
             result.tenants_deferred += 1
             return
-        result.bills_listed += len(changed)
-        pending = await bills_we_posted(factory, changed, realm, by_reference=True)
-        through = now.isoformat()
+        except ErpListingIncomplete as exc:
+            span = int((until - since).total_seconds() // 60)
+            if exc.gap is not ListingGap.truncated or span <= MIN_WINDOW_MINUTES:
+                raise
+            # Too long to read whole: ask half of it next tick. Nothing else
+            # moves, so nothing listed so far is lost (decisions §567).
+            result.windows_narrowed += 1
+            logger.info("[merge-readback] org %s: feed too long; window narrowed", org.id)
+            await _save_cursor(
+                org.id, expected, {**expected, "window_minutes": max(MIN_WINDOW_MINUTES, span // 2)}
+            )
+            return
+        result.bills_listed += len(feed.bills)
+        pending = await bills_we_posted(factory, feed.bills, realm, by_reference=True)
+        deleted = {b for b in pending if b in feed.deleted}
+        through = until.isoformat()
+        listed_at = now.isoformat()
+        window = window * 2 if bounded and window else None
 
     done = 0
     for bill_id in pending[: settings.merge_readback_sweep_batch_size]:
@@ -195,9 +249,16 @@ async def _sweep_tenant(org: Organization, *, now: datetime, result: MergeReadba
         try:
             report = await adapter.bill_report(bill_id)
         except MergeBillNotFound:
-            result.bills_not_found += 1
-            done += 1
-            continue
+            if bill_id not in deleted:
+                result.bills_not_found += 1
+                done += 1
+                continue
+            # The listing said ``remote_was_deleted``: Merge's own word, which
+            # a 404 on the single read does not take back.
+            report = ErpBillReport(
+                bill_id=bill_id, state=ErpBillState.deleted, match_by_reference=True
+            )
+            result.bills_deleted_by_listing += 1
         except ErpCallBudgetExhausted:
             result.tenants_deferred += 1
             break
@@ -207,7 +268,8 @@ async def _sweep_tenant(org: Organization, *, now: datetime, result: MergeReadba
                 "[merge-readback] org %s: bill read failed: %s", org.id, exc.__class__.__name__
             )
             break
-        result.bills_read += 1
+        else:
+            result.bills_read += 1
         async with factory() as db:
             outcome = await apply_bill_report(
                 db, org=org, report=report, realm=realm, erp_type=MERGE_PROVIDER, event_id=None
@@ -215,9 +277,32 @@ async def _sweep_tenant(org: Organization, *, now: datetime, result: MergeReadba
         if outcome.action not in ("unmatched", "unchanged"):
             result.bills_applied += 1
         done += 1
-    new = {"through": through, "pending": pending[done:]}
+    left = pending[done:]
+    new: dict = {"through": through, "pending": left}
+    still_deleted = [b for b in left if b in deleted]
+    if still_deleted:
+        new["deleted"] = still_deleted
+    if listed_at and listed_at != through:
+        new["listed_at"] = listed_at
+    if window:
+        new["window_minutes"] = window
     if new != expected:
         await _save_cursor(org.id, expected, new)
+
+
+def _listing_start(through: object, listed_at: object, now: datetime) -> datetime:
+    """Where the next listing starts. A first pass looks back
+    ``lookback_hours``. A mark set at our own clock's now (the listing reached
+    the present) is asked from less the overlap, so a bill stamped just before
+    it by a skewed clock or a lagging sync is still listed (§543). A past
+    window's end is asked from less a second: the overlap would re-read more
+    than the window could move, and the window must always advance (§567)."""
+    last = _parse(through)
+    if last is None:
+        return now - timedelta(hours=settings.merge_readback_sweep_lookback_hours)
+    overlap = timedelta(minutes=settings.merge_readback_sweep_overlap_minutes)
+    seen = _parse(listed_at) or last
+    return min(last - _SEAM, seen - overlap) if seen > last else last - overlap
 
 
 async def run_merge_readback_once(*, now: datetime | None = None) -> MergeReadbackResult:

@@ -108,9 +108,36 @@ test.describe('invoice modal — recall an approval', () => {
 		const id = await createApproved(page, number, { erpBill: true });
 		const modal = await openWithVerdict(page, id, number);
 
+		const recall = modal.getByTestId('recall-approval');
+		const reason = modal.getByTestId('recall-refusal');
+		const sentence =
+			"The ERP may already hold a bill for this invoice, and a bill there can be paid there. Correct or void it in the ERP; its approval can't be recalled from FeohLedger.";
+		await expect(recall).toBeDisabled();
+		await expect(reason).toHaveText(sentence);
+		// The shared RefusalNote: named by the button, on its own line above it.
+		await expect(recall).toHaveAccessibleDescription(sentence);
+		const [noteBox, buttonBox] = await Promise.all([reason.boundingBox(), recall.boundingBox()]);
+		expect(noteBox!.y + noteBox!.height).toBeLessThanOrEqual(buttonBox!.y);
+	});
+
+	test('an invoice already sent over PEPPOL disables Recall and says why', async ({ page }) => {
+		const number = `${PREFIX}-PEPPOL-${Date.now()}`;
+		const id = await createApproved(page, number);
+		// The transmission is the fixture (decisions §573); sending one needs the
+		// org's PEPPOL settings, which `einvoice-export.spec.ts` covers.
+		tenantPsql(
+			`INSERT INTO peppol_transmissions (id, invoice_id, direction, participant_scheme,` +
+				` participant_value, doc_type_id, process_id, business_message_id, status, provider,` +
+				` organization_id, entity_id)` +
+				` SELECT gen_random_uuid(), id, 'outbound', '9930', 'E2E-RECEIVER', 'dt', 'pr',` +
+				` replace(correlation_id::text, '-', ''), 'sent', 'mock', organization_id, entity_id` +
+				` FROM invoices WHERE id='${id}'`
+		);
+		const modal = await openWithVerdict(page, id, number);
+
 		await expect(modal.getByTestId('recall-approval')).toBeDisabled();
 		await expect(modal.getByTestId('recall-refusal')).toHaveText(
-			"The ERP may already hold a bill for this invoice, and a bill there can be paid there. Correct or void it in the ERP; its approval can't be recalled from FeohLedger."
+			"This invoice has already been sent over PEPPOL, and the receiver holds the approved document. Issue a credit note and send a corrected invoice; its approval can't be recalled."
 		);
 	});
 

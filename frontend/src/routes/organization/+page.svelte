@@ -42,6 +42,7 @@
 	import CommerceConnectionPanel from '#lib/components/organization/CommerceConnectionPanel.svelte';
 	import ScimTokenPanel from '#lib/components/organization/ScimTokenPanel.svelte';
 	import CloseWorkspacePanel from '#lib/components/organization/CloseWorkspacePanel.svelte';
+	import PartnerLinkPanel from '#lib/components/organization/PartnerLinkPanel.svelte';
 	import LineTotalCheckPanel from '#lib/components/organization/LineTotalCheckPanel.svelte';
 	import MatchRulesPanel from '#lib/components/organization/MatchRulesPanel.svelte';
 	import AgentAutonomyPanel from '#lib/components/organization/AgentAutonomyPanel.svelte';
@@ -384,6 +385,9 @@
 			labelKey: 'org.rail.group.account',
 			items: [
 				{ slug: 'plan', labelKey: 'org.section.plan' },
+				// Consenting to be adopted by a partner / reseller: any admin, no
+				// partner capability needed (decisions §574).
+				{ slug: 'partner-link', labelKey: 'org.partnerLink.heading' },
 				// Deleting an unused workspace, which frees its addresses
 				// (decisions §306). Last: the one irreversible panel.
 				{ slug: 'close', labelKey: 'org.section.close' }
@@ -2064,6 +2068,10 @@
 
 				{#if section === 'exception-agents'}
 					<AgentAutonomyPanel {readOnly} {userLoaded} />
+				{/if}
+
+				{#if section === 'partner-link'}
+					<PartnerLinkPanel {readOnly} />
 				{/if}
 
 				{#if section === 'close'}

@@ -2,8 +2,16 @@
 
 A *partner* (reseller) org administers a set of branded *child* tenants. The
 relationship is the nullable self-FK ``Organization.parent_org_id`` (migration
-0065, control plane): a child points at its parent; a partner is any org
-referenced by >= 1 child.
+0065, control plane): a child points at its parent. WHICH orgs may act as a
+partner is the operator-granted ``Organization.is_partner`` (migration 0151,
+``docs/decisions.md`` §574): every route here requires it on top of the admin
+role, and refuses a workspace without it with a coded 403
+(``partner_capability_required``). The operator grants it with
+``scripts/set_partner_capability.py``; nothing in the API writes it.
+
+Consenting to BE adopted is not a partner act, so minting the link code lives
+in Organization settings (``POST /api/organization/partner-link-code``, any
+admin, no capability) and only the redeem side lives here.
 
 Trust model (the load-bearing point): the caller's org is resolved by the
 standard ``get_tenant`` chokepoint, which cross-checks the JWT ``org`` claim
@@ -33,6 +41,7 @@ from sqlalchemy.orm.attributes import flag_modified
 
 from app.api.deps import ROLE_ADMIN, require_roles
 from app.api.organization import _resolve_brand
+from app.api.refusals import coded_refusal
 from app.api.set_password_links import (
     link_expires_at,
     mint_employee_link,
@@ -47,7 +56,7 @@ from app.models.user import User
 from app.schemas.organization import BrandConfig
 from app.services.audit_dispatch import dispatch_auth_audit
 from app.services.billing.entitlements import live_plan_codes
-from app.services.partner_link_token import build_link_code, verify_link_code
+from app.services.partner_link_token import verify_link_code
 from app.services.tenant_provisioning import provision_tenant
 from app.tenant import get_tenant, lock_organization
 from app.utils.emails import looks_like_email
@@ -88,6 +97,72 @@ async def _claim_link_code_jti(jti: str) -> bool:
         return False
 
 
+#: The coded 403 for an admin of a workspace the operator has not made a
+#: partner (decisions §574). Distinct from the plain role 403 so the client can
+#: say which of the two it is.
+PARTNER_CAPABILITY_REQUIRED = "partner_capability_required"
+
+
+async def require_partner_capability(
+    user: User = Depends(require_roles(ROLE_ADMIN)),
+    org: Organization = Depends(get_tenant),
+) -> Organization:
+    """The caller's org, provided the operator has granted it the partner
+    capability (``Organization.is_partner``).
+
+    Composed AFTER the admin role gate (``user`` is resolved first), so a
+    non-admin still gets the role's plain 403 exactly as before; an admin of a
+    workspace that is not a partner gets the coded one. ``org`` is the
+    ``get_tenant`` chokepoint's org (JWT ``org`` claim cross-checked), so the
+    flag read is the caller's own workspace's, never a header's choice.
+    """
+    _require_partner(org)
+    return org
+
+
+def _require_partner(org: Organization) -> None:
+    """The coded 403 unless ``org`` holds the capability. Attach and provision
+    call it again on the row re-read under its lock: the dependency's read is
+    unlocked; an operator revoke (`services/partner_capability`)
+    counts children under the same row lock, so a link written after this check
+    is one the revoke either waited for and counted, or never saw because it
+    committed first and this re-read sees ``is_partner`` false (decisions §578)."""
+    if not org.is_partner:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=coded_refusal(
+                PARTNER_CAPABILITY_REQUIRED,
+                "This workspace is not set up as a partner.",
+            ),
+        )
+
+
+async def _lock_partner_and_child(
+    db: AsyncSession, partner: Organization, child_id: uuid.UUID
+) -> tuple[Organization, Organization | None]:
+    """Lock the partner's row and the child's in ONE statement, in id order.
+
+    The partner's lock is what serializes a link with an operator revoke; the
+    child's with another partner adopting it. One fixed order (by id, never
+    "the caller's first") means two attaches naming each other's org cannot
+    deadlock (decisions §578)."""
+    rows = (
+        (
+            await db.execute(
+                select(Organization)
+                .where(Organization.id.in_([partner.id, child_id]))
+                .order_by(Organization.id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    by_id = {row.id: row for row in rows}
+    return by_id[partner.id], by_id.get(child_id)
+
+
 class ChildTenantSummary(BaseModel):
     """A single child tenant, as seen by its administering partner."""
 
@@ -99,8 +174,9 @@ class ChildTenantSummary(BaseModel):
 
 
 class PartnerOverview(BaseModel):
-    """The partner's own identity + its child tenants. ``is_partner`` is True
-    when the org administers >= 1 child (no separate flag — it's derived)."""
+    """The partner's own identity + its child tenants. ``is_partner`` is the
+    operator-granted capability (always True here: the route requires it);
+    kept on the payload so an older client reading it still works."""
 
     organization_id: uuid.UUID
     name: str
@@ -151,16 +227,15 @@ async def _one_child_summary(db: AsyncSession, child: Organization) -> ChildTena
 
 @router.get("", response_model=PartnerOverview)
 async def get_partner_overview(
-    org: Organization = Depends(get_tenant),
     user: User = Depends(require_roles(ROLE_ADMIN)),
+    org: Organization = Depends(require_partner_capability),
     db: AsyncSession = Depends(get_control_db),
 ) -> PartnerOverview:
     """List the child tenants this partner org administers.
 
-    Admin-only. Scoped to ``parent_org_id == org.id`` — never returns a tenant
-    the caller doesn't parent. A standalone org (no children) gets an empty list
-    and ``is_partner: false``, so the UI can render an empty/"not a partner"
-    state without a distinct error.
+    Admin of a partner workspace only. Scoped to ``parent_org_id == org.id`` —
+    never returns a tenant the caller doesn't parent. A partner with no
+    children yet gets an empty list.
     """
     children = (
         (
@@ -178,7 +253,7 @@ async def get_partner_overview(
     return PartnerOverview(
         organization_id=org.id,
         name=org.name,
-        is_partner=len(children) > 0,
+        is_partner=org.is_partner,
         children=[_child_summary(c, plan=plans[c.id]) for c in children],
     )
 
@@ -186,8 +261,8 @@ async def get_partner_overview(
 @router.get("/children/{child_id}/branding", response_model=BrandConfig)
 async def get_child_branding(
     child_id: uuid.UUID,
-    org: Organization = Depends(get_tenant),
     user: User = Depends(require_roles(ROLE_ADMIN)),
+    org: Organization = Depends(require_partner_capability),
     db: AsyncSession = Depends(get_control_db),
 ) -> BrandConfig:
     """Read one child tenant's white-label branding.
@@ -204,8 +279,8 @@ async def get_child_branding(
 async def update_child_branding(
     child_id: uuid.UUID,
     body: BrandConfig,
-    org: Organization = Depends(get_tenant),
     user: User = Depends(require_roles(ROLE_ADMIN)),
+    org: Organization = Depends(require_partner_capability),
     db: AsyncSession = Depends(get_control_db),
 ) -> BrandConfig:
     """Push branding onto one child tenant. Admin-only; audited into the CHILD's trail.
@@ -265,7 +340,9 @@ async def update_child_branding(
 # Authorization model (the load-bearing privilege boundary): a partner must NOT
 # be able to unilaterally declare an arbitrary org its child — that would be a
 # cross-tenant takeover. So attach requires the prospective child's OWN admin to
-# first mint a short-lived, HMAC-signed *link code* (proof of consent); the
+# first mint a short-lived, HMAC-signed *link code* (proof of consent — minted
+# in Organization settings, `POST /api/organization/partner-link-code`, by any
+# admin, partner or not, decisions §574); the
 # partner's admin then redeems that code to attach. The signature (key held by
 # the platform via sops/KMS) is what makes this safe — a partner can't forge a
 # code or aim it at an org that never consented. A child that already has a
@@ -273,67 +350,10 @@ async def update_child_branding(
 # ---------------------------------------------------------------------------
 
 
-class LinkCodeResponse(BaseModel):
-    """The minted link code an org's admin hands to a prospective partner.
-
-    PII-free: the code is an opaque signed token over the child org id only (no
-    name/slug), plus a human-readable expiry hint so the issuer knows how long
-    the partner has to redeem it.
-    """
-
-    link_code: str
-    expires_in_minutes: int
-
-
 class AttachChildRequest(BaseModel):
     """Redeem a child-issued link code to attach that child to the caller."""
 
     link_code: str = Field(min_length=1, max_length=4096)
-
-
-@router.post("/link-code", response_model=LinkCodeResponse)
-async def mint_link_code(
-    org: Organization = Depends(get_tenant),
-    user: User = Depends(require_roles(ROLE_ADMIN)),
-    db: AsyncSession = Depends(get_control_db),
-) -> LinkCodeResponse:
-    """Mint a single-use link code so THIS org can be attached as a child.
-
-    Admin-only; the code is issued FOR the caller's own org (``org.id`` from the
-    ``get_tenant`` chokepoint — a swapped header / forged Host can't widen it).
-    Handing the code to a partner is the org's act of CONSENT to being adopted —
-    the partner can do nothing with it until then. The code carries only the
-    caller's org id under an HMAC signature; it expires in
-    ``FEOH_PARTNER_LINK_TTL_MINUTES`` and is burned on first redeem.
-
-    A 503 (feature off) when no signing key is configured — distinct from a 4xx
-    so the operator knows to set ``FEOH_PARTNER_LINK_SIGNING_KEY``, not that they
-    did something wrong. Issuing is audited (PII-free) into the org's own trail.
-    """
-    code = build_link_code(
-        child_org_id=org.id,
-        signing_key=settings.partner_link_signing_key,
-        ttl_minutes=settings.partner_link_ttl_minutes,
-    )
-    if code is None:
-        # No key → fail closed: the feature is not configured.
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Partner linking is not enabled.",
-        )
-
-    await dispatch_auth_audit(
-        organization_id=org.id,
-        actor_id=user.id,
-        action="partner.link_code_issued",
-        entity_type="organization",
-        entity_id=org.id,
-        details={"ttl_minutes": settings.partner_link_ttl_minutes},
-    )
-    return LinkCodeResponse(
-        link_code=code,
-        expires_in_minutes=settings.partner_link_ttl_minutes,
-    )
 
 
 class ProvisionChildRequest(BaseModel):
@@ -378,8 +398,8 @@ class ProvisionChildResponse(ChildTenantSummary):
 )
 async def provision_child(
     body: ProvisionChildRequest,
-    org: Organization = Depends(get_tenant),
     user: User = Depends(require_roles(ROLE_ADMIN)),
+    org: Organization = Depends(require_partner_capability),
     db: AsyncSession = Depends(get_control_db),
 ) -> ProvisionChildResponse:
     """Provision a brand-new child tenant already parented to the caller.
@@ -432,6 +452,14 @@ async def provision_child(
     require_link_base(body.slug, None)
 
     admin_name = body.admin_name or f"{body.name} Admin"
+
+    # Lock the partner's row for the rest of this transaction and re-check the
+    # capability under it, so an operator revoke (which counts children under the
+    # same lock) cannot commit between this check and the parent link below
+    # (decisions §578). Held across provisioning: the new tenant is born
+    # parented, or not at all.
+    org = await lock_organization(db, org)
+    _require_partner(org)
 
     # provision_tenant owns the orphan-DB rollback: if the control-plane insert
     # or tenant-table creation fails after CREATE DATABASE, it drops the DB it
@@ -534,15 +562,15 @@ async def _send_child_admin_link(
 @router.post("/children", response_model=ChildTenantSummary, status_code=status.HTTP_201_CREATED)
 async def attach_child(
     body: AttachChildRequest,
-    org: Organization = Depends(get_tenant),
     user: User = Depends(require_roles(ROLE_ADMIN)),
+    org: Organization = Depends(require_partner_capability),
     db: AsyncSession = Depends(get_control_db),
 ) -> ChildTenantSummary:
     """Attach a consenting child tenant to the caller's partner org.
 
     Admin-only. The privilege boundary: the only way to reach a child here is to
     present a valid, unexpired, unconsumed link code that the CHILD's own admin
-    minted (``POST /api/partner/link-code``) — so a partner can never adopt an
+    minted (``POST /api/organization/partner-link-code``) — so a partner can never adopt an
     org that didn't consent. The signature is verified first; an invalid /
     expired / wrong-purpose code is one opaque 400 (no enumeration). The jti is
     then claimed single-use in Redis (fail-closed) so a code can't be replayed.
@@ -588,7 +616,12 @@ async def attach_child(
             detail="This link code has already been used.",
         )
 
-    child = await db.get(Organization, child_id)
+    # Lock both rows (one statement, id order) and re-check the capability under
+    # the partner's lock: an operator revoke counts children under that same
+    # lock, so it either waits for this link and refuses, or commits first and
+    # this re-read refuses (decisions §578).
+    org, child = await _lock_partner_and_child(db, org, child_id)
+    _require_partner(org)
     if child is None:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -630,8 +663,8 @@ async def attach_child(
 @router.delete("/children/{child_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def detach_child(
     child_id: uuid.UUID,
-    org: Organization = Depends(get_tenant),
     user: User = Depends(require_roles(ROLE_ADMIN)),
+    org: Organization = Depends(require_partner_capability),
     db: AsyncSession = Depends(get_control_db),
 ) -> None:
     """Detach a child tenant from the caller's partner org.

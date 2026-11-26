@@ -13,6 +13,7 @@ See ``backend/docs/expense-management.md``.
 
 import uuid
 from datetime import UTC, datetime
+from decimal import Decimal
 from types import SimpleNamespace
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -38,6 +39,7 @@ from app.schemas.expense import (
 )
 from app.services.approval_chain import check_segregation
 from app.services.audit_dispatch import dispatch_audit
+from app.services.expense_preapproval_cover import drawn_by_preapproval, remaining_of
 from app.tenant import (
     apply_entity_scope,
     ensure_in_entity_scope,
@@ -49,7 +51,10 @@ from app.tenant import (
 router = APIRouter(prefix="/expense-preapprovals", tags=["expense-preapprovals"])
 
 
-def _to_response(p: ExpensePreapproval) -> ExpensePreapprovalResponse:
+def _to_response(p: ExpensePreapproval, drawn: Decimal | None = None) -> ExpensePreapprovalResponse:
+    """``drawn`` is the sum of the lines' recorded draws (decisions §563); a
+    caller that cannot have any (create, a decision on a pending row) omits it."""
+    drawn_total = drawn or Decimal("0")
     return ExpensePreapprovalResponse(
         id=str(p.id),
         requester_user_id=str(p.requester_user_id),
@@ -62,6 +67,10 @@ def _to_response(p: ExpensePreapproval) -> ExpensePreapprovalResponse:
         decided_by=str(p.decided_by) if p.decided_by else None,
         decided_at=p.decided_at.isoformat() if p.decided_at else None,
         expense_report_id=str(p.expense_report_id) if p.expense_report_id else None,
+        drawn_amount=drawn_total,
+        remaining_amount=(
+            remaining_of(p, drawn_total) if p.status == PreapprovalStatus.approved else None
+        ),
         created_at=p.created_at.isoformat() if p.created_at else "",
         updated_at=p.updated_at.isoformat() if p.updated_at else "",
     )
@@ -106,8 +115,10 @@ async def list_preapprovals(
         .limit(pagination.limit)
     )
     rows = (await db.execute(paged)).scalars().all()
+    # One grouped read for the page, not one per row.
+    drawn = await drawn_by_preapproval(db, [p.id for p in rows])
     return ExpensePreapprovalListResponse(
-        items=[_to_response(p) for p in rows],
+        items=[_to_response(p, drawn.get(p.id)) for p in rows],
         total=total,
         page=pagination.page,
         page_size=pagination.page_size,
@@ -163,7 +174,9 @@ async def get_preapproval(
     await ensure_in_entity_scope(
         db, ExpensePreapproval, preapproval_id, entity_id, detail="Pre-approval not found"
     )
-    return _to_response(await _get_preapproval_or_404(db, preapproval_id))
+    preapproval = await _get_preapproval_or_404(db, preapproval_id)
+    drawn = await drawn_by_preapproval(db, [preapproval.id])
+    return _to_response(preapproval, drawn.get(preapproval.id))
 
 
 async def _decide(

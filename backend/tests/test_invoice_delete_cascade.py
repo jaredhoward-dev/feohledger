@@ -61,9 +61,9 @@ async def _seed_invoice(mk, org_id, *, number: str) -> str:
 
 
 async def test_delete_invoice_with_virtual_card_succeeds(realdb):
-    """The exact live repro: an approved invoice with an auto-issued
-    virtual card (plus its own reveal token + rebate) must delete cleanly,
-    not 500."""
+    """The exact live repro: an approved invoice with a virtual card (plus its
+    own reveal token + rebate) must delete cleanly, not 500. The card is
+    cancelled: a live one refuses the delete (decisions §577, below)."""
     org_id = realdb.info(TENANT).org_id
     mk = realdb.sessionmaker(TENANT)
     invoice_id = await _seed_invoice(mk, org_id, number="DELCASC-CARD")
@@ -75,7 +75,7 @@ async def test_delete_invoice_with_virtual_card_succeeds(realdb):
             card_provider="mock",
             provider_card_id=f"card_{uuid.uuid4().hex[:8]}",
             amount_limit=Decimal("500.00"),
-            status="charged",
+            status="cancelled",
         )
         s.add(card)
         await s.flush()
@@ -334,7 +334,9 @@ async def test_delete_refuses_an_invoice_with_a_live_payment(realdb):
     async with realdb.client(key=TENANT, role="admin") as c:
         resp = await c.delete(f"/api/invoices/{inv_id}")
     assert resp.status_code == 409, resp.text
-    assert "payment run" in resp.json()["detail"]
+    detail = resp.json()["detail"]
+    assert detail["code"] == "invoice_delete_claimed"
+    assert detail["params"] == {"claim": "payment"}
     assert await _still_there(mk, inv_id)
 
 
@@ -352,3 +354,424 @@ async def test_bulk_delete_skips_an_invoice_with_a_live_payment(realdb):
     assert resp.json() == {"deleted": 1, "skipped": [paying]}
     assert await _still_there(mk, paying)
     assert not await _still_there(mk, free)
+
+
+# ---------------------------------------------------------------------------
+# A live virtual card is a claim too (decisions §577): bearer-spendable for the
+# face amount, or already charged. The cascade deleted it with the invoice, so
+# the ledger lost a card that could still move (or had moved) money. Both doors
+# now refuse it, by the card rail's own predicate (`status <> 'cancelled'`);
+# cancelling the card is the way out.
+# ---------------------------------------------------------------------------
+
+
+async def _with_card(mk, org_id, invoice_id: str, status: str) -> uuid.UUID:
+    async with mk() as s:
+        card = VirtualCard(
+            organization_id=org_id,
+            invoice_id=uuid.UUID(invoice_id),
+            card_provider="mock",
+            provider_card_id=f"card_{uuid.uuid4().hex[:8]}",
+            amount_limit=Decimal("500.00"),
+            status=status,
+        )
+        s.add(card)
+        await s.commit()
+        return card.id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("card_status", ["active", "charged"])
+async def test_delete_refuses_an_invoice_a_live_card_holds(realdb, card_status):
+    mk = realdb.sessionmaker(TENANT)
+    org_id = realdb.info(TENANT).org_id
+    inv_id = await _seed_invoice(mk, org_id, number=f"DEL-LIVE-CARD-{card_status}")
+    card_id = await _with_card(mk, org_id, inv_id, card_status)
+
+    async with realdb.client(key=TENANT, role="admin") as c:
+        resp = await c.delete(f"/api/invoices/{inv_id}")
+    assert resp.status_code == 409, resp.text
+    detail = resp.json()["detail"]
+    assert detail["code"] == "invoice_delete_claimed"
+    assert detail["params"] == {"claim": "virtual_card"}
+    assert await _still_there(mk, inv_id)
+    async with mk() as s:
+        assert (await s.execute(select(VirtualCard).where(VirtualCard.id == card_id))).first()
+    assert await _deletion_rows(mk, inv_id) == []
+
+
+@pytest.mark.asyncio
+async def test_delete_goes_through_once_the_card_is_cancelled(realdb):
+    mk = realdb.sessionmaker(TENANT)
+    org_id = realdb.info(TENANT).org_id
+    inv_id = await _seed_invoice(mk, org_id, number="DEL-LIVE-CARD-CANCEL")
+    card_id = await _with_card(mk, org_id, inv_id, "active")
+
+    async with realdb.client(key=TENANT, role="admin") as c:
+        assert (await c.delete(f"/api/invoices/{inv_id}")).status_code == 409
+        async with mk() as s:
+            card = (
+                await s.execute(select(VirtualCard).where(VirtualCard.id == card_id))
+            ).scalar_one()
+            card.status = "cancelled"
+            await s.commit()
+        resp = await c.delete(f"/api/invoices/{inv_id}")
+    assert resp.status_code == 204, resp.text
+    assert not await _still_there(mk, inv_id)
+
+
+@pytest.mark.asyncio
+async def test_bulk_delete_skips_an_invoice_a_live_card_holds(realdb):
+    mk = realdb.sessionmaker(TENANT)
+    org_id = realdb.info(TENANT).org_id
+    carded = await _seed_invoice(mk, org_id, number="DEL-LIVE-CARD-B1")
+    free = await _seed_invoice(mk, org_id, number="DEL-LIVE-CARD-B2")
+    await _with_card(mk, org_id, carded, "active")
+
+    async with realdb.client(key=TENANT, role="admin") as c:
+        resp = await c.post("/api/invoices/bulk/delete", json={"ids": [carded, free]})
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {"deleted": 1, "skipped": [carded]}
+    assert await _still_there(mk, carded)
+    assert not await _still_there(mk, free)
+
+
+# ---------------------------------------------------------------------------
+# A voided payment returns the invoice to `approved`, so it can be deleted,
+# while the ERP side of the void (or a discount credit) is still unfinished in
+# `WorkflowInstance.state_data`. The cascade deleted that instance and the
+# BillPayment / credit stood in the ERP untracked; both doors now refuse while
+# any of the three pending maps holds an entry (decisions §580).
+# ---------------------------------------------------------------------------
+
+
+async def _with_state(mk, org_id, invoice_id: str, state_data: dict) -> None:
+    from app.models.workflow import WorkflowDefinition, WorkflowInstance
+
+    async with mk() as s:
+        defn = WorkflowDefinition(
+            organization_id=org_id, name=f"del-{uuid.uuid4().hex[:6]}", steps_config={"steps": []}
+        )
+        s.add(defn)
+        await s.flush()
+        s.add(
+            WorkflowInstance(
+                definition_id=defn.id,
+                invoice_id=uuid.UUID(invoice_id),
+                state="active",
+                state_data=state_data,
+            )
+        )
+        await s.commit()
+
+
+_PENDING_STATES = {
+    "void": {"erp_payment_voids_pending": [str(uuid.UUID(int=1))]},
+    "void_credit": {"erp_discount_credit_voids_pending": {str(uuid.UUID(int=2)): "VC-1"}},
+    "credit": {"erp_discount_credits_pending": {str(uuid.UUID(int=3)): {"credit_id": None}}},
+    # A payment write whose outcome was never recorded (decisions §584).
+    "write": {"erp_payment_writes_pending": {str(uuid.UUID(int=4)): {"token": "t"}}},
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("pending", sorted(_PENDING_STATES))
+async def test_delete_refuses_while_an_erp_reversal_is_pending(realdb, pending):
+    mk = realdb.sessionmaker(TENANT)
+    org_id = realdb.info(TENANT).org_id
+    inv_id = await _seed_invoice(mk, org_id, number=f"DEL-ERP-PEND-{pending}")
+    await _with_state(mk, org_id, inv_id, _PENDING_STATES[pending])
+
+    async with realdb.client(key=TENANT, role="admin") as c:
+        resp = await c.delete(f"/api/invoices/{inv_id}")
+    assert resp.status_code == 409, resp.text
+    detail = resp.json()["detail"]
+    assert detail["code"] == "invoice_delete_erp_reversal_pending"
+    assert detail["params"] == {}
+    assert await _still_there(mk, inv_id)
+    assert await _deletion_rows(mk, inv_id) == []
+
+
+@pytest.mark.asyncio
+async def test_delete_goes_through_when_the_pending_maps_are_empty(realdb):
+    """Other state_data, or a key left empty, is not an unfinished reversal."""
+    mk = realdb.sessionmaker(TENANT)
+    org_id = realdb.info(TENANT).org_id
+    inv_id = await _seed_invoice(mk, org_id, number="DEL-ERP-PEND-NONE")
+    await _with_state(mk, org_id, inv_id, {"erp_payment_voids_pending": [], "approval_level": 1})
+
+    async with realdb.client(key=TENANT, role="admin") as c:
+        resp = await c.delete(f"/api/invoices/{inv_id}")
+    assert resp.status_code == 204, resp.text
+    assert not await _still_there(mk, inv_id)
+
+
+@pytest.mark.asyncio
+async def test_bulk_delete_skips_an_invoice_with_a_pending_erp_reversal(realdb):
+    mk = realdb.sessionmaker(TENANT)
+    org_id = realdb.info(TENANT).org_id
+    pending = await _seed_invoice(mk, org_id, number="DEL-ERP-PEND-B1")
+    free = await _seed_invoice(mk, org_id, number="DEL-ERP-PEND-B2")
+    await _with_state(mk, org_id, pending, _PENDING_STATES["void"])
+
+    async with realdb.client(key=TENANT, role="admin") as c:
+        resp = await c.post("/api/invoices/bulk/delete", json={"ids": [pending, free]})
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {"deleted": 1, "skipped": [pending]}
+    assert await _still_there(mk, pending)
+    assert not await _still_there(mk, free)
+    assert await _deletion_rows(mk, pending) == []
+
+
+# ---------------------------------------------------------------------------
+# A PEPPOL transmission not `failed` is the local record of a legally
+# significant e-invoice the receiver may hold; the cascade erased it. Deleting
+# is refused, as the recall is (§573): a credit note corrects it (§580). A
+# `failed` transmission never left, and the cascade still clears it.
+# ---------------------------------------------------------------------------
+
+
+async def _with_transmission(
+    mk, org_id, invoice_id: str, status: str, *, direction: str = "outbound"
+) -> uuid.UUID:
+    from app.models.peppol_transmission import PeppolTransmission
+
+    async with mk() as s:
+        row = PeppolTransmission(
+            invoice_id=uuid.UUID(invoice_id),
+            direction=direction,
+            participant_scheme="9930",
+            participant_value="SUPPLIER123",
+            doc_type_id="doc",
+            process_id="proc",
+            business_message_id=uuid.uuid4().hex,
+            status=status,
+            provider="mock",
+            organization_id=org_id,
+        )
+        s.add(row)
+        await s.commit()
+        return row.id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["sending", "sent", "delivered"])
+async def test_delete_refuses_an_invoice_sent_over_peppol(realdb, status):
+    mk = realdb.sessionmaker(TENANT)
+    org_id = realdb.info(TENANT).org_id
+    inv_id = await _seed_invoice(mk, org_id, number=f"DEL-PEPPOL-{status}")
+    await _with_transmission(mk, org_id, inv_id, status)
+
+    async with realdb.client(key=TENANT, role="admin") as c:
+        resp = await c.delete(f"/api/invoices/{inv_id}")
+    assert resp.status_code == 409, resp.text
+    detail = resp.json()["detail"]
+    assert detail["code"] == "invoice_delete_peppol_transmitted"
+    assert detail["params"] == {}
+    assert await _still_there(mk, inv_id)
+
+
+@pytest.mark.asyncio
+async def test_delete_clears_a_failed_peppol_transmission(realdb):
+    from app.models.peppol_transmission import PeppolTransmission
+
+    mk = realdb.sessionmaker(TENANT)
+    org_id = realdb.info(TENANT).org_id
+    inv_id = await _seed_invoice(mk, org_id, number="DEL-PEPPOL-FAILED")
+    await _with_transmission(mk, org_id, inv_id, "failed")
+
+    async with realdb.client(key=TENANT, role="admin") as c:
+        resp = await c.delete(f"/api/invoices/{inv_id}")
+    assert resp.status_code == 204, resp.text
+    async with mk() as s:
+        left = await s.execute(
+            select(PeppolTransmission.id).where(PeppolTransmission.invoice_id == uuid.UUID(inv_id))
+        )
+        assert left.first() is None
+
+
+@pytest.mark.asyncio
+async def test_bulk_delete_skips_an_invoice_sent_over_peppol(realdb):
+    mk = realdb.sessionmaker(TENANT)
+    org_id = realdb.info(TENANT).org_id
+    sent = await _seed_invoice(mk, org_id, number="DEL-PEPPOL-B1")
+    free = await _seed_invoice(mk, org_id, number="DEL-PEPPOL-B2")
+    await _with_transmission(mk, org_id, sent, "sent")
+
+    async with realdb.client(key=TENANT, role="admin") as c:
+        resp = await c.post("/api/invoices/bulk/delete", json={"ids": [sent, free]})
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {"deleted": 1, "skipped": [sent]}
+    assert await _still_there(mk, sent)
+    assert not await _still_there(mk, free)
+
+
+@pytest.mark.asyncio
+async def test_a_live_claim_is_named_before_a_peppol_transmission(realdb):
+    """A claim can be cleared (cancel the card); a transmission cannot, so the
+    claim is named first."""
+    mk = realdb.sessionmaker(TENANT)
+    org_id = realdb.info(TENANT).org_id
+    inv_id = await _seed_invoice(mk, org_id, number="DEL-PEPPOL-CLAIM")
+    await _with_card(mk, org_id, inv_id, "active")
+    await _with_transmission(mk, org_id, inv_id, "sent")
+
+    async with realdb.client(key=TENANT, role="admin") as c:
+        resp = await c.delete(f"/api/invoices/{inv_id}")
+    assert resp.status_code == 409, resp.text
+    assert resp.json()["detail"]["code"] == "invoice_delete_claimed"
+
+
+# ---------------------------------------------------------------------------
+# An INBOUND transmission is the record of an e-invoice a supplier delivered to
+# us. Deleting its invoice (a spam or duplicate document) is allowed, but the
+# row is detached and stamped, never deleted (§586).
+# ---------------------------------------------------------------------------
+
+
+async def _transmission(mk, row_id: uuid.UUID):
+    from app.models.peppol_transmission import PeppolTransmission
+
+    async with mk() as s:
+        return (
+            await s.execute(select(PeppolTransmission).where(PeppolTransmission.id == row_id))
+        ).scalar_one_or_none()
+
+
+@pytest.mark.asyncio
+async def test_delete_keeps_a_received_transmission_detached_and_marked(realdb):
+    mk = realdb.sessionmaker(TENANT)
+    org_id = realdb.info(TENANT).org_id
+    inv_id = await _seed_invoice(mk, org_id, number="DEL-PEPPOL-IN")
+    inbound = await _with_transmission(mk, org_id, inv_id, "delivered", direction="inbound")
+    # A failed outbound attempt on the same invoice never left: still cleared.
+    failed = await _with_transmission(mk, org_id, inv_id, "failed")
+
+    async with realdb.client(key=TENANT, role="admin") as c:
+        resp = await c.delete(f"/api/invoices/{inv_id}")
+    assert resp.status_code == 204, resp.text
+    assert not await _still_there(mk, inv_id)
+
+    row = await _transmission(mk, inbound)
+    assert row is not None, "the record of a received e-invoice must survive the delete"
+    assert row.invoice_id is None
+    assert row.deleted_invoice_id == uuid.UUID(inv_id)
+    assert row.invoice_deleted_at is not None
+    # The stamp names the same person the `invoice.deleted` audit row does.
+    (audit,) = await _deletion_rows(mk, inv_id)
+    assert row.invoice_deleted_by_id == audit.actor_id is not None
+    # Nothing else about the received document changed.
+    assert row.status == "delivered" and row.participant_value == "SUPPLIER123"
+    assert await _transmission(mk, failed) is None
+
+
+@pytest.mark.asyncio
+async def test_bulk_delete_keeps_a_received_transmission_detached(realdb):
+    mk = realdb.sessionmaker(TENANT)
+    org_id = realdb.info(TENANT).org_id
+    inv_id = await _seed_invoice(mk, org_id, number="DEL-PEPPOL-IN-BULK")
+    inbound = await _with_transmission(mk, org_id, inv_id, "delivered", direction="inbound")
+
+    async with realdb.client(key=TENANT, role="admin") as c:
+        resp = await c.post("/api/invoices/bulk/delete", json={"ids": [inv_id]})
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {"deleted": 1, "skipped": []}
+
+    row = await _transmission(mk, inbound)
+    assert row is not None and row.invoice_id is None
+    assert row.deleted_invoice_id == uuid.UUID(inv_id)
+    assert row.invoice_deleted_by_id is not None and row.invoice_deleted_at is not None
+
+
+@pytest.mark.asyncio
+async def test_only_an_inbound_stamped_row_may_lose_its_invoice(realdb):
+    """`ck_peppol_detached_inbound` holds the rule at the data layer."""
+    from sqlalchemy import update
+    from sqlalchemy.exc import IntegrityError
+
+    from app.models.peppol_transmission import PeppolTransmission
+
+    mk = realdb.sessionmaker(TENANT)
+    org_id = realdb.info(TENANT).org_id
+    inv_id = await _seed_invoice(mk, org_id, number="DEL-PEPPOL-CK")
+    outbound = await _with_transmission(mk, org_id, inv_id, "failed")
+    inbound = await _with_transmission(mk, org_id, inv_id, "delivered", direction="inbound")
+
+    for row_id in (outbound, inbound):  # outbound never; inbound not unstamped
+        async with mk() as s:
+            with pytest.raises(IntegrityError, match="ck_peppol_detached_inbound"):
+                await s.execute(
+                    update(PeppolTransmission)
+                    .where(PeppolTransmission.id == row_id)
+                    .values(invoice_id=None)
+                )
+
+
+# ---------------------------------------------------------------------------
+# The pending maps are read under the instance's row lock (decisions §581): a
+# write committing while the delete runs — a discount credit's reservation, a
+# void a write-back re-arms — is waited for and seen, not read from the
+# snapshot before it and then cascaded away.
+# ---------------------------------------------------------------------------
+
+
+async def _someone_waits_on_a_lock(mk, *, timeout_s: float = 10.0) -> bool:
+    import asyncio
+
+    from sqlalchemy import text
+
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout_s
+    while loop.time() < deadline:
+        async with mk() as s:
+            waiting = (
+                await s.execute(
+                    text(
+                        "SELECT count(*) FROM pg_stat_activity WHERE datname = "
+                        "current_database() AND wait_event_type = 'Lock'"
+                    )
+                )
+            ).scalar_one()
+        if waiting:
+            return True
+        await asyncio.sleep(0.02)
+    return False
+
+
+@pytest.mark.asyncio
+async def test_delete_waits_for_a_pending_write_on_the_instance_and_refuses(realdb):
+    import asyncio
+
+    from app.models.workflow import WorkflowInstance
+
+    mk = realdb.sessionmaker(TENANT)
+    org_id = realdb.info(TENANT).org_id
+    inv_id = await _seed_invoice(mk, org_id, number="DEL-ERP-PEND-RACE")
+    await _with_state(mk, org_id, inv_id, {"approval_level": 1})
+
+    async with mk() as writer:
+        instance = (
+            await writer.execute(
+                select(WorkflowInstance)
+                .where(WorkflowInstance.invoice_id == uuid.UUID(inv_id))
+                .with_for_update()
+            )
+        ).scalar_one()
+        instance.state_data = {
+            **instance.state_data,
+            "erp_discount_credits_pending": {str(uuid.UUID(int=4)): {"credit_id": None}},
+        }
+        await writer.flush()
+        async with realdb.client(key=TENANT, role="admin") as c:
+            delete = asyncio.create_task(c.delete(f"/api/invoices/{inv_id}"))
+            try:
+                assert await _someone_waits_on_a_lock(mk), "the delete did not wait"
+                assert not delete.done()
+                await writer.commit()
+                resp = await asyncio.wait_for(delete, timeout=30)
+            finally:
+                if not delete.done():
+                    delete.cancel()
+    assert resp.status_code == 409, resp.text
+    assert resp.json()["detail"]["code"] == "invoice_delete_erp_reversal_pending"
+    assert await _still_there(mk, inv_id)

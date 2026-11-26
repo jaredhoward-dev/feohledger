@@ -8,7 +8,9 @@ Resolution: returns a canned :class:`ParticipantCapability` for any receiver
 whose scheme is a known EAS code (so the happy path works for arbitrary test
 ids), and ``registered=False`` for a participant whose value is on the
 ``unknown``/sentinel list — exercising the ``receiver_not_registered`` failure
-path. Send always succeeds with a deterministic-shape MessageId.
+path. Send always succeeds with a deterministic-shape MessageId, so a lookup
+by business message id answers ``sent`` with that same MessageId — what the
+mock's send would have produced.
 """
 
 from __future__ import annotations
@@ -21,6 +23,7 @@ from app.services.peppol_adapters.base import (
     ParticipantCapability,
     ParticipantId,
     PeppolAdapter,
+    TransmissionLookup,
     TransmissionRequest,
     TransmissionResult,
 )
@@ -55,12 +58,16 @@ class MockPeppolAdapter(PeppolAdapter):
             supported_doc_types=(PEPPOL_BIS_BILLING_DOCTYPE,),
         )
 
-    async def send(self, request: TransmissionRequest) -> TransmissionResult:
+    @staticmethod
+    def _message_id(business_message_id: str) -> str:
         # Deterministic MessageId derived from the business message id so a
         # retry of the same logical transmission yields a stable id — mirrors
         # how a real AP dedupes on our idempotency key. No PII in the id.
-        digest = hashlib.sha256(request.business_message_id.encode()).hexdigest()[:24]
-        message_id = f"mock-msg-{digest}"
+        digest = hashlib.sha256(business_message_id.encode()).hexdigest()[:24]
+        return f"mock-msg-{digest}"
+
+    async def send(self, request: TransmissionRequest) -> TransmissionResult:
+        message_id = self._message_id(request.business_message_id)
         return TransmissionResult(
             success=True,
             message_id=message_id,
@@ -71,6 +78,16 @@ class MockPeppolAdapter(PeppolAdapter):
                 "business_message_id": request.business_message_id,
                 "doc_type": request.doc_type_id,
             },
+        )
+
+    async def lookup_transmission(self, business_message_id: str) -> TransmissionLookup:
+        # The mock's send never fails and keeps no state, so the only honest
+        # answer is the one its send gives: sent, under the derived MessageId.
+        message_id = self._message_id(business_message_id)
+        return TransmissionLookup(
+            outcome="sent",
+            message_id=message_id,
+            raw_response={"mock": True, "message_id": message_id},
         )
 
     async def test_connection(self) -> bool:

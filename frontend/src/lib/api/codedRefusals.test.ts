@@ -861,6 +861,14 @@ describe('recalling an approval (decisions §374)', () => {
 			expect(codedRefusalText('invoice_recall_claimed', { claim: 'payment' }, t)).toBe(
 				cat['refusal.paymentBlocksRecall']
 			);
+			for (const [code, key] of [
+				['invoice_recall_peppol_transmitted', 'refusal.recallPeppolTransmitted'],
+				['invoice_recall_mirror_unsigned', 'refusal.recallMirrorUnsigned'],
+				['invoice_recall_mirror_progressed', 'refusal.recallMirrorProgressed'],
+				['invoice_recall_is_mirror', 'refusal.recallIsMirror']
+			] as const) {
+				expect(codedRefusalText(code, { mirror_status: 'approved' }, t)).toBe(cat[key]);
+			}
 			expect(codedRefusalText('invoice_recall_claimed', { claim: 'virtual_card' }, t)).toBe(
 				cat['refusal.cardBlocksRecall']
 			);
@@ -873,6 +881,72 @@ describe('recalling an approval (decisions §374)', () => {
 	it('falls back to the server sentence for a claim this build does not know', () => {
 		expect(codedRefusalText('invoice_recall_claimed', {}, enT)).toBeNull();
 		expect(codedRefusalText('invoice_recall_claimed', { claim: 'cheque' }, enT)).toBeNull();
+	});
+});
+
+describe('deleting an invoice a rail holds (decisions §577)', () => {
+	const locales = { en, de, fr, es, 'pt-BR': ptBR, ja } as const;
+
+	it('states the live-payment and live-card refusals in all six locales', () => {
+		for (const [loc, catalogue] of Object.entries(locales)) {
+			const t = translator(catalogue as typeof en, loc);
+			const cat = catalogue as Record<string, string>;
+			expect(cat['refusal.paymentBlocksDelete']).toBeTruthy();
+			expect(cat['refusal.cardBlocksDelete']).toBeTruthy();
+			expect(codedRefusalText('invoice_delete_claimed', { claim: 'payment' }, t)).toBe(
+				cat['refusal.paymentBlocksDelete']
+			);
+			expect(codedRefusalText('invoice_delete_claimed', { claim: 'virtual_card' }, t)).toBe(
+				cat['refusal.cardBlocksDelete']
+			);
+		}
+	});
+
+	it('falls back to the server sentence for a claim this build does not know', () => {
+		expect(codedRefusalText('invoice_delete_claimed', {}, enT)).toBeNull();
+		expect(codedRefusalText('invoice_delete_claimed', { claim: 'cheque' }, enT)).toBeNull();
+	});
+});
+
+describe('deleting an invoice with an unfinished ERP reversal or a PEPPOL transmission (decisions §580)', () => {
+	const locales = { en, de, fr, es, 'pt-BR': ptBR, ja } as const;
+
+	it('states both refusals in all six locales', () => {
+		for (const [loc, catalogue] of Object.entries(locales)) {
+			const t = translator(catalogue as typeof en, loc);
+			const cat = catalogue as Record<string, string>;
+			expect(cat['refusal.erpReversalBlocksDelete']).toBeTruthy();
+			expect(cat['refusal.peppolBlocksDelete']).toBeTruthy();
+			expect(codedRefusalText('invoice_delete_erp_reversal_pending', {}, t)).toBe(
+				cat['refusal.erpReversalBlocksDelete']
+			);
+			expect(codedRefusalText('invoice_delete_peppol_transmitted', {}, t)).toBe(
+				cat['refusal.peppolBlocksDelete']
+			);
+		}
+	});
+});
+
+describe('Partner Admin and the link code (decisions §574)', () => {
+	const locales = { en, de, fr, es, 'pt-BR': ptBR, ja } as const;
+
+	it('states the capability and linking-disabled refusals in all six locales', () => {
+		for (const [loc, catalogue] of Object.entries(locales)) {
+			const t = translator(catalogue as typeof en, loc);
+			const cat = catalogue as Record<string, string>;
+			for (const [code, key] of [
+				['partner_capability_required', 'refusal.partnerCapabilityRequired'],
+				['partner_linking_disabled', 'refusal.partnerLinkingDisabled']
+			] as const) {
+				expect(cat[key], `${loc} ${key}`).toBeTruthy();
+				expect(codedRefusalText(code, {}, t)).toBe(cat[key]);
+			}
+		}
+		expect(CODED_REFUSAL_CODES).toContain('partner_capability_required');
+		expect(CODED_REFUSAL_CODES).toContain('partner_linking_disabled');
+		expect(localizeApiDetail(detail('partner_linking_disabled', {}), deT)).toBe(
+			de['refusal.partnerLinkingDisabled']
+		);
 	});
 });
 
@@ -895,7 +969,10 @@ describe('voiding a flagged bill in the ERP (decisions §539, §542, §545)', ()
 			['erp_void_not_found', 'refusal.erpVoidNotFound'],
 			['erp_lookup_not_failed', 'refusal.erpLookupNotFailed'],
 			['erp_lookup_unsupported', 'refusal.erpLookupUnsupported'],
-			['erp_lookup_failed', 'refusal.erpLookupFailed']
+			['erp_lookup_failed', 'refusal.erpLookupFailed'],
+			['erp_bill_confirm_not_offered', 'refusal.erpBillConfirmNotOffered'],
+			['erp_bill_confirm_not_found', 'refusal.erpBillConfirmNotFound'],
+			['erp_bill_claimed', 'refusal.erpBillClaimed']
 		];
 		for (const [loc, catalogue] of Object.entries(locales)) {
 			const t = translator(catalogue as typeof en, loc);
@@ -1674,7 +1751,9 @@ describe('the invoice bulk-status endpoint’s own skips (`api/invoices.bulk_sta
 		const codes = [...source.matchAll(/^INVOICE_[A-Z_]+ = "(invoice_[a-z_]+)"/gm)].map(
 			(x) => x[1]
 		);
-		expect(codes).toHaveLength(5);
+		// Five bulk-status skips, plus the delete door's claim (decisions §577)
+		// and its ERP-reversal and PEPPOL refusals (§580).
+		expect(codes).toHaveLength(8);
 		for (const code of codes) {
 			expect(CODED_REFUSAL_CODES, `no sentence for "${code}"`).toContain(code);
 		}

@@ -31,6 +31,18 @@ export type OrphanState =
   | { kind: "none" }
   | { kind: "found"; bill: OrphanBill };
 
+/** The body of `POST /api/invoices/{id}/confirm-erp-bill` (decisions §587):
+ *  the bill the lookup named and the person's reason, or `null` while there
+ *  is no found bill or no reason, so the confirm control stays disabled. */
+export function confirmBillBody(
+  state: OrphanState,
+  reason: string,
+): { erp_document_id: string; reason: string } | null {
+  const trimmed = reason.trim();
+  if (state.kind !== "found" || !trimmed) return null;
+  return { erp_document_id: state.bill.erp_document_id, reason: trimmed };
+}
+
 /** The state a lookup answer (or its error) puts the panel in. A coded 409 /
  *  502 is a refusal shown beside the control; anything else is an error. */
 export function orphanStateFrom(

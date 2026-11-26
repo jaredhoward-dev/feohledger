@@ -85,7 +85,11 @@ Existing fields stay: `pipeline`, `vendor_spend`, `aging`,
   the two aren't misread as the same number. See
   `tests/test_analytics_rejected_exclusion.py` for a regression test pinning
   the contrast.
-- `aging` — open-invoice exposure bucketed by **days past the due date**:
+- `aging` — open-invoice exposure bucketed by **days past the effective due
+  date** (the current payment schedule's, else the invoice's own:
+  `open_ap_due.effective_due_of` over the correlated `current_schedule_due`,
+  banded by `open_ap_due.aging_band`, so a row sits in a past-due band exactly when the overdue count would count
+  it; decisions §565, §569):
   `current` (not yet due), `days_30` (1-30), `days_60` (31-60), `days_90`
   (61-90), `days_90_plus` (90+). The same five buckets back the
   `aging_snapshot` CSV export and the emailed scheduled report — which, having
@@ -96,7 +100,10 @@ Existing fields stay: `pipeline`, `vendor_spend`, `aging`,
   `due_date` filter — so an open invoice with a null `due_date` buckets as
   `current` (unknowable, so not overdue) rather than being silently dropped;
   otherwise the bands stop summing to the balance the moment one open invoice
-  is missing a due date.
+  is missing a due date. The one deliberate difference from the overdue
+  count's population: an invoice whose payment completed but whose `paid`
+  sync-back has not run still bands here (it is still in the AP balance) while
+  the count leaves it out as paid out (decisions §565).
 - `touchless_rate` — straight-through-processing rate. **Definition: the share
   of decided invoices (cleared review, or rejected) that went through with NO
   person intervening — approved automatically, no field or line-item
@@ -112,9 +119,16 @@ Existing fields stay: `pipeline`, `vendor_spend`, `aging`,
   was a partial slice of a month — sometimes a seventh, stub bucket of a
   fortnight's data — that reads as a spend collapse and shifts every single day
   as the window slides.
-- `upcoming_payments` — the (at most ten) unpaid invoices due within
-  `open_ap_due.DUE_SOON_DAYS` (seven) days or overdue, the same constant
-  `due_soon_count` reads, so the two windows cannot drift. Each row's `amount` is the invoice's **face** amount, in the
+- `upcoming_payments` — the (at most ten) open-AP invoices due within
+  `open_ap_due.DUE_SOON_DAYS` (seven) days or overdue, read from
+  `open_ap_due_population` (the overdue and due-soon counts' own select, which
+  leaves out an invoice already paid out awaiting its `paid` sync-back) and
+  ordered on its effective due date, so a rescheduled invoice is flagged here
+  exactly when `overdue_count` counts it (decisions §565). Each row's
+  `due_date` is that EFFECTIVE date (the current payment schedule's, else the
+  invoice's own), `is_overdue` is `open_ap_due.is_overdue` evaluated in the
+  same SELECT, and `own_due_date` is the invoice's own, so the web row says
+  "rescheduled from …" when they differ (`ui/DueDate.svelte`). Each row's `amount` is the invoice's **face** amount, in the
   row's own `currency` (the invoice's) — not a reporting figure. Label each row
   with that code, never with `reporting.reporting_currency` or the org's: the
   row carried no code until `docs/decisions.md` §200, so the web dashboard
@@ -1095,7 +1109,10 @@ The rule now:
   `due_date` alone. The SQL bound is on the future edge only. The row set, its
   effective due date and the flag come from `services/open_ap_due`
   (`open_ap_due_population`, `is_overdue`), the select the dashboard's
-  `overdue_*` and `GET /api/invoices?overdue=true` join too.
+  `overdue_*` and `GET /api/invoices?overdue=true` join too. An invoice whose
+  payment already completed (awaiting its `paid` sync-back) is not in it: the
+  money has left, and projecting it again double-counted the outflow
+  (decisions §565).
 - `services/analytics.bucket_outflows` times a flagged row on **today** — it
   cannot leave in the past — so it lands in the period containing today, the
   forecast's first. It counts in `scheduled_amount` and `count` and on its own

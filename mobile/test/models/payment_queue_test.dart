@@ -67,6 +67,30 @@ void main() {
   // `services/payment_runs.run_refusal_reasons` gives it — the SAME predicate
   // set `POST /api/payments/runs` enforces. Parsing it is what stops the app
   // staging a batch the backend then hard-409s as a whole.
+  group('PaymentQueueItem.rescheduledFrom', () {
+    PaymentQueueItem item(String? due, String? own) =>
+        PaymentQueueItem.fromJson({
+          'id': 'inv1',
+          'amount': 1,
+          'due_date': due,
+          'own_due_date': own,
+        });
+
+    test('names the own date when a schedule moved it', () {
+      final row = item('2026-02-10', '2026-02-01');
+      expect(row.dueDate, DateTime(2026, 2, 10));
+      expect(row.ownDueDate, DateTime(2026, 2, 1));
+      expect(row.rescheduledFrom, DateTime(2026, 2, 1));
+    });
+
+    test('says nothing when the dates agree or one is missing', () {
+      expect(item('2026-02-01', '2026-02-01').rescheduledFrom, isNull);
+      expect(item('2026-02-01T00:00:00', '2026-02-01').rescheduledFrom, isNull);
+      expect(item('2026-02-01', null).rescheduledFrom, isNull);
+      expect(item(null, '2026-02-01').rescheduledFrom, isNull);
+    });
+  });
+
   group('PaymentQueueItem refusal verdict', () {
     Map<String, dynamic> row({
       bool? blocked,

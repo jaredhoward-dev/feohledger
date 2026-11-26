@@ -39,6 +39,7 @@ async def _invoice(
     amount="500.00",
     approval_config=None,
     vendor_name="Parity Vendor",
+    assigned_to=None,
 ) -> uuid.UUID:
     async with realdb.sessionmaker(TENANT)() as s:
         entity_id = (await s.execute(select(Entity.id).where(Entity.is_default))).scalar_one()
@@ -51,6 +52,8 @@ async def _invoice(
             uploaded_by_id=uploaded_by or uuid.uuid4(),
             organization_id=realdb.info(TENANT).org_id,
             entity_id=entity_id,
+            assigned_to_id=assigned_to,
+            assigned_to="A Colleague" if assigned_to else None,
         )
         s.add(inv)
         await s.flush()
@@ -101,6 +104,24 @@ def _scenarios(realdb, role):
                 "approver_strategy": "chain",
                 "approval_chain": [{"approver_ids": [other], "required_approvals": 1}],
             },
+        },
+        # Assignment is routing, not authority (decisions §564): an invoice
+        # assigned to a colleague is decided by the same gates as an
+        # unassigned one — accepted when they pass, refused by the gate that
+        # fails, never by the assignment itself.
+        "assigned_to_other": {"assigned_to": uuid.UUID(other)},
+        "assigned_to_other_uploaded_by_caller": {
+            "assigned_to": uuid.UUID(other),
+            "uploaded_by": me,
+        },
+        "assigned_to_other_over_max": {
+            "assigned_to": uuid.UUID(other),
+            "amount": "5000.00",
+            "approval_config": {"max_invoice_amount": 1000},
+        },
+        "assigned_to_other_named_other_approver": {
+            "assigned_to": uuid.UUID(other),
+            "approval_config": {"approver_strategy": "specific", "approver_ids": [other]},
         },
     }
 
@@ -159,6 +180,47 @@ async def test_the_review_verdict_matches_what_approve_and_reject_answer(realdb,
         if role != "cfo":
             expected.add("approval_cfo_required")
         assert seen_codes == expected, seen_codes
+
+
+@pytest.mark.parametrize("role", ["admin", "ap_manager", "cfo"])
+async def test_an_approver_the_invoice_is_not_assigned_to_can_decide_it(realdb, role):
+    """Decisions §564: the review modal no longer hides Approve / Reject when
+    the invoice is assigned to someone else, so the server must keep accepting
+    a qualified approver who is not the assignee — and the verdict must say so
+    rather than invent an assignment refusal. The assignment itself is left as
+    it was: acting does not take the invoice over."""
+    colleague = uuid.uuid4()
+    me = realdb.info(TENANT).users[role]
+
+    approve_id = await _invoice(realdb, assigned_to=colleague)
+    verdict = await _verdict(realdb, role, approve_id)
+    assert (verdict["approve"], verdict["reject"]) == (None, None), verdict
+    async with realdb.client(key=TENANT, role=role) as c:
+        resp = await c.post(f"/api/invoices/{approve_id}/approve", json={})
+    assert resp.status_code == 200, resp.text
+
+    reject_id = await _invoice(realdb, assigned_to=colleague)
+    async with realdb.client(key=TENANT, role=role) as c:
+        resp = await c.post(f"/api/invoices/{reject_id}/reject", json={"reason": "not ours"})
+    assert resp.status_code == 200, resp.text
+
+    async with realdb.sessionmaker(TENANT)() as s:
+        approved = await s.get(Invoice, approve_id)
+        rejected = await s.get(Invoice, reject_id)
+        assert approved.status == InvoiceStatus.approved
+        assert rejected.status == InvoiceStatus.rejected
+        assert approved.assigned_to_id == colleague
+        actions = set(
+            (
+                await s.execute(
+                    select(AuditLog.action).where(
+                        AuditLog.entity_id.in_([approve_id, reject_id]),
+                        AuditLog.actor_id == me,
+                    )
+                )
+            ).scalars()
+        )
+    assert {"invoice.approved", "invoice.rejected"} <= actions, actions
 
 
 async def test_reading_the_verdict_writes_nothing(realdb):

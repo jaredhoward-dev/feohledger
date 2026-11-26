@@ -572,7 +572,11 @@ export interface DashboardData {
 		 * invoice (`docs/decisions.md` §200). `null` renders bare.
 		 */
 		currency: string | null;
+		/** The EFFECTIVE due date (current payment schedule's, else the
+		 * invoice's own): the date `is_overdue` and the overdue count read. */
 		due_date: string | null;
+		/** The invoice's own due date; differs when rescheduled (§565). */
+		own_due_date?: string | null;
 		is_overdue: boolean;
 	}>;
 	/**

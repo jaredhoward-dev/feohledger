@@ -104,6 +104,10 @@ function deleteExpense(id: string): void {
 }
 
 function deletePreapproval(id: string): void {
+	// A line drawing it down references it (decisions §563): unlink first.
+	tenantPsql(
+		`UPDATE expenses SET preapproval_id=NULL, preapproval_drawn_amount=NULL WHERE preapproval_id='${id}'`
+	);
 	tenantPsql(`DELETE FROM expense_preapprovals WHERE id='${id}'`);
 }
 

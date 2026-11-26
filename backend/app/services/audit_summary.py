@@ -254,7 +254,9 @@ def parse_response(text: str) -> AuditSummaryResult | None:
 #: from another version is regenerated even when no audit row has moved.
 #: v2 — ERP outcomes (`erp_failed` / `erp_confirmed` / ...) are summarized, and
 #: `erp_submitted` reads "submitted to ERP", not "sent to ERP".
-SUMMARY_FORMAT_VERSION = 2
+#: v3 — the PEPPOL send's start and an operator's settlement of a stalled send
+#: (`peppol_send_started` / `peppol_send_settled`, decisions §580) are summarized.
+SUMMARY_FORMAT_VERSION = 3
 
 # Each phrase is the predicate of "Invoice X <predicate>". A PASSIVE phrase
 # ("approved") follows "was"; an ACTIVE one ("failed to post to the ERP")
@@ -311,6 +313,13 @@ _ACTION_PHRASES: dict[str, tuple[str, bool]] = {
         "held back from the ERP re-send after the call allowance reset",
         _PASSIVE,
     ),
+    # PEPPOL. Like `erp_submitted`, `peppol_send_started` is only the START of
+    # a send (the reservation, committed before the network is touched,
+    # decisions §580); `peppol_sent` / `peppol_send_failed` say how it ended. A
+    # send whose process died is closed by an operator's settlement, which
+    # carries the outcome it recorded (`status`: sent / delivered / failed).
+    "invoice.peppol_send_started": ("submitted over PEPPOL", _PASSIVE),
+    "invoice.peppol_send_settled": ("had its stalled PEPPOL send settled", _ACTIVE),
     "invoice.peppol_sent": ("sent over PEPPOL", _PASSIVE),
     "invoice.peppol_send_failed": ("failed to send over PEPPOL", _ACTIVE),
     "invoice.payment_scheduled": ("scheduled for payment", _PASSIVE),

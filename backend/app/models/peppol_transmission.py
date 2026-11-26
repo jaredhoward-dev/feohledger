@@ -16,6 +16,14 @@ partial-unique ``message_id`` column let the next (inbound) slice dedupe
 redeliveries by the AS4 MessageId — the same shape payment webhooks dedupe by
 ``event_id``.
 
+Inbound rows outlive their invoice (decisions §586). Deleting an invoice we
+RECEIVED over PEPPOL detaches its inbound row (``invoice_id`` → NULL) and stamps
+``invoice_deleted_at`` / ``invoice_deleted_by_id`` / ``deleted_invoice_id``
+instead of deleting it, so the local record of a received e-invoice survives
+under the ``peppol_transmissions`` retention class. Only an inbound row may be
+detached (``ck_peppol_detached_inbound``): an outbound row's invoice is never
+deletable while it is live (§580), and a failed one is cleared with it.
+
 PII invariant: ``participant_value`` / ``sender_value`` hold org / tax ids that
 live legitimately on this row and inside the UBL payload, but NEVER enter a log
 line or an HTTP error body. Money (``amount``) is ``Numeric(15, 2)`` — never
@@ -46,8 +54,9 @@ class PeppolTransmission(Base, EntityMixin, TimestampMixin):
     __tablename__ = "peppol_transmissions"
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    invoice_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("invoices.id"), nullable=False, index=True
+    # NULL only on an inbound row whose invoice was deleted (§586).
+    invoice_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("invoices.id"), nullable=True, index=True
     )
     # "outbound" | "inbound" — this slice only writes "outbound".
     direction: Mapped[str] = mapped_column(String(10), nullable=False, default="outbound")
@@ -79,6 +88,12 @@ class PeppolTransmission(Base, EntityMixin, TimestampMixin):
     organization_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), nullable=False, index=True
     )
+    # Set together when the invoice this inbound row delivered is deleted
+    # (§586): when, by whom (a control-plane user id — no cross-database FK),
+    # and which invoice (its id, which the `invoice.deleted` audit row names).
+    invoice_deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    invoice_deleted_by_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    deleted_invoice_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
     # entity_id comes from EntityMixin; created_at/updated_at from TimestampMixin.
 
     __table_args__ = (
@@ -88,6 +103,12 @@ class PeppolTransmission(Base, EntityMixin, TimestampMixin):
         CheckConstraint("direction IN ('outbound','inbound')", name="ck_peppol_direction"),
         CheckConstraint(
             "status IN ('sending','sent','delivered','failed')", name="ck_peppol_status"
+        ),
+        # Only an inbound row may outlive its invoice, and a detached row says
+        # when it was detached (§586). Text matches migration 0152 verbatim.
+        CheckConstraint(
+            "invoice_id IS NOT NULL OR (direction = 'inbound' AND invoice_deleted_at IS NOT NULL)",
+            name="ck_peppol_detached_inbound",
         ),
         # The single-column ix_peppol_transmissions_{invoice_id,organization_id,
         # entity_id} indexes are auto-created by `index=True` on those columns

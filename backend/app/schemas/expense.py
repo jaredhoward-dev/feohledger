@@ -149,6 +149,12 @@ class ExpenseResponse(BaseModel):
     # §434). Always the authenticated caller, never read from a request body.
     # NULL for a line written before migration 0134 (not backfilled, §141).
     created_by_user_id: str | None = None
+    # The approved pre-approval this line draws down, and how much (decisions
+    # §563). Set at report submit on a line that needed cover; cleared when the
+    # report is rejected. NULL on a draft line and on any line submitted before
+    # migration 0149 (no link is invented).
+    preapproval_id: str | None = None
+    preapproval_drawn_amount: OptionalMoneyAmount = None
     created_at: str
     updated_at: str
 
@@ -543,6 +549,12 @@ class ExpensePreapprovalResponse(BaseModel):
     decided_by: str | None
     decided_at: str | None
     expense_report_id: str | None
+    # The draw-down (decisions §563): the sum of what submitted / approved
+    # lines have drawn against this estimate, and what is left of it. Same
+    # currency as ``estimated_amount``. ``remaining_amount`` is NULL unless the
+    # pre-approval is approved — a pending or rejected one covers nothing.
+    drawn_amount: MoneyAmount = Decimal("0")
+    remaining_amount: OptionalMoneyAmount = None
     created_at: str
     updated_at: str
 

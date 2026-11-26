@@ -235,20 +235,22 @@ async def test_touchless_rate_is_zero_when_no_invoices_decided():
 
 
 @pytest.mark.asyncio
-async def test_upcoming_payments_flag_overdue_only_when_due_date_before_today():
-    """Today's due date is `is_overdue=False` (still on time);
-    yesterday is True. A regression on the inequality direction would
-    nag the AP team for paying on time."""
+async def test_upcoming_payments_carry_the_sql_flag_and_both_dates():
+    """The row's `is_overdue` is the one `open_ap_due.is_overdue` evaluated in
+    the same SELECT as its effective date, never recomputed here; `due_date`
+    is that effective date and `own_due_date` the invoice's own, so a client
+    can say "rescheduled from" (decisions §565). The inequality itself
+    (yesterday overdue, today on time) is pinned against Postgres in
+    `test_dashboard_aggregates.py`."""
     import uuid
 
-    # `utc_today()`, not `date.today()`: every value this test compares
-    # against is derived by the app from the UTC date (app/utils/dates.py —
-    # no call site under app/ reads the local date). Anchoring the fixtures
-    # on the LOCAL date puts them a day off for the window each day where
-    # the two disagree, which lands exactly on the boundaries this test
-    # exists to pin. CI runs UTC and never saw it.
+    from app.schemas.dashboard import DashboardResponse
+
+    # `utc_today()`, not `date.today()`: every value the app compares is
+    # derived from the UTC date (app/utils/dates.py).
     today = utc_today()
     upcoming_rows = [
+        # Rescheduled: own date long past, effective date yesterday → overdue.
         (
             uuid.uuid4(),
             "INV-1",
@@ -258,23 +260,31 @@ async def test_upcoming_payments_flag_overdue_only_when_due_date_before_today():
             "USD",
             None,
             None,
+            today - timedelta(days=20),
+            True,
         ),
-        (uuid.uuid4(), "INV-2", "Bravo", Decimal("100"), today, "USD", None, None),  # on time
+        # Rescheduled forward: own date past, effective date ahead → on time.
         (
             uuid.uuid4(),
-            "INV-3",
-            "Charlie",
+            "INV-2",
+            "Bravo",
             Decimal("100"),
             today + timedelta(days=3),
             "USD",
             None,
             None,
-        ),  # future
+            today - timedelta(days=2),
+            False,
+        ),
     ]
     db = _mk_db(*_full_results(upcoming=upcoming_rows))
     result = await get_dashboard(db=db, org=_org(), user=_user(), entity_id=None)
-    flags = {row["invoice_number"]: row["is_overdue"] for row in result["upcoming_payments"]}
-    assert flags == {"INV-1": True, "INV-2": False, "INV-3": False}
+    wire = DashboardResponse.model_validate(result).model_dump(mode="json")
+    rows = {row["invoice_number"]: row for row in wire["upcoming_payments"]}
+    assert rows["INV-1"]["is_overdue"] is True
+    assert rows["INV-2"]["is_overdue"] is False
+    assert rows["INV-2"]["due_date"] == (today + timedelta(days=3)).isoformat()
+    assert rows["INV-2"]["own_due_date"] == (today - timedelta(days=2)).isoformat()
 
 
 @pytest.mark.asyncio
@@ -291,8 +301,8 @@ async def test_upcoming_payment_rows_carry_their_own_invoice_currency():
 
     today = utc_today()
     upcoming_rows = [
-        (uuid.uuid4(), "INV-US", "Acme", Decimal("100"), today, "USD", None, None),
-        (uuid.uuid4(), "INV-EU", "Bravo", Decimal("200"), today, "EUR", None, None),
+        (uuid.uuid4(), "INV-US", "Acme", Decimal("100"), today, "USD", None, None, today, False),
+        (uuid.uuid4(), "INV-EU", "Bravo", Decimal("200"), today, "EUR", None, None, today, False),
     ]
     db = _mk_db(*_full_results(upcoming=upcoming_rows))
     result = await get_dashboard(db=db, org=_org(), user=_user(), entity_id=None)
@@ -318,9 +328,20 @@ async def test_upcoming_total_amount_sums_in_decimal_not_accumulated_float():
 
     today = utc_today()
     upcoming_rows = [
-        (uuid.uuid4(), "INV-1", "Acme", Decimal("10.10"), today, "USD", None, None),
-        (uuid.uuid4(), "INV-2", "Bravo", Decimal("20.20"), today, "USD", None, None),
-        (uuid.uuid4(), "INV-3", "Charlie", Decimal("30.30"), today, "USD", None, None),
+        (uuid.uuid4(), "INV-1", "Acme", Decimal("10.10"), today, "USD", None, None, today, False),
+        (uuid.uuid4(), "INV-2", "Bravo", Decimal("20.20"), today, "USD", None, None, today, False),
+        (
+            uuid.uuid4(),
+            "INV-3",
+            "Charlie",
+            Decimal("30.30"),
+            today,
+            "USD",
+            None,
+            None,
+            today,
+            False,
+        ),
     ]
     db = _mk_db(*_full_results(upcoming=upcoming_rows))
     result = await get_dashboard(db=db, org=_org(), user=_user(), entity_id=None)

@@ -52,7 +52,7 @@
 
 	// The panel replaces whatever had focus (often nothing — this is first
 	// paint), so put focus on its heading each time a load fails: a screen
-	// reader announces what went wrong, and Tab lands on Try again next.
+	// reader announces what went wrong, and Tab lands on Retry next.
 	$effect(() => {
 		if (status !== 'error') return;
 		failedOnce = true;
@@ -81,7 +81,6 @@
 				heading={m('shell.accountLoad.errorHeading')}
 				headingLevel={1}
 				message={m('shell.accountLoad.errorBody')}
-				retryLabel={m('common.tryAgain')}
 				{retrying}
 				{onretry}
 			>

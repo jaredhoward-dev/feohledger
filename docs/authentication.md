@@ -313,6 +313,15 @@ the lost race; `tests/test_migration_0138_email_lower_unique.py` the migration.
 
 `GET /api/auth/me` — returns the authenticated user's profile including their roles (e.g. `["admin", "ap_manager"]`). Used by the frontend layout to validate the session on page load and determine role-based UI visibility.
 
+It also reports `is_partner`: whether the operator has granted the workspace
+the partner (reseller) capability (`organizations.is_partner`, decisions
+§574). It is a property of the workspace, reported to every role; the nav's
+Partner Admin row and `/admin/partner` read it. Every `/api/partner` route
+requires it after the admin role: an admin of a workspace without it gets a
+coded 403 `partner_capability_required` (a non-admin still gets the role's
+plain 403 first). Attach and provision re-check it under the partner's row
+lock, so an operator revoke and a new child link serialize (decisions §578).
+
 `PATCH /api/auth/me` — self-service endpoint for updating name and password (requires current password).
 
 ### Terms and Privacy acceptance
@@ -2855,6 +2864,14 @@ the delegate, and `approval_chain.check_level_approver` accepts the active
 delegate of a named approver on a `specific` step or chain level. The delegator
 stays authorized too. Only invoice approval routes this way — exception
 assignment and expense reports do not read the delegation.
+
+**Assignment itself is routing too** (decisions §564). No approval gate reads
+`Invoice.assigned_to_id`: an approver the invoice is not assigned to may approve
+or reject it whenever the gates above accept them, and the invoice modal offers
+the buttons on the `review-actions` verdict alone, with a non-blocking "Assigned
+to *X*" note. Where a step does restrict who may decide — a `specific` step's
+`approver_ids`, a chain level's approvers — that list is the gate
+(`approval_not_named_approver`), not the assignee.
 
 A delegate who holds no `invoice.approve` (an ap_clerk) is refused
 (decisions §511): an invoice routed to them would sit with someone who can

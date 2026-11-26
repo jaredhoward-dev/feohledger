@@ -57,6 +57,30 @@ INVOICE_RECALL_IN_ERP = "invoice_recall_in_erp"
 #: card, read by ``erp_export_gate.live_claims`` (decisions §309 / §357).
 #: ``params.claim`` is ``payment`` / ``virtual_card``.
 INVOICE_RECALL_CLAIMED = "invoice_recall_claimed"
+#: Refused because the approved document has already gone out over PEPPOL: a
+#: live (not `failed`) outbound ``peppol_transmissions`` row. The receiver's
+#: Access Point holds the approved figures and nothing un-sends them; a
+#: transmitted e-invoice is corrected by a credit note and a new document,
+#: never a silent edit (decisions §573). A `sending` row counts — its outcome
+#: is unknown, so it fails closed as an unknown ERP push does.
+INVOICE_RECALL_PEPPOL_TRANSMITTED = "invoice_recall_peppol_transmitted"
+#: Refused because the invoice was routed inter-company and its mirror payable
+#: under the counterparty entity is still unsigned (never approved, nothing
+#: paying it): the mirror carries this invoice's approved amount and
+#: segregation set, copied at routing. Delete the mirror, then recall, and
+#: route again once re-approved — routing copies the corrected figures and the
+#: then-current set afresh (decisions §573).
+INVOICE_RECALL_MIRROR_UNSIGNED = "invoice_recall_mirror_unsigned"
+#: Refused because the mirror has progressed past that: it was approved under
+#: the counterparty entity, or one of our rails is paying it. Its copy of the
+#: figures has been signed, so the pair is corrected by a credit memo on each
+#: side, not by reopening one (decisions §573).
+INVOICE_RECALL_MIRROR_PROGRESSED = "invoice_recall_mirror_progressed"
+#: Refused because the invoice IS an inter-company mirror: its figures are
+#: copied from the originating invoice under the other entity, so correcting
+#: it alone leaves the pair disagreeing. Delete it and correct the original
+#: (decisions §573).
+INVOICE_RECALL_IS_MIRROR = "invoice_recall_is_mirror"
 
 _RECALL_CLAIM_MESSAGES = {
     "payment": (
@@ -1001,6 +1025,85 @@ def holds_recallable_approval(invoice: Invoice) -> bool:
     return invoice.status == InvoiceStatus.failed and was_ever_approved(invoice)
 
 
+async def _peppol_transmitted(db: AsyncSession, invoice_id: uuid.UUID) -> bool:
+    """Whether a live (not `failed`) outbound PEPPOL transmission exists for
+    the invoice — the rows ``uq_peppol_one_live_per_invoice_direction`` counts."""
+    from app.models.peppol_transmission import PeppolTransmission
+
+    row = await db.execute(
+        select(PeppolTransmission.id)
+        .where(
+            PeppolTransmission.invoice_id == invoice_id,
+            PeppolTransmission.direction == "outbound",
+            PeppolTransmission.status != "failed",
+        )
+        .limit(1)
+    )
+    return row.first() is not None
+
+
+async def _is_intercompany_mirror(db: AsyncSession, invoice_id: uuid.UUID) -> bool:
+    """Whether ``invoice_id`` is the MIRROR side of an inter-company pair. The
+    link is set on both rows, so the side is read from routing's own
+    ``invoice.intercompany_routed`` audit row (``details.role``), as migration
+    0100 reads it — the append-only trail is the one record of which row
+    routing created."""
+    from app.models.workflow import AuditLog
+
+    row = await db.execute(
+        select(AuditLog.id)
+        .where(
+            AuditLog.entity_id == invoice_id,
+            AuditLog.action == "invoice.intercompany_routed",
+            AuditLog.details["role"].astext == "mirror",
+        )
+        .limit(1)
+    )
+    return row.first() is not None
+
+
+async def _intercompany_recall_refusal(db: AsyncSession, invoice: Invoice) -> dict | None:
+    """The inter-company leg of :func:`recall_refusal` (decisions §573): the
+    paired invoice holds a copy of this one's approved figures, so the recall
+    is refused while the pair is linked — with what to do instead, which
+    depends on which side this is and how far the mirror has gone."""
+    from app.models.invoice_status import PRE_APPROVAL_STATUSES, was_ever_approved
+    from app.services.erp_export_gate import live_claims
+
+    if invoice.intercompany_mirror_id is None:
+        return None
+    partner = await db.get(Invoice, invoice.intercompany_mirror_id)
+    if partner is None:
+        return None
+    if await _is_intercompany_mirror(db, invoice.id):
+        return coded_refusal(
+            INVOICE_RECALL_IS_MIRROR,
+            "This invoice is an inter-company mirror: its figures are copied from the "
+            "originating invoice under the other entity. Delete this mirror and correct "
+            "the original invoice, then route it again.",
+        )
+    unsigned = (
+        partner.status in PRE_APPROVAL_STATUSES
+        and not was_ever_approved(partner)
+        and partner.id not in await live_claims(db, [partner.id])
+    )
+    if unsigned:
+        return coded_refusal(
+            INVOICE_RECALL_MIRROR_UNSIGNED,
+            "This invoice has been routed inter-company, and its mirror under the other "
+            "entity copied the approved figures. Delete the mirror (it hasn't been "
+            "approved yet), then recall this approval, and route the invoice again once "
+            "it is re-approved.",
+        )
+    return coded_refusal(
+        INVOICE_RECALL_MIRROR_PROGRESSED,
+        "This invoice has been routed inter-company, and its mirror under the other "
+        "entity has already been approved or is being paid there. Correct the pair with "
+        "a credit memo on each side; this approval can't be recalled.",
+        mirror_status=partner.status.value,
+    )
+
+
 async def recall_refusal(db: AsyncSession, invoice: Invoice, *, actor) -> dict | None:
     """What `POST /{id}/recall-approval` would answer ``actor`` for ``invoice``
     right now — the coded refusal, or None. The ONE rule: the door raises from
@@ -1017,11 +1120,26 @@ async def recall_refusal(db: AsyncSession, invoice: Invoice, *, actor) -> dict |
        (``services/erp.possibly_posted`` — fail-closed: an attempt whose outcome
        is unknown counts). Named before a claim because nothing in FeohLedger
        clears it, so nobody cancels a run only to meet it next;
-    4. a live payment or virtual card (``invoice_recall_claimed``), read by
+    4. the approved document already went out over PEPPOL
+       (``invoice_recall_peppol_transmitted``) — a live outbound transmission;
+       the network holds it and only a credit note corrects it (§573);
+    5. the pair's mirror has been signed or is being paid
+       (``invoice_recall_mirror_progressed``) — only a credit memo on each side
+       corrects it, so, like 3 and 4, it is named before a claim (§573);
+    6. a live payment or virtual card (``invoice_recall_claimed``), read by
        ``erp_export_gate.live_claims`` — the rails' own predicates, so "live"
        reads here as it does for the run builder, the card mint, the ERP push
        and closing. A payment run holds its invoices through exactly these
-       payment rows, so this is also "the invoice is in a payment run".
+       payment rows, so this is also "the invoice is in a payment run". Named
+       before the two pair refusals whose way out is a DELETE
+       (``invoice_recall_is_mirror``: delete this mirror;
+       ``invoice_recall_mirror_unsigned``: delete the mirror, then recall),
+       because ``DELETE /invoices/{id}`` refuses a claimed invoice and the
+       recall would refuse the claim next: the person is told to cancel the run
+       or void the payment / card first (§578);
+    7. the rest of the inter-company pair
+       (:func:`_intercompany_recall_refusal`) — the other side holds a copy of
+       the approved figures and segregation set (§573).
 
     Call it on a row locked for update, as the door does: the run builder, the
     card mint and the ERP push each lock the invoice too, so no claim or push
@@ -1051,10 +1169,20 @@ async def recall_refusal(db: AsyncSession, invoice: Invoice, *, actor) -> dict |
             "paid there. Correct or void it in the ERP; its approval can't be recalled "
             "from FeohLedger.",
         )
+    if await _peppol_transmitted(db, invoice.id):
+        return coded_refusal(
+            INVOICE_RECALL_PEPPOL_TRANSMITTED,
+            "This invoice has already been sent over PEPPOL, and the receiver holds the "
+            "approved document. Issue a credit note and send a corrected invoice; its "
+            "approval can't be recalled.",
+        )
+    intercompany = await _intercompany_recall_refusal(db, invoice)
+    if intercompany is not None and intercompany["code"] == INVOICE_RECALL_MIRROR_PROGRESSED:
+        return intercompany
     claim = (await live_claims(db, [invoice.id])).get(invoice.id)
     if claim is not None:
         return coded_refusal(INVOICE_RECALL_CLAIMED, _RECALL_CLAIM_MESSAGES[claim], claim=claim)
-    return None
+    return intercompany
 
 
 async def recall_approval(

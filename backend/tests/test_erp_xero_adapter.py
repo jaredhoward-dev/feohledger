@@ -34,6 +34,7 @@ from app.services.erp_adapters.base import (
 from app.services.erp_adapters.dispatcher import get_erp_adapter
 from app.services.erp_adapters.xero import XeroAdapter
 from app.utils.json_money import dumps_exact_json
+from tests.fake_erp_module import load_fake_erp
 
 TENANT = "xero-tenant-0001"
 VENDOR = "c0ffee00-0000-0000-0000-000000000001"
@@ -539,6 +540,7 @@ def test_existing_bill_with_same_total_short_circuits(token):
         "InvoiceNumber": "SUP-1001",
         "Type": "ACCPAY",
         "Total": 1150.0,
+        "CurrencyCode": "ZAR",
     }
     with patch("httpx.AsyncClient") as cm:
         client = _client(cm)
@@ -570,6 +572,125 @@ def test_existing_bill_with_a_different_total_is_refused_not_adopted(token):
         result = _run(_adapter().post_invoice(_payload()))
     assert result.success is False
     assert result.message == "Xero post refused: duplicate_document_number"
+
+
+@pytest.mark.parametrize("total", [1150.0, 99.0])
+def test_existing_bill_on_a_shared_key_is_never_adopted(token, total):
+    """Another invoice carries this supplier + number (``bill_key_shared``,
+    set by ``services/erp``), so the found bill may be its own: refused with
+    a code, not adopted at the approved total, and no second bill created
+    (decisions §572). Not ``not_posted``: an earlier attempt of ours may have
+    created it."""
+    existing = {
+        "InvoiceID": "inv-other",
+        "InvoiceNumber": "SUP-1001",
+        "Type": "ACCPAY",
+        "Total": total,
+    }
+    with patch("httpx.AsyncClient") as cm:
+        client = _client(cm)
+        client.get = _get_router(lookup=_resp(200, {"Invoices": [existing]}))
+        client.put = AsyncMock(side_effect=AssertionError("must not create a second bill"))
+        client.post = AsyncMock(side_effect=AssertionError("must not write"))
+        result = _run(_adapter().post_invoice(_payload(bill_key_shared=True)))
+    assert result.success is False
+    assert result.erp_document_id is None
+    assert result.refusal_code == "erp_bill_key_shared"
+    assert result.message == "Xero post refused: erp_bill_key_shared"
+    assert result.retryable is False
+    assert result.not_posted is False
+    client.put.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    "total, adopted", [(1150.0, True), (99.0, False)], ids=["approved-total", "other-total"]
+)
+def test_the_confirmed_bill_on_a_shared_key_is_adopted_as_any_adoption(token, total, adopted):
+    """A person confirmed this very bill as this invoice's
+    (``payload.confirmed_bill_id``, decisions §587): it is adopted on the
+    shared key, and only at the approved total, as an unshared adoption is."""
+    existing = {"InvoiceID": "inv-mine", "InvoiceNumber": "SUP-1001", "Type": "ACCPAY"}
+    existing["Total"] = total
+    existing["CurrencyCode"] = "ZAR"
+    with patch("httpx.AsyncClient") as cm:
+        client = _client(cm)
+        client.get = _get_router(lookup=_resp(200, {"Invoices": [existing]}))
+        client.put = AsyncMock(side_effect=AssertionError("must not create a second bill"))
+        client.post = AsyncMock(side_effect=AssertionError("must not write"))
+        result = _run(
+            _adapter().post_invoice(_payload(bill_key_shared=True, confirmed_bill_id="inv-mine"))
+        )
+    assert result.success is adopted
+    if adopted:
+        assert result.erp_document_id == "inv-mine"
+    else:
+        assert result.refusal_code == "duplicate_document_number"
+    client.put.assert_not_awaited()
+
+
+@pytest.mark.parametrize("confirmed", [None, "inv-old"], ids=["unshared", "confirmed"])
+@pytest.mark.parametrize(
+    "currency", ["USD", None, "", "zar?"], ids=["other", "absent", "blank", "bad"]
+)
+def test_a_bill_at_the_same_total_in_another_currency_is_never_adopted(token, currency, confirmed):
+    """The same figure in another currency, or a bill stating none, is not
+    known to be this invoice's bill: refused ``currency_mismatch``, coded,
+    nothing created, never adopted — confirmed or not (decisions §588)."""
+    existing = {"InvoiceID": "inv-old", "InvoiceNumber": "SUP-1001", "Type": "ACCPAY"}
+    existing["Total"] = 1150.0
+    if currency is not None:
+        existing["CurrencyCode"] = currency
+    with patch("httpx.AsyncClient") as cm:
+        client = _client(cm)
+        client.get = _get_router(lookup=_resp(200, {"Invoices": [existing]}))
+        client.put = AsyncMock(side_effect=AssertionError("must not create a second bill"))
+        client.post = AsyncMock(side_effect=AssertionError("must not write"))
+        result = _run(
+            _adapter().post_invoice(
+                _payload(bill_key_shared=confirmed is not None, confirmed_bill_id=confirmed)
+            )
+        )
+    assert result.success is False
+    assert result.refusal_code == "currency_mismatch"
+    assert result.erp_document_id is None
+    assert result.not_posted is False
+    client.put.assert_not_awaited()
+
+
+def test_a_confirmation_of_another_bill_does_not_adopt_this_one(token):
+    """The confirmation names one bill; any other found on the key is still
+    refused ``erp_bill_key_shared`` (§587)."""
+    existing = {"InvoiceID": "inv-other", "InvoiceNumber": "SUP-1001", "Type": "ACCPAY"}
+    existing["Total"] = 1150.0
+    with patch("httpx.AsyncClient") as cm:
+        client = _client(cm)
+        client.get = _get_router(lookup=_resp(200, {"Invoices": [existing]}))
+        client.put = AsyncMock(side_effect=AssertionError("must not create a second bill"))
+        result = _run(
+            _adapter().post_invoice(_payload(bill_key_shared=True, confirmed_bill_id="inv-mine"))
+        )
+    assert result.success is False
+    assert result.refusal_code == "erp_bill_key_shared"
+    client.put.assert_not_awaited()
+
+
+def test_a_shared_key_with_no_bill_on_it_still_creates(token):
+    """Refusing adoption is not refusing the push: with nothing on the key
+    there is nothing to adopt, so the bill is created as usual (§572)."""
+    with patch("httpx.AsyncClient") as cm:
+        client = _client(cm)
+        client.get = _get_router(
+            lookup=_resp(200, {"Invoices": []}),
+            accounts=_resp(200, _accounts()),
+            bills={"inv-1": {"InvoiceID": "inv-1", "Status": "AUTHORISED", "Total": 1150.0}},
+        )
+        client.put = AsyncMock(
+            return_value=_resp(200, {"Invoices": [{"InvoiceID": "inv-1", "Total": 1150.0}]})
+        )
+        result = _run(_adapter().post_invoice(_payload(bill_key_shared=True)))
+    assert result.success
+    assert result.erp_document_id == "inv-1"
+    client.put.assert_awaited_once()
 
 
 # ---------------------------------------------------------------------------
@@ -1586,3 +1707,195 @@ def test_a_tax_number_search_url_is_redacted_from_the_httpx_log():
         "&includeArchived=true"
     )
     assert "GB123456789" not in str(redact_url_query(line))
+
+
+# ---------------------------------------------------------------------------
+# The orphan-bill lookup (decisions §556, §566): the push's supplier + number
+# match, alone and read-only
+# ---------------------------------------------------------------------------
+
+_REAL_ASYNC_CLIENT = httpx.AsyncClient
+FAKE_BASE = "http://fake-erp.test/xero/api.xro/2.0"
+FAKE_CONTACT = "xero-contact-1"
+
+
+@pytest.fixture
+def xero_fake(monkeypatch, token):
+    """tools/fake-erp, reset, as the adapter's only transport; records every
+    request method the adapter sends."""
+    module = load_fake_erp()
+    module.STATE = module._fresh_state()
+    monkeypatch.setattr(settings, "erp_xero_api_base", FAKE_BASE)
+    transport = httpx.ASGITransport(app=module.app)
+    methods: list[str] = []
+
+    async def record(request):
+        methods.append(request.method)
+
+    def client(*args, **kwargs):
+        kwargs.pop("auth", None)  # the refresh-on-401 wrapper is not under test
+        kwargs.setdefault("transport", transport)
+        kwargs["event_hooks"] = {"request": [record]}
+        return _REAL_ASYNC_CLIENT(*args, **kwargs)
+
+    monkeypatch.setattr(httpx, "AsyncClient", client)
+    module.methods = methods
+    return module
+
+
+def _fake_bill(
+    fake, *, number: str, contact: str = FAKE_CONTACT, status="AUTHORISED", total="1150.00"
+):
+    state = fake._xero_state()
+    state["counter"] += 1
+    record = {
+        "InvoiceID": f"xero-inv-{state['counter']}",
+        "InvoiceNumber": number,
+        "Type": "ACCPAY",
+        "Contact": {"ContactID": contact},
+        "Status": status,
+        "CurrencyCode": "ZAR",
+        "LineItems": [],
+        "Total": fake._XeroDecimal(total),
+        "AmountPaid": fake._XeroDecimal(0),
+        "AmountCredited": fake._XeroDecimal(0),
+        "Payments": [],
+        "CreditNotes": [],
+    }
+    fake._xero_touch(record)
+    state["invoices"][record["InvoiceID"]] = record
+    return record["InvoiceID"]
+
+
+def test_the_lookup_is_offered_and_its_key_is_marked_shared():
+    assert XeroAdapter.supports_bill_lookup is True
+    # Supplier + number: nothing on a Xero bill is unique to one invoice.
+    assert XeroAdapter.bill_lookup_key_shared is True
+
+
+def test_the_lookup_finds_the_bill_on_its_key_and_writes_nothing(xero_fake):
+    bill_id = _fake_bill(xero_fake, number="SUP-1001")
+    _fake_bill(xero_fake, number="SUP-1002")  # same supplier, another number
+
+    found = _run(_adapter().find_posted_bill(_payload(vendor_erp_id=FAKE_CONTACT)))
+
+    assert found is not None
+    assert found.document_id == bill_id
+    assert found.document_number == "SUP-1001"
+    assert found.amount == Decimal("1150.00")
+    assert found.currency == "ZAR"
+    assert found.status == ErpInvoiceStatus.open
+    assert xero_fake.methods == ["GET"]
+
+
+def test_the_lookup_says_none_for_another_supplier_or_a_voided_bill(xero_fake):
+    _fake_bill(xero_fake, number="SUP-1001", contact="xero-contact-2")
+    _fake_bill(xero_fake, number="SUP-1001", status="VOIDED")
+
+    assert _run(_adapter().find_posted_bill(_payload(vendor_erp_id=FAKE_CONTACT))) is None
+
+
+def test_two_bills_on_one_key_raise_rather_than_pick_one(xero_fake):
+    _fake_bill(xero_fake, number="SUP-1001")
+    _fake_bill(xero_fake, number="SUP-1001", status="DRAFT")
+
+    from app.services.erp_adapters.xero import XeroBillLookupAmbiguous
+
+    # Xero answered 200: not an HTTP failure, so not named as one (§569).
+    with pytest.raises(XeroBillLookupAmbiguous):
+        _run(_adapter().find_posted_bill(_payload(vendor_erp_id=FAKE_CONTACT)))
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        _resp(500, {}),
+        _resp(429, {}),
+        _resp(403, {}),
+        # A bill with no id, on another contact, with no contact, or at a
+        # status the filter did not ask for: Xero ignored the filter, or the
+        # shape is not one the push matches on.
+        _resp(
+            200,
+            {
+                "Invoices": [
+                    {
+                        "InvoiceNumber": "SUP-1001",
+                        "Type": "ACCPAY",
+                        "Contact": {"ContactID": VENDOR},
+                        "Status": "AUTHORISED",
+                    }
+                ]
+            },
+        ),
+        _resp(
+            200,
+            {
+                "Invoices": [
+                    {
+                        "InvoiceID": "i1",
+                        "InvoiceNumber": "SUP-1001",
+                        "Type": "ACCPAY",
+                        "Contact": {"ContactID": "other"},
+                        "Status": "AUTHORISED",
+                    }
+                ]
+            },
+        ),
+        _resp(
+            200,
+            {
+                "Invoices": [
+                    {
+                        "InvoiceID": "i1",
+                        "InvoiceNumber": "SUP-1001",
+                        "Type": "ACCPAY",
+                        "Status": "AUTHORISED",
+                    }
+                ]
+            },
+        ),
+        _resp(
+            200,
+            {
+                "Invoices": [
+                    {
+                        "InvoiceID": "i1",
+                        "InvoiceNumber": "SUP-1001",
+                        "Type": "ACCPAY",
+                        "Contact": {"ContactID": VENDOR},
+                        "Status": "VOIDED",
+                    }
+                ]
+            },
+        ),
+        httpx.Response(200, content=b"not json"),
+    ],
+)
+def test_a_lookup_that_cannot_answer_raises_never_none(token, answer):
+    with patch("httpx.AsyncClient") as cm:
+        client = _client(cm)
+        client.get = AsyncMock(return_value=answer)
+        client.put = AsyncMock(side_effect=AssertionError("read-only"))
+        client.post = AsyncMock(side_effect=AssertionError("read-only"))
+        with pytest.raises(Exception) as raised:
+            _run(_adapter().find_posted_bill(_payload()))
+    assert not isinstance(raised.value, AssertionError)
+    from app.services.erp_adapters.xero import XeroBillLookupAmbiguous, XeroRequestError
+
+    # A refused read names its HTTP status; a readable answer that is not one
+    # bill of ours says so instead of passing off a 200 as a failure (§569).
+    if answer.status_code != 200:
+        assert isinstance(raised.value, XeroRequestError)
+    elif answer.content != b"not json":
+        assert isinstance(raised.value, XeroBillLookupAmbiguous)
+        assert "HTTP" not in str(raised.value)
+
+
+@pytest.mark.parametrize("overrides", [{"vendor_erp_id": None}, {"invoice_number": "  "}])
+def test_a_payload_the_push_would_refuse_raises_before_any_call(token, overrides):
+    with patch("httpx.AsyncClient") as cm:
+        client = _client(cm)
+        client.get = AsyncMock(side_effect=AssertionError("no call"))
+        with pytest.raises(ValueError):
+            _run(_adapter().find_posted_bill(_payload(**overrides)))

@@ -76,7 +76,8 @@ DEFAULT_DURATIONS = BACKEND_ROOT / ".test_durations"
 # tripped at 5.25% on 2026-11-13 (PR #714, rounds 8–10) and was rebuilt from
 # run 43546852382 to 0.01% (2 of 15,816). It tripped at 5.04% on 2026-11-25
 # (PR #771, rounds 42–43) and was rebuilt from run 45634434605 to 0.16% (29 of
-# 17,806).
+# 17,806). It tripped at 5.20% on 2026-11-25 (PR #772, rounds 48–49) and was
+# rebuilt from run 45708054123 to 0.82% (152 of 18,624).
 # Ratchet only downward — see the module docstring.
 MAX_MISSING_FRACTION = 0.05
 

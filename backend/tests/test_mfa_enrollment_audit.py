@@ -196,13 +196,11 @@ async def test_disabling_totp_is_audited(audit):
 
     secret = pyotp.random_base32()
     user = _fake_user(mfa_secret=secret, mfa_enabled=True)
-    org = SimpleNamespace(id=user.organization_id, settings={}, name="Acme")
+    org = SimpleNamespace(id=user.organization_id, settings={}, name="Acme", is_partner=False)
     code = pyotp.TOTP(secret).now()
 
     with patch("app.api.auth.settings.mfa_enabled", True):
-        await disable_mfa(
-            body=MFADisableRequest(code=code), user=user, db=_db_returning([], org, org)
-        )
+        await disable_mfa(body=MFADisableRequest(code=code), user=user, db=_db_returning(org))
 
     assert user.mfa_enabled is False
     assert _actions(audit) == ["auth.mfa.disabled"]
@@ -279,7 +277,7 @@ async def test_passkey_removal_audit_names_the_same_credential(audit):
         rp_id="localhost",
         credential_id="authenticator-handle",
     )
-    org = SimpleNamespace(id=user.organization_id, settings={}, name="Acme")
+    org = SimpleNamespace(id=user.organization_id, settings={}, name="Acme", is_partner=False)
     db = _db_returning(cred, org, org)
 
     with (

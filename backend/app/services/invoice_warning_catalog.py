@@ -906,19 +906,59 @@ _ERP_NAMED_SENTENCES: dict[str, str] = {
         "although the money was paid. Resolve what stopped it, then use Retry ERP sync on "
         "the payment's run in Payments."
     ),
+    # A write whose outcome FeohLedger does not know (a network drop after the
+    # send, an unreadable answer, the attempts cap, a bill that moved —
+    # decisions §588): our payment may stand, so the sentence never says
+    # "unpaid" or "retry"; the person looks for it by its marker.
+    "erp_payment_writeback_unconfirmed": (
+        "may already show this invoice's payment: FeohLedger sent it but could not confirm "
+        "it was recorded. Check the bill for a payment referenced “{marker}” before "
+        "recording one."
+    ),
     "erp_payment_writeback_balance_open": (
         "recorded this invoice's payment, but the bill still shows {amount} {currency} open "
         "there (a discount or credit taken in FeohLedger). Close the difference in the ERP."
+    ),
+    # The same open balance while a discount credit of ours may stand there
+    # (decisions §585): the opt-in's credit is recorded and FeohLedger finishes
+    # it, so the sentence must not ask anyone to book the difference again.
+    "erp_discount_credit_pending": (
+        "recorded this invoice's payment, but the bill still shows {amount} {currency} open "
+        "there. FeohLedger booked credit {credit} for the early-payment discount and will "
+        "apply it, so don't book another."
+    ),
+    # Its twin for a credit whose id FeohLedger never learned (§579): it may
+    # stand, found only by the marker it carries.
+    "erp_discount_credit_pending_unidentified": (
+        "recorded this invoice's payment, but the bill still shows {amount} {currency} open "
+        "there. FeohLedger may have booked a credit for this discount, so check for "
+        "“{marker}” before booking one."
     ),
     "erp_payment_void_writeback_failed": (
         "still shows this bill paid by a payment that was voided in FeohLedger, because "
         "voiding it in the ERP failed. Void that payment in the ERP so the books agree."
     ),
+    # A discount credit (decisions §575) FeohLedger cannot finish on its own:
+    # created but never identified, or retried until the cap (§579). The
+    # payment id and the credit's marker are in `exceptions.erp_report`.
+    "erp_discount_credit_stalled": (
+        "may hold an early-payment discount credit FeohLedger created for this invoice's "
+        "payment that it could not apply or reverse automatically. Find the credit marked "
+        "“FeohLedger discount” with this payment's id there, and apply or delete it so "
+        "the discount is counted once."
+    ),
 }
 
 #: Params a named sentence carries besides ``erp`` (both twins carry them).
 _ERP_NAMED_PARAMS: dict[str, dict[str, ParamKind]] = {
+    "erp_payment_writeback_unconfirmed": {"marker": "text"},
     "erp_payment_writeback_balance_open": {"amount": "money", "currency": "currency"},
+    "erp_discount_credit_pending": {"amount": "money", "currency": "currency", "credit": "text"},
+    "erp_discount_credit_pending_unidentified": {
+        "amount": "money",
+        "currency": "currency",
+        "marker": "text",
+    },
 }
 
 _DISPATCH_STOPPED_TAIL = (

@@ -118,6 +118,25 @@ class TransmissionResult:
     raw_response: dict | None = field(default=None)
 
 
+#: :attr:`TransmissionLookup.outcome` values. ``sent`` / ``delivered`` /
+#: ``failed`` are the Access Point's own verdict on the document;
+#: ``not_found`` means the AP holds no transmission under our business message
+#: id, so the document never reached it; ``unknown`` means the AP could not be
+#: asked (transport error, not configured) and nothing may be concluded.
+LOOKUP_OUTCOMES = ("sent", "delivered", "failed", "not_found", "unknown")
+
+
+@dataclass
+class TransmissionLookup:
+    """What the Access Point knows of one transmission, by our
+    ``business_message_id`` (decisions §580)."""
+
+    outcome: str  # one of LOOKUP_OUTCOMES
+    message_id: str | None = None  # the AP's MessageId, when it has one
+    failure_reason: str | None = None  # PII-free code
+    raw_response: dict | None = field(default=None)
+
+
 class PeppolAdapter:
     """Base class for PEPPOL Access Point integrations.
 
@@ -139,6 +158,17 @@ class PeppolAdapter:
         Idempotent at the gateway by ``request.business_message_id`` (defence in
         depth — the authoritative one-time guarantee is the DB unique index on
         the transmission row)."""
+        raise NotImplementedError
+
+    async def lookup_transmission(self, business_message_id: str) -> TransmissionLookup:
+        """Ask the Access Point what became of the transmission it holds under
+        ``business_message_id`` (our idempotency key).
+
+        Used only to settle a ``sending`` row whose outcome was never recorded
+        (the process died between the reservation and the outcome commit,
+        decisions §580). An adapter that cannot ask raises
+        ``NotImplementedError``; the caller then refuses to settle the row,
+        because a row is never marked ``failed`` without the AP's answer."""
         raise NotImplementedError
 
     async def test_connection(self) -> bool:

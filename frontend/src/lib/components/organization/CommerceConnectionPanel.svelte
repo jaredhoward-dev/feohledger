@@ -45,6 +45,7 @@
 	import SecretField from '#lib/components/ui/SecretField.svelte';
 	import { toast } from '#lib/components/ui/Toast.svelte';
 	import { m } from '#lib/i18n/store.svelte.ts';
+	import LoadError from '#lib/components/ui/LoadError.svelte';
 	import LoadingState from '#lib/components/ui/LoadingState.svelte';
 	import type { Entity } from '#lib/stores/entity.svelte.ts';
 	import {
@@ -360,10 +361,7 @@
 	{#if readOnly}
 		<p class="card-hint" data-testid="commerce-admin-only">{m('org.readOnly.sectionAdminOnly')}</p>
 	{:else if loadFailed}
-		<div class="load-failed" role="alert">
-			<p class="card-hint failure-text">{m('org.commerce.loadFailed')}</p>
-			<button type="button" class="btn-test" onclick={load}>{m('common.tryAgain')}</button>
-		</div>
+		<LoadError message={m('org.commerce.loadFailed')} onretry={load} testId="commerce-load-failed" />
 	{:else if !catalog}
 		<LoadingState />
 	{:else}
@@ -701,13 +699,6 @@
 	}
 
 	.action-buttons {
-		display: flex;
-		align-items: center;
-		flex-wrap: wrap;
-		gap: 12px;
-	}
-
-	.load-failed {
 		display: flex;
 		align-items: center;
 		flex-wrap: wrap;

@@ -277,6 +277,7 @@ async def open_settlement_mismatch_exception(
 
 __all__ = [
     "SettlementCompletion",
+    "payment_covered_sql",
     "open_settlement_mismatch_exception",
     "record_completion",
     "record_settlement",
@@ -325,7 +326,9 @@ async def card_leg_card(db: AsyncSession, payment: Payment):
         await db.execute(
             select(VirtualCard)
             .where(or_(*clauses))
-            .order_by(spent_first, VirtualCard.created_at.desc())
+            # `id` breaks a `created_at` tie so this and `payment_covered_sql`
+            # pick the same card (decisions §569).
+            .order_by(spent_first, VirtualCard.created_at.desc(), VirtualCard.id.desc())
             .limit(1)
         )
     ).scalar_one_or_none()
@@ -373,6 +376,98 @@ async def payment_coverage(db: AsyncSession, payment: Payment, invoice_currency:
         source_currency=payment.source_currency,
         settled_amount_unstorable=unstorable,
         awaiting_card_spend=awaiting,
+    )
+
+
+def _same_currency_sql(a, b):
+    """SQL twin of `payment_settlement._same_currency`: NULL on either side is a
+    wildcard, else codes compare trimmed and case-folded."""
+    from sqlalchemy import or_
+
+    return or_(a.is_(None), b.is_(None), func.upper(func.btrim(a)) == func.upper(func.btrim(b)))
+
+
+def payment_covered_sql(invoice_currency=None):
+    """SQL twin of `payment_coverage(...).state == "covered"` for the `Payment`
+    row in scope: True exactly when that payment discharges its invoice.
+
+    For set-based readers that cannot call the async per-payment function, such
+    as `open_ap_due.paid_out` (decisions §569). `invoice_currency` is the
+    invoice's currency column (default `Invoice.currency`, correlated on the
+    caller's outer invoice). Clause for clause:
+
+    * an unstorable figure is `uncertain`, never covered;
+    * a card leg (`CARD_LEG_METHOD`) is `in_flight` unless the card
+      `card_leg_card` would pick (spent first, then newest) is SETTLED
+      (`CARD_SETTLED_STATUS`); settled with nothing stamped on the payment, the
+      card's own `amount_charged` / `currency` stand in;
+    * no figure on record is `covered` (the rail moved money and reported none);
+    * otherwise covered iff the figure reaches some currency-compatible
+      authorized leg (the invoice-currency target, or the FX source leg when
+      the payment carries one) within `SETTLEMENT_AMOUNT_TOLERANCE`, both sides
+      rounded to cents as `_q` does. Short, or no compatible leg, is not.
+
+    `tests/test_payment_coverage_sql_parity.py` runs both over every case; a
+    change to `payment_coverage` or `settlement_coverage` changes this too.
+    """
+    from sqlalchemy import and_, case, not_, or_
+
+    from app.models.virtual_card import VirtualCard
+    from app.services.card_issuance import CARD_SPENT_STATUSES
+    from app.services.payment_settlement import SETTLEMENT_AMOUNT_TOLERANCE
+
+    if invoice_currency is None:
+        invoice_currency = Invoice.currency
+
+    def picked_card(column):
+        spent_first = case((VirtualCard.status.in_(CARD_SPENT_STATUSES), 0), else_=1)
+        return (
+            select(column)
+            .where(
+                or_(
+                    VirtualCard.payment_id == Payment.id,
+                    and_(
+                        Payment.invoice_id.is_not(None),
+                        VirtualCard.invoice_id == Payment.invoice_id,
+                        VirtualCard.payment_id.is_(None),
+                    ),
+                )
+            )
+            .order_by(spent_first, VirtualCard.created_at.desc(), VirtualCard.id.desc())
+            .limit(1)
+            .scalar_subquery()
+        )
+
+    is_card = func.coalesce(Payment.method, "") == CARD_LEG_METHOD
+    from_card = and_(is_card, Payment.settled_amount.is_(None))
+    settled = case(
+        (from_card, picked_card(VirtualCard.amount_charged)), else_=Payment.settled_amount
+    )
+    settled_ccy = case(
+        (from_card, picked_card(VirtualCard.currency)), else_=Payment.settled_currency
+    )
+    tolerance = SETTLEMENT_AMOUNT_TOLERANCE
+
+    def reaches(leg_amount, leg_currency):
+        return and_(
+            _same_currency_sql(settled_ccy, leg_currency),
+            func.round(settled, 2) >= func.round(leg_amount, 2) - tolerance,
+        )
+
+    return and_(
+        not_(func.coalesce(Payment.settled_amount_unstorable, False)),
+        or_(
+            not_(is_card),
+            func.coalesce(picked_card(VirtualCard.status), "") == CARD_SETTLED_STATUS,
+        ),
+        or_(
+            settled.is_(None),
+            reaches(Payment.amount, invoice_currency),
+            and_(
+                Payment.source_amount.is_not(None),
+                reaches(Payment.source_amount, Payment.source_currency),
+            ),
+        ),
     )
 
 
