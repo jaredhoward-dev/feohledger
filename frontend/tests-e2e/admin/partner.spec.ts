@@ -4,7 +4,7 @@ import {
 	expect,
 	sectionTabHrefs,
 	signInAndWait,
-	stubPartnerCapability,
+	stubPartnerWorkspace,
 	TENANT_ROOT_URL,
 	test
 } from '../fixtures/helpers';
@@ -61,21 +61,7 @@ test.describe('/admin/partner (admin of a partner workspace)', () => {
 	test.use({ storageState: { cookies: [], origins: [] } });
 
 	test('the Partner Admin row is shown and the page opens', async ({ page }) => {
-		await stubPartnerCapability(page);
-		await page.route(
-			(url) => url.pathname === '/api/partner',
-			(route) =>
-				route.request().method() === 'GET'
-					? route.fulfill({
-							json: {
-								organization_id: '00000000-0000-4000-8000-000000000450',
-								name: 'Partner Fixture Workspace',
-								is_partner: true,
-								children: []
-							}
-						})
-					: route.fallback()
-		);
+		await stubPartnerWorkspace(page);
 		await signInAndWait(page);
 
 		await page.goto(SETTINGS_TAB);

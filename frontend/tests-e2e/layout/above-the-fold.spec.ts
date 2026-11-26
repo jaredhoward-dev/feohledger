@@ -5,7 +5,7 @@ import { enPortal } from '#lib/i18n/locales/portal/en.ts';
 import { enSettings } from '#lib/i18n/locales/settings/en.ts';
 import { NAV } from '#lib/nav.ts';
 
-import { expect, NO_TENANT_BASE, test } from '../fixtures/helpers';
+import { expect, NO_TENANT_BASE, stubPartnerWorkspace, test } from '../fixtures/helpers';
 
 /**
  * Above the fold — every page's heading, primary action and first input or
@@ -50,6 +50,11 @@ interface Row {
 	heading: { key: string } | { text: string };
 	action: Slot;
 	filter: Slot;
+	/**
+	 * Network stubs the page needs before it opens, for a page the worker
+	 * tenant cannot reach as seeded (registered before navigation).
+	 */
+	setup?: (page: Page) => Promise<void>;
 }
 
 const button = (key: string): Find => {
@@ -281,7 +286,11 @@ const ROWS: Record<string, Row> = {
 	'/admin/partner': {
 		heading: { key: 'admin.partner.title' },
 		action: button('admin.partner.createChild'),
-		filter: { none: 'the child-tenant list has no search or filter control' }
+		filter: { none: 'the child-tenant list has no search or filter control' },
+		// The page opens only for a workspace the operator made a partner
+		// (decisions §574), and no e2e tenant is one — so the capability and an
+		// empty overview are stubbed (`stubPartnerWorkspace`).
+		setup: stubPartnerWorkspace
 	},
 	'/admin/api-keys': {
 		heading: { key: 'admin.apiKeys.title' },
@@ -361,6 +370,7 @@ for (const viewport of VIEWPORTS) {
 		for (const [href, row] of Object.entries(ROWS)) {
 			test(`${href} shows its heading, action and filter without scrolling`, async ({ page }) => {
 				await acceptConsent(page);
+				await row.setup?.(page);
 				await page.goto(href);
 				await expectOnScreen(page.locator('#main-content'), row, `${href} @ ${size}`);
 			});
