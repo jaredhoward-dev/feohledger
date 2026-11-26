@@ -26,11 +26,14 @@ would make it unbounded.
 
 1. :func:`queue_invoice_objects` — called from ``_delete_invoice_cascade`` in
    the delete's own transaction. It writes one ``pending_object_deletions`` row
-   per folder (the outbox) and queues a ``post_commit`` job that empties them
-   once the delete has committed. A rolled-back delete drops both together.
-2. :func:`drain_pending` — the retention sweep's retry of any row that job did
-   not finish (storage down, worker gone). A row is removed only when its
-   folder is empty.
+   per folder (the outbox) and queues ONE ``post_commit`` job per transaction
+   that empties every row the transaction wrote (a bulk delete included) once
+   it has committed. A rolled-back delete drops both together.
+2. :func:`drain_pending` — what that job runs, and the retention sweep's retry
+   of any row it did not finish (storage down, worker gone). It claims rows in
+   a short committed transaction before touching storage, so no row lock is
+   held across a bucket call and two drains never work the same row inside its
+   lease. A row is removed only when its folder is empty.
 3. :func:`sweep_orphaned_invoice_objects` — a bounded listing of the tenant's
    folders compared against live ``invoices`` rows, for folders no outbox row
    names: invoices deleted before §592, or a write whose row never committed.
@@ -53,10 +56,11 @@ from __future__ import annotations
 
 import logging
 import uuid
-from dataclasses import dataclass
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import delete, exists, or_, select
+from sqlalchemy import delete, exists, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.config import settings
@@ -64,7 +68,7 @@ from app.models.invoice import Invoice
 from app.models.pending_object_deletion import OWNER_INVOICE, PendingObjectDeletion
 from app.services import storage
 from app.services.audit_dispatch import dispatch_audit
-from app.services.post_commit import enqueue_post_commit
+from app.services.post_commit import enqueue_post_commit, is_post_commit_queued
 
 logger = logging.getLogger(__name__)
 
@@ -141,13 +145,32 @@ async def _owned_by_a_live_invoice(db: AsyncSession, invoice_id: uuid.UUID, pref
     )
 
 
+@dataclass
+class _Batch:
+    """The outbox rows one transaction queued, drained by ONE post-commit job.
+
+    Bulk delete calls :func:`queue_invoice_objects` once per invoice; a job and
+    a session per invoice would be N sessions and N passes after the commit.
+    The job reads ``rows`` when it runs, so every row queued before the commit
+    is in it.
+    """
+
+    engine: object
+    rows: dict[uuid.UUID, list[uuid.UUID]] = field(default_factory=dict)
+    job: Callable[[], Awaitable[None]] | None = None
+
+
+_BATCH_KEY = "_feoh_invoice_object_batch"
+
+
 async def queue_invoice_objects(db: AsyncSession, invoice_id: uuid.UUID) -> None:
     """Queue the invoice's folders for deletion once this transaction commits.
 
     Must run inside the delete's transaction, before the invoice row goes (its
     organisation id is read from it). The outbox rows commit or roll back with
     the delete; the ``post_commit`` job is the fast path and the retention
-    sweep the durable one.
+    sweep the durable one. However many invoices one transaction deletes, it
+    queues one job, which drains every row the transaction wrote.
     """
     organization_id = (
         await db.execute(select(Invoice.organization_id).where(Invoice.id == invoice_id))
@@ -165,18 +188,30 @@ async def queue_invoice_objects(db: AsyncSession, invoice_id: uuid.UUID) -> None
     ]
     db.add_all(rows)
     await db.flush()
-    row_ids = [row.id for row in rows]
     engine = db.bind
     if engine is None:  # an unbound session: the retention sweep will drain it
         return
 
+    batch: _Batch | None = db.info.get(_BATCH_KEY)
+    # A batch whose job is no longer queued belongs to a transaction that has
+    # committed (its job ran or is running) or rolled back: start another.
+    if batch is None or batch.job is None or not is_post_commit_queued(db, batch.job):
+        batch = _Batch(engine=engine)
+        batch.job = _drain_batch_job(batch)
+        db.info[_BATCH_KEY] = batch
+        enqueue_post_commit(db, batch.job, name="invoice_objects.purge")
+    batch.rows.setdefault(organization_id, []).extend(row.id for row in rows)
+
+
+def _drain_batch_job(batch: _Batch) -> Callable[[], Awaitable[None]]:
     async def _purge() -> None:
-        factory = async_sessionmaker(engine, expire_on_commit=False)
+        factory = async_sessionmaker(batch.engine, expire_on_commit=False)
         async with factory() as session:
-            await drain_pending(session, organization_id=organization_id, row_ids=row_ids)
+            for organization_id, row_ids in batch.rows.items():
+                await drain_pending(session, organization_id=organization_id, row_ids=row_ids)
             await session.commit()
 
-    enqueue_post_commit(db, _purge, name="invoice_objects.purge")
+    return _purge
 
 
 async def _purge_folder(
@@ -228,6 +263,68 @@ async def _audit(
     )
 
 
+#: How long a claimed outbox row is left to the drain that claimed it. A drain
+#: that dies mid-pass (worker killed, restart) leaves its rows marked; after
+#: this long another drain may take them. Emptying a folder is idempotent, so a
+#: drain merely slower than this costs a repeat delete, never a lost row.
+CLAIM_LEASE = timedelta(minutes=15)
+
+#: ``last_error`` while a drain holds the row (between its claim and finish).
+CLAIMED = "claimed"
+
+
+async def _claim(
+    factory: async_sessionmaker,
+    *,
+    organization_id: uuid.UUID,
+    row_ids: list[uuid.UUID] | None,
+    limit: int | None,
+    stamp: datetime,
+) -> list[tuple[uuid.UUID, str]]:
+    """Take rows for this drain in one short committed transaction.
+
+    ``SKIP LOCKED`` passes over rows another drain is claiming right now, and
+    the ``CLAIMED`` marker with a fresh ``last_attempt_at`` over rows another
+    drain claimed and is still working on. Postgres re-checks the WHERE on a
+    row whose claim committed while this one waited, so two drains never both
+    take a row inside its lease.
+    """
+    async with factory() as session:
+        stmt = select(PendingObjectDeletion.id, PendingObjectDeletion.prefix).where(
+            PendingObjectDeletion.organization_id == organization_id,
+            or_(
+                PendingObjectDeletion.last_error.is_distinct_from(CLAIMED),
+                PendingObjectDeletion.last_attempt_at.is_(None),
+                PendingObjectDeletion.last_attempt_at < stamp - CLAIM_LEASE,
+            ),
+        )
+        if row_ids is not None:
+            stmt = stmt.where(PendingObjectDeletion.id.in_(row_ids))
+        stmt = stmt.order_by(PendingObjectDeletion.created_at.asc(), PendingObjectDeletion.id.asc())
+        if limit is not None:
+            stmt = stmt.limit(limit)
+        claimed = [
+            (row_id, prefix)
+            for row_id, prefix in (
+                await session.execute(
+                    stmt.with_for_update(skip_locked=True, of=PendingObjectDeletion)
+                )
+            ).all()
+        ]
+        if claimed:
+            await session.execute(
+                update(PendingObjectDeletion)
+                .where(PendingObjectDeletion.id.in_([row_id for row_id, _ in claimed]))
+                .values(
+                    attempts=PendingObjectDeletion.attempts + 1,
+                    last_error=CLAIMED,
+                    last_attempt_at=stamp,
+                )
+            )
+        await session.commit()
+    return claimed
+
+
 async def drain_pending(
     db: AsyncSession,
     *,
@@ -239,31 +336,44 @@ async def drain_pending(
     """Empty queued folders; remove each row once its folder is gone.
 
     ``row_ids`` names the rows a just-committed delete queued (the post-commit
-    path); otherwise the oldest ``limit`` rows (the sweep). A failure keeps the
-    row with ``attempts`` / ``last_error`` (a class name) for the next pass. A
-    refused folder — one a live invoice still owns — drops the row and keeps
-    every object: the row was wrong, the documents are not. Caller commits.
+    path); otherwise the oldest ``limit`` rows (the sweep). Three short
+    transactions of its own on ``db``'s engine, so no row lock is held across
+    a storage call: claim the rows (:func:`_claim`, which bumps ``attempts``),
+    empty the folders, then delete the emptied rows and record failures. A
+    failure keeps the row with ``last_error`` (a class name) for the next pass.
+    A refused folder — one a live invoice still owns — drops the row and keeps
+    every object: the row was wrong, the documents are not. ``db`` is used only
+    to read ownership; the rows and the audit row commit here, not with it.
     """
     result = PurgeResult()
-    stmt = select(PendingObjectDeletion).where(
-        PendingObjectDeletion.organization_id == organization_id
-    )
-    if row_ids is not None:
-        stmt = stmt.where(PendingObjectDeletion.id.in_(row_ids))
-    stmt = stmt.order_by(PendingObjectDeletion.created_at.asc(), PendingObjectDeletion.id.asc())
-    if limit is not None:
-        stmt = stmt.limit(limit)
-    rows = (await db.execute(stmt.with_for_update(skip_locked=True))).scalars().all()
+    engine = db.bind
+    if engine is None:
+        raise RuntimeError("drain_pending needs a session bound to an engine")
+    factory = async_sessionmaker(engine, expire_on_commit=False)
     stamp = now or datetime.now(UTC)
-    for row in rows:
-        outcome = await _purge_folder(db, organization_id, row.prefix, result)
-        if outcome is None:
-            row.attempts = (row.attempts or 0) + 1
-            row.last_error = "storage_error"
-            row.last_attempt_at = stamp
-            continue
-        await db.execute(delete(PendingObjectDeletion).where(PendingObjectDeletion.id == row.id))
-    await _audit(db, organization_id, "invoice_deleted" if row_ids else "retry", result)
+    claimed = await _claim(
+        factory, organization_id=organization_id, row_ids=row_ids, limit=limit, stamp=stamp
+    )
+    if not claimed:
+        return result
+    done: list[uuid.UUID] = []
+    failed: list[uuid.UUID] = []
+    for row_id, prefix in claimed:
+        outcome = await _purge_folder(db, organization_id, prefix, result)
+        (failed if outcome is None else done).append(row_id)
+    async with factory() as session:
+        if done:
+            await session.execute(
+                delete(PendingObjectDeletion).where(PendingObjectDeletion.id.in_(done))
+            )
+        if failed:
+            await session.execute(
+                update(PendingObjectDeletion)
+                .where(PendingObjectDeletion.id.in_(failed))
+                .values(last_error="storage_error")
+            )
+        await _audit(session, organization_id, "invoice_deleted" if row_ids else "retry", result)
+        await session.commit()
     return result
 
 

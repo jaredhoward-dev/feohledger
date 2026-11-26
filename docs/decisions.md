@@ -29732,3 +29732,25 @@ mocked client) and `test_migration_0153_pending_object_deletions.py`. The suite
 otherwise sees an empty folder listing (`conftest._isolate_orphan_scan`): the
 harness orgs keep their ids across runs while their rows are truncated, so the
 shared MinIO bucket holds real orphans an unrelated test's scan would delete.
+
+**One job per transaction, and no lock across a bucket call (review of this
+entry).** As first written, every `_delete_invoice_cascade` call queued its own
+post-commit job, so a bulk delete of N invoices opened N sessions after the
+commit, and `drain_pending` held `SELECT … FOR UPDATE` on the outbox rows
+through every S3 round trip. Now `queue_invoice_objects` keeps one batch per
+transaction on `Session.info` and queues one job for it
+(`post_commit.is_post_commit_queued` says whether the batch's job is still
+waiting; a commit or rollback starts a new batch), and that job drains every
+row the transaction wrote. `drain_pending` claims rows in its own short
+committed transaction (`FOR UPDATE SKIP LOCKED`, `attempts + 1`,
+`last_error = 'claimed'`, `last_attempt_at`), empties the folders holding no
+lock, then deletes the emptied rows and records failures in a second short
+transaction that also writes the audit row. A row claimed within the last
+`CLAIM_LEASE` (15 minutes) is left to its drain, so the sweep and a post-commit
+drain never work the same row; a drain that dies leaves its claim to lapse, and
+a slower-than-the-lease drain costs a repeat idempotent delete, never a lost
+row. The caller's session is only read (ownership), so the sweep's and an
+erasure's own transactions are not committed early. Tests: one job and one
+claim for a three-invoice bulk delete with one failing folder (only its row
+stays); a second drain mid-storage-call finds the rows unlocked and claimed and
+takes none; an expired claim is retaken, a fresh one is not.

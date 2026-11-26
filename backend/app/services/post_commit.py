@@ -88,6 +88,21 @@ def enqueue_post_commit(
     info.setdefault(_JOBS_KEY, []).append((name, factory, _open_savepoint(session)))
 
 
+def is_post_commit_queued(session, factory: Callable[[], Awaitable[None]]) -> bool:
+    """Is `factory` still queued on `session`, waiting for the commit?
+
+    For a caller that wants ONE job per transaction however many times it is
+    asked for (invoice_objects batches a bulk delete's folders this way): keep
+    the factory, and enqueue a new one only when this says the old one is gone
+    — run by a commit, or dropped by a rollback or a rolled-back savepoint.
+    """
+    try:
+        jobs = session.info.get(_JOBS_KEY) or []
+    except Exception:  # noqa: BLE001 — a caller with no usable session
+        return False
+    return any(queued is factory for _name, queued, _savepoint in jobs)
+
+
 def _open_savepoint(session):
     """The innermost open SAVEPOINT of `session`, or None."""
     sync = getattr(session, "sync_session", session)
