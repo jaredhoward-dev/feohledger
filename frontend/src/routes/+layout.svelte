@@ -15,6 +15,7 @@
 	import { goto } from '$app/navigation';
 	import { page } from '$app/state';
 	import { hasTenantContext } from '#lib/tenant.ts';
+	import { SHELL_NARROW_QUERY } from '#lib/breakpoints.ts';
 	import { browser } from '$app/env';
 	import { initLocale, m } from '#lib/i18n/store.svelte.ts';
 	import { theme } from '#lib/stores/theme.svelte.ts';
@@ -126,19 +127,18 @@
 		}
 	});
 
-	// WCAG 1.4.10 Reflow: on narrow viewports collapse the sidebar to its icon
-	// rail so the 220px panel doesn't force the page wider than the screen. Nav
-	// stays reachable (icon rail), and expanding it there opens the panel as an
-	// OVERLAY over the page (`sidebar.overlay`) rather than pushing the content
-	// into the ~100px a 320px screen has left beside it (#635 finding 39).
-	// Desktop is unaffected — the breakpoint only fires at 700px and below.
+	// WCAG 1.4.10 Reflow: at or below the shell's narrow breakpoint (the scale's
+	// `lg`, 768px — `lib/breakpoints.ts`) the sidebar is its icon rail, so the
+	// 220px panel never forces the page wider than the screen. Nav stays
+	// reachable (icon rail, every item named), and expanding it there opens the
+	// panel as an OVERLAY over the page (`sidebar.overlay`) rather than pushing
+	// the content into the ~100px a 320px screen has left beside it (#635
+	// finding 39). The store keeps the reader's wide-viewport choice apart, so
+	// widening the window again restores it (decisions §590).
 	$effect(() => {
 		if (!browser) return;
-		const mq = window.matchMedia('(max-width: 700px)');
-		const apply = () => {
-			sidebar.setNarrow(mq.matches);
-			if (mq.matches) sidebar.collapse();
-		};
+		const mq = window.matchMedia(SHELL_NARROW_QUERY);
+		const apply = () => sidebar.setNarrow(mq.matches);
 		apply();
 		mq.addEventListener('change', apply);
 		return () => mq.removeEventListener('change', apply);
