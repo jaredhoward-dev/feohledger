@@ -216,7 +216,9 @@ async def test_an_unlinked_pay_from_account_reaches_the_adapter_as_unmapped(real
 async def test_a_refused_write_back_is_coded_flagged_and_keeps_the_invoice_paid(realdb):
     await _configure(realdb)
     run_id, inv_id, pay_id = await _seed(realdb)
-    refused = erp_refusal("QuickBooks Online", "payment_account_not_mapped")
+    # Refused before any write (as every adapter refuses an unmapped account):
+    # nothing can stand, so the flag says the bill is unpaid (decisions §590).
+    refused = erp_preflight_refusal("QuickBooks Online", "payment_account_not_mapped")
     await _sync(realdb, run_id, FakeQbo(refused))
 
     [invoice] = await _rows(realdb, Invoice, id=inv_id)
@@ -245,7 +247,15 @@ async def test_a_failed_write_back_with_no_refusal_code_is_still_explained(reald
     run_id, inv_id, pay_id = await _seed(realdb)
     await _sync(realdb, run_id, FakeQbo(ErpPostResult(success=False, message="x", retryable=True)))
     [flag] = await _rows(realdb, APException, invoice_id=inv_id)
-    assert flag.description_code == "exception.erp_payment_writeback_failed"
+    # An outcome nobody knows: the payment may stand, so the sentence asks for
+    # a look by its marker, never "unpaid" or "retry" (decisions §590).
+    assert flag.description_code == "exception.erp_payment_writeback_unconfirmed"
+    assert flag.description_params == {
+        "erp": "QuickBooks Online",
+        "marker": f"FeohLedger payment {pay_id}",
+    }
+    assert "unpaid" not in flag.description and "Retry" not in flag.description
+    assert flag.erp_report["outcome"] == "unconfirmed"
     assert flag.erp_report["failure"] == "erp_post_failed"
     assert flag.erp_report["refusal"] is None
     assert flag.erp_report["retryable"] is True
@@ -2062,3 +2072,202 @@ def test_the_open_balance_sentence_is_chosen_by_what_credit_may_stand(standing, 
     )
     assert unnamed["code"] == "exception." + code + "_unnamed"
     assert "erp" not in unnamed["params"]
+
+
+# ---------------------------------------------------------------------------
+# An unknown write outcome keeps its reservation and re-arms a racing void; a
+# capped write or void flag says so and a person's resolve clears the cap; a
+# pending write never retries against a bill the invoice no longer points at
+# (§590)
+# ---------------------------------------------------------------------------
+
+
+def _network_drop() -> ErpPostResult:
+    return ErpPostResult(success=False, message="xero post failed: network_error")
+
+
+async def _write_flags(realdb, inv_id, kind="payment_writeback_failed") -> list[APException]:
+    rows = await _rows(realdb, APException, invoice_id=inv_id)
+    return [r for r in rows if r.erp_report["kind"] == kind]
+
+
+async def _decide(realdb, flag_id, action: str = "resolve", via: str | None = None):
+    from app.services.exception_lifecycle import record_decision
+
+    async with realdb.sessionmaker("a")() as s:
+        row = await s.get(APException, flag_id)
+        await record_decision(
+            s,
+            exception=row,
+            action=action,
+            resolution="checked the ERP",
+            actor_id=uuid.uuid4(),
+            actor_name="AP Manager",
+            via=via,
+        )
+        await s.commit()
+
+
+async def _reopen(realdb, flag_id) -> None:
+    async with realdb.sessionmaker("a")() as s:
+        (await s.get(APException, flag_id)).status = "open"
+        await s.commit()
+
+
+async def test_an_unknown_outcome_with_a_racing_void_keeps_it_and_the_next_pass_voids(realdb):
+    """The send created BP-9, then the answer was lost (network drop). The void
+    committed meanwhile and its own ERP void found nothing. Before §590 the
+    failure cleared the reservation and re-armed nothing: BP-9 stood on a
+    voided payment's bill. Now the void is re-armed and the next pass voids."""
+    run_id, inv_id, pay_id = await _seed(realdb)
+    await _configure(realdb)
+    await _mark_paid(realdb, inv_id)
+    adapter = FakeQbo()
+
+    async def create_bp9_then_drop(payload):
+        await _void_payment(realdb, inv_id, pay_id)
+        async with realdb.sessionmaker("a")() as s:
+            await erp_payment_writeback._clear_pending(s, inv_id, pay_id)
+            await s.commit()
+        return _network_drop()  # BP-9 now stands in the ERP
+
+    adapter.post_payment.side_effect = create_bp9_then_drop
+    assert await _rerun(realdb, pay_id, adapter) == erp_payment_writeback.FAILED
+    [instance] = await _rows(realdb, WorkflowInstance, invoice_id=inv_id)
+    assert instance.state_data[erp_payment_writeback.PENDING_VOIDS_KEY] == [str(pay_id)]
+    # The void owns what may stand now; the write is not retried.
+    assert await _write_rec(realdb, inv_id, pay_id) is None
+
+    assert await _resume_voids(realdb, adapter) == 0
+    (voided,) = adapter.void_payment.await_args.args
+    assert voided.payment_id == str(pay_id)
+    rows = _actions(await _rows(realdb, AuditLog, entity_id=pay_id), "payment.erp_voided")
+    assert [r.details["erp_document_id"] for r in rows] == ["BP-9"]
+    adapter.post_payment.assert_awaited_once()
+
+
+async def test_an_unknown_outcome_keeps_the_reservation_for_the_sweep(realdb):
+    run_id, inv_id, pay_id = await _seed(realdb)
+    await _configure(realdb)
+    adapter = FakeQbo(_network_drop())
+    await _sync(realdb, run_id, adapter)
+    kept = await _write_rec(realdb, inv_id, pay_id)
+    assert kept is not None and kept["unconfirmed"] is True
+    assert "claimed_until" not in kept and kept["attempts"] == 1  # released, counted
+    [flag] = await _write_flags(realdb, inv_id)
+    assert flag.description_code == "exception.erp_payment_writeback_unconfirmed"
+
+    # The sweep writes it again: the adapter finds our earlier payment by its
+    # id before it creates, and the record clears on the recorded outcome.
+    adapter.post_payment.side_effect = None
+    adapter.post_payment.return_value = ErpPostResult(
+        success=True, erp_document_id="BP-9", bill_balance_after=Decimal(0)
+    )
+    assert await _resume_writes(realdb, adapter) == 0
+    assert await _write_rec(realdb, inv_id, pay_id) is None
+    assert adapter.post_payment.await_count == 2
+
+
+async def test_a_definite_refusal_before_any_write_clears_the_reservation(realdb):
+    run_id, inv_id, pay_id = await _seed(realdb)
+    await _configure(realdb)
+    refused = erp_preflight_refusal("QuickBooks Online", "payment_account_not_mapped")
+    await _sync(realdb, run_id, FakeQbo(refused))
+    assert await _write_rec(realdb, inv_id, pay_id) is None
+    [flag] = await _write_flags(realdb, inv_id)
+    assert flag.description_code == "exception.erp_payment_writeback_failed"
+    assert "outcome" not in flag.erp_report
+
+
+async def test_the_write_cap_flag_is_unconfirmed_and_a_resolve_retries_it(realdb, monkeypatch):
+    monkeypatch.setattr(erp_payment_writeback, "MAX_WRITE_ATTEMPTS", 1)
+    run_id, inv_id, pay_id = await _seed(realdb)
+    await _configure(realdb)
+    adapter = FakeQbo(_network_drop())
+    await _sync(realdb, run_id, adapter)  # attempt 1: unknown, flagged
+    assert await _resume_writes(realdb, adapter) == 1  # the cap: nothing sent
+    adapter.post_payment.assert_awaited_once()
+    assert (await _write_rec(realdb, inv_id, pay_id))["exhausted"] is True
+    flags = await _write_flags(realdb, inv_id)
+    # Its own row beside the first unknown outcome's, never swallowed by it.
+    [capped] = [f for f in flags if f.erp_report["failure"] == "retries_exhausted"]
+    assert len(flags) == 2
+    assert capped.description_code == "exception.erp_payment_writeback_unconfirmed"
+    assert capped.erp_report["attempts"] == 1
+    assert "Retry" not in capped.description and "unpaid" not in capped.description
+
+    # Dismissing leaves it capped (the person took the ERP side over), and so
+    # does an agent's resolve: only a person's resolve re-arms it.
+    flag_id = capped.id
+    await _decide(realdb, flag_id, "dismiss")
+    assert (await _write_rec(realdb, inv_id, pay_id))["exhausted"] is True
+    await _reopen(realdb, flag_id)
+    await _decide(realdb, flag_id, "resolve", via="agent")
+    assert (await _write_rec(realdb, inv_id, pay_id))["exhausted"] is True
+    await _reopen(realdb, flag_id)
+    await _decide(realdb, flag_id)
+    rec = await _write_rec(realdb, inv_id, pay_id)
+    assert rec is not None and "exhausted" not in rec and rec["attempts"] == 0
+    [resolved] = [
+        r
+        for r in await _rows(realdb, AuditLog, entity_id=flag_id)
+        if r.details.get("erp_retry_rearmed")
+    ]
+    assert resolved.details["erp_retry_rearmed"] == "payment_write"
+    assert resolved.details["payment_id"] == str(pay_id)
+
+    adapter.post_payment.side_effect = None
+    adapter.post_payment.return_value = ErpPostResult(
+        success=True, erp_document_id="BP-9", bill_balance_after=Decimal(0)
+    )
+    assert await _resume_writes(realdb, adapter) == 0
+    assert await _write_rec(realdb, inv_id, pay_id) is None
+
+
+async def test_the_void_cap_flag_says_so_and_a_resolve_retries_it(realdb, monkeypatch):
+    monkeypatch.setattr(erp_payment_writeback, "MAX_VOID_ATTEMPTS", 2)
+    run_id, inv_id, pay_id = await _seed(realdb)
+    await _configure(realdb)
+    adapter = FakeQbo()
+    await _sync(realdb, run_id, adapter)
+    await _void_payment(realdb, inv_id, pay_id)
+    adapter.void_payment.return_value = ErpPostResult(
+        success=False, message="quickbooks_online void failed: http_500", retryable=True
+    )
+    for _ in range(3):
+        assert await _resume_voids(realdb, adapter) == 1
+    assert adapter.void_payment.await_count == 2
+    flags = await _write_flags(realdb, inv_id, "payment_void_writeback_failed")
+    [capped] = [f for f in flags if f.erp_report["failure"] == "retries_exhausted"]
+    assert len(flags) == 2  # not swallowed by the first failure's live row
+    assert capped.erp_report["attempts"] == 2
+
+    await _decide(realdb, capped.id)
+    [instance] = await _rows(realdb, WorkflowInstance, invoice_id=inv_id)
+    assert VOID_ATTEMPTS not in instance.state_data
+    assert instance.state_data[erp_payment_writeback.PENDING_VOIDS_KEY] == [str(pay_id)]
+    adapter.void_payment.return_value = ErpPostResult(success=True, erp_document_id="BP-9")
+    assert await _resume_voids(realdb, adapter) == 0
+    assert adapter.void_payment.await_count == 3
+
+
+async def test_a_pending_write_for_another_bill_is_kept_and_flagged_not_retried(realdb):
+    run_id, inv_id, pay_id = await _seed(realdb)
+    await _configure(realdb)
+    await _mark_paid(realdb, inv_id)
+    adapter = FakeQbo()
+    await _set_write_rec(
+        realdb, inv_id, pay_id, token="dead", bill_id="499", attempts=1, claimed_until=_past()
+    )
+    # The invoice points at bill 501 now; the record names 499.
+    assert await _resume_writes(realdb, adapter) == 1
+    assert await _rerun(realdb, pay_id, adapter) == erp_payment_writeback.SKIPPED
+    adapter.post_payment.assert_not_awaited()
+    assert (await _write_rec(realdb, inv_id, pay_id))["bill_id"] == "499"
+    [flag] = await _write_flags(realdb, inv_id)
+    assert flag.erp_report["failure"] == "bill_changed"
+    assert flag.erp_report["erp_document_id"] == "499"
+    assert flag.erp_report["current_bill_id"] == "501"
+    assert flag.description_code == "exception.erp_payment_writeback_unconfirmed"
+    assert await _resume_writes(realdb, adapter) == 1
+    assert len(await _write_flags(realdb, inv_id)) == 1  # flagged once

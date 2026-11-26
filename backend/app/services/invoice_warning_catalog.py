@@ -906,6 +906,15 @@ _ERP_NAMED_SENTENCES: dict[str, str] = {
         "although the money was paid. Resolve what stopped it, then use Retry ERP sync on "
         "the payment's run in Payments."
     ),
+    # A write whose outcome FeohLedger does not know (a network drop after the
+    # send, an unreadable answer, the attempts cap, a bill that moved —
+    # decisions §590): our payment may stand, so the sentence never says
+    # "unpaid" or "retry"; the person looks for it by its marker.
+    "erp_payment_writeback_unconfirmed": (
+        "may already show this invoice's payment: FeohLedger sent it but could not confirm "
+        "it was recorded. Check the bill for a payment referenced “{marker}” before "
+        "recording one."
+    ),
     "erp_payment_writeback_balance_open": (
         "recorded this invoice's payment, but the bill still shows {amount} {currency} open "
         "there (a discount or credit taken in FeohLedger). Close the difference in the ERP."
@@ -942,6 +951,7 @@ _ERP_NAMED_SENTENCES: dict[str, str] = {
 
 #: Params a named sentence carries besides ``erp`` (both twins carry them).
 _ERP_NAMED_PARAMS: dict[str, dict[str, ParamKind]] = {
+    "erp_payment_writeback_unconfirmed": {"marker": "text"},
     "erp_payment_writeback_balance_open": {"amount": "money", "currency": "currency"},
     "erp_discount_credit_pending": {"amount": "money", "currency": "currency", "credit": "text"},
     "erp_discount_credit_pending_unidentified": {
