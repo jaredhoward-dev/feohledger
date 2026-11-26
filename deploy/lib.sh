@@ -4,7 +4,8 @@
 # Shared by every deploy script (sourced, never run): the ONE place the
 # database mode is decided, and the compose invocation that follows from it —
 # plus feoh_sync_source, deploy.sh's choice of which commit to build, and
-# feoh_smoke_check, which smoke.sh runs after every deploy (bottom).
+# feoh_smoke_check, which smoke.sh runs after every deploy, and
+# feoh_fetch_secrets, which brings the secrets ciphertext down from S3 (bottom).
 #
 #   external — the sops env sets FEOH_DATABASE_URL (the documented path:
 #              Amazon RDS). The `postgres` service never starts; pg client
@@ -464,4 +465,107 @@ feoh_smoke_check() {
 	echo "smoke check failed: ${url} answered HTTP ${code} with $(wc -c <"$body" | tr -d ' ') byte(s) after ${attempts} attempt(s). $(head -c 300 "$err")" >&2
 	rm -f "$body" "$err"
 	return 1
+}
+
+# ── Secrets delivery (issue #735, docs/decisions.md §591) ───────────────────
+#
+# infra-secrets' CI uploads the sops CIPHERTEXT of feohledger/prod.sops.yaml to
+# a dedicated bucket (infra/secrets_delivery.tf) on every merge to its main.
+# deploy.sh fetches the current version here, under its deploy lock and before
+# decrypt-env.sh, so a release (or the gated vm-deploy dispatch) always runs on
+# the secrets infra-secrets' main holds — no hand-copy.
+#
+# The bucket name is not in this public repo: it is one line in the gitignored
+# deploy/secrets-bucket (terraform output secrets_bucket), written once per VM.
+
+FEOH_SECRETS_KEY=prod.sops.yaml
+FEOH_SECRETS_BUCKET_FILE=secrets-bucket
+# The sops `lastmodified` of the last file decrypt-env.sh accepted.
+FEOH_SECRETS_APPLIED_FILE=.secrets-applied
+
+# feoh_sops_lastmodified <file> prints the `lastmodified` of the file's
+# top-level `sops:` block, or nothing. Metadata only: no key, no value.
+feoh_sops_lastmodified() {
+	awk '
+		/^sops:[[:space:]]*$/ { in_sops = 1; next }
+		in_sops && /^[^[:space:]#]/ { in_sops = 0 }
+		in_sops && $1 == "lastmodified:" {
+			v = $2
+			gsub(/["\047]/, "", v)
+			print v
+			exit
+		}
+	' "$1" 2>/dev/null || true
+}
+
+# feoh_fetch_secrets [allow-rollback] replaces deploy/prod.sops.yaml with the
+# bucket's current version, and sets FEOH_SECRETS_LASTMODIFIED for
+# feoh_record_secrets_applied. Any failure returns non-zero BEFORE the old file
+# is touched, so the old file and deploy/.env stay as they were.
+#
+# It logs the S3 version id and the sops lastmodified only — the deploy log is
+# public (vm-deploy.yml prints its tail), so never a key name.
+#
+# The replay guard: infra-secrets' CI holds no KMS, so it cannot forge a file
+# sops accepts, but it could re-upload an older, genuine one (a revoked key
+# brought back). A file whose lastmodified is older than the last one applied is
+# refused unless allow-rollback is 1 (deploy.sh --allow-secrets-rollback).
+feoh_fetch_secrets() {
+	local allow_rollback=${1:-0} bucket tmp version new old=""
+	bucket=$(head -n 1 "$FEOH_SECRETS_BUCKET_FILE" 2>/dev/null | tr -d '[:space:]' || true)
+	if [ -z "$bucket" ]; then
+		echo "secrets: deploy/${FEOH_SECRETS_BUCKET_FILE} is missing or empty — write the secrets bucket's name into it once (terraform output -raw secrets_bucket; deploy/README.md § Secrets)." >&2
+		return 1
+	fi
+	[[ "$bucket" =~ ^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$ ]] || {
+		echo "secrets: deploy/${FEOH_SECRETS_BUCKET_FILE} does not hold an S3 bucket name." >&2
+		return 1
+	}
+	tmp=$(umask 077 && mktemp "${FEOH_SECRETS_KEY}.fetch.XXXXXX") || {
+		echo "secrets: could not create a temp file in deploy/." >&2
+		return 1
+	}
+	if ! version=$(aws s3api get-object --bucket "$bucket" --key "$FEOH_SECRETS_KEY" \
+		--query VersionId --output text "$tmp"); then
+		rm -f "$tmp"
+		echo "secrets: could not fetch the secrets ciphertext from S3 — the deploy stops here; prod.sops.yaml and .env are unchanged." >&2
+		return 1
+	fi
+	if ! [[ "$version" =~ ^[A-Za-z0-9._-]+$ ]] || [ "$version" = None ] || [ "$version" = null ]; then
+		rm -f "$tmp"
+		echo "secrets: S3 returned no version id — is versioning on for the secrets bucket? Nothing was changed." >&2
+		return 1
+	fi
+	if ! grep -q '^sops:' "$tmp"; then
+		rm -f "$tmp"
+		echo "secrets: S3 version ${version} is not sops ciphertext (no sops: block) — refused; nothing was changed." >&2
+		return 1
+	fi
+	new=$(feoh_sops_lastmodified "$tmp")
+	if ! [[ "$new" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\.[0-9]+)?Z$ ]]; then
+		rm -f "$tmp"
+		echo "secrets: S3 version ${version} has no readable sops lastmodified — refused; nothing was changed." >&2
+		return 1
+	fi
+	[ -f "$FEOH_SECRETS_APPLIED_FILE" ] && old=$(head -n 1 "$FEOH_SECRETS_APPLIED_FILE" | tr -d '[:space:]')
+	# RFC 3339 UTC timestamps of one shape order as strings.
+	if [ -n "$old" ] && [[ "$new" < "$old" ]]; then
+		if [ "$allow_rollback" != 1 ]; then
+			rm -f "$tmp"
+			echo "secrets: S3 version ${version} was last modified ${new}, OLDER than the ${old} already applied — refused as a possible replay. If this rollback is deliberate, re-run deploy.sh --no-pull --allow-secrets-rollback from a Session Manager shell. Nothing was changed." >&2
+			return 1
+		fi
+		echo "WARN: secrets rollback allowed: applying ${new}, older than ${old}." >&2
+	fi
+	mv -f "$tmp" "$FEOH_SECRETS_KEY"
+	echo "==> secrets: S3 version ${version}, sops lastmodified ${new}"
+	FEOH_SECRETS_LASTMODIFIED=$new
+}
+
+# feoh_record_secrets_applied records the lastmodified feoh_fetch_secrets
+# fetched, once decrypt-env.sh has accepted the file — the replay guard's floor.
+feoh_record_secrets_applied() {
+	[ -n "${FEOH_SECRETS_LASTMODIFIED:-}" ] || return 0
+	printf '%s\n' "$FEOH_SECRETS_LASTMODIFIED" >"${FEOH_SECRETS_APPLIED_FILE}.tmp" &&
+		mv -f "${FEOH_SECRETS_APPLIED_FILE}.tmp" "$FEOH_SECRETS_APPLIED_FILE"
 }

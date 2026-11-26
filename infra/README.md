@@ -26,6 +26,7 @@ infra/
 ├── canary/api-certificate/      # the canary's script (index.js), zipped at plan time into .build/ (gitignored)
 ├── deploy.tf                    # release deploys: the SSM command document that runs deploy.sh --ref, + the deploy role's grant to run it
 ├── backup_erasure.tf            # backup erasure (decisions §490): two OIDC roles (daily check; approved erase) + three SSM documents on the VM
+├── secrets_delivery.tf          # secrets delivery (decisions §591): the ciphertext bucket + infra-secrets' upload role (put one key, no KMS)
 ├── frontend.tf                  # the SPA: private S3 bucket + CloudFront (OAC, SPA router, headers, logs, alarms) + the deploy role's publish grant
 ├── cloudfront/spa-router.js     # the CloudFront Function: built files pass through, routes become /index.html
 ├── outputs.tf                   # exports for downstream modules
@@ -206,7 +207,7 @@ Both instances are burstable and run in *unlimited* credit mode (the AWS default
 **What it sets up**
 
 - **No SSH.** Port 22 is closed and there is no key pair; you reach the VM with Session Manager: `aws ssm start-session --target <app_instance_id> --profile feohledger` (needs the Session Manager plugin for the AWS CLI installed locally).
-- **The VM holds no AWS keys.** Its instance role can decrypt the sops secrets, read and write the three data buckets under the app key, and send mail as the platform domain — nothing else.
+- **The VM holds no AWS keys.** Its instance role can fetch (`secrets_delivery.tf`) and decrypt the sops secrets, read and write the three data buckets under the app key, and send mail as the platform domain — nothing else.
 - **The database is private.** Private subnets with no internet route, reachable only from the VM's security group, encrypted with the app key, TLS forced (`rds.force_ssl`), deletion-protected, IAM database authentication enabled — the app signs in as the `feoh_app` role with a per-connection token, and the VM role's `rds-db:connect` names that one user on this one instance (`compute.tf`, `../docs/decisions.md` §310); the master keeps password login for break-glass only — and restorable to any point in the last `db_backup_retention_days` (default 7). The nightly logical dumps (`../deploy/backup.sh`) keep 90 days beyond that.
 - **DNS.** `api.` points at the VM's Elastic IP. The apex and `*.` (every tenant) are aliases of the SPA's CloudFront distribution, with `frontend_on_cloudfront = true` (§ Frontend on CloudFront); the VM serves no SPA since `../docs/decisions.md` §364.
 - **Alarms** go to `alert_emails` through SNS — each address must click AWS's confirmation link once. The VM recovers itself onto new hardware on a host failure and reboots on a guest failure. Database storage running out also texts `alert_phone_number`, as do the external uptime checks (§ Uptime checks and paging).
@@ -641,6 +642,25 @@ script locally against an expired host
 This repo is **public**, so it holds no secret — not even an encrypted one (`../docs/decisions.md` §12, §165). The project's secrets live sops-encrypted in the private `jaredhoward-dev/infra-secrets` repo under `feohledger/`, keyed by `alias/feohledger-sops`. The estate account bootstrap (`~/github/templates/scripts/new-project-account.sh`) created that key in the FeohLedger account, alongside the state bucket and the deploy role; this module neither creates nor manages it.
 
 The one secret this module handles is the RDS master password (break-glass only — the app signs in with IAM tokens, `../docs/decisions.md` §310), and it handles it without storing it: an ephemeral variable feeding a write-only attribute, supplied from `infra-secrets/feohledger/terraform.sops.yaml` at apply time (§ Workload stack). The earlier plan here — a `carlpett/sops` `sops_file` data source — was dropped because a data source's value lands in state in plaintext; the write-only path keeps it out of state and plan files entirely. Every other variable is operator config, not a credential; it is still sops-encrypted in `infra-secrets/feohledger/prod.tfvars.sops` and decrypted only for the length of `terraform plan` (§ Applying). Access is IAM — an operator needs `kms:Decrypt` on the key plus read access to the private repo; nothing in this repo changes. Rotation: `../docs/secrets-rotation.md`.
+
+### Secrets delivery
+
+`secrets_delivery.tf` (`../docs/decisions.md` §591, issue #735). A dedicated,
+versioned, SSE-S3 bucket (`var.secrets_bucket_name`, set in `prod.tfvars.sops`
+like every bucket name) holds one object: the sops **ciphertext** of
+`infra-secrets/feohledger/prod.sops.yaml`. Its bucket policy denies `PutObject`
+to everyone but `feohledger-secrets-upload` and reads to everyone but the app
+VM role; about 30 superseded versions are kept.
+
+`feohledger-secrets-upload` is minted here, like the backup-erasure roles, not
+by the estate baseline: it serves this project's bucket only. It trusts exactly
+`<infra_secrets_oidc_sub_prefix>:ref:refs/heads/main` — the private repo is on
+immutable subject claims too, so read its prefix with
+`gh api repos/<owner>/infra-secrets/actions/oidc/customization/sub --jq .sub_claim_prefix`,
+never build it. It may `PutObject` that one key and nothing else, and holds no
+KMS permission: it can move ciphertext, never read or forge it. The gate stays
+in this repo — the next `production`-approved deploy applies the file
+(`../deploy/README.md` § Secrets delivery, which lists the owner steps).
 
 ## Tearing everything down
 

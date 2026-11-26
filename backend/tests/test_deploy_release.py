@@ -766,6 +766,39 @@ printf 200
 """
 
 
+# The S3 side of secrets delivery (lib.sh feoh_fetch_secrets): get-object
+# copies $S3_OBJECT to its last argument and prints $S3_VERSION, as
+# `--query VersionId --output text` would. STUB_FAIL=get-object fails it.
+DEPLOY_AWS_STUB = """#!/bin/sh
+printf 'aws %s\\n' "$*" >> "$STUB_DIR/calls"
+if [ -n "${STUB_FAIL:-}" ]; then
+  case "$*" in *"$STUB_FAIL"*) exit 1 ;; esac
+fi
+case "$*" in
+  *"s3api get-object"*)
+    for arg; do last=$arg; done
+    cp "$S3_OBJECT" "$last"
+    printf '%s\\n' "$S3_VERSION" ;;
+esac
+exit 0
+"""
+
+
+def sops_fixture(lastmodified: str) -> str:
+    """A SYNTHETIC sops file: fake ENC[] values, no real ciphertext or key."""
+    return (
+        "FEOH_FAKE_ONE: ENC[AES256_GCM,data:AAAA,iv:BBBB,tag:CCCC,type:str]\n"
+        "FEOH_FAKE_TWO: ENC[AES256_GCM,data:DDDD,iv:EEEE,tag:FFFF,type:str]\n"
+        "sops:\n"
+        "    kms:\n"
+        "        - arn: arn:aws:kms:us-east-1:000000000000:alias/example-sops\n"
+        "          enc: ZmFrZQ==\n"
+        f"    lastmodified: \"{lastmodified}\"\n"
+        "    mac: ENC[AES256_GCM,data:GGGG,iv:HHHH,tag:IIII,type:str]\n"
+        "    version: 3.9.0\n"
+    )
+
+
 class Stack:
     def __init__(self, root: Path) -> None:
         self.root = root
@@ -782,6 +815,10 @@ class Stack:
         ):
             shutil.copy2(DEPLOY / name, self.deploy / name)
         (self.deploy / "prod.sops.yaml").write_text("{}\n")
+        (self.deploy / "secrets-bucket").write_text("feoh-secrets-test\n")
+        _with_stub(root, "aws", DEPLOY_AWS_STUB)
+        self.fixture = root / "s3-object.yaml"
+        self.fixture.write_text(sops_fixture("2026-11-20T10:00:00Z"))
         decrypt = self.deploy / "decrypt-env.sh"
         decrypt.write_text(
             "#!/bin/sh\nprintf 'APP_DOMAIN=app.example.com\\nAPI_DOMAIN=api.example.com\\n"
@@ -797,6 +834,7 @@ class Stack:
         if shutil.which("flock") is None:
             _with_stub(root, "flock", "#!/bin/sh\nexit 0\n")
         self.hosts = self.deploy / "tenants.caddy"
+        self.version = "v3.example-Version_id"
 
     def run(self, *args: str, fail: str = "") -> subprocess.CompletedProcess[str]:
         (self.root / "calls").write_text("")
@@ -812,6 +850,8 @@ class Stack:
                 "REPO": str(self.repo),
                 "FEOH_SMOKE_INTERVAL": "0",
                 "STUB_FAIL": fail,
+                "S3_OBJECT": str(self.fixture),
+                "S3_VERSION": self.version,
             },
         )
 
@@ -926,3 +966,114 @@ def test_a_failed_post_deploy_prune_warns_but_the_deploy_stands(stack: Stack) ->
     assert result.returncode == 0, result.stderr
     assert "WARN: dangling-image prune failed" in result.stderr
     assert "deploy complete" in result.stdout
+
+
+# ── Secrets delivery (lib.sh feoh_fetch_secrets, docs/decisions.md §591) ────
+
+
+def test_a_deploy_fetches_the_secrets_before_decrypting_and_logs_only_metadata(
+    stack: Stack,
+) -> None:
+    result = stack.run()
+
+    assert result.returncode == 0, result.stderr
+    calls = stack.calls()
+    fetch = next(c for c in calls if "s3api get-object" in c)
+    assert "--bucket feoh-secrets-test --key prod.sops.yaml" in fetch
+    assert (stack.deploy / "prod.sops.yaml").read_text() == stack.fixture.read_text()
+    assert "S3 version v3.example-Version_id, sops lastmodified 2026-11-20T10:00:00Z" in (
+        result.stdout
+    )
+    # The run log is public: no key name from the file may reach it.
+    assert "FEOH_FAKE" not in result.stdout + result.stderr
+    assert (stack.deploy / ".secrets-applied").read_text().strip() == "2026-11-20T10:00:00Z"
+    assert not list(stack.deploy.glob("prod.sops.yaml.fetch.*")), "the temp file was left behind"
+
+
+def test_a_failed_fetch_stops_the_deploy_and_keeps_the_old_file(stack: Stack) -> None:
+    before = (stack.deploy / "prod.sops.yaml").read_text()
+    (stack.deploy / ".env").write_text("OLD=1\n")
+
+    result = stack.run(fail="get-object")
+
+    assert result.returncode != 0
+    assert "could not fetch the secrets ciphertext" in result.stderr
+    assert (stack.deploy / "prod.sops.yaml").read_text() == before
+    assert (stack.deploy / ".env").read_text() == "OLD=1\n"
+    assert not any("build api" in c for c in stack.calls()), "the deploy went on without secrets"
+    assert not list(stack.deploy.glob("prod.sops.yaml.fetch.*"))
+
+
+def test_an_older_secrets_file_is_refused_as_a_replay(stack: Stack) -> None:
+    (stack.deploy / ".secrets-applied").write_text("2026-11-24T00:00:00Z\n")
+    before = (stack.deploy / "prod.sops.yaml").read_text()
+
+    result = stack.run()
+
+    assert result.returncode != 0
+    assert "OLDER than the 2026-11-24T00:00:00Z already applied" in result.stderr
+    assert "--allow-secrets-rollback" in result.stderr
+    assert (stack.deploy / "prod.sops.yaml").read_text() == before
+    assert not any("build api" in c for c in stack.calls())
+
+
+def test_allow_secrets_rollback_applies_the_older_file_and_lowers_the_floor(stack: Stack) -> None:
+    (stack.deploy / ".secrets-applied").write_text("2026-11-24T00:00:00Z\n")
+
+    result = stack.run("--allow-secrets-rollback")
+
+    assert result.returncode == 0, result.stderr
+    assert "secrets rollback allowed" in result.stderr
+    assert (stack.deploy / ".secrets-applied").read_text().strip() == "2026-11-20T10:00:00Z"
+
+
+def test_the_same_or_a_newer_secrets_file_is_accepted(stack: Stack) -> None:
+    (stack.deploy / ".secrets-applied").write_text("2026-11-20T10:00:00Z\n")
+    assert stack.run().returncode == 0
+    stack.fixture.write_text(sops_fixture("2026-11-25T08:30:00Z"))
+    result = stack.run()
+    assert result.returncode == 0, result.stderr
+    assert (stack.deploy / ".secrets-applied").read_text().strip() == "2026-11-25T08:30:00Z"
+
+
+@pytest.mark.parametrize(
+    "body, why",
+    [
+        ("FEOH_FAKE_ONE: plaintext\n", "not sops ciphertext"),
+        ("FEOH_FAKE_ONE: ENC[x]\nsops:\n    version: 3.9.0\n", "no readable sops lastmodified"),
+    ],
+)
+def test_a_file_that_is_not_sops_ciphertext_is_refused(stack: Stack, body: str, why: str) -> None:
+    stack.fixture.write_text(body)
+    before = (stack.deploy / "prod.sops.yaml").read_text()
+
+    result = stack.run()
+
+    assert result.returncode != 0
+    assert why in result.stderr
+    assert "plaintext" not in result.stderr + result.stdout
+    assert (stack.deploy / "prod.sops.yaml").read_text() == before
+
+
+def test_no_version_id_means_an_unversioned_bucket_and_is_refused(stack: Stack) -> None:
+    stack.version = "None"
+    result = stack.run()
+    assert result.returncode != 0
+    assert "no version id" in result.stderr
+
+
+def test_a_vm_without_the_bucket_file_is_told_how_to_set_it(stack: Stack) -> None:
+    (stack.deploy / "secrets-bucket").unlink()
+    result = stack.run()
+    assert result.returncode != 0
+    assert "deploy/secrets-bucket is missing" in result.stderr
+    assert not any("get-object" in c for c in stack.calls())
+
+
+def test_deploy_sh_fetches_under_the_lock_and_before_decrypting() -> None:
+    code = _code()
+    assert code.index("flock -n 9") < code.index("feoh_fetch_secrets")
+    assert code.index("feoh_fetch_secrets") < code.index("./decrypt-env.sh")
+    assert code.index("./decrypt-env.sh") < code.index("feoh_record_secrets_applied")
+    ignored = (DEPLOY / ".gitignore").read_text().splitlines()
+    assert {"secrets-bucket", ".secrets-applied", "prod.sops.yaml.fetch.*"} <= set(ignored)

@@ -29564,6 +29564,82 @@ section tabs scrolling at 320 on `/bank-reconciliation`);
 `signup/panel-layout.spec.ts`'s "just above the auth breakpoint" size moves
 961 → 1025.
 
+## 591. Production secrets reach the VM as ciphertext from infra-secrets' CI, and only a gated deploy applies them (#735, round 51)
+
+**Problem.** A change to `feohledger/prod.sops.yaml` took five hand steps
+before a deploy could use it: commit in the private `infra-secrets` repo, upload
+the ciphertext to a `transfer/` prefix of the backups bucket, copy it onto the VM
+from a Session Manager shell, delete every version of the transfer object, and
+optionally `./decrypt-env.sh`. Nothing in the release path fetched a new file,
+so a forgotten copy left the VM on stale secrets (v0.3.0's new required key,
+#733) and a forgotten cleanup left ciphertext in `transfer/` for up to 120 days.
+
+**Decision (option A of #735).**
+
+- **Storage.** A dedicated bucket (`infra/secrets_delivery.tf`), not a prefix
+  under the backups bucket's whole-bucket grant: versioned, Block Public Access,
+  SSE-S3, about 30 noncurrent versions kept. Its bucket policy denies
+  `PutObject` to every principal but the upload role and `GetObject` /
+  `GetObjectVersion` to every principal but the app VM role. Its name is a
+  variable kept in the private `prod.tfvars.sops`, as every bucket name is, and
+  reaches the VM as one line in the gitignored `deploy/secrets-bucket`.
+- **Writer.** `feohledger-secrets-upload`, minted in this module like the
+  backup-erasure roles (§490) because it serves this project's bucket alone.
+  It trusts `<infra_secrets_oidc_sub_prefix>:ref:refs/heads/main` with
+  `StringEquals`; infra-secrets presents immutable subject claims (read from
+  `gh api …/actions/oidc/customization/sub`, as for this repo, #449), so the
+  prefix is a variable, never built from the slug. It may `PutObject` the one key
+  and holds **no KMS permission**: it cannot read the file or forge one sops
+  accepts (the MAC needs the data key). SSE-S3 rather than the app key for the
+  same reason: an SSE-KMS put needs the writer to hold the key.
+- **Upload.** infra-secrets' own workflow, on a push to `main` touching the
+  file: refuses anything that is not sops ciphertext under the project key, puts
+  it with a SHA-256 checksum S3 verifies, and compares the checksum S3 returns —
+  no read grant needed. It prints neither key names nor values.
+- **Apply.** `deploy.sh` fetches the current version under its deploy lock,
+  before `decrypt-env.sh` (`lib.sh` `feoh_fetch_secrets`): a 0600 temp file in
+  `deploy/`, checked for a `sops:` block and a readable `lastmodified`, then
+  `mv`'d over `prod.sops.yaml`. A failed or refused fetch stops the deploy with
+  the old file and `.env` untouched. The log names the S3 version id and the sops
+  `lastmodified`, nothing more (the run log is public).
+- **Replay guard.** The upload role cannot forge, but it can re-upload an
+  older genuine file. A file whose `lastmodified` is older than the last one
+  `decrypt-env.sh` accepted (`deploy/.secrets-applied`) is refused unless
+  `--allow-secrets-rollback` is passed, which only a Session Manager shell can
+  do (the SSM document takes nothing but a sha). The VM therefore gets no
+  `GetObjectVersion`: a rollback is a revert in infra-secrets plus that flag.
+- **A secrets-only change** goes live through the existing `vm-deploy.yml`
+  `workflow_dispatch`, run from the live release's tag and approved under
+  `production`: the same SSM document, the same sha-only parameter, the same
+  code, new secrets. No new workflow or document was needed. An emergency
+  rotation goes live only through that one approved run (owner decision).
+- **Least privilege.** `deploy_role_can_use_sops = false` in feohledger's
+  `bootstrap.tfvars`: this repo's CI never decrypts sops, so the deploy role
+  loses the baseline's default grant on the sops key.
+- **Retired.** The `transfer/` steps are gone from `deploy/README.md`,
+  `docs/secrets-rotation.md` and the infra-secrets README.
+
+**Rejected.** CI decrypting into Parameter Store / Secrets Manager, or `sops
+publish` (plaintext on an ungateable runner); the VM pulling infra-secrets with a
+deploy key (a standing credential to every project's ciphertext, as §275
+rejected); infra-secrets' CI sending the SSM command, or S3 → EventBridge → Run
+Command (secrets applied with no reviewer). `sops exec-env` in place of a
+plaintext `deploy/.env` was out of scope (owner decision): compose embeds the
+values in the container config either way.
+
+**Not verified here.** Everything that needs AWS: the apply, the OIDC handshake
+from a private repo on the Free plan, the first upload, and the live sops key
+policy after the baseline re-apply. sops' `lastmodified` format is assumed to be
+RFC 3339 UTC (`…Z`); anything else is refused, fail-closed.
+
+**Tests.** `infra/tests/guardrails.tftest.hcl` (the upload role's one subject,
+its one-key put and no KMS, the bucket's versioning, public-access block,
+lifecycle and deny statements, the VM's read-only grant);
+`backend/tests/test_deploy_release.py` (fetch before decrypt and under the
+lock, metadata-only log, a failed fetch keeps the old file and `.env`, an older
+file refused, `--allow-secrets-rollback`, non-ciphertext and unversioned
+refusals, a missing `deploy/secrets-bucket`).
+
 ## 592. A deleted invoice's documents leave object storage through an outbox, and an orphan scan reaches what no row names (follow-up from §586, round 51)
 
 **The gap.** `_delete_invoice_cascade` removed an invoice's rows but none of its
