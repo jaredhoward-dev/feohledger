@@ -1364,20 +1364,6 @@ user-visible halves still open.
       **Trigger:** counsel's view on e-invoice retention, or the first tenant
       receiving over PEPPOL in a jurisdiction with a retention rule.
 
-- [ ] **(c) The open-balance flag invites a manual discount booking even when
-      our discount credit may exist.** Since §577 a credit created but not
-      applied (or half-reversed by a void) is recorded by id and finished by
-      the sweep, and the flag's `erp_report` carries `discount_credit_pending`
-      / `discount_credit_document_id`, but its sentence
-      (`erp_payment_writeback_balance_open`) still asks the bookkeeper to
-      close the difference in the ERP — so a person can book a second credit
-      while ours is pending. **Durable fix:** a separate warning code
-      (`erp_discount_credit_pending`: "FeohLedger booked credit <id> and will
-      apply it — don't book another") chosen whenever a credit may exist,
-      through the invoice-warning catalogue (six web locales + mobile ARBs,
-      regenerated). **Trigger:** the first discount-credit opt-in tenant, or the
-      next change to the write-back flags.
-
 - [ ] **(c) A Xero push refused `erp_bill_key_shared` has no in-app way to
       take the bill as its own.** §572 stops the push adopting a bill found on
       a supplier + number another invoice shares (the push and the orphan

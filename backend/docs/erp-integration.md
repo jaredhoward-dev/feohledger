@@ -653,7 +653,16 @@ published schemas were read instead):
 when known, and the payload's ids and amount); the balance-open flag's
 `erp_report` then carries `discount_credit_pending: true` and
 `discount_credit_document_id`, meaning a retry will apply it and nobody should
-book another. The status-sync sweep (`resume_pending_credits`, after
+book another. Its sentence says so too (decisions §585): while a record names
+the payment the flag reads `erp_discount_credit_pending` ("FeohLedger booked
+credit {credit} and will apply it, so don't book another"), or, when the id was
+never learned, the retries are exhausted or the recorded id is not ours,
+`erp_discount_credit_pending_unidentified` ("check for “FeohLedger discount
+<payment id>” before booking one"). Only with no record, where no credit of ours
+can exist, does it read `erp_payment_writeback_balance_open` and ask the
+bookkeeper to close the difference. An attempt that made no credit call (the
+record claimed by another pass, or exhausted) reads the record as it stands. The
+status-sync sweep (`resume_pending_credits`, after
 `resume_pending_voids`) re-posts with `credit_id`, and QuickBooks applies that
 credit by id rather than relying on `requestid` replay. A void records our
 credit's id in `state_data.erp_discount_credit_voids_pending` before deleting

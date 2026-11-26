@@ -30870,3 +30870,63 @@ flag carries the reason as `discount_credit_failure`.
   - the stall flag is one per payment and reason.
 - `test_qbo_status_sync_adapter.py`: a refresh failure or a lost connection on
   the create call (after a 401) is `not_posted`.
+
+## 585. While a discount credit of ours may stand, the open-balance flag names it instead of asking a person to close the difference (§577 / §579 follow-up, round 50)
+
+Since §577 a discount credit that may stand in the ERP unapplied is recorded
+(`state_data.erp_discount_credits_pending[<payment id>]`) and finished by its
+record, and the balance-open flag's `erp_report` carried
+`discount_credit_pending` / `discount_credit_document_id`. Its sentence did not:
+`erp_payment_writeback_balance_open` still said "Close the difference in the
+ERP". A bookkeeper reading it books a second credit, and the discount is taken
+twice the moment ours is applied.
+
+**The sentence is now chosen by what credit may stand**
+(`erp_payment_writeback._balance_open_finding`), on the same `erp_report.kind`
+(`payment_writeback_balance_open`), so dedupe and the frontend's report
+handling are unchanged:
+
+- **No record** — no credit of ours can exist (opt-in off, a refusal before
+  any write, the credit applied): `erp_payment_writeback_balance_open`, as
+  before. The bookkeeper closes the difference.
+- **A record by id FeohLedger will finish** (created but not applied, a
+  re-run's pre-write refusal): `erp_discount_credit_pending`, params `amount`,
+  `currency`, `credit` (text): "FeohLedger booked credit {credit} for the
+  early-payment discount and will apply it, so don't book another."
+- **A record FeohLedger cannot finish alone** — no id (§579's unidentified
+  record), retries exhausted, or the recorded id read back as not ours (§583):
+  `erp_discount_credit_pending_unidentified`, params `amount`, `currency`,
+  `marker` (text, `FeohLedger discount <payment id>`): "FeohLedger may have
+  booked a credit for this discount, so check for “{marker}” before booking
+  one." These are the cases the stall flag (§579, §583) also opens for; the
+  pending sentence would promise an application nothing will make.
+
+Both are ERP-named sentences with `_unnamed` twins, through the catalogue,
+in six web locales and seven mobile ARBs, regenerated.
+
+- **The record is read when this attempt made no credit call.** A re-run whose
+  claim lost to another pass, or over an exhausted record, keeps nothing of its
+  own (`kept` is None), but the record still stands. The flag reads it once,
+  only on the balance-open path and only for an adapter that books credits; the
+  report's `discount_credit_pending` keys now come from the same read, so the
+  report and the sentence never disagree.
+- **Rejected: one code with an optional `credit` param.** An absent param is a
+  different sentence, and the catalogue rule is that a different sentence is a
+  code of its own (the `_unnamed` twins follow the same rule), never a spliced
+  or blank param.
+- **Rejected: a new `erp_report.kind`.** The kind is what the dedupe and the
+  frontend's ERP report key on; the fact (the bill still shows a balance open
+  after our payment) is the same, and only the advice differs.
+- **Not covered: a credit pending reversal** (`erp_discount_credit_voids_pending`)
+  belongs to a voided payment. A re-pay's balance-open flag is about the new
+  payment, whose discount a person may legitimately book once ours is reversed.
+
+**Tests.** `tests/test_erp_payment_writeback.py`: the created-but-unapplied
+credit's flag reads `erp_discount_credit_pending` with `credit: VC-7`; a credit
+with no id reads the `_unidentified` variant with the payment's marker; an
+exhausted record, and a record claimed by another pass, read the record as it
+stands; a pre-write refusal keeps `erp_payment_writeback_balance_open`; a
+parametrized unit test covers each selection, named and unnamed.
+`frontend/src/lib/api/exceptionDescription.test.ts` renders both new codes in
+German with the money formatted and the credit / marker in place. The
+generator's `--check` holds web and mobile in sync.
