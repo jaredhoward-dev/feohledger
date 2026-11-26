@@ -46,6 +46,7 @@ from app.services.exception_lifecycle import (
     EXCEPTION_SEVERITY_RANK,
     EXCEPTION_TYPE_LABELS,
     RESOLUTION_ACTIONS,
+    RESOLUTION_STATUSES,
     invoices_for,
     needs_approval_chain,
     record_assignment,
@@ -789,7 +790,14 @@ async def resolve_exception(
         raise HTTPException(status_code=400, detail=str(exc_)) from exc_
     await db.commit()
 
-    return {"id": str(exc.id), "status": exc.status, "message": f"Exception {body.action}d"}
+    # The past tense comes from the verb → status map, never from appending "d"
+    # to the verb (which produced "Exception dismissd"). `record_decision` has
+    # already refused any verb outside the map, so the lookup cannot miss.
+    return {
+        "id": str(exc.id),
+        "status": exc.status,
+        "message": f"Exception {RESOLUTION_STATUSES[body.action]}",
+    }
 
 
 @router.post("/{exception_id}/record-erp-payment")

@@ -1025,7 +1025,7 @@ plain JSONB under RDS storage encryption until that migration.
 
 `backend/app/services/erp_adapters/catalog.py` is the single source of truth for
 the Organization → ERP form, served at `GET /api/organization/erp/providers`
-(admin). Each entry carries `key`, `label`, `regions` (ISO codes; the picker groups `US` and `ZA`, and lists any other region — `GB` for Sage Accounting — under "Other"), `auth`
+(admin). Each entry carries `key`, `label`, `regions` (ISO codes; the picker leads with one "Popular in …" group per region in `frontend/src/lib/types/erpConnection.ts::ERP_REGION_GROUPS`, in that order — `US`, `ZA`, `GB` — and lists a provider with no grouped region under "Other"; a provider in two regions appears under both), `auth`
 (`credentials` | `oauth`), `fields` (`name`, `label_key` — a frontend i18n
 `MessageKey`, `secret`, `required`, optional `placeholder` / `help_key` /
 `options`) and `docs_url`; the endpoint adds `available` (adapter registered in
@@ -1038,7 +1038,7 @@ included, under `erp_integrations`, §281).
 |---|---|---|---|
 | `quickbooks_online` | QuickBooks Online | US | OAuth (optional BYO app; `environment`) |
 | `xero` | Xero | US, ZA | OAuth (optional BYO app; `bill_status`, `default_tax_type`) |
-| `sage_accounting` | Sage Business Cloud Accounting (v3.1: UK, IE, CA, DE, ES, FR; the US product was retired 2024-12-31) | GB (listed under "Other") | OAuth (optional BYO app) |
+| `sage_accounting` | Sage Business Cloud Accounting (v3.1: UK, IE, CA, DE, ES, FR; the US product was retired 2024-12-31) | GB | OAuth (optional BYO app) |
 | `sage_accounting_za` | Sage Business Cloud Accounting (South Africa) | ZA | API key + Sage login + company |
 | `blackbaud_fe_nxt` | Blackbaud Financial Edge NXT | US | OAuth (optional BYO app + SKY API subscription key) |
 | `sage_intacct` | Sage Intacct | US, ZA | REST API client credentials + company / user |
@@ -3557,12 +3557,22 @@ product on 2024-12-31** and ended US access on 2025-01-31
 ([Sage](https://www.sage.com/en-us/sage-business-cloud/sage-accounting/)), so
 no US business exists to connect. A US customer on Sage is on Sage Intacct
 (`sage_intacct`) or the desktop Sage 50, which has no connector. Test this
-adapter against a UK trial business. Sage Business Cloud Accounting
+adapter against a UK trial business (setup below). Sage Business Cloud Accounting
 **South Africa** (the Pastel successor) runs on a separate codebase with its
 own API (`https://accounting.sageone.co.za/api/2.0.0`, API key + basic auth,
 not OAuth), and Sage's developer community confirms v3.1 does not serve it.
 So this adapter covers the other v3.1 regions; a ZA business cannot
 complete its consent flow. A ZA Sage adapter is separate work.
+
+**Setting up the UK trial business: finish Sage's first-run setup first.** A
+new Sage Accounting business opens on a first-run onboarding (Sage Copilot's
+"Yes, set up my business" confirmation). Until that is confirmed in the
+browser you connect from, Sage's sign-in drops the OAuth request: the connect
+never reaches the consent screen or comes back to `/api/erp/oauth/callback`,
+so FeohLedger shows no `erp_error` code to explain it.
+Sign in to Sage Accounting in that browser, confirm "Yes, set up my business",
+then press Connect (seen in the live UK pass, #743). Locally, connect from
+Chrome / Chromium, not Brave or Firefox (§ Connecting an OAuth ERP).
 
 **`settings.erp` keys:** `oauth` (written by `erp_oauth` only),
 `default_tax_rate_id` (optional fallback), `void_reason` (optional; default
@@ -4456,6 +4466,14 @@ Chromium (Playwright's `page.request` and Chromium both carry it). No deployed
 API can take this branch: it needs both a loopback `FEOH_API_PUBLIC_URL` and a
 non-deployed `FEOH_ENVIRONMENT`, so a misconfigured deployment keeps `Lax` and
 fails closed at the callback.
+
+**Brave blocks it too, despite being Chromium.** Brave Shields' cookie
+blocking drops the connect's browser-binding cookie on `localhost`, so a local
+connect started in Brave comes back `erp_error=browser_mismatch` after the
+provider's consent screen (seen in the live Sage Accounting UK pass, #743).
+Turn Shields off for `acme.localhost` and `localhost`, or use Chrome /
+Chromium. Production is unaffected: the tenant app and the API share one site
+there, so the cookie is first-party `SameSite=Lax` and Shields leaves it alone.
 
 The callback's query (`code`, `state`, `realmId`) never reaches the uvicorn
 access log: `app/utils/access_log.py` strips the query of every path in
