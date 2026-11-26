@@ -247,7 +247,7 @@ The visual styling for all of the above lives **globally in `src/app.css`** (cla
 - `ChatLayout.svelte` — the two-column chat workspace both chat pages render:
   side rail + chat pane (scrolling `role="log"` region, then notices and the
   composer). `<ChatLayout railLabel railId busy bind:scrollEl>` with `rail`,
-  `log` and `footer` snippets. Below 720px the rail collapses behind a one-line
+  `log` and `footer` snippets. At 768px and below (the scale's `lg`) the rail collapses behind a one-line
   disclosure button (`aria-expanded`, before the rail in the DOM so focus order
   matches) and the log is capped to the viewport, so the composer is on a
   phone's first screen (`tests-e2e/layout/above-the-fold.spec.ts`).

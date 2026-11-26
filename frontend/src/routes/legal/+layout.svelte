@@ -287,8 +287,11 @@
 	   792px — fits with room around it (it was 52rem before the scale, §590). Both
 	   queries turn at the same number on purpose: a card that is rounded and
 	   bordered while still touching both window edges is the in-between state
-	   that looks like a mistake. */
-	@media (max-width: 1024px) {
+	   that looks like a mistake. The narrow side is the negation of the wide
+	   one, so exactly one of them matches at 1024 itself. No lower step keeps
+	   the card: at `lg` (768) the sheet is 768px with the 16px gutter and 792px
+	   with the 28px one, so a card from 769 would touch or overrun both edges. */
+	@media not all and (min-width: 1024px) {
 		.legal-sheet {
 			margin-top: 0;
 			border-inline: 0;

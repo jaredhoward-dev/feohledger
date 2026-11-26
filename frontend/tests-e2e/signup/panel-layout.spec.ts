@@ -5,8 +5,9 @@ import { expect, NO_TENANT_BASE, test } from '../fixtures/helpers';
 /**
  * The auth shell's brand panel must wrap its text, never clip it.
  *
- * Issue #635: at ~1000px wide (just above the 960px single-column
- * breakpoint) signup's "What happens next" panel cut step 3 off mid-word —
+ * Issue #635: at ~1000px wide, just above the auth shell's single-column
+ * breakpoint of the time, signup's "What happens next" panel cut step 3 off
+ * mid-word —
  * "…or from the link in your welc" — because the panel is `overflow: hidden`
  * (it has to be: the decorative art is drawn wider than the panel and bleeds
  * off its edge on purpose) and its content was taller or wider than the box.
@@ -55,8 +56,12 @@ for (const size of [
 	{ width: 1000, height: 700 },
 	{ width: 1000, height: 560 },
 	{ width: 1280, height: 720 },
+	// Just above the two-column breakpoint (the scale's `xl`, 1024px — the
+	// two-column layout starts AT 1024, decisions §590): the panel is at its
+	// narrowest beside the form, the shape #635 caught clipping.
 	{ width: 1025, height: 640 },
-	// At 1024px and below signup keeps the panel (`panelOnMobile`), stacked under the
+	{ width: 1025, height: 560 },
+	// Below 1024px signup keeps the panel (`panelOnMobile`), stacked under the
 	// form and at its narrowest — and still clipping. `a11y/reflow.spec.ts`
 	// cannot see this: it measures page-level scroll, which a clip hides.
 	{ width: 375, height: 812 },
@@ -86,7 +91,7 @@ for (const size of [
 // with no break opportunity — a German compound, an address, a translation
 // longer than English — is what a clip actually eats, so put one in step 3
 // and require it to wrap inside the panel too.
-for (const width of [1000, 320]) test(`an unbroken word in the panel wraps instead of running under the clip (${width}px)`, async ({ page }) => {
+for (const width of [1025, 320]) test(`an unbroken word in the panel wraps instead of running under the clip (${width}px)`, async ({ page }) => {
 	await page.setViewportSize({ width, height: 720 });
 	await page.emulateMedia({ reducedMotion: 'reduce' });
 	await page.goto('/signup');

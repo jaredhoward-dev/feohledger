@@ -135,6 +135,16 @@ nothing switches there.
   never costs reflow) and *up* for a `min-width` rule (the wide layout waits
   until it really fits). A genuinely new step changes `breakpoints.ts`, this
   table and the decisions log together.
+- **Where two queries meet, exactly one side matches.** A `max-width: N` and
+  a `min-width: N` both match at N, so at that one width a component gets the
+  narrow and the wide rules at once (the legal sheet lost its card *and*
+  gained the wide gutter at 1024). When a wide rule starts at a step, write the
+  narrow side as its negation, `@media not all and (min-width: N)`; N then
+  belongs to the wide side. The auth shell, sign-in's proofs and the legal
+  sheet all turn this way at `xl` — the two-column sign-in starts AT 1024, so
+  iPad landscape keeps it. `breakpoints.test.ts` fails on a `max-width: N` in a
+  file that also has a `min-width: N`. A lone `max-width` with no wide partner
+  (the shell's `lg`) keeps the inclusive "at and below" reading.
 - **`@container` queries are outside the scale** — they measure a component's
   own box, not the viewport (the help centre uses three).
 
@@ -142,8 +152,11 @@ nothing switches there.
 
 - **Sidebar** — at or below `lg` the shell is the icon rail (auto-collapsed),
   and opening it is an overlay, never a push (§ Accessibility patterns →
-  Sidebar on a phone). The reader's wide-viewport choice is remembered
-  separately and comes back when the window widens.
+  Sidebar on a phone). The reader's wide-viewport choice is kept separately
+  and comes back when the window widens; it lasts the session (held in
+  memory, not persisted, so a reload starts expanded). The store seeds
+  `narrow` from `matchMedia` when it is created, so a phone's first paint is
+  already the rail.
 - **`SectionTabs`** — tabs that do not fit go into the More menu; what stays
   in the row (always at least the active tab) scrolls sideways *inside* the row
   when it still does not fit, rather than being clipped or widening the page.
@@ -1813,8 +1826,8 @@ inherit it for free. Reuse these; don't re-solve them per page.
   change. Desktop keeps the push layout. State lives
   in `stores/sidebar.svelte.ts` (`narrow`, `overlay`), which keeps the reader's
   wide-viewport expand / collapse choice apart from the narrow overlay, so
-  widening the window restores the wide choice instead of whatever the phone
-  layout forced. Guard: `tests-e2e/a11y/sidebar-overlay.spec.ts` (375 and
+  widening the window restores the wide choice (for the session; it is not
+  persisted) instead of whatever the phone layout forced. Guard: `tests-e2e/a11y/sidebar-overlay.spec.ts` (375 and
   320px, the 768/769 boundary, the restored choice, rail names and 24px
   targets, both themes under axe, desktop unchanged) and `stores/sidebar.test.ts`.
 - **Icon-only controls** — every icon-only `<button>` needs an

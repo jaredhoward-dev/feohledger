@@ -195,8 +195,8 @@ test.describe('/organization section navigation', () => {
 	});
 
 	test('on a 320px viewport the rail is behind its toggle', async ({ page }) => {
-		// 320px is the width WCAG 1.4.10 names, and the rail's own breakpoint is
-		// 60rem — so this is the layout a phone gets: the panel, not a 16-row
+		// 320px is the width WCAG 1.4.10 names, and the rail sits beside the
+		// panel only from 1024px (the scale's `xl`) — so this is the layout a phone gets: the panel, not a 16-row
 		// menu above it.
 		await page.setViewportSize({ width: 320, height: 720 });
 		await page.goto('/organization');

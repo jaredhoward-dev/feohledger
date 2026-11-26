@@ -14,6 +14,10 @@
  * Pixels, not rems: every query had been px apart from three rem ones, and one
  * unit is what lets a reader compare two queries at a glance.
  *
+ * Where a wide and a narrow query meet at one value, the narrow side is
+ * written `not all and (min-width: N)`, so exactly one side matches at N
+ * (`breakpoints.test.ts` flags a `max-width: N` beside a `min-width: N`).
+ *
  * The supported floor is 320px (WCAG 2.2 SC 1.4.10). It is not a breakpoint —
  * nothing switches there — it is the width every route must still reflow at
  * (`tests-e2e/a11y/reflow.spec.ts`).

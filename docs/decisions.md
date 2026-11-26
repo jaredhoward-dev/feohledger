@@ -29564,6 +29564,31 @@ section tabs scrolling at 320 on `/bank-reconciliation`);
 `signup/panel-layout.spec.ts`'s "just above the auth breakpoint" size moves
 961 → 1025.
 
+
+**Review follow-up (same round).** *Boundaries.* A `max-width: N` beside a
+`min-width: N` matches both at N; at exactly 1024px the legal sheet lost its
+card and took the wide gutter at once. Where a wide and a narrow query meet,
+the narrow side is now `not all and (min-width: N)`, so N belongs to the wide
+side alone; `breakpoints.test.ts` flags a `max-width: N` in a file that also
+has a `min-width: N`. The auth shell and sign-in's proofs take the same form:
+the two-column sign-in starts AT 1024, so iPad landscape keeps it, and
+`signup/panel-layout.spec.ts` regains #635's short case just above the step
+(1025×560). The legal card is gone at 833–1023 (it was a card from 52rem);
+accepted, because no lower step keeps it: at `lg` the sheet is 768px with the
+16px gutter and 792px with the 28px one, so a card from 769 would touch or
+overrun both window edges — the state the rule exists to avoid. *Sidebar.* The
+store seeds `narrow` from `SHELL_NARROW_QUERY` when created in the browser;
+left to the layout's effect, a phone painted the 220px panel for a frame. The
+wide expand/collapse choice lasts the session — it is held in memory, not
+persisted, and a reload starts expanded; persisting it was not taken up.
+*Section tabs.* The More budget was taken from the row, which is More's flex
+sibling and had already shrunk by More's width, then subtracted More again
+(about 80px of tabs pushed into the menu); it now reads
+`.section-tabs-inner`'s content width, and the split is the pure
+`lib/sectionTabsSplit.ts`, unit-tested. The 320px e2e no longer asserts that
+"Bank Reconciliation" fits whole beside More, which it cannot; it asserts the
+row scrolls to both of the tab's edges, with `/intake` as the fits-whole case.
+
 ## 591. Production secrets reach the VM as ciphertext from infra-secrets' CI, and only a gated deploy applies them (#735, round 51)
 
 **Problem.** A change to `feohledger/prod.sops.yaml` took five hand steps

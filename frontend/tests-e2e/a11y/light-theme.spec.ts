@@ -374,7 +374,7 @@ test.describe('light theme — the public no-tenant origin', () => {
 	test('at 320px the landing header holds the mark, the CTA and the theme switch without overflow', async ({
 		page
 	}) => {
-		// 1.4.10 at the criterion's own width. Below 760px the theme switch
+		// 1.4.10 at the criterion's own width. At 768px and below (the scale's `lg`) the theme switch
 		// sits in the header's menu with the section links (#635 finding 25),
 		// so it is measured with the menu open — the bar beside it holds the
 		// mark, the CTA and the menu toggle.
