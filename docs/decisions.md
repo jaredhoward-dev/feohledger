@@ -30870,3 +30870,69 @@ flag carries the reason as `discount_credit_failure`.
   - the stall flag is one per payment and reason.
 - `test_qbo_status_sync_adapter.py`: a refresh failure or a lost connection on
   the create call (after a 401) is `not_posted`.
+
+## 586. A received PEPPOL e-invoice's record outlives its deleted invoice, detached and stamped, then expires under its own retention class (§580 follow-up, round 50)
+
+**The gap.** §580 refused deleting an invoice whose outbound transmission was
+not `failed`, and left inbound rows as they were: `_delete_invoice_cascade`
+still deleted them. Deleting an invoice we *received* (a spam or duplicate
+document) is legitimate, but the inbound `peppol_transmissions` row is the
+local record that a supplier delivered an e-invoice to us, which some
+jurisdictions require be retained, and it went with the invoice.
+
+**Decision: detach and stamp, never delete.** The cascade now sets the inbound
+row's `invoice_id` to NULL and stamps `invoice_deleted_at`,
+`invoice_deleted_by_id` (the actor `invoice.deleted` names) and
+`deleted_invoice_id` (the id that audit row's `entity_id` carries), in the same
+transaction (migration 0152). Outbound rows are unchanged: a live one still
+refuses the delete (§580) and a `failed` one, which never left, is still
+deleted. `ck_peppol_detached_inbound` holds the rule at the data layer: a row
+with no invoice must be inbound and stamped. The FK stays `NO ACTION` with an
+explicit detach, as every other unlink in the cascade does, because
+`ON DELETE SET NULL` could not record who deleted the invoice. The partial
+unique index on `(invoice_id, direction)` is unchanged: NULLs are distinct, so
+detached rows coexist. A side effect kept on purpose: the surviving
+`message_id` still dedupes, so a redelivery of the deleted document does not
+recreate it.
+
+**Retention class `peppol_transmissions`.** A detached row is governed by a new
+record class (platform default window, settable through
+`PUT /api/retention-policy`). The sweep deletes a detached inbound row once
+`created_at` — receipt, the date e-invoice retention rules count from — is
+past the window, batch-capped and counted in the `retention.archived`
+manifest. A row still attached to an invoice is never touched: it lives as
+long as its invoice, which the invoice class only soft-archives. Deleting
+rather than redacting at expiry, because once the invoice is gone and the
+window has passed nothing needs the row, and a redacted row with a NOT NULL
+participant id would be a placeholder, not a record.
+
+**Erasure.** The row is transactional, carrying the supplier company's
+participant id (a business identifier), amount and message id; it is
+preserved by erasure as the invoice is, and nothing on a detached row links
+to a vendor. The retention window is what bounds it, including for a sole
+trader whose participant id is personal data.
+
+**Rejected: refusing the delete outright,** as §580 does for outbound. It would
+leave spam permanently in the AP queue. **Rejected: soft-deleting the
+invoice** to keep the link. Every invoice reader would have to learn to skip
+it, for the sake of one child table.
+
+**Not decided here:** how long a jurisdiction requires a received e-invoice be
+kept. The class defaults to the platform window (84 months) and is
+per-tenant; the follow-up's trigger (counsel's view) now sets a number, not
+code. The received payload object in storage is not touched by any invoice
+delete (that holds for every invoice, not only PEPPOL ones).
+
+**Readers.** Every query that lists transmissions filters by an invoice id
+(the route, the send reservation and settle, the recall and delete refusals),
+so a detached row appears on no invoice. The workspace-closure guard counts any
+row, so a detached one still blocks closing a workspace that holds e-invoice
+records.
+
+**Tests.** `test_invoice_delete_cascade.py` (single and bulk delete keep the
+inbound row detached and stamped; a failed outbound row on the same invoice is
+cleared; the check refuses detaching an outbound or unstamped row; §580's
+refusals unchanged), `test_migration_0152_peppol_inbound_detach.py` (model
+parity, down / up / up, downgrade refused over a detached row, control-plane
+no-op), `test_retention.py` (only a detached row past its window expires,
+idempotent, manifest counts, policy endpoint accepts the class).

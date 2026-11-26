@@ -1350,20 +1350,6 @@ user-visible halves still open.
       `payment.erp_voided`-less voided payment found with a BillPayment in the
       ERP, or the next change to `write_back_payment`.
 
-- [ ] **(c) Deleting an invoice received over PEPPOL erases its inbound
-      transmission record.** §580 refuses deleting an invoice with a
-      non-`failed` *outbound* transmission (a sent e-invoice is corrected by a
-      credit note), but an invoice we *received* over PEPPOL can still be
-      deleted and `_delete_invoice_cascade` deletes its inbound
-      `PeppolTransmission` row with it, losing the local record of a received
-      e-invoice that some jurisdictions require be retained. Not refused
-      outright because deleting a received spam / duplicate document is a
-      legitimate action. **Durable fix:** keep the inbound transmission row
-      (detach it from the invoice, mark it `invoice_deleted` with the actor)
-      rather than deleting it, under the retention policy's record class.
-      **Trigger:** counsel's view on e-invoice retention, or the first tenant
-      receiving over PEPPOL in a jurisdiction with a retention rule.
-
 - [ ] **(c) The open-balance flag invites a manual discount booking even when
       our discount credit may exist.** Since §577 a credit created but not
       applied (or half-reversed by a void) is recorded by id and finished by
