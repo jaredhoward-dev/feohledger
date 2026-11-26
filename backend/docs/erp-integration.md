@@ -3557,12 +3557,22 @@ product on 2024-12-31** and ended US access on 2025-01-31
 ([Sage](https://www.sage.com/en-us/sage-business-cloud/sage-accounting/)), so
 no US business exists to connect. A US customer on Sage is on Sage Intacct
 (`sage_intacct`) or the desktop Sage 50, which has no connector. Test this
-adapter against a UK trial business. Sage Business Cloud Accounting
+adapter against a UK trial business (setup below). Sage Business Cloud Accounting
 **South Africa** (the Pastel successor) runs on a separate codebase with its
 own API (`https://accounting.sageone.co.za/api/2.0.0`, API key + basic auth,
 not OAuth), and Sage's developer community confirms v3.1 does not serve it.
 So this adapter covers the other v3.1 regions; a ZA business cannot
 complete its consent flow. A ZA Sage adapter is separate work.
+
+**Setting up the UK trial business: finish Sage's first-run setup first.** A
+new Sage Accounting business opens on a first-run onboarding (Sage Copilot's
+"Yes, set up my business" confirmation). Until that is confirmed in the
+browser you connect from, Sage's sign-in drops the OAuth request: the connect
+never reaches the consent screen or comes back to `/api/erp/oauth/callback`,
+so FeohLedger shows no `erp_error` code to explain it.
+Sign in to Sage Accounting in that browser, confirm "Yes, set up my business",
+then press Connect (seen in the live UK pass, #743). Locally, connect from
+Chrome / Chromium, not Brave or Firefox (§ Connecting an OAuth ERP).
 
 **`settings.erp` keys:** `oauth` (written by `erp_oauth` only),
 `default_tax_rate_id` (optional fallback), `void_reason` (optional; default
@@ -4456,6 +4466,14 @@ Chromium (Playwright's `page.request` and Chromium both carry it). No deployed
 API can take this branch: it needs both a loopback `FEOH_API_PUBLIC_URL` and a
 non-deployed `FEOH_ENVIRONMENT`, so a misconfigured deployment keeps `Lax` and
 fails closed at the callback.
+
+**Brave blocks it too, despite being Chromium.** Brave Shields' cookie
+blocking drops the connect's browser-binding cookie on `localhost`, so a local
+connect started in Brave comes back `erp_error=browser_mismatch` after the
+provider's consent screen (seen in the live Sage Accounting UK pass, #743).
+Turn Shields off for `acme.localhost` and `localhost`, or use Chrome /
+Chromium. Production is unaffected: the tenant app and the API share one site
+there, so the cookie is first-party `SameSite=Lax` and Shields leaves it alone.
 
 The callback's query (`code`, `state`, `realmId`) never reaches the uvicorn
 access log: `app/utils/access_log.py` strips the query of every path in
