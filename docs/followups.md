@@ -1378,24 +1378,20 @@ user-visible halves still open.
       regenerated). **Trigger:** the first discount-credit opt-in tenant, or the
       next change to the write-back flags.
 
-- [ ] **(c) A Xero push refused `erp_bill_key_shared` has no in-app way to
-      take the bill as its own.** §572 stops the push adopting a bill found on
-      a supplier + number another invoice shares (the push and the orphan
-      lookup now apply one rule, `shared_lookup_keys`), and nothing is created
-      beside it. But when the found bill really is this invoice's (an earlier
-      attempt's lost response, the sharer a rejected duplicate), retries keep
-      refusing: the only exits are correcting the invoice number or clearing
-      the sharer. **Durable fix:** carry a FeohLedger marker Xero preserves on
-      ACCPAY bills so adoption keys on something unique. Xero's OpenAPI
+- [ ] **(c) Xero adoption still keys on a supplier + number, not on a mark of
+      ours.** §572 refuses adoption on a key another invoice shares, and §587
+      added the in-app exit: a `payment.void` holder who may retry the push
+      confirms the found bill as this invoice's (`POST
+      /api/invoices/{id}/confirm-erp-bill`), and the push adopts that bill
+      only. What remains is that a person has to decide it, and that an
+      unshared key still adopts a bill keyed by hand in Xero (§566).
+      **Durable fix:** carry a FeohLedger marker Xero preserves on ACCPAY
+      bills so adoption keys on something unique. Xero's OpenAPI
       (`XeroAPI/Xero-OpenAPI` `xero_accounting.yaml`, read 2026-11-25) marks
       `Reference` "ACCREC only" and describes `Url` only as a source-document
-      link, with no statement that it is kept on bills or filterable; the
-      invoices reference page did not render for an automated fetch that day.
-      Failing that, a `payment.void`-gated "this bill is this invoice's" action
-      that records the confirmation and finishes the push. **Trigger:** the
-      first `erp_bill_key_shared` refusal a tenant cannot clear by renumbering,
-      or the live Xero contract test (`pnpm test:erp:xero-live`) showing a
-      marker field survives a round trip on an ACCPAY bill.
+      link, with no statement that it is kept on bills or filterable.
+      **Trigger:** the live Xero contract test (`pnpm test:erp:xero-live`)
+      showing a marker field survives a round trip on an ACCPAY bill.
 
 ### Surfaced by round 12 (2026-11-15, round PR #716, decisions §410–§421)
 

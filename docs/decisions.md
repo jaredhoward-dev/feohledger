@@ -30870,3 +30870,77 @@ flag carries the reason as `discount_credit_failure`.
   - the stall flag is one per payment and reason.
 - `test_qbo_status_sync_adapter.py`: a refresh failure or a lost connection on
   the create call (after a 401) is `not_posted`.
+
+## 587. A person confirms the bill on a shared Xero key as this invoice's; the push then adopts that bill and no other, and a second invoice cannot claim it (§572 follow-up, round 50)
+
+**Context.** Since §572 the Xero push refuses `erp_bill_key_shared` when it
+finds a live bill on a supplier + number another invoice shares. When the bill
+really is this invoice's (an earlier attempt's response was lost and the
+sharer is a rejected duplicate), retries kept refusing until someone
+renumbered an invoice, and renumbering a real supplier number weakens
+duplicate detection.
+
+**Decision.**
+
+- **A served verdict, then a lookup, then a confirmation.** Every push that
+  lands at `failed` now records its coded refusal on the workflow state
+  (`erp_last_refusal_code`, written by the final-failure branch and
+  `_fail_push`, dropped by `reset_erp_push_budget` as every new push starts).
+  `erp_bill_confirm.confirm_verdicts` serves `erp_bill_confirm_refusal` on
+  `GET /review-actions` only when that code is `erp_bill_key_shared` (the
+  §560 pattern: absent offers nothing). `GET /erp-bill-confirmation` names the
+  bill with the adapter's own lookup, without §566's shared-key refusal: that
+  refusal guards the orphan *void*, and here the person reads the bill to say
+  whose it is. `POST /confirm-erp-bill` `{erp_document_id, reason}` re-runs
+  the lookup with no lock held, then under the invoice and instance locks
+  re-checks the verdict, that the lookup still names that very id
+  (`erp_bill_confirm_not_found`), and the claim (below), records
+  `erp_confirmed_bill` on the workflow state with an append-only
+  `invoice.erp_bill_confirmed` row (actor, reason), commits, and starts
+  `POST /retry-erp`'s own start.
+- **The bill reaches the invoice through the adoption path, not a side
+  door.** `_call_erp` passes the confirmation as
+  `InvoicePayload.confirmed_bill_id`; Xero adopts a found bill on a shared key
+  only when its `InvoiceID` is that id, and then exactly as an unshared
+  adoption: at the approved total, a different total still
+  `duplicate_document_number`. So `failed → sending_to_erp → sent_to_erp →
+  posted_in_erp | done`, `erp_document_id` / URL and the workflow completion
+  are the push's own. *Rejected: writing `erp_document_id` and the transitions
+  from the endpoint* — it would restate the success branch (status sync,
+  completion, realm) and skip the total check.
+- **One bill, one invoice.** `claimed_elsewhere` refuses `erp_bill_claimed`
+  when any other invoice, at any status, has the bill as its
+  `erp_document_id`, as the orphan its own failed push recorded, or as its
+  confirmation. It runs before the ERP call and again under a
+  `pg_advisory_xact_lock` on the bill id, so two invoices confirming one bill
+  at once serialize and the second sees the first's committed claim. The
+  claim is recorded on the confirming invoice rather than a mark on the
+  sharer: the sharer's own push still refuses (its key is shared and it
+  confirmed nothing), and every confirmation reads every claim, so no list of
+  sharers has to be kept in step as invoices are renumbered.
+- **Gate: `payment.void` and a role that may retry** (admin, ap_manager,
+  cfo). Deciding whose a bill in the ERP is decides whether it stays payable
+  there, which is the orphan lookup and void's duty (§556); the action ends in
+  a retry, so it is no wider than `/retry-erp` either. Both endpoints depend on
+  `payment.void` (pinned in `test_sod_endpoint_wiring.py`) and the verdict
+  checks the role list.
+- **A refused retry keeps the confirmation.** If a retry gate refuses (an
+  open flag, a live claim) the invoice stays `failed` with the confirmation
+  recorded; Retry ERP Send honours it later.
+- **Mobile is unchanged:** it shows the push's refusal sentence but offers
+  no ERP-bill actions (neither the orphan lookup nor this one).
+
+**Residual.** A person decides; nothing in Xero proves the bill is ours. The
+marker that would make adoption key on something unique stays the follow-up.
+
+**Tests.** `test_erp_bill_confirm.py` (verdict: candidate, roles and
+permission, ERP; confirm records once, audits actor + reason, retries; a
+second invoice refused whether the first holds the bill or only confirmed it,
+and after a first confirmation the sharer is refused; a bill the lookup no
+longer names refused with nothing recorded; RBAC; `_call_erp` hands the
+confirmation over; a final failure records its code),
+`test_erp_xero_adapter.py` (the confirmed id is adopted at the approved total
+only; a confirmation of another bill does not adopt), `test_erp_push_flow.py`,
+`test_sod_endpoint_wiring.py`, `test_audit_append_only.py`; vitest
+`erpOrphanBill.test.ts` (`confirmBillBody`), `codedRefusals.test.ts`; e2e
+`invoices/erp-bill-confirm.spec.ts` (typechecked, not run).
