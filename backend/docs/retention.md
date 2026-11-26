@@ -77,13 +77,16 @@ Not a retention window: an invoice delete's storage half (`docs/decisions.md`
 §592, `services/invoice_objects`). Deleting an invoice queues its two folders,
 `{org}/{invoice}/` (the document from every channel, every superseded version,
 a received PEPPOL payload) and `{org}/chat/{invoice}/` (chat attachments), in
-`pending_object_deletions` inside the delete's transaction, and a post-commit
-job empties them. Every tick of this sweep then, per tenant:
+`pending_object_deletions` inside the delete's transaction, and one post-commit
+job per transaction (a bulk delete included) empties them. Every tick of this
+sweep then, per tenant:
 
 1. **retries the outbox** — the oldest `FEOH_RETENTION_BATCH_SIZE` rows that
    job did not finish (`drain_pending`); a row is removed only once its folder
    is empty, and a failure keeps it with `attempts` / `last_error` (a class
-   name);
+   name). Rows are claimed in a short committed transaction before any bucket
+   call (`last_error = 'claimed'`), so no row lock is held across storage and a
+   row another drain claimed within `CLAIM_LEASE` (15 minutes) is skipped;
 2. **walks one page of orphans** — one S3 listing page of the folders under
    `{org}/` and `{org}/chat/` (resuming where the last tick stopped), keeps the
    ones shaped like an invoice folder, and deletes those whose invoice row does

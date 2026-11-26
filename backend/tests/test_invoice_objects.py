@@ -25,6 +25,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 from botocore.exceptions import ClientError
+from sqlalchemy import delete as sa_delete
 from sqlalchemy import select
 
 from app.models.invoice import Invoice, InvoiceStatus
@@ -278,6 +279,174 @@ async def test_a_folder_holding_a_live_invoices_document_is_refused(realdb, monk
         result = await invoice_objects.drain_pending(db, organization_id=org_id, limit=10)
         await db.commit()
     assert calls == [] and result.refused == 1
+
+
+@pytest.mark.asyncio
+async def test_bulk_delete_runs_one_post_commit_job_for_every_folder(realdb, monkeypatch):
+    """N invoices in one transaction: one job, one session, one claim, and a
+    failure on one folder leaves only that folder's row."""
+    from app.services import post_commit
+
+    org_id = realdb.info(TENANT).org_id
+    mk = realdb.sessionmaker(TENANT)
+    ids = [await _seed_invoice(mk, org_id, number=f"OBJ-ONE-{n}") for n in range(3)]
+    broken = f"{org_id}/{ids[1]}/"
+    calls: list[str] = []
+
+    async def _fake(prefix: str) -> int:
+        calls.append(prefix)
+        if prefix == broken:
+            raise ConnectionError("storage down")
+        return 1
+
+    monkeypatch.setattr(storage, "delete_prefix", _fake)
+    queued: list[str] = []
+    real_enqueue = post_commit.enqueue_post_commit
+
+    def _spy(session, factory, *, name):
+        queued.append(name)
+        real_enqueue(session, factory, name=name)
+
+    monkeypatch.setattr(invoice_objects, "enqueue_post_commit", _spy)
+    claims: list[int] = []
+    real_claim = invoice_objects._claim
+
+    async def _claim_spy(*args, **kwargs):
+        got = await real_claim(*args, **kwargs)
+        claims.append(len(got))
+        return got
+
+    monkeypatch.setattr(invoice_objects, "_claim", _claim_spy)
+
+    async with realdb.client(key=TENANT, role="admin") as c:
+        resp = await c.post("/api/invoices/bulk/delete", json={"ids": [str(i) for i in ids]})
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["deleted"] == 3
+    await drain_post_commit()
+
+    assert queued.count("invoice_objects.purge") == 1
+    assert claims == [6]
+    expected = [p for i in ids for p in invoice_objects.invoice_object_prefixes(org_id, i)]
+    assert sorted(calls) == sorted(expected)
+    rows = await _pending(mk)
+    assert [r.prefix for r in rows] == [broken]
+    assert rows[0].attempts == 1 and rows[0].last_error == "storage_error"
+    audits = await _purge_audits(mk)
+    assert len(audits) == 1
+    assert audits[0].details["folders_purged"] == 5 and audits[0].details["failed"] == 1
+
+
+@pytest.mark.asyncio
+async def test_a_new_transaction_on_the_same_session_gets_its_own_job(realdb, monkeypatch):
+    org_id = realdb.info(TENANT).org_id
+    mk = realdb.sessionmaker(TENANT)
+    a = await _seed_invoice(mk, org_id, number="OBJ-TX-A")
+    b = await _seed_invoice(mk, org_id, number="OBJ-TX-B")
+    calls = _record_deletes(monkeypatch, removed=0)
+
+    async with mk() as db:
+        await invoice_objects.queue_invoice_objects(db, a)
+        await db.rollback()
+        # The rolled-back transaction's job is gone; this one must queue anew.
+        await invoice_objects.queue_invoice_objects(db, b)
+        await db.execute(sa_delete(Invoice).where(Invoice.id == b))
+        await db.commit()
+    await drain_post_commit()
+
+    assert sorted(calls) == sorted(invoice_objects.invoice_object_prefixes(org_id, b))
+    assert await _pending(mk) == []
+
+
+async def _queue_rows(mk, org_id, count: int) -> list[str]:
+    prefixes = [f"{org_id}/{uuid.uuid4()}/" for _ in range(count)]
+    async with mk() as s:
+        for prefix in prefixes:
+            s.add(
+                PendingObjectDeletion(
+                    organization_id=org_id,
+                    prefix=prefix,
+                    owner_type="invoice",
+                    owner_id=uuid.UUID(prefix.rstrip("/").split("/")[-1]),
+                )
+            )
+        await s.commit()
+    return prefixes
+
+
+@pytest.mark.asyncio
+async def test_no_row_lock_is_held_while_storage_works_and_a_second_drain_skips_claimed_rows(
+    realdb, monkeypatch
+):
+    import asyncio
+
+    org_id = realdb.info(TENANT).org_id
+    mk = realdb.sessionmaker(TENANT)
+    prefixes = await _queue_rows(mk, org_id, 2)
+    entered, release = asyncio.Event(), asyncio.Event()
+    calls: list[str] = []
+
+    async def _slow(prefix: str) -> int:
+        calls.append(prefix)
+        entered.set()
+        await release.wait()
+        return 1
+
+    monkeypatch.setattr(storage, "delete_prefix", _slow)
+
+    async def _first() -> invoice_objects.PurgeResult:
+        async with mk() as db:
+            return await invoice_objects.drain_pending(db, organization_id=org_id, limit=10)
+
+    first = asyncio.create_task(_first())
+    await asyncio.wait_for(entered.wait(), timeout=10)
+
+    # Mid-storage-call: the claim has committed, so the rows are not locked
+    # (NOWAIT would raise if they were) and they carry the claim.
+    async with mk() as s:
+        rows = (
+            (await s.execute(select(PendingObjectDeletion).with_for_update(nowait=True)))
+            .scalars()
+            .all()
+        )
+        assert sorted(r.prefix for r in rows) == sorted(prefixes)
+        assert all(r.last_error == invoice_objects.CLAIMED and r.attempts == 1 for r in rows)
+        await s.rollback()
+
+    # A concurrent drain (the sweep) takes none of them.
+    async with mk() as db:
+        second = await invoice_objects.drain_pending(db, organization_id=org_id, limit=10)
+    assert second.folders_purged == 0 and second.failed == 0
+
+    release.set()
+    result = await first
+    assert result.folders_purged == 2
+    assert sorted(calls) == sorted(prefixes)
+    assert await _pending(mk) == []
+
+
+@pytest.mark.asyncio
+async def test_a_claim_left_by_a_dead_drain_is_retaken_after_its_lease(realdb, monkeypatch):
+    org_id = realdb.info(TENANT).org_id
+    mk = realdb.sessionmaker(TENANT)
+    now = datetime.now(UTC)
+    fresh, stale = await _queue_rows(mk, org_id, 2)
+    async with mk() as s:
+        for row in (await s.execute(select(PendingObjectDeletion))).scalars().all():
+            row.last_error = invoice_objects.CLAIMED
+            row.attempts = 1
+            row.last_attempt_at = (
+                now - timedelta(minutes=1)
+                if row.prefix == fresh
+                else now - invoice_objects.CLAIM_LEASE - timedelta(minutes=1)
+            )
+        await s.commit()
+    calls = _record_deletes(monkeypatch, removed=1)
+
+    async with mk() as db:
+        await invoice_objects.drain_pending(db, organization_id=org_id, limit=10, now=now)
+
+    assert calls == [stale]
+    assert [r.prefix for r in await _pending(mk)] == [fresh]
 
 
 def _fake_bucket(monkeypatch, folders: dict[str, dict[str, datetime | None]]):

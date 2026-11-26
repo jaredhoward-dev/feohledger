@@ -309,10 +309,16 @@ and `contract_renewal` are in the same position and page the same way (below).
 / a generated period leaves the candidate set and the next tick resumes past it.
 The retention sweep's object-storage pass (`services/invoice_objects`, decisions
 §592) does both: its `pending_object_deletions` outbox caps, because an emptied
-folder's row is deleted, while its orphan scan of the bucket pages — one S3
+folder's row is deleted (and a row another drain claimed within `CLAIM_LEASE`
+is skipped, so the cap moves past it), while its orphan scan of the bucket pages — one S3
 listing page per tick under `{org}/` and `{org}/chat/`, resuming from an
 in-process continuation token, because a live invoice's folder never leaves the
-listing. A restart only restarts the walk from the top.
+listing. A restart only restarts the walk from the top. The outbox drain is
+two-phase too: it claims its rows in a short committed transaction (`FOR UPDATE
+SKIP LOCKED`, marked `claimed` with `last_attempt_at`) and holds no row lock
+while it calls the bucket, then deletes the emptied rows in another; the
+delete's post-commit job runs the same drain once per transaction, however many
+invoices it deleted.
 
 The page boundary is safe for the same reason the two-phase shape is safe at all:
 step 2 re-claims the row under `FOR UPDATE` and re-checks the predicate there, so
