@@ -2749,7 +2749,14 @@ booked leaves the same flag, with its refusal code. An accepted short settlement
 (`/settlement/accept`) writes back what was settled. Voiding a settled payment
 voids its BillPayment; the intent is recorded in the void's own transaction
 (`erp_payment_voids_pending`) so the status-sync sweep finishes it if the
-process dies first. Voiding a payment the ERP REPORTED opens the blocking
+process dies first. The write itself is reserve → call → record (decisions
+§584): `erp_payment_writes_pending` is committed before `post_payment` and
+cleared with the recorded outcome, so a lost outcome is finished by the sweep
+(`resume_pending_writes`) — the void re-armed if the payment was voided
+meanwhile, else the payment written back again, which the adapter's
+find-by-payment-id makes a lookup, never a second ERP payment. A void that
+keeps failing is audited when its cause changes, not every pass, and stops at
+12 attempts with its flag open. Voiding a payment the ERP REPORTED opens the blocking
 `payment_reconciliation` in the same transaction: the invoice is `approved`
 again while QuickBooks may still show the bill paid, and nothing about that
 bill would ever be reported again. A bill settled in QuickBooks by a vendor

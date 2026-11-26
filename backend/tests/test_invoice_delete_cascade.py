@@ -469,6 +469,8 @@ _PENDING_STATES = {
     "void": {"erp_payment_voids_pending": [str(uuid.UUID(int=1))]},
     "void_credit": {"erp_discount_credit_voids_pending": {str(uuid.UUID(int=2)): "VC-1"}},
     "credit": {"erp_discount_credits_pending": {str(uuid.UUID(int=3)): {"credit_id": None}}},
+    # A payment write whose outcome was never recorded (decisions §584).
+    "write": {"erp_payment_writes_pending": {str(uuid.UUID(int=4)): {"token": "t"}}},
 }
 
 

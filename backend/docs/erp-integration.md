@@ -618,7 +618,9 @@ naming the code. A payment void reverses our credit FIRST
 booked while on; `payment.erp_discount_credit_reversed`); if that fails the
 payment void is not attempted, `payment.erp_void_failed` carries
 `document: discount_credit`, and the pending marker makes the sweep retry from
-the credit. QuickBooks' `bill_report` counts our discount application as ours
+the credit. The one exception is a recorded credit refused
+`discount_credit_not_ours` (edited in the ERP): the payment is voided anyway
+and the credit stays recorded and flagged on its own (decisions §584). QuickBooks' `bill_report` counts our discount application as ours
 (`_discount_marker`), so a bill closed by our payment plus our credit is
 `paid_only_by_us`; Xero's existing rule (a credit no larger than the discount
 our own payment took, beside our write-back) already reads it as ours.
@@ -747,6 +749,32 @@ during the void's ERP call leaves the void pending. The
 `discount_credit_stalled` flag is kept one per payment and reason, so a live
 `unidentified` flag never hides a later `discount_credit_not_ours` with its
 id, nor another payment's stall on the same invoice.
+
+**The payment write is reserved too; a credit not ours no longer holds the
+void** (decisions §584). Before `post_payment`, the write-back commits
+`state_data.erp_payment_writes_pending[<payment id>]` (`token`, `bill_id`,
+`attempts`, `claimed_until`) under the same locks, and the transaction that
+records the outcome — success or failure — clears it when it still names that
+attempt's token. If that transaction rolls back or the process dies, the
+status-sync sweep's `resume_pending_writes` (run before
+`resume_pending_voids`) finds the record once its claim lapses: a payment no
+longer `completed` has its void re-armed (fresh `erp_payment_void_rearmed`
+token) and the record dropped together, so the same pass voids whatever was
+written; a payment still `completed` is written back again, and the adapter's
+own find-by-payment-id (QuickBooks `PrivateNote`, Xero `Reference`, NetSuite
+`externalId`) answers with our earlier BillPayment instead of creating one. A
+live claim or `MAX_WRITE_ATTEMPTS` (12, then `payment.erp_post_failed` with
+`retries_exhausted` and a `payment_writeback_failed` flag with `failure:
+retries_exhausted`, once) means nothing is sent. The invoice delete door counts
+the key as pending.
+A payment void whose credit reverse is refused `discount_credit_not_ours`
+calls `void_payment` anyway: `payment.erp_voided` carries
+`discount_credit_held: <id>`, the credit's entries stay, and the
+`discount_credit_stalled` flag (`reason: discount_credit_not_ours`) names it.
+A void that keeps failing records `erp_payment_void_attempts[<payment id>]`
+(`outcome`, `attempts`); `payment.erp_void_failed` is audited only when the
+outcome changes or `MAX_VOID_ATTEMPTS` (12) is reached, after which no pass
+calls the ERP for it until a write-back re-arms it (which resets the count).
 
 The code is exercised against `tools/fake-erp` and the adapter doubles only,
 not yet a real company; a read-back that is not what we wrote fails closed
