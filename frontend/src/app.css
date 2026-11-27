@@ -195,6 +195,11 @@
 	/* A border one step louder than --border: the hover edge of a card or a
 	   secondary button. */
 	--border-strong: #3a3e4f;
+	/* The resting edge of a checkbox or radio: the only thing that shows an
+	   unticked box is there at all, so it is held to WCAG 1.4.11's 3:1
+	   against --bg, --surface and --surface-2. --border (1.38:1 on --bg) is a
+	   divider tone and left the empty box near-invisible on dark. */
+	--control-border: #767b8f;
 	/* The edge of a floating dialog, quieter than --border. */
 	--border-soft: rgba(226, 228, 234, 0.09);
 	/* The dimmed page behind a modal. */
@@ -289,6 +294,7 @@
 	--shadow-card: inset 0 1px 0 rgba(255, 255, 255, 0.7), 0 12px 30px -22px rgba(20, 24, 40, 0.28);
 	--shadow-float: inset 0 1px 0 rgba(255, 255, 255, 0.8), 0 28px 70px -26px rgba(20, 24, 40, 0.38);
 	--border-strong: #b6bccb;
+	--control-border: #767c8d;
 	--border-soft: rgba(23, 26, 36, 0.1);
 	--overlay: rgba(23, 26, 36, 0.4);
 	--scrollbar-thumb: #c4c9d4;
@@ -329,6 +335,7 @@
 		--shadow-card: inset 0 1px 0 rgba(255, 255, 255, 0.7), 0 12px 30px -22px rgba(20, 24, 40, 0.28);
 		--shadow-float: inset 0 1px 0 rgba(255, 255, 255, 0.8), 0 28px 70px -26px rgba(20, 24, 40, 0.38);
 		--border-strong: #b6bccb;
+		--control-border: #767c8d;
 		--border-soft: rgba(23, 26, 36, 0.1);
 		--overlay: rgba(23, 26, 36, 0.4);
 		--scrollbar-thumb: #c4c9d4;
@@ -546,7 +553,7 @@ input[type='checkbox'] {
 	background-repeat: no-repeat;
 	background-position: center;
 	background-size: 11px;
-	box-shadow: inset 0 0 0 1px var(--border);
+	box-shadow: inset 0 0 0 1px var(--control-border);
 	cursor: pointer;
 	transition: background-color 0.12s, box-shadow 0.12s;
 }
@@ -599,7 +606,7 @@ input[type='radio'] {
 	margin: 0;
 	flex-shrink: 0;
 	vertical-align: middle;
-	border: 1px solid var(--border);
+	border: 1px solid var(--control-border);
 	border-radius: 50%;
 	background: var(--bg);
 	cursor: pointer;

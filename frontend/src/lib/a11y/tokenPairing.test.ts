@@ -345,6 +345,21 @@ for (const theme of PALETTE_THEMES) describe(`palette contract [${theme}]`, () =
 	 * dark refusal is the rule authors design to; the light theme only has to
 	 * keep `--text` legible on it.
 	 */
+	// WCAG 1.4.11: the outline is the only thing that shows an UNTICKED
+	// checkbox or radio exists, so it needs 3:1 against every ground a form
+	// sits on. Measured here because the rule scan pairs text, not edges.
+	it('--control-border is visible (3:1) on --bg, --surface and --surface-2', () => {
+		const value = palette['--control-border'];
+		expect(value, '--control-border must be declared in :root').toBeDefined();
+		for (const surface of ['--bg', '--surface', '--surface-2'] as const) {
+			const ratio = contrastRatio(value, palette[surface]) as number;
+			expect(
+				ratio,
+				`--control-border (${value}) on ${surface} (${palette[surface]}) is ${formatRatio(ratio)}`
+			).toBeGreaterThanOrEqual(3);
+		}
+	});
+
 	it('--surface-2 admits --text', () => {
 		expect(contrastRatio(palette['--text'], palette['--surface-2']) as number).toBeGreaterThanOrEqual(
 			WCAG_AA_NORMAL
@@ -355,6 +370,21 @@ for (const theme of PALETTE_THEMES) describe(`palette contract [${theme}]`, () =
 			expect(contrastRatio(palette['--text-muted'], palette['--surface-2']) as number).toBeLessThan(
 				WCAG_AA_NORMAL
 			);
+		});
+	}
+});
+
+describe('form controls draw their resting edge in --control-border', () => {
+	const css = appCss?.source ?? '';
+	for (const [selector, prop] of [
+		["input[type='checkbox']", 'box-shadow'],
+		["input[type='radio']", 'border']
+	] as const) {
+		it(`${selector} uses --control-border, not the divider --border`, () => {
+			const start = css.indexOf(`\n${selector} {`);
+			expect(start, `${selector} base rule not found in app.css`).toBeGreaterThan(-1);
+			const body = css.slice(start, css.indexOf('}', start));
+			expect(body).toMatch(new RegExp(`${prop}:[^;]*var\\(--control-border\\)`));
 		});
 	}
 });
